@@ -1,0 +1,623 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Rollout context: shared state created once before strategy dispatch.
+
+Grouped into five topical sub-contexts — :class:`RuntimeContext`,
+:class:`HardwareContext`, :class:`PolicyContext`, :class:`ProcessorContext`,
+and :class:`DatasetContext` — assembled into :class:`RolloutContext`.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from threading import Event
+
+import torch
+
+from lerobot.configs import FeatureType, PreTrainedConfig
+from lerobot.datasets import (
+    LeRobotDataset,
+    aggregate_pipeline_dataset_features,
+    create_initial_features,
+)
+from lerobot.policies import get_policy_class, make_pre_post_processors
+from lerobot.policies.peft import load_peft_policy
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import validate_visual_features_consistency
+from lerobot.processor import (
+    PolicyProcessorPipeline,
+    RobotAction,
+    RobotObservation,
+    RobotProcessorPipeline,
+    make_default_processors,
+    rename_stats,
+)
+from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+from lerobot.robots import make_robot_from_config
+from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
+from lerobot.utils.feature_utils import (
+    combine_feature_dicts,
+    dataset_to_policy_features,
+    hw_to_dataset_features,
+)
+
+from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
+from .inference import (
+    InferenceEngine,
+    RTCInferenceConfig,
+    SyncInferenceConfig,
+    create_inference_engine,
+)
+from .inference.rtc import supports_rtc_inference
+from .robot_wrapper import ThreadSafeRobot
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_action_key_order(
+    policy_action_names: list[str] | None,
+    dataset_action_names: list[str],
+    *,
+    strict: bool = False,
+) -> list[str]:
+    """Choose action name ordering for mapping policy tensor outputs to robot action dicts."""
+    if not policy_action_names:
+        return dataset_action_names
+    policy_action_names = list(policy_action_names)
+    if len(policy_action_names) != len(dataset_action_names):
+        if strict:
+            raise ValueError(
+                "Strict policy action contract has "
+                f"{len(policy_action_names)} names but robot exposes {len(dataset_action_names)}."
+            )
+        logger.warning(
+            "policy.action_feature_names length (%d) != dataset action dim (%d); using dataset order",
+            len(policy_action_names),
+            len(dataset_action_names),
+        )
+        return dataset_action_names
+    if set(dataset_action_names) != set(policy_action_names):
+        if strict:
+            raise ValueError(
+                "Strict policy action names do not match robot actions: "
+                f"policy={policy_action_names}, robot={dataset_action_names}."
+            )
+        logger.warning("policy.action_feature_names keys don't match dataset; using dataset order")
+        return dataset_action_names
+    return policy_action_names
+
+
+def _validate_strict_hardware_feature_contract(
+    policy_config: PreTrainedConfig,
+    observation_features_hw: dict[str, type | tuple],
+    action_features_hw: dict[str, type],
+    rename_map: dict[str, str],
+) -> None:
+    """Validate package-owned state/action/camera geometry before hardware connect."""
+    if not getattr(policy_config, "strict_hardware_feature_contract", False):
+        return
+
+    expected_state = list(getattr(policy_config, "state_feature_names", None) or [])
+    provided_state = [key for key, value in observation_features_hw.items() if value is float]
+    if provided_state != expected_state:
+        raise ValueError(
+            "Strict policy state order does not match robot observations: "
+            f"policy={expected_state}, robot={provided_state}."
+        )
+
+    expected_action = list(getattr(policy_config, "action_feature_names", None) or [])
+    provided_action = list(action_features_hw)
+    if set(provided_action) != set(expected_action):
+        raise ValueError(
+            "Strict policy actions do not match robot actions: "
+            f"policy={expected_action}, robot={provided_action}."
+        )
+
+    expected_visuals = {
+        key: tuple(feature.shape)
+        for key, feature in policy_config.input_features.items()
+        if feature.type == FeatureType.VISUAL
+    }
+    provided_visuals = {
+        rename_map.get(f"observation.images.{key}", f"observation.images.{key}"): tuple(shape)
+        for key, shape in observation_features_hw.items()
+        if isinstance(shape, tuple)
+    }
+    if set(provided_visuals) != set(expected_visuals):
+        raise ValueError(
+            "Strict policy camera names do not match robot cameras after rename_map: "
+            f"policy={sorted(expected_visuals)}, robot={sorted(provided_visuals)}."
+        )
+    for key, policy_shape in expected_visuals.items():
+        hardware_hwc = provided_visuals[key]
+        hardware_chw = (
+            (hardware_hwc[2], hardware_hwc[0], hardware_hwc[1]) if len(hardware_hwc) == 3 else hardware_hwc
+        )
+        if hardware_chw != policy_shape:
+            raise ValueError(
+                f"Strict policy camera {key!r} expects CHW {policy_shape}, robot provides HWC {hardware_hwc}."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Sub-contexts
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RuntimeContext:
+    """Runtime knobs shared with every strategy."""
+
+    cfg: RolloutConfig
+    shutdown_event: Event
+
+
+@dataclass
+class HardwareContext:
+    """Connected hardware.
+
+    The raw robot is available via ``robot_wrapper.inner`` when needed
+    (e.g. for disconnect); strategies should otherwise go through the
+    thread-safe wrapper.
+
+    ``initial_position`` stores the robot's joint positions at connect
+    time.  Strategies use it to return the robot to a safe pose before
+    shutting down.
+    """
+
+    robot_wrapper: ThreadSafeRobot
+    teleop: Teleoperator | None
+    initial_position: dict | None = None
+
+
+@dataclass
+class PolicyContext:
+    """Loaded policy and its inference engine."""
+
+    policy: PreTrainedPolicy
+    preprocessor: PolicyProcessorPipeline
+    postprocessor: PolicyProcessorPipeline
+    inference: InferenceEngine
+
+
+@dataclass
+class ProcessorContext:
+    """Robot-side pipelines (run outside the policy)."""
+
+    teleop_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction]
+    robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction]
+    robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation]
+
+
+@dataclass
+class DatasetContext:
+    """Dataset and feature bookkeeping."""
+
+    dataset: LeRobotDataset | None
+    dataset_features: dict = field(default_factory=dict)
+    hw_features: dict = field(default_factory=dict)
+    ordered_action_keys: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RolloutContext:
+    """Bundle of sub-contexts passed to every rollout strategy.
+
+    Built once by :func:`build_rollout_context` before strategy dispatch.
+    """
+
+    runtime: RuntimeContext
+    hardware: HardwareContext
+    policy: PolicyContext
+    processors: ProcessorContext
+    data: DatasetContext
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+
+
+def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
+    """Load policy weights, keeping adapter and base-model revisions independent."""
+    pretrained_revision = policy_config.pretrained_revision
+    policy_class = get_policy_class(policy_config.type)
+
+    if not policy_config.use_peft:
+        return policy_class.from_pretrained(
+            policy_config.pretrained_path,
+            config=policy_config,
+            revision=pretrained_revision,
+        )
+
+    return load_peft_policy(
+        policy_class,
+        policy_config,
+        policy_config.pretrained_path,
+        adapter_revision=pretrained_revision,
+    )
+
+
+def build_rollout_context(
+    cfg: RolloutConfig,
+    shutdown_event: Event,
+    teleop_action_processor: RobotProcessorPipeline | None = None,
+    robot_action_processor: RobotProcessorPipeline | None = None,
+    robot_observation_processor: RobotProcessorPipeline | None = None,
+) -> RolloutContext:
+    """Wire up policy, processors, hardware, dataset, and inference engine.
+
+    The order is policy-first / hardware-last so a bad ``--policy.path``
+    fails fast without touching the robot.
+    """
+    is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
+
+    # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
+    logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
+    policy_config = cfg.policy
+
+    if hasattr(policy_config, "compile_model"):
+        policy_config.compile_model = cfg.use_torch_compile
+
+    # A top-level --device is the rollout runtime source of truth. Synchronize it
+    # before loading so policies and restored policy-specific processors that read
+    # config.device do not keep the checkpoint's training-host device.
+    policy_config.device = cfg.device
+
+    if policy_config.type == "vqbet" and cfg.device == "mps":
+        raise NotImplementedError(
+            "Current implementation of VQBeT does not support `mps` backend. "
+            "Please use `cpu` or `cuda` backend."
+        )
+
+    policy = _load_pretrained_policy(policy_config)
+
+    if is_rtc:
+        if not supports_rtc_inference(policy):
+            raise ValueError(
+                f"RTC inference is not supported by policy type '{policy_config.type}': "
+                "the policy must implement RTC semantics and predict_action_chunk must accept "
+                "inference_delay and prev_chunk_left_over. Use '--inference.type=sync' instead."
+            )
+        policy.config.rtc_config = cfg.inference.rtc
+        if hasattr(policy, "init_rtc_processor"):
+            policy.init_rtc_processor()
+
+    policy = policy.to(cfg.device)
+    policy.eval()
+    logger.info("Policy loaded: type=%s, device=%s", policy_config.type, cfg.device)
+
+    if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
+        try:
+            if hasattr(torch, "compile"):
+                compile_kwargs = {
+                    "backend": cfg.torch_compile_backend,
+                    "mode": cfg.torch_compile_mode,
+                    "options": {"triton.cudagraphs": False},
+                }
+                policy.predict_action_chunk = torch.compile(policy.predict_action_chunk, **compile_kwargs)
+                logger.info("torch.compile applied to predict_action_chunk")
+        except Exception as e:
+            logger.warning("Failed to apply torch.compile: %s", e)
+
+    # --- 2. Robot-side processors (user-supplied or defaults) --------
+    if (
+        teleop_action_processor is None
+        or robot_action_processor is None
+        or robot_observation_processor is None
+    ):
+        _t, _r, _o = make_default_processors()
+        teleop_action_processor = teleop_action_processor or _t
+        robot_action_processor = robot_action_processor or _r
+        robot_observation_processor = robot_observation_processor or _o
+
+    # --- 3. Hardware descriptions only (constructors must not connect) -
+    robot = make_robot_from_config(cfg.robot)
+    robot_wrapper = ThreadSafeRobot(robot)
+    teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+
+    # TODO(Steven): once Teleoperator motor-control methods are standardised
+    # (``enable_torque`` / ``disable_torque`` / ``write_goal_positions``), gate
+    # the DAgger strategy on their presence here and fail fast with a helpful
+    # message instead of relying on the operator to pre-align the leader by
+    # hand.  See :func:`DAggerStrategy._apply_transition` for the matching
+    # disabled call sites.
+    # if isinstance(cfg.strategy, DAggerStrategyConfig) and teleop is not None:
+    #     required_teleop_methods = ("enable_torque", "disable_torque", "write_goal_positions")
+    #     missing = [m for m in required_teleop_methods if not callable(getattr(teleop, m, None))]
+    #     if missing:
+    #         teleop.disconnect()
+    #         raise ValueError(
+    #             f"DAgger strategy requires a teleoperator with motor control methods "
+    #             f"{required_teleop_methods}. '{type(teleop).__name__}' is missing: {missing}"
+    #         )
+
+    # --- 4. Features + action-key reconciliation ---------------------
+    # TODO(Steven):Only ``.pos`` joint features are routed to the policy as state and as the
+    # action target; velocity and torque channels (when present) are kept in
+    # the raw observation but excluded from the policy-facing tensors.
+    all_obs_features = robot.observation_features
+    # ``observation_features`` values are either a tuple (camera shape) or the
+    # ``float`` type itself used as a sentinel for scalar motor features —
+    # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
+    # Keep cameras (tuple) plus both joint-position (.pos) and base-velocity (.vel)
+    # scalar state features. LeKiwi's observation.state is 9-dim (6 arm .pos +
+    # x/y/theta.vel) and the policy was trained/normalized on all 9; the old .pos-only
+    # filter fed a 6-dim state into a 9-dim normalizer → RuntimeError (size 6 vs 9).
+    # Pure-arm robots have no .vel state keys, so this is a no-op for them.
+    observation_features_hw = {
+        k: v
+        for k, v in all_obs_features.items()
+        if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".vel")))
+    }
+    # Keep both joint-position (.pos) and base-velocity (.vel) action features so
+    # mobile manipulators command the base too (e.g. LeKiwi: 6 arm .pos +
+    # x/y/theta.vel = 9-dim action). Pure-arm robots have no .vel keys, so this is
+    # a no-op for them. Without the .vel keys the base velocities are silently
+    # dropped from dataset_features[ACTION]/ordered_action_keys and the base never moves.
+    action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith((".pos", ".vel"))}
+
+    # Hardware is connected later (step 8) so package validation can fail before touching the
+    # robot, but cameras configured without an explicit width/height only learn their
+    # resolution at connect -- and ``observation_features`` is a cached_property, so the
+    # placeholder Nones would never be refreshed. Reject that here instead of letting
+    # (None, None, 3) reach dataset creation and the strict contract check.
+    unresolved = sorted(
+        key
+        for key, shape in observation_features_hw.items()
+        if isinstance(shape, tuple) and any(dim is None for dim in shape)
+    )
+    if unresolved:
+        # Auto-detected resolution is a supported camera config (OpenCVCameraConfig leaves
+        # width/height None on purpose), and on main it worked because connect() ran first.
+        # Rejecting it outright breaks those setups, so connect now to let the cameras report
+        # their real dimensions, then drop the cached_property so the refreshed values are
+        # picked up. Robots with fully explicit resolutions keep the late-connect path and
+        # still fail package validation before any hardware is touched.
+        logger.info(
+            "Camera resolution unknown before connect for: %s. Connecting robot early to resolve it.",
+            ", ".join(unresolved),
+        )
+        robot.connect()
+        # From the successful connect onward, any raise must undo it -- the cleanup
+        # handler below only guards the assembly block, so a failure in this refresh
+        # (including the still-unresolved raise) would otherwise leave the arm torqued
+        # with cameras and serial ports claimed.
+        try:
+            robot.__dict__.pop("observation_features", None)
+            all_obs_features = robot.observation_features
+            observation_features_hw = {
+                k: v
+                for k, v in all_obs_features.items()
+                if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".vel")))
+            }
+            still_unresolved = sorted(
+                key
+                for key, shape in observation_features_hw.items()
+                if isinstance(shape, tuple) and any(dim is None for dim in shape)
+            )
+            if still_unresolved:
+                raise ValueError(
+                    f"Camera resolution is still unknown after connect for: "
+                    f"{', '.join(still_unresolved)}. Set an explicit width and height on these "
+                    "cameras (e.g. --robot.cameras='{front: {type: opencv, index_or_path: 0, "
+                    "width: 640, height: 480}}')."
+                )
+        except BaseException:
+            if robot.is_connected:
+                robot.disconnect()
+            raise
+
+    # From here to assembly, any raise must undo the early camera-resolution connect
+    # above -- never leave the arm torqued with cameras and serial ports claimed.
+    try:
+        _validate_strict_hardware_feature_contract(
+            policy_config,
+            observation_features_hw,
+            action_features_hw,
+            cfg.rename_map,
+        )
+
+        # The action side is always needed: sync inference reads action names from
+        # ``dataset_features[ACTION]`` to map policy tensors back to robot actions.
+        action_dataset_features = aggregate_pipeline_dataset_features(
+            pipeline=teleop_action_processor,
+            initial_features=create_initial_features(action=action_features_hw),
+            use_videos=cfg.dataset.video if cfg.dataset else True,
+        )
+        # Observation-side aggregation is needed because of build_dataset_frame
+        observation_dataset_features = aggregate_pipeline_dataset_features(
+            pipeline=robot_observation_processor,
+            initial_features=create_initial_features(observation=observation_features_hw),
+            use_videos=cfg.dataset.video if cfg.dataset else True,
+        )
+        dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
+        hw_features = hw_to_dataset_features(observation_features_hw, "observation")
+        raw_action_keys = list(action_features_hw.keys())
+        policy_action_names = getattr(policy_config, "action_feature_names", None)
+        ordered_action_keys = _resolve_action_key_order(
+            list(policy_action_names) if policy_action_names else None,
+            raw_action_keys,
+            strict=bool(getattr(policy_config, "strict_hardware_feature_contract", False)),
+        )
+
+        # Validate visual features if no rename_map is active
+        rename_map = cfg.rename_map
+        if not rename_map:
+            validate_visual_features_consistency(
+                policy_config,
+                dataset_to_policy_features(dataset_features),
+            )
+
+        # --- 5. Dataset -------------
+        dataset = None
+        if cfg.dataset is not None and not isinstance(cfg.strategy, BaseStrategyConfig):
+            logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
+            if cfg.resume:
+                dataset = LeRobotDataset.resume(
+                    cfg.dataset.repo_id,
+                    root=cfg.dataset.root,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    rgb_encoder=cfg.dataset.rgb_encoder,
+                    depth_encoder=cfg.dataset.depth_encoder,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
+                    * len(robot.cameras if hasattr(robot, "cameras") else []),
+                )
+            else:
+                if isinstance(cfg.strategy, DAggerStrategyConfig):
+                    dataset_features["intervention"] = {
+                        "dtype": "bool",
+                        "shape": (1,),
+                        "names": None,
+                    }
+
+                repo_name = cfg.dataset.repo_id.split("/", 1)[-1]
+                if not repo_name.startswith("rollout_"):
+                    raise ValueError(
+                        "Dataset names for rollout must start with 'rollout_'. "
+                        "Use --dataset.repo_id=<user>/rollout_<name> for policy deployment datasets."
+                    )
+                cfg.dataset.stamp_repo_id()
+                target_video_mb = getattr(cfg.strategy, "target_video_file_size_mb", None)
+                dataset = LeRobotDataset.create(
+                    cfg.dataset.repo_id,
+                    cfg.dataset.fps,
+                    root=cfg.dataset.root,
+                    robot_type=robot.name,
+                    features=dataset_features,
+                    use_videos=cfg.dataset.video,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
+                    * len(robot.cameras if hasattr(robot, "cameras") else []),
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    rgb_encoder=cfg.dataset.rgb_encoder,
+                    depth_encoder=cfg.dataset.depth_encoder,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
+                    video_files_size_in_mb=target_video_mb,
+                )
+
+        if dataset is not None:
+            logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
+
+        # --- 6. Policy pre/post processors (needs dataset stats if any) ---
+        dataset_stats = None
+        if dataset is not None:
+            dataset_stats = rename_stats(
+                dataset.meta.stats,
+                cfg.rename_map,
+            )
+
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy_config,
+            pretrained_path=cfg.policy.pretrained_path,
+            pretrained_revision=policy_config.pretrained_revision,
+            dataset_stats=dataset_stats,
+            preprocessor_overrides={
+                "device_processor": {"device": cfg.device},
+                "rename_observations_processor": {"rename_map": cfg.rename_map},
+            },
+        )
+
+        if isinstance(cfg.inference, SyncInferenceConfig) and any(
+            isinstance(step, RelativeActionsProcessorStep) and step.enabled
+            for step in getattr(preprocessor, "steps", ())
+        ):
+            raise NotImplementedError(
+                "SyncInferenceEngine does not support policies with relative actions for now."
+                "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
+            )
+
+        # --- 7. Inference strategy (needs policy + pre/post + hardware) --
+        logger.info(
+            "Creating inference engine (type=%s)...",
+            cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
+        )
+        task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+        inference_strategy = create_inference_engine(
+            cfg.inference,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            robot_wrapper=robot_wrapper,
+            hw_features=hw_features,
+            dataset_features=dataset_features,
+            ordered_action_keys=ordered_action_keys,
+            task=task_str,
+            fps=cfg.fps,
+            device=cfg.device,
+            use_torch_compile=cfg.use_torch_compile,
+            compile_warmup_inferences=cfg.compile_warmup_inferences,
+            preflight_inferences=getattr(cfg, "preflight_inferences", 0),
+            shutdown_event=shutdown_event,
+        )
+
+        # --- 8. Hardware connection (only after package validation) -------
+        initial_position = None
+        # May already be connected: unresolved camera resolutions force an early connect above.
+        if robot.is_connected:
+            logger.info("Robot already connected (early connect for camera resolution): %s", robot.name)
+        else:
+            logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
+            robot.connect()
+            logger.info("Robot connected: %s", robot.name)
+
+        # Store the initial joint positions so we can return to a safe pose on shutdown.
+        initial_obs = robot.get_observation()
+        initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
+        logger.info("Captured initial robot position (%d keys)", len(initial_position))
+
+        if teleop is not None:
+            logger.info("Connecting teleoperator (%s)...", cfg.teleop.type)
+            teleop.connect()
+            logger.info("Teleoperator connected")
+    except BaseException:
+        if teleop is not None and teleop.is_connected:
+            teleop.disconnect()
+        if robot.is_connected:
+            robot.disconnect()
+        raise
+
+    # --- 9. Assemble ---------------------------------------------------
+    logger.info("Rollout context assembled successfully")
+    return RolloutContext(
+        runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
+        hardware=HardwareContext(
+            robot_wrapper=robot_wrapper, teleop=teleop, initial_position=initial_position
+        ),
+        policy=PolicyContext(
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            inference=inference_strategy,
+        ),
+        processors=ProcessorContext(
+            teleop_action_processor=teleop_action_processor,
+            robot_action_processor=robot_action_processor,
+            robot_observation_processor=robot_observation_processor,
+        ),
+        data=DatasetContext(
+            dataset=dataset,
+            dataset_features=dataset_features,
+            hw_features=hw_features,
+            ordered_action_keys=ordered_action_keys,
+        ),
+    )
