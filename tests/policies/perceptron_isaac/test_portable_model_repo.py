@@ -99,6 +99,23 @@ def test_policy_allows_direct_parent_portable_model_repo(tmp_path: Path) -> None
     assert config.hf_model_path == str(model_path)
 
 
+def test_policy_allows_portable_parent_fast_processor(tmp_path: Path) -> None:
+    model_path = _write_portable_repo(tmp_path / "artifact")
+    fast_processor_path = model_path / "fast_processor_pinned"
+    fast_processor_path.mkdir()
+    policy_path = model_path / "lerobot_policy"
+    policy_path.mkdir()
+    config = PerceptronIsaacConfig(
+        hf_model_path="..",
+        fast_processor_path="../fast_processor_pinned",
+        fast_processor_tree_sha256="0" * 64,
+    )
+
+    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, policy_path)
+
+    assert config.fast_processor_path == str(fast_processor_path)
+
+
 def test_portable_package_verifies_adapter_without_legacy_manifest(tmp_path: Path) -> None:
     model_path = _write_portable_repo(tmp_path / "artifact")
     policy_path = model_path / "lerobot_policy"

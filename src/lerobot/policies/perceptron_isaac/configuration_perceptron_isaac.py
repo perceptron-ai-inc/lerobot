@@ -63,6 +63,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # Flow-sample averaging: sample the flow ODE `num_flow_samples` times (fresh noise each) and
     # mean the normalized chunks before unnormalize. 1 = single sample (no averaging).
     num_flow_samples: int = 4
+    flow_seed_base: int | None = None
     # Flow-target clip. This is the checkpoint-owned value: the inference recipe carries it on
     # the ``flow_action`` wire, and the importer copies it from there.
     clip_normalized_max: float = 10.0

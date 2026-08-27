@@ -1051,6 +1051,30 @@ def test_native_policy_online_rollout_uses_policy_clock(tmp_path):
     assert settled_policy._frame_index == 0
 
 
+def test_online_renderer_inherits_conditioning_contract(tmp_path):
+    stats_path = tmp_path / "stats.json"
+    _write_native_stats(stats_path)
+    config = PerceptronIsaacConfig(
+        device="cpu",
+        native_stats_path=str(stats_path),
+        action_conditioning=True,
+        action_conditioning_role="user",
+        mistake_conditioning=True,
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+
+    step = PerceptronIsaacPolicy(config)._ensure_online_render_step()
+
+    assert step.action_conditioning is True
+    assert step.action_conditioning_role == "user"
+    assert step.mistake_conditioning is True
+    step._ensure_renderer()
+    assert step._stream_builder.metadata.action_conditioning is True
+    assert step._stream_builder.metadata.action_conditioning_role == "user"
+    assert step._stream_builder.metadata.mistake_conditioning is True
+
+
 def test_native_policy_requires_and_resets_executed_action_history(tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
@@ -1061,6 +1085,8 @@ def test_native_policy_requires_and_resets_executed_action_history(tmp_path):
         n_action_steps=1,
         chunk_size=30,
         action_conditioning=True,
+        clip_normalized_max=10.0,
+        fast_clip_normalized_max=1.0,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
@@ -1094,10 +1120,11 @@ def test_native_policy_requires_and_resets_executed_action_history(tmp_path):
     with pytest.raises(ValueError, match="finite"):
         policy.record_executed_action(np.full(7, np.nan, dtype=np.float32))
 
-    executed_action = np.full(7, 0.25, dtype=np.float32)
+    executed_action = np.full(7, 2.0, dtype=np.float32)
     policy.record_executed_action(executed_action)
     policy.select_action(batch(1))
     expected = normalize_isaac_actions(executed_action[None, :], load_isaac_stats(stats_path).action)[0]
+    expected = np.clip(expected, -config.fast_clip_normalized_max, config.fast_clip_normalized_max)
     np.testing.assert_allclose(
         renderer.build_calls[-1]["observation_window"][-1]["previous_action"],
         expected,
@@ -2297,7 +2324,7 @@ def test_native_policy_requests_model_side_flow_sample_averaging(tmp_path):
     np.testing.assert_allclose(actions.numpy(), np.full((1, 30, 7), 2.0, dtype=np.float32))
 
 
-def test_native_policy_flow_seed_base_is_deterministic(monkeypatch, tmp_path):
+def test_native_policy_uses_configured_flow_seed_base_without_environment(monkeypatch, tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
 
@@ -2306,6 +2333,7 @@ def test_native_policy_flow_seed_base_is_deterministic(monkeypatch, tmp_path):
             device="cpu",
             native_stats_path=str(stats_path),
             num_flow_samples=4,
+            flow_seed_base=1234,
             input_features=_features(),
             output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
         )
@@ -2313,7 +2341,7 @@ def test_native_policy_flow_seed_base_is_deterministic(monkeypatch, tmp_path):
         policy._isaac_model = FakeRandomFlowIsaacModel()
         return policy
 
-    monkeypatch.setenv("ISAAC_FLOW_SEED_BASE", "1234")
+    monkeypatch.delenv("ISAAC_FLOW_SEED_BASE", raising=False)
     first = _policy().predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
     second = _policy().predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
 

@@ -787,7 +787,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if not np.isfinite(action_vector).all():
             raise ValueError("Executed action must contain only finite values.")
         normalized = normalize_isaac_actions(action_vector[None, :], self._stats.action)[0]
-        clip_max = float(self.config.clip_normalized_max)
+        clip_max = float(self.config.fast_clip_normalized_max)
         self._pending_executed_action = np.clip(normalized, -clip_max, clip_max).astype(
             np.float32, copy=False
         )
@@ -1177,6 +1177,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 vector_max_states=int(self.config.vector_max_states),
                 dataset_name=str(self.config.dataset_name),
                 robot_type=str(self.config.robot_type),
+                action_conditioning=bool(self.config.action_conditioning),
+                action_conditioning_role=str(self.config.action_conditioning_role),
+                mistake_conditioning=bool(self.config.mistake_conditioning),
                 camera_order=list(self.config.camera_order),
                 image_size=tuple(self.config.image_size),
                 image_preprocessing=str(self.config.image_preprocessing),
@@ -1429,7 +1432,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         import os
 
-        seed_base = os.environ.get("ISAAC_FLOW_SEED_BASE")
+        seed_base = self.config.flow_seed_base
+        if seed_base is None:
+            seed_base_env = os.environ.get("ISAAC_FLOW_SEED_BASE")
+            seed_base = int(seed_base_env) if seed_base_env is not None else None
         if seed_base is not None:
             self._flow_seed_index = int(getattr(self, "_flow_seed_index", -1)) + 1
             seed = int(seed_base) + self._flow_seed_index
@@ -2387,20 +2393,29 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 raise RuntimeError(f"Checkpoint-local path {attr} must be relative, got {path}.")
             unresolved_candidate = root / path
             if ".." in path.parts:
+                portable_parent = root.parent
+                expected_portable_path = None
                 if attr == "hf_model_path" and path == Path(".."):
-                    try:
-                        portable_parent = unresolved_candidate.resolve(strict=True)
-                    except (OSError, RuntimeError):
-                        portable_parent = None
-                    if portable_parent == root.parent and _is_portable_isaac05_repository(portable_parent):
-                        absolute = str(portable_parent)
-                        relative_paths[attr] = {
-                            "absolute": absolute,
-                            "relative": path.as_posix(),
-                            "root": str(root),
-                        }
-                        setattr(config, attr, absolute)
-                        continue
+                    expected_portable_path = portable_parent
+                elif attr == "fast_processor_path" and path == Path("../fast_processor_pinned"):
+                    expected_portable_path = portable_parent / "fast_processor_pinned"
+                try:
+                    resolved_portable_path = unresolved_candidate.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    resolved_portable_path = None
+                if (
+                    expected_portable_path is not None
+                    and resolved_portable_path == expected_portable_path
+                    and _is_portable_isaac05_repository(portable_parent)
+                ):
+                    absolute = str(resolved_portable_path)
+                    relative_paths[attr] = {
+                        "absolute": absolute,
+                        "relative": path.as_posix(),
+                        "root": str(root),
+                    }
+                    setattr(config, attr, absolute)
+                    continue
                 raise RuntimeError(f"Checkpoint-local path {attr} escapes the package root: {path}.")
             try:
                 candidate = unresolved_candidate.resolve(strict=True)
