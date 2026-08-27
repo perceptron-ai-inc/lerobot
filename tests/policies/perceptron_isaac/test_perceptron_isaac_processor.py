@@ -1047,6 +1047,8 @@ def test_native_policy_online_rollout_uses_policy_clock(tmp_path):
     # only executed post-settle steps, so the first chunk anchors at (k-1)/fps regardless of
     # num_settle_steps rather than carrying a +num_settle_steps/fps offset.
     np.testing.assert_allclose([settled_renderer.build_calls[-1]["anchor_timestamp_seconds"]], [0.1])
+    settled_window = settled_renderer.build_calls[-1]["observation_window"]
+    assert [float(frame["proprio"][0]) for frame in settled_window] == [10.0, 10.0, 10.0]
     assert settled_policy._settle_index == 10
     assert settled_policy._frame_index == 0
 

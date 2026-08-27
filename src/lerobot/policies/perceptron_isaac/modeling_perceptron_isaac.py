@@ -1477,8 +1477,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         # steps in its model clock, so idle settle frames must not advance the episode clock.
         if self._settle_index < settle:
             self._settle_index += 1
-            if not has_stream and not self.config.action_conditioning:
-                self._update_online_rollout_state(batch)
+            # Idle settle frames must not enter the model observation window. The first
+            # post-settle observation starts the policy-owned history and is padded there.
             self._ensure_native_metadata()
             idle = np.zeros((1, self.config.action_dim), dtype=np.float32)
             idle[:, -1] = float(self.config.settle_gripper)
