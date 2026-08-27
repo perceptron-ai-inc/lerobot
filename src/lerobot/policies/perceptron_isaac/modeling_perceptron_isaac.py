@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from huggingface_hub import save_torch_state_dict
 from torch import Tensor
+from transformers import AutoModelForCausalLM
 
 from lerobot.lerobot_types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
@@ -57,6 +58,7 @@ from .mharmony_native import (
 from .processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY,
     PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY,
+    PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY,
     PERCEPTRON_ISAAC_RENDER_META_KEY,
     PERCEPTRON_ISAAC_SERVING_STATS_KEY,
     PERCEPTRON_ISAAC_STREAM_KEY,
@@ -120,6 +122,17 @@ def _verify_sha256(
             mismatch_error = mismatch_error(expected, actual)
         raise RuntimeError(mismatch_error or f"{context} mismatch: expected {expected}, found {actual}.")
     return expected
+
+
+def _is_portable_isaac05_repository(model_dir: Path) -> bool:
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(config, dict) and config.get("model_type") == "isaac_0_5"
 
 
 class PerceptronIsaacPolicy(PreTrainedPolicy):
@@ -744,6 +757,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
         self._online_image_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
         self._online_state_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
+        self._online_action_queue: deque[np.ndarray | None] = deque(
+            maxlen=max(1, int(self.config.n_obs_steps))
+        )
+        self._pending_executed_action: np.ndarray | None = None
+        self._record_action_for_history = False
         self._online_render_step: PerceptronIsaacMharmonyPackProcessorStep | None = None
         self._last_norm_chunk: Tensor | None = None
         self._frame_index: int = -1
@@ -751,6 +769,29 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._settle_index: int = 0
         self._last_external_timestamp_seconds: float | None = None
         self._flow_seed_index: int = -1
+
+    def record_executed_action(self, action: Tensor | np.ndarray) -> None:
+        """Record one postprocessed action for the next causal observation."""
+        if not self.config.action_conditioning or not self._record_action_for_history:
+            return
+        if self._pending_executed_action is not None:
+            raise RuntimeError("record_executed_action called twice before the next observation.")
+        self._ensure_native_metadata()
+        action_array = (
+            action.detach().cpu().numpy() if isinstance(action, Tensor) else np.asarray(action)
+        ).astype(np.float32, copy=False)
+        action_vector = action_array.reshape(-1)
+        expected_shape = (int(self.config.action_dim),)
+        if action_vector.shape != expected_shape:
+            raise ValueError(f"Executed action must have shape {expected_shape}, got {action_array.shape}.")
+        if not np.isfinite(action_vector).all():
+            raise ValueError("Executed action must contain only finite values.")
+        normalized = normalize_isaac_actions(action_vector[None, :], self._stats.action)[0]
+        clip_max = float(self.config.clip_normalized_max)
+        self._pending_executed_action = np.clip(normalized, -clip_max, clip_max).astype(
+            np.float32, copy=False
+        )
+        self._record_action_for_history = False
 
     def get_optim_params(self) -> list[dict[str, Any]]:
         """Return shell optimizer groups after enforcing the native training guard."""
@@ -869,7 +910,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 raw = json.loads(config_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError):
                 return False
-            genesis_vla = raw.get("genesis_vla") if isinstance(raw, dict) else None
+            if not isinstance(raw, dict):
+                return False
+            if raw.get("model_type") == "isaac_0_5":
+                return True
+            genesis_vla = raw.get("genesis_vla")
             return bool(
                 raw.get("model_type") == "qwen3_5_moe"
                 and isinstance(genesis_vla, dict)
@@ -881,6 +926,21 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     def _load_backbone(self, *, training: bool = False) -> None:
         if not self.config.hf_model_path:
             raise RuntimeError("PerceptronIsaacConfig.hf_model_path is required to load the Isaac HF VLA.")
+        model_dir = Path(self.config.hf_model_path)
+        if _is_portable_isaac05_repository(model_dir):
+            if training:
+                self._require_native_training_supported()
+            device = self._resolve_device()
+            self._isaac_model = AutoModelForCausalLM.from_pretrained(
+                model_dir,
+                trust_remote_code=True,
+                local_files_only=True,
+                dtype=torch.bfloat16,
+                device_map={"": str(device)},
+                low_cpu_mem_usage=True,
+                attn_implementation="sdpa",
+            )
+            return
         if not self._config_declares_mk1(self.config):
             from .modeling_qwen35_vla import (
                 _load_qwen35_vla_from_verified_package,
@@ -1039,9 +1099,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     def _require_native_training_supported(self) -> None:
         if self.config.hf_model_path and self._config_declares_mk1(self.config):
             raise RuntimeError(
-                "Native MK1 training is not supported yet: production training requires FP32 "
-                "parameter storage, while the native grouped_mm null-MoE dispatcher requires BF16. "
-                "Use Genesis for MK1 training; LeRobot native MK1 remains inference-only."
+                "Isaac-0.5 training is not supported yet: production training requires FP32 "
+                "parameter storage, while the grouped_mm null-MoE dispatcher requires BF16. "
+                "Use the training repository for now; LeRobot Isaac-0.5 remains inference-only."
             )
 
     def _maybe_adopt_serving_stats(self, batch: dict[str, Any]) -> None:
@@ -1172,9 +1232,20 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         states = render_step._extract_state_tensor(batch, batch_size)
         if images.shape[:2] != states.shape[:2]:
             raise ValueError(f"Image/state window shape mismatch: {images.shape[:2]} vs {states.shape[:2]}.")
+        if self.config.action_conditioning and images.shape[1] != 1:
+            raise ValueError(
+                "Action-conditioned online rollout requires one observation per select_action call."
+            )
         for idx in range(images.shape[1]):
             self._online_image_queue.append(images[0, idx])
             self._online_state_queue.append(states[0, idx])
+            if self.config.action_conditioning:
+                self._online_action_queue.append(
+                    None if self._frame_index == 0 else self._pending_executed_action
+                )
+                self._pending_executed_action = None
+            else:
+                self._online_action_queue.append(None)
 
     def _online_anchor_timestamp_seconds(self) -> float:
         self._ensure_native_metadata()
@@ -1250,11 +1321,13 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         image_keys = render_step._resolve_image_keys(batch)
         image_values = list(self._online_image_queue)
         state_values = list(self._online_state_queue)
+        action_values = list(self._online_action_queue)
         target_steps = max(1, int(self.config.n_obs_steps))
         if len(image_values) < target_steps:
             pad_count = target_steps - len(image_values)
             image_values = [image_values[0]] * pad_count + image_values
             state_values = [state_values[0]] * pad_count + state_values
+            action_values = [None] * pad_count + action_values
         image_window = np.stack(image_values, axis=0)
         state_window = np.stack(state_values, axis=0)
         observation = {
@@ -1270,6 +1343,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY: [
                 external_anchor if external_anchor is not None else self._online_anchor_timestamp_seconds()
             ],
+            PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY: [action_values],
         }
         transition = {
             TransitionKey.OBSERVATION: observation,
@@ -1314,6 +1388,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self.eval()
         if self._isaac_model is None:
             self._load_backbone()
+        model = self._isaac_model
+        assert model is not None
         self._maybe_adopt_serving_stats(batch)
         self._ensure_native_metadata()
 
@@ -1330,7 +1406,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         n_flow = max(1, int(getattr(self.config, "num_flow_samples", 1) or 1))
 
         def _sample() -> Tensor:
-            return self._isaac_model.sample_action(
+            return model.sample_action(
                 stream,
                 num_steps=self.config.num_inference_steps,
                 action_dim=self.config.action_dim,
@@ -1371,6 +1447,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         else:
             actions_norm = _run_samples()
 
+        if not bool(torch.isfinite(actions_norm).all()):
+            raise RuntimeError("Perceptron Isaac model returned non-finite normalized actions.")
         self._last_norm_chunk = actions_norm[0].detach()
         return actions_norm[:, :, : self.config.action_dim].float()
 
@@ -1393,7 +1471,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         # steps in its model clock, so idle settle frames must not advance the episode clock.
         if self._settle_index < settle:
             self._settle_index += 1
-            if not has_stream:
+            if not has_stream and not self.config.action_conditioning:
                 self._update_online_rollout_state(batch)
             self._ensure_native_metadata()
             idle = np.zeros((1, self.config.action_dim), dtype=np.float32)
@@ -1401,6 +1479,15 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             idle_norm = normalize_isaac_actions(idle, self._stats.action)
             return torch.from_numpy(idle_norm).float()
 
+        if (
+            self.config.action_conditioning
+            and not has_stream
+            and self._frame_index >= 0
+            and self._pending_executed_action is None
+        ):
+            raise RuntimeError(
+                "Action-conditioned rollout requires record_executed_action after each selected action."
+            )
         self._frame_index += 1
         if not has_stream:
             self._update_online_rollout_state(batch)
@@ -1420,7 +1507,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             )
             actions = actions[:, : self.config.n_action_steps]
             self._queues[ACTION].extend(actions.transpose(0, 1))
-        return self._queues[ACTION].popleft()
+        selected_action = self._queues[ACTION].popleft()
+        self._record_action_for_history = bool(self.config.action_conditioning and not has_stream)
+        return selected_action
 
     def get_loss_denominators(self, batch: dict[str, Any]) -> dict[str, Tensor]:
         """Return local valid counts before model forward for exact update-wide normalization."""
@@ -1587,6 +1676,26 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if previous_qwen_package is not None:
             previous_qwen_package.cleanup()
             delattr(config, "_qwen35_verified_package")
+        model_path = getattr(config, "hf_model_path", None)
+        if model_path is not None and _is_portable_isaac05_repository(Path(model_path)):
+            expected_adapter = getattr(config, "deployment_adapter_sha256", None)
+            if not expected_adapter:
+                raise RuntimeError("Portable Isaac-0.5 package requires deployment_adapter_sha256.")
+            adapter_path = root / "isaac_deployment_adapter.json"
+            if not PerceptronIsaacPolicy._is_package_file(root, adapter_path):
+                raise RuntimeError(
+                    f"Portable Isaac-0.5 package is missing its deployment adapter: {adapter_path}."
+                )
+            _verify_sha256(
+                expected_adapter,
+                "deployment_adapter_sha256",
+                adapter_path,
+                mismatch_error=lambda expected, actual: (
+                    "Portable Isaac-0.5 deployment adapter digest mismatch: "
+                    f"expected {expected}, found {actual}."
+                ),
+            )
+            return
         is_mk1_package = PerceptronIsaacPolicy._config_declares_mk1(config)
         if is_mk1_package:
             if config.artifact_kind == "neutral_debug":
@@ -2278,6 +2387,20 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 raise RuntimeError(f"Checkpoint-local path {attr} must be relative, got {path}.")
             unresolved_candidate = root / path
             if ".." in path.parts:
+                if attr == "hf_model_path" and path == Path(".."):
+                    try:
+                        portable_parent = unresolved_candidate.resolve(strict=True)
+                    except (OSError, RuntimeError):
+                        portable_parent = None
+                    if portable_parent == root.parent and _is_portable_isaac05_repository(portable_parent):
+                        absolute = str(portable_parent)
+                        relative_paths[attr] = {
+                            "absolute": absolute,
+                            "relative": path.as_posix(),
+                            "root": str(root),
+                        }
+                        setattr(config, attr, absolute)
+                        continue
                 raise RuntimeError(f"Checkpoint-local path {attr} escapes the package root: {path}.")
             try:
                 candidate = unresolved_candidate.resolve(strict=True)

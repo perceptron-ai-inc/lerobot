@@ -5,11 +5,28 @@ import pytest
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
+from lerobot.policies.perceptron_isaac.mharmony_contract import SUPPORTED_MHARMONY_VERSION
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
 def test_image_preprocessing_defaults_to_legacy_stretch() -> None:
     assert PerceptronIsaacConfig().image_preprocessing == "stretch"
+
+
+def test_mharmony_version_defaults_to_supported_public_release() -> None:
+    assert PerceptronIsaacConfig().mharmony_version == SUPPORTED_MHARMONY_VERSION
+
+
+def test_legacy_mharmony_marker_is_explicitly_upgraded() -> None:
+    with pytest.warns(FutureWarning, match="genesis-in-tree"):
+        config = PerceptronIsaacConfig(mharmony_version="genesis-in-tree")
+
+    assert config.mharmony_version == SUPPORTED_MHARMONY_VERSION
+
+
+def test_unknown_mharmony_version_is_rejected() -> None:
+    with pytest.raises(ValueError, match=r"supports mharmony==0\.1\.0"):
+        PerceptronIsaacConfig(mharmony_version="0.2.0")
 
 
 def test_image_preprocessing_round_trips_in_policy_package(tmp_path) -> None:

@@ -17,6 +17,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from ..utils import ensure_vla_feature_contract
 from .checkpoint_integrity import is_lowercase_sha256
 from .isaac_stats import require_closed_loop_safe_isaac_profile
+from .mharmony_contract import SUPPORTED_MHARMONY_VERSION, normalize_mharmony_version_marker
 
 # Checkpoint-local stats sidecar written next to config.json at save time. Relative on
 # purpose: PEFT loaders resolve it against the adapter checkpoint root first (see
@@ -173,6 +174,9 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     include_scene_description: bool = False  # scene-free serving by default (reproducible)
     vector_max_states: int = 128  # proprio is padded to this width before the encoder
     normalize_task_text: bool = True
+    action_conditioning: bool = False
+    action_conditioning_role: str = "user"
+    mistake_conditioning: bool = False
 
     # LeRobot-native mharmony processor geometry. Eval and direct serving share
     # the same processor-owned packing and the policy consumes pre-rendered streams.
@@ -217,7 +221,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # a checkpoint records the complete tree digest before remote code is used.
     fast_processor_path: str | None = None
     fast_processor_tree_sha256: str | None = None
-    mharmony_version: str | None = None
+    # Exact standalone runtime covered by the ISAAC render-parity contract.
+    mharmony_version: str = SUPPORTED_MHARMONY_VERSION
     # True = native eval contract: preprocessor owns mharmony packing, policy returns
     # normalized actions, postprocessor owns unnormalization/clipping.
     native_require_processor_stream: bool = True
@@ -269,6 +274,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        self.mharmony_version = normalize_mharmony_version_marker(self.mharmony_version)
         if self.n_action_steps <= 0:
             raise ValueError("Perceptron Isaac n_action_steps must be positive.")
         if self.n_action_steps > self.chunk_size:
@@ -346,6 +352,10 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         if self.include_scene_description:
             raise ValueError(
                 "Perceptron Isaac no-scene LIBERO checkpoints require include_scene_description=false."
+            )
+        if self.action_conditioning_role != "user":
+            raise ValueError(
+                "Native Perceptron Isaac action conditioning supports only action_conditioning_role='user'."
             )
         if (self.joint_signs is None) != (self.joint_offsets is None):
             raise ValueError("joint_signs and joint_offsets must both be set or both be None.")
