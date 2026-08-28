@@ -62,7 +62,7 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 from pprint import pformat
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
 
 import einops
 import gymnasium as gym
@@ -99,6 +99,13 @@ if TYPE_CHECKING or _peft_available:
     from peft import PeftModel
 else:
     PeftModel = None
+
+
+@runtime_checkable
+class ExecutedActionRecorder(Protocol):
+    """Optional policy capability for causal executed-action history."""
+
+    def record_executed_action(self, action: Tensor | np.ndarray) -> None: ...
 
 
 logger = logging.getLogger(__name__)
@@ -299,6 +306,8 @@ def rollout(
             # Convert to CPU / numpy.
             action_numpy: np.ndarray = action.to("cpu").numpy()
             assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
+            if isinstance(policy, ExecutedActionRecorder):
+                policy.record_executed_action(action_numpy)
 
             # Apply the next action.
             observation, reward, terminated, truncated, info = env.step(action_numpy)

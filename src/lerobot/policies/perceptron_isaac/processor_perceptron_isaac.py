@@ -60,6 +60,7 @@ from .isaac_stats import (
     require_closed_loop_safe_isaac_stats,
     unnormalize_isaac_actions,
 )
+from .mharmony_contract import SUPPORTED_MHARMONY_VERSION, normalize_mharmony_version_marker
 from .mharmony_native import (
     IsaacActionOutlierError,
     IsaacMharmonyRenderMetadata,
@@ -70,6 +71,7 @@ from .mharmony_native import (
 PERCEPTRON_ISAAC_STREAM_KEY = "perceptron_isaac_stream"
 PERCEPTRON_ISAAC_RENDER_META_KEY = "perceptron_isaac_render_meta"
 PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY = "perceptron_isaac_anchor_timestamp_seconds"
+PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY = "perceptron_isaac_previous_actions"
 # Backward-compatible policy-specific alias for the shared filtered-batch protocol.
 PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY = RETAINED_SAMPLE_INDICES_KEY
 # When online single-step serving skips rendering (the anchor arrives only after
@@ -372,12 +374,15 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
     native_stats_path: str | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
     fast_processor_path: str | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
     fast_processor_tree_sha256: str | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
-    mharmony_version: str | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
+    mharmony_version: str = field(default=SUPPORTED_MHARMONY_VERSION, metadata=_PACK_CONFIG_METADATA)
     action_dim: int = field(default=7, metadata=_PACK_CONFIG_METADATA)
     proprio_dim: int = field(default=8, metadata=_PACK_CONFIG_METADATA)
     vector_max_states: int = field(default=128, metadata=_PACK_CONFIG_METADATA)
     dataset_name: str = field(default="libero", metadata=_PACK_CONFIG_METADATA)
     robot_type: str = field(default="generic", metadata=_PACK_CONFIG_METADATA)
+    action_conditioning: bool = field(default=False, metadata=_PACK_CONFIG_METADATA)
+    action_conditioning_role: str = field(default="user", metadata=_PACK_CONFIG_METADATA)
+    mistake_conditioning: bool = field(default=False, metadata=_PACK_CONFIG_METADATA)
     render_metadata: dict[str, Any] | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
     train_clip_normalized_actions: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     clip_normalized_max: float = field(default=10.0, metadata=_PACK_CONFIG_METADATA)
@@ -392,6 +397,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
     state_feature_names: list[str] | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
 
     def __post_init__(self) -> None:
+        self.mharmony_version = normalize_mharmony_version_marker(self.mharmony_version)
         require_closed_loop_safe_isaac_profile(
             profile_id=self.normalization_profile_id,
             profile_scope=self.normalization_profile_scope,
@@ -631,11 +637,15 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 target_fps=self._stats.target_fps,
                 dataset_name=str(self.dataset_name),
                 robot_type=str(self.robot_type),
+                action_conditioning=bool(self.action_conditioning),
+                action_conditioning_role=str(self.action_conditioning_role),
+                mistake_conditioning=bool(self.mistake_conditioning),
                 patch_size=int(self.patch_size),
                 max_num_patches=self.max_num_patches if self.max_num_patches is not None else 576,
                 min_num_patches=self.min_num_patches,
                 pixel_shuffle_scale=int(self.pixel_shuffle_scale),
                 temporal_patch_size=int(self.temporal_patch_size),
+                mharmony_version=self.mharmony_version,
             )
         self._validate_target_fps(metadata.target_fps, artifact="render metadata")
         self._stream_builder = IsaacNativeMharmonyRenderer(metadata=metadata, stats=self._stats)
@@ -1017,9 +1027,13 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         if len(windows) != 1:
             raise NotImplementedError("Perceptron Isaac eval rendering currently supports batch_size=1.")
         dtype = _dtype_from_name(self.dtype)
+        fast_processor = (
+            self._ensure_fast_processor() if self._stream_builder.metadata.action_conditioning else None
+        )
         stream = self._stream_builder.build(
             observation_window=windows[0],
             prompt=tasks[0],
+            fast_processor=fast_processor,
             device=self.device,
             dtype=dtype,
             patch_size=self.patch_size,
@@ -1141,6 +1155,19 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             build_perceptron_isaac_observation_window(images[idx], states[idx], tuple(self.camera_order))
             for idx in range(batch_size)
         ]
+        previous_action_batches = complementary.get(PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY)
+        if previous_action_batches is not None:
+            if not isinstance(previous_action_batches, list) or len(previous_action_batches) != batch_size:
+                raise ValueError(
+                    f"{PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY} must contain one history per batch item."
+                )
+            for window, previous_actions in zip(windows, previous_action_batches, strict=True):
+                if not isinstance(previous_actions, list) or len(previous_actions) != len(window):
+                    raise ValueError(
+                        f"{PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY} histories must align with observation windows."
+                    )
+                for frame, previous_action in zip(window, previous_actions, strict=True):
+                    frame["previous_action"] = previous_action
         anchors = self._anchor_timestamps(complementary, batch_size)
         complementary[self.stream_key] = self._render_streams(
             windows=windows,
@@ -1408,6 +1435,9 @@ def make_perceptron_isaac_pre_post_processors(
         "dataset_name": str(config.dataset_name),
         "robot_type": str(config.robot_type),
         "target_fps": config.target_fps,
+        "action_conditioning": bool(config.action_conditioning),
+        "action_conditioning_role": str(config.action_conditioning_role),
+        "mistake_conditioning": bool(config.mistake_conditioning),
         "normalization_profile_id": config.normalization_profile_id,
         "normalization_profile_scope": config.normalization_profile_scope,
         "normalization_validation_status": config.normalization_validation_status,

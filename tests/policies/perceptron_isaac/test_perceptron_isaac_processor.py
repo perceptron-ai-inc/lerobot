@@ -17,6 +17,7 @@ import torch
 # install it (see .github/workflows/fast_tests.yml).
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
+import lerobot.policies.perceptron_isaac.mharmony_native as mharmony_native
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.lerobot_types import TransitionKey
 from lerobot.policies import get_policy_class, make_policy_config, make_pre_post_processors
@@ -33,6 +34,7 @@ from lerobot.policies.perceptron_isaac.isaac_stats import (
     unnormalize_isaac_actions,
 )
 from lerobot.policies.perceptron_isaac.mharmony_adapter import import_mharmony_module
+from lerobot.policies.perceptron_isaac.mharmony_contract import SUPPORTED_MHARMONY_VERSION
 from lerobot.policies.perceptron_isaac.mharmony_native import (
     IsaacActionOutlierError,
     IsaacMharmonyRenderMetadata,
@@ -320,7 +322,7 @@ class FakeNativeRenderer:
         self.build_calls = []
         self.build_training_calls = []
         self.collate_calls = []
-        self.metadata = SimpleNamespace(target_fps=20.0)
+        self.metadata = SimpleNamespace(target_fps=20.0, action_conditioning=False)
         self.stats = SimpleNamespace(target_fps=20.0)
         self.sequence_length = 1
 
@@ -570,12 +572,15 @@ def test_render_registry_configs_round_trip_without_schema_drift(tmp_path):
         "native_stats_path": "/tmp/native_stats.json",
         "fast_processor_path": None,
         "fast_processor_tree_sha256": None,
-        "mharmony_version": "genesis-in-tree",
+        "mharmony_version": SUPPORTED_MHARMONY_VERSION,
         "action_dim": 7,
         "proprio_dim": 8,
         "vector_max_states": 128,
         "dataset_name": "libero",
         "robot_type": "generic",
+        "action_conditioning": False,
+        "action_conditioning_role": "user",
+        "mistake_conditioning": False,
         "render_metadata": None,
         "train_clip_normalized_actions": True,
         "clip_normalized_max": 10.0,
@@ -623,7 +628,7 @@ def test_native_backend_factory_uses_mharmony_pack_step(tmp_path):
         device="cpu",
         native_render_metadata_path="/tmp/native_render.json",
         native_stats_path=str(stats_path),
-        mharmony_version="genesis-in-tree",
+        mharmony_version=SUPPORTED_MHARMONY_VERSION,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
@@ -642,9 +647,16 @@ def test_native_backend_factory_uses_mharmony_pack_step(tmp_path):
     assert native_step.inference_backend == "native_mharmony"
     assert native_step.native_render_metadata_path == "/tmp/native_render.json"
     assert native_step.native_stats_path == str(stats_path)
-    assert native_step.mharmony_version == "genesis-in-tree"
+    assert native_step.mharmony_version == SUPPORTED_MHARMONY_VERSION
     assert action_step.stats_path == str(stats_path)
     assert action_step.gripper_binary_to_signed is False
+
+
+def test_legacy_processor_mharmony_marker_is_upgraded() -> None:
+    with pytest.warns(FutureWarning, match="genesis-in-tree"):
+        step = PerceptronIsaacMharmonyPackProcessorStep(mharmony_version="genesis-in-tree")
+
+    assert step.mharmony_version == SUPPORTED_MHARMONY_VERSION
 
 
 def test_unsafe_normalization_profile_fails_closed_in_config_and_processor(tmp_path):
@@ -1035,8 +1047,99 @@ def test_native_policy_online_rollout_uses_policy_clock(tmp_path):
     # only executed post-settle steps, so the first chunk anchors at (k-1)/fps regardless of
     # num_settle_steps rather than carrying a +num_settle_steps/fps offset.
     np.testing.assert_allclose([settled_renderer.build_calls[-1]["anchor_timestamp_seconds"]], [0.1])
+    settled_window = settled_renderer.build_calls[-1]["observation_window"]
+    assert [float(frame["proprio"][0]) for frame in settled_window] == [10.0, 10.0, 10.0]
     assert settled_policy._settle_index == 10
     assert settled_policy._frame_index == 0
+
+
+def test_online_renderer_inherits_conditioning_contract(tmp_path):
+    stats_path = tmp_path / "stats.json"
+    _write_native_stats(stats_path)
+    config = PerceptronIsaacConfig(
+        device="cpu",
+        native_stats_path=str(stats_path),
+        action_conditioning=True,
+        action_conditioning_role="user",
+        mistake_conditioning=True,
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+
+    step = PerceptronIsaacPolicy(config)._ensure_online_render_step()
+
+    assert step.action_conditioning is True
+    assert step.action_conditioning_role == "user"
+    assert step.mistake_conditioning is True
+    step._ensure_renderer()
+    assert step._stream_builder.metadata.action_conditioning is True
+    assert step._stream_builder.metadata.action_conditioning_role == "user"
+    assert step._stream_builder.metadata.mistake_conditioning is True
+
+
+def test_native_policy_requires_and_resets_executed_action_history(tmp_path):
+    stats_path = tmp_path / "stats.json"
+    _write_native_stats(stats_path)
+    config = PerceptronIsaacConfig(
+        device="cpu",
+        native_stats_path=str(stats_path),
+        n_obs_steps=3,
+        n_action_steps=1,
+        chunk_size=30,
+        action_conditioning=True,
+        clip_normalized_max=10.0,
+        fast_clip_normalized_max=1.0,
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+
+    def batch(index: int) -> dict[str, object]:
+        return {
+            "observation.images.image": torch.full((3, 256, 256), index / 10.0),
+            "observation.images.wrist_image": torch.full((3, 256, 256), (index + 1) / 10.0),
+            OBS_STATE: torch.full((8,), float(index)),
+            "task": "pick up the mug",
+        }
+
+    policy = PerceptronIsaacPolicy(config)
+    policy._isaac_model = FakeIsaacModel()
+    render_step = policy._ensure_online_render_step()
+    renderer = _install_fake_native_renderer(render_step)
+    renderer.metadata.action_conditioning = True
+    render_step._fast_processor = object()
+
+    policy.select_action(batch(0))
+    assert [frame.get("previous_action") for frame in renderer.build_calls[-1]["observation_window"]] == [
+        None,
+        None,
+        None,
+    ]
+
+    with pytest.raises(RuntimeError, match="record_executed_action"):
+        policy.select_action(batch(1))
+    assert policy._frame_index == 0
+
+    with pytest.raises(ValueError, match="finite"):
+        policy.record_executed_action(np.full(7, np.nan, dtype=np.float32))
+
+    executed_action = np.full(7, 2.0, dtype=np.float32)
+    policy.record_executed_action(executed_action)
+    policy.select_action(batch(1))
+    expected = normalize_isaac_actions(executed_action[None, :], load_isaac_stats(stats_path).action)[0]
+    expected = np.clip(expected, -config.fast_clip_normalized_max, config.fast_clip_normalized_max)
+    np.testing.assert_allclose(
+        renderer.build_calls[-1]["observation_window"][-1]["previous_action"],
+        expected,
+    )
+
+    policy.reset()
+    assert list(policy._online_action_queue) == []
+    assert policy._pending_executed_action is None
+    first_step = policy._ensure_online_render_step()
+    first_renderer = _install_fake_native_renderer(first_step)
+    first_renderer.metadata.action_conditioning = True
+    first_step._fast_processor = object()
+    policy.select_action(batch(0))
 
 
 def test_native_policy_external_timestamp_is_monotonic_and_resettable(tmp_path):
@@ -2165,6 +2268,24 @@ def test_native_policy_consumes_processor_stream_and_returns_normalized_actions(
     assert policy._isaac_model.sample_calls[0]["num_flow_samples"] == 4
 
 
+def test_native_policy_rejects_non_finite_normalized_actions(tmp_path):
+    stats_path = tmp_path / "stats.json"
+    _write_native_stats(stats_path)
+    cfg = PerceptronIsaacConfig(
+        device="cpu",
+        native_stats_path=str(stats_path),
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+    policy = PerceptronIsaacPolicy(cfg)
+    policy._isaac_model = FakeIsaacModel(value=float("nan"))
+
+    with pytest.raises(RuntimeError, match="non-finite normalized actions"):
+        policy.predict_action_chunk(
+            {PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick up the mug"}
+        )
+
+
 def test_native_policy_autocasts_bf16_compute_with_fp32_master_weights(tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
@@ -2205,7 +2326,7 @@ def test_native_policy_requests_model_side_flow_sample_averaging(tmp_path):
     np.testing.assert_allclose(actions.numpy(), np.full((1, 30, 7), 2.0, dtype=np.float32))
 
 
-def test_native_policy_flow_seed_base_is_deterministic(monkeypatch, tmp_path):
+def test_native_policy_uses_configured_flow_seed_base_without_environment(monkeypatch, tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
 
@@ -2214,6 +2335,7 @@ def test_native_policy_flow_seed_base_is_deterministic(monkeypatch, tmp_path):
             device="cpu",
             native_stats_path=str(stats_path),
             num_flow_samples=4,
+            flow_seed_base=1234,
             input_features=_features(),
             output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
         )
@@ -2221,7 +2343,7 @@ def test_native_policy_flow_seed_base_is_deterministic(monkeypatch, tmp_path):
         policy._isaac_model = FakeRandomFlowIsaacModel()
         return policy
 
-    monkeypatch.setenv("ISAAC_FLOW_SEED_BASE", "1234")
+    monkeypatch.delenv("ISAAC_FLOW_SEED_BASE", raising=False)
     first = _policy().predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
     second = _policy().predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
 
@@ -2610,6 +2732,94 @@ def test_native_mharmony_content_plan_matches_libero_prompt_contract(tmp_path):
     np.testing.assert_allclose(episode_start.observation_timestamps_seconds, [0.0, 0.0, 0.0])
 
 
+def _libero_content_plan_window() -> list[dict[str, object]]:
+    return [
+        {
+            "images": {
+                "image": np.zeros((4, 4, 3), dtype=np.uint8),
+                "wrist_image": np.ones((4, 4, 3), dtype=np.uint8),
+            },
+            "proprio": np.zeros(8, dtype=np.float32),
+        }
+        for _ in range(3)
+    ]
+
+
+def test_native_mharmony_places_historical_fast_actions_before_next_observation(tmp_path):
+    stats_path = tmp_path / "stats.json"
+    _write_native_stats(stats_path)
+    plan = build_isaac_mharmony_content_plan(
+        observation_window=_libero_content_plan_window(),
+        prompt="pick up the mug",
+        metadata=IsaacMharmonyRenderMetadata(action_conditioning=True),
+        stats=load_isaac_stats(stats_path),
+        anchor_timestamp_seconds=0.1,
+        historical_fast_action_tokens=[None, [17, 18], [19]],
+    )
+
+    kinds = [item["kind"] for item in plan.user_content]
+    assert kinds == [
+        "text",
+        "timestamp",
+        "image",
+        "image",
+        "tokens",
+        "timestamp",
+        "image",
+        "image",
+        "tokens",
+        "timestamp",
+        "image",
+        "image",
+        "vector",
+    ]
+    action_items = [item for item in plan.user_content if item["kind"] == "tokens"]
+    assert [item["tokens"] for item in action_items] == [[17, 18], [19]]
+    assert [item["tags"]["action_conditioning_observation_window"] for item in action_items] == [
+        [0, 1],
+        [1, 2],
+    ]
+    assert all(item["tags"]["token_group"] == "fast_action" for item in action_items)
+
+
+def test_native_mharmony_encodes_normalized_executed_actions_as_fast_history():
+    class RecordingFastProcessor:
+        def __init__(self):
+            self.actions = []
+
+        def __call__(self, actions):
+            self.actions.append(np.asarray(actions))
+            return [[23, 24]]
+
+    processor = RecordingFastProcessor()
+    window = _libero_content_plan_window()
+    window[1]["previous_action"] = np.arange(7, dtype=np.float32)
+
+    tokens = mharmony_native.encode_isaac_historical_fast_actions(
+        observation_window=window,
+        metadata=IsaacMharmonyRenderMetadata(action_conditioning=True),
+        fast_processor=processor,
+    )
+
+    assert tokens == [None, [23, 24], None]
+    assert len(processor.actions) == 1
+    np.testing.assert_allclose(processor.actions[0], np.arange(7, dtype=np.float32).reshape(1, 1, 7))
+
+
+def test_native_mharmony_renders_mistake_false_when_checkpoint_trained_with_support(tmp_path):
+    stats_path = tmp_path / "stats.json"
+    _write_native_stats(stats_path)
+    plan = build_isaac_mharmony_content_plan(
+        observation_window=_libero_content_plan_window(),
+        prompt="pick up the mug",
+        metadata=IsaacMharmonyRenderMetadata(mistake_conditioning=True),
+        stats=load_isaac_stats(stats_path),
+        anchor_timestamp_seconds=0.1,
+    )
+
+    assert "mistake: false" in plan.preamble.splitlines()
+
+
 def test_native_mharmony_metadata_rejects_prompt_contract_mismatch():
     cfg = PerceptronIsaacConfig(
         device="cpu",
@@ -2635,16 +2845,15 @@ def test_native_mharmony_metadata_requires_robot_type():
 
 
 def test_native_mharmony_import_helper_allows_only_mharmony_namespace():
-    with pytest.raises(ImportError, match="genesis.data.mharmony"):
+    with pytest.raises(ImportError, match="mharmony"):
         import_mharmony_module("genesis.inference.flow_matching.observation")
-    with pytest.raises(ImportError, match="genesis.data.mharmony"):
-        import_mharmony_module("genesis.data.mharmony_anything")
+    with pytest.raises(ImportError, match="mharmony"):
+        import_mharmony_module("mharmony_anything")
 
 
-def test_perceptron_isaac_direct_genesis_imports_are_confined_to_mharmony_adapter():
+def test_perceptron_isaac_forbids_all_genesis_imports():
     root = Path(__file__).parents[3]
     isaac_root = root / "src/lerobot/policies/perceptron_isaac"
-    adapter_path = isaac_root / "mharmony_adapter.py"
     offenders = []
     for path in isaac_root.rglob("*.py"):
         tree = ast.parse(path.read_text())
@@ -2656,9 +2865,7 @@ def test_perceptron_isaac_direct_genesis_imports_are_confined_to_mharmony_adapte
             else:
                 names = []
             for module_name in names:
-                if not module_name.startswith("genesis"):
-                    continue
-                if path != adapter_path or not module_name.startswith("genesis.data.mharmony"):
+                if module_name.startswith("genesis"):
                     offenders.append(f"{path}:{node.lineno}:{module_name}")
 
             if not isinstance(node, ast.Call) or not node.args:
@@ -2674,9 +2881,7 @@ def test_perceptron_isaac_direct_genesis_imports_are_confined_to_mharmony_adapte
             if not isinstance(first_arg, ast.Constant) or not isinstance(first_arg.value, str):
                 continue
             module_name = first_arg.value
-            if not module_name.startswith("genesis"):
-                continue
-            if path != adapter_path or not module_name.startswith("genesis.data.mharmony"):
+            if module_name.startswith("genesis"):
                 offenders.append(f"{path}:{node.lineno}:{module_name}")
 
     assert offenders == []
