@@ -39,6 +39,7 @@ from .fast_processor import (
     materialize_pinned_fast_processor_snapshot,
     resolve_pinned_fast_processor_snapshot,
 )
+from .hardware_features import so100_hardware_feature_aliases
 from .isaac_stats import NATIVE_NORMALIZATION_EPS
 from .mk1_checkpoint_contract import (
     Mk1CheckpointContract,
@@ -2351,26 +2352,17 @@ def _package_geometry(
     )
 
 
-_SO100_SEMANTIC_TO_HARDWARE = {
-    "main_shoulder_pan": "shoulder_pan.pos",
-    "main_shoulder_lift": "shoulder_lift.pos",
-    "main_elbow_flex": "elbow_flex.pos",
-    "main_wrist_flex": "wrist_flex.pos",
-    "main_wrist_roll": "wrist_roll.pos",
-    "main_gripper": "gripper.pos",
-}
-
-
 def _hardware_feature_names(robot_type: str, semantic_layout: list[str]) -> list[str] | None:
     if robot_type == "bi_yam":
         return list(semantic_layout)
     if robot_type == "so100_so101":
-        expected_semantics = list(_SO100_SEMANTIC_TO_HARDWARE)
+        aliases = so100_hardware_feature_aliases()
+        expected_semantics = list(aliases)
         if semantic_layout != expected_semantics:
             raise IsaacCheckpointImportError(
                 "SO100/SO101 semantic state/action components do not match joint_gripper_6."
             )
-        return [_SO100_SEMANTIC_TO_HARDWARE[name] for name in semantic_layout]
+        return [aliases[name] for name in semantic_layout]
     return None
 
 

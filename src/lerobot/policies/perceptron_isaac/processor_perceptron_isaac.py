@@ -100,11 +100,16 @@ _LIST_CONFIG_FIELD_NAMES = frozenset({"camera_order", "image_size", "image_keys"
 
 
 def _adopt_dataset_state_feature_names(config: PerceptronIsaacConfig, dataset_meta: Any | None) -> None:
-    """Capture non-strict dataset state layout so gripper masks can be derived and saved."""
-    if dataset_meta is None or config.strict_hardware_feature_contract:
+    """Validate strict joint order or capture non-strict state names for gripper masks."""
+    if dataset_meta is None:
         return
     features = getattr(dataset_meta, "features", None)
     if not isinstance(features, dict):
+        if config.strict_hardware_feature_contract:
+            config.set_dataset_feature_metadata({})
+        return
+    config.set_dataset_feature_metadata(features)
+    if config.strict_hardware_feature_contract:
         return
     state_feature = features.get(OBS_STATE)
     if state_feature is None:

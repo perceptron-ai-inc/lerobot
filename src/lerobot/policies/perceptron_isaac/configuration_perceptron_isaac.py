@@ -9,13 +9,16 @@ are intentionally unsupported.
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 
+from ..processor_utils import flatten_feature_names
 from ..utils import ensure_vla_feature_contract
 from .checkpoint_integrity import is_lowercase_sha256
+from .hardware_features import so100_hardware_feature_aliases
 from .isaac_stats import require_closed_loop_safe_isaac_profile
 from .mharmony_contract import SUPPORTED_MHARMONY_VERSION, normalize_mharmony_version_marker
 
@@ -455,6 +458,22 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         )
         if self.strict_hardware_feature_contract or self.strict_environment_feature_contract:
             self._validate_known_deployment_contract()
+
+    def set_dataset_feature_metadata(self, features: dict[str, Any]) -> None:
+        """Validate strict hardware joint order before positional values or stats are consumed."""
+        if not self.strict_hardware_feature_contract:
+            return
+        aliases = so100_hardware_feature_aliases() if self.robot_type.lower() == "so100_so101" else {}
+        for key, expected in ((ACTION, self.action_feature_names), (OBS_STATE, self.state_feature_names)):
+            assert expected is not None, "Strict hardware configs must declare state and action names."
+            names = flatten_feature_names(features.get(key, {}).get("names"), empty_as_none=True)
+            canonical_names = [aliases.get(name, name) for name in names] if names is not None else None
+            if canonical_names != expected:
+                raise ValueError(
+                    f"ISAAC dataset feature order for {key} must match the package hardware layout: "
+                    f"expected={expected}, got={names}. Only reviewed semantic aliases are accepted; "
+                    "different layouts require an explicit dataset transform."
+                )
 
     def _save_pretrained(self, save_directory: Path) -> None:
         """Write config.json, exporting checkpoint-local sidecars when known.
