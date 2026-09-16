@@ -25,9 +25,6 @@ from .groot.configuration_groot import GrootConfig as GrootConfig
 from .lingbot_va.configuration_lingbot_va import LingBotVAConfig as LingBotVAConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config as MolmoAct2Config
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as MultiTaskDiTConfig
-
-# NOTE: import the configuration module directly rather than the ``perceptron_isaac`` package;
-# the package ``__init__`` pulls in modeling/processor, which need transformers.
 from .perceptron_isaac.configuration_perceptron_isaac import (
     PerceptronIsaacConfig as PerceptronIsaacConfig,
 )

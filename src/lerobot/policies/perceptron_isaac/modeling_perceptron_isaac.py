@@ -17,17 +17,22 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import numpy as np
 import torch
 from huggingface_hub import save_torch_state_dict
 from torch import Tensor
-from transformers import AutoModelForCausalLM
 
 from lerobot.lerobot_types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.hub import resolve_hub_snapshot
+from lerobot.utils.import_utils import _transformers_available, require_package
+
+if TYPE_CHECKING or _transformers_available:
+    from transformers import AutoModelForCausalLM
+else:
+    AutoModelForCausalLM = None
 
 from ..pretrained import PreTrainedPolicy
 from .checkpoint_integrity import (
@@ -142,6 +147,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     config_class = PerceptronIsaacConfig
 
     def __init__(self, config: PerceptronIsaacConfig, **kwargs):
+        require_package("transformers", extra="perceptron_isaac")
         super().__init__(config)
         config.validate_features()
         self.config = config
