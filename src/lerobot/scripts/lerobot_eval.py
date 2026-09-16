@@ -56,7 +56,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from functools import partial
@@ -111,15 +111,24 @@ class ExecutedActionRecorder(Protocol):
 logger = logging.getLogger(__name__)
 
 
-def _env_features_to_dataset_features(env_features: dict) -> dict:
-    """Convert EnvConfig.features to the dict format expected by LeRobotDataset.create()."""
+def _recording_feature_name(key: str, features_map: dict[str, str] | None) -> str:
+    """Use the environment's declared rename contract and slash-free dataset keys."""
+    return (features_map or {}).get(key, key).replace("/", ".")
+
+
+def _env_features_to_dataset_features(env_features: dict, features_map: dict[str, str] | None = None) -> dict:
+    """Build the recording schema from the same declared keys used by frame conversion."""
     features = {}
     for key, ft in env_features.items():
-        shape = tuple(ft.shape)
-        if ft.type is FeatureType.VISUAL:
-            features[key] = {"dtype": "video", "shape": shape, "names": ["height", "width", "channel"]}
-        else:
-            features[key] = {"dtype": "float32", "shape": shape, "names": None}
+        name = _recording_feature_name(key, features_map)
+        if name in features:
+            raise ValueError(f"Eval recording feature mapping collides at {name!r}.")
+        visual = ft.type is FeatureType.VISUAL
+        features[name] = {
+            "dtype": "video" if visual else "float32",
+            "shape": tuple(ft.shape),
+            "names": ["height", "width", "channel"] if visual else None,
+        }
     features["next.reward"] = {"dtype": "float32", "shape": (1,), "names": None}
     features["next.success"] = {"dtype": "bool", "shape": (1,), "names": None}
     features["next.done"] = {"dtype": "bool", "shape": (1,), "names": None}
@@ -135,39 +144,66 @@ def _build_raw_frame(
     done: bool,
     task: str,
     env_features: dict,
+    features_map: dict[str, str] | None = None,
 ) -> dict:
-    """Build a dataset frame from raw env observations for one env index.
-
-    Keys in the frame match the keys in env_features so they align with the
-    dataset schema created by _env_features_to_dataset_features().
-    """
+    """Record unprocessed observations and executed actions, not policy-normalized tensors."""
     frame: dict[str, Any] = {}
-    for key in env_features:
-        if key == ACTION:
+    for key, feature in env_features.items():
+        if key == ACTION or key.startswith("next."):
             continue
-        if key.startswith("next."):
-            continue
-        if "pixels" in raw_obs and isinstance(raw_obs["pixels"], dict):
-            for cam_name, img in raw_obs["pixels"].items():
-                candidate = f"{OBS_IMAGES}.{cam_name}"
-                if candidate == key:
-                    frame[key] = img[env_idx]
-            if key in frame:
-                continue
-        if "pixels" in raw_obs and not isinstance(raw_obs["pixels"], dict) and key in ("pixels", OBS_IMAGE):
-            frame[key] = raw_obs["pixels"][env_idx]
-            continue
-        if key in raw_obs and isinstance(raw_obs[key], np.ndarray):
-            val = raw_obs[key][env_idx]
-            if val.dtype == np.float64:
-                val = val.astype(np.float32)
-            frame[key] = val
-    frame[ACTION] = action
+        name = _recording_feature_name(key, features_map)
+        value: Any = raw_obs.get(key)
+        if value is None:
+            value = raw_obs
+            for component in key.split("/"):
+                value = value.get(component) if isinstance(value, dict) else None
+        if feature.type is FeatureType.VISUAL and value is None:
+            pixels = raw_obs.get("pixels")
+            if isinstance(pixels, dict) and name.startswith(f"{OBS_IMAGES}."):
+                value = pixels.get(name.removeprefix(f"{OBS_IMAGES}."))
+            elif isinstance(pixels, np.ndarray) and name == OBS_IMAGE:
+                value = pixels
+        if not isinstance(value, np.ndarray):
+            raise ValueError(f"Eval recording missing raw observation for {key!r} (dataset key {name!r}).")
+        item = value[env_idx]
+        frame[name] = item if feature.type is FeatureType.VISUAL else np.asarray(item, dtype=np.float32)
+    frame[_recording_feature_name(ACTION, features_map)] = np.asarray(action, dtype=np.float32)
     frame["next.reward"] = np.atleast_1d(np.float32(reward))
     frame["next.success"] = np.atleast_1d(np.bool_(success))
     frame["next.done"] = np.atleast_1d(np.bool_(done))
     frame["task"] = task
     return frame
+
+
+@contextmanager
+def _eval_recording_datasets(env, recording_dir, env_features, features_map, repo_id, private):
+    """Own one dataset writer per vector slot across every episode batch of a task."""
+    if recording_dir is None or env_features is None:
+        yield None
+        return
+    features = _env_features_to_dataset_features(env_features, features_map)
+    datasets = []
+    with ExitStack() as writers:
+        for index in range(env.num_envs):
+            multi_env = env.num_envs > 1
+            root = recording_dir / f"env_{index}" if multi_env else recording_dir
+            name = repo_id or "eval_recording"
+            if multi_env:
+                name = f"{name}_env_{index}"
+            dataset = LeRobotDataset.create(
+                repo_id=name,
+                fps=env.unwrapped.metadata.get("render_fps", 30),
+                features=features,
+                root=root,
+                use_videos=True,
+            )
+            writers.callback(dataset.finalize)
+            datasets.append(dataset)
+        yield datasets
+    # Publish only a successful, fully finalized recording, never an aborted evaluation.
+    for dataset in datasets:
+        if repo_id is not None and dataset.num_episodes > 0:
+            dataset.push_to_hub(private=private)
 
 
 def rollout(
@@ -185,6 +221,8 @@ def rollout(
     recording_repo_id: str | None = None,
     recording_private: bool = False,
     predicted_latents_callback: Callable[[PreTrainedPolicy], None] | None = None,
+    env_features_map: dict[str, str] | None = None,
+    _recording_datasets: list[LeRobotDataset] | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -228,51 +266,40 @@ def rollout(
     if render_callback is not None:
         render_callback(env)
 
-    recording_datasets: list[LeRobotDataset] | None = None
-    raw_observation = None
-    task_desc = ""
-    if recording_dir is not None and env_features is not None:
-        features = _env_features_to_dataset_features(env_features)
-        fps = env.unwrapped.metadata.get("render_fps", 30)
-        recording_datasets = []
-        multi_env = env.num_envs > 1
-        base_repo_id = recording_repo_id or "eval_recording"
-        for i in range(env.num_envs):
-            root = str(recording_dir / f"env_{i}") if multi_env else str(recording_dir)
-            repo_id = f"{base_repo_id}_env_{i}" if multi_env else base_repo_id
-            recording_datasets.append(
-                LeRobotDataset.create(
-                    repo_id=repo_id,
-                    fps=fps,
-                    features=features,
-                    root=root,
-                    use_videos=True,
+    with ExitStack() as recording_scope:
+        recording_datasets = _recording_datasets
+        if recording_datasets is None:
+            recording_datasets = recording_scope.enter_context(
+                _eval_recording_datasets(
+                    env, recording_dir, env_features, env_features_map, recording_repo_id, recording_private
                 )
             )
-        raw_observation = deepcopy(observation)
-        try:
-            task_desc = list(env.call("task_description"))[0]
-        except (AttributeError, NotImplementedError):
-            task_desc = ""
+        raw_observation = None
+        task_desc = ""
+        if recording_datasets is not None:
+            raw_observation = deepcopy(observation)
+            try:
+                task_desc = list(env.call("task_description"))[0]
+            except (AttributeError, NotImplementedError):
+                task_desc = ""
 
-    all_observations = []
-    all_actions = []
-    all_rewards = []
-    all_successes = []
-    all_dones = []
+        all_observations = []
+        all_actions = []
+        all_rewards = []
+        all_successes = []
+        all_dones = []
 
-    step = 0
-    # Keep track of which environments are done.
-    done = np.array([False] * env.num_envs)
-    max_steps = env.call("_max_episode_steps")[0]
-    progbar = trange(
-        max_steps,
-        desc=f"Running rollout with at most {max_steps} steps",
-        disable=inside_slurm(),  # we dont want progress bar when we use slurm, since it clutters the logs
-        leave=False,
-    )
-    check_env_attributes_and_types(env)
-    try:
+        step = 0
+        # Keep track of which environments are done.
+        done = np.array([False] * env.num_envs)
+        max_steps = env.call("_max_episode_steps")[0]
+        progbar = trange(
+            max_steps,
+            desc=f"Running rollout with at most {max_steps} steps",
+            disable=inside_slurm(),  # we dont want progress bar when we use slurm, since it clutters the logs
+            leave=False,
+        )
+        check_env_attributes_and_types(env)
         while not np.all(done) and step < max_steps:
             # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
             observation = preprocess_observation(observation)
@@ -355,12 +382,13 @@ def rollout(
                         action_numpy[env_idx],
                         reward[env_idx],
                         successes[env_idx],
-                        bool(terminated[env_idx] | truncated[env_idx]),
+                        bool(terminated[env_idx] | truncated[env_idx]) or step + 1 == max_steps,
                         task_desc,
-                        recording_datasets[env_idx].features,
+                        env_features,
+                        env_features_map,
                     )
                     recording_datasets[env_idx].add_frame(frame)
-                    if terminated[env_idx] or truncated[env_idx]:
+                    if terminated[env_idx] or truncated[env_idx] or step + 1 == max_steps:
                         recording_datasets[env_idx].save_episode()
                 raw_observation = deepcopy(observation)
 
@@ -383,15 +411,6 @@ def rollout(
             )
             progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
             progbar.update()
-    finally:
-        if recording_datasets is not None:
-            for ds in recording_datasets:
-                ds.finalize()
-                if recording_repo_id is not None:
-                    if ds.num_episodes > 0:
-                        ds.push_to_hub(private=recording_private)
-                    else:
-                        logging.warning("No episodes recorded for %s — skipping push to hub.", ds.repo_id)
 
     # Track the final observation.
     if return_observations:
@@ -434,6 +453,7 @@ def eval_policy(
     recording_repo_id: str | None = None,
     recording_private: bool = False,
     save_predicted_video: bool = False,
+    env_features_map: dict[str, str] | None = None,
 ) -> dict:
     """
     Args:
@@ -522,133 +542,140 @@ def eval_policy(
 
     # we dont want progress bar when we use slurm, since it clutters the logs
     progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
-    for batch_ix in progbar:
-        # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
-        # step.
-        if max_episodes_rendered > 0:
-            ep_frames: list[np.ndarray] = []
+    with _eval_recording_datasets(
+        env, recording_dir, env_features, env_features_map, recording_repo_id, recording_private
+    ) as recording_datasets:
+        for batch_ix in progbar:
+            # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
+            # step.
+            if max_episodes_rendered > 0:
+                ep_frames: list[np.ndarray] = []
 
-        if save_predicted_video:
-            pred_latents: list[torch.Tensor] = []
+            if save_predicted_video:
+                pred_latents: list[torch.Tensor] = []
 
-        if start_seed is None:
-            seeds = None
-        else:
-            seeds = range(
-                start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs)
-            )
-        rollout_data = rollout(
-            env=env,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            seeds=list(seeds) if seeds else None,
-            return_observations=return_episode_data,
-            render_callback=render_frame if max_episodes_rendered > 0 else None,
-            recording_dir=recording_dir,
-            env_features=env_features,
-            recording_repo_id=recording_repo_id,
-            recording_private=recording_private,
-            predicted_latents_callback=collect_predicted_latents if save_predicted_video else None,
-        )
-
-        # Figure out where in each rollout sequence the first done condition was encountered (results after
-        # this won't be included).
-        n_steps = rollout_data["done"].shape[1]
-        # Note: this relies on a property of argmax: that it returns the first occurrence as a tiebreaker.
-        done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
-
-        # Make a mask with shape (batch, n_steps) to mask out rollout data after the first done
-        # (batch-element-wise). Note the `done_indices + 1` to make sure to keep the data from the done step.
-        mask = (torch.arange(n_steps) <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)).int()
-        # Extend metrics.
-        batch_sum_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "sum")
-        sum_rewards.extend(batch_sum_rewards.tolist())
-        batch_max_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "max")
-        max_rewards.extend(batch_max_rewards.tolist())
-        batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
-        all_successes.extend(batch_successes.tolist())
-        if seeds:
-            all_seeds.extend(seeds)
-        else:
-            all_seeds.extend([None] * env.num_envs)
-
-        # FIXME: episode_data is either None or it doesn't exist
-        if return_episode_data:
-            this_episode_data = _compile_episode_data(
-                rollout_data,
-                done_indices,
-                start_episode_index=batch_ix * env.num_envs,
-                start_data_index=(0 if episode_data is None else (episode_data["index"][-1].item() + 1)),
-                fps=env.unwrapped.metadata["render_fps"],
-            )
-            if episode_data is None:
-                episode_data = this_episode_data
+            if start_seed is None:
+                seeds = None
             else:
-                # Some sanity checks to make sure we are correctly compiling the data.
-                assert episode_data["episode_index"][-1] + 1 == this_episode_data["episode_index"][0]
-                assert episode_data["index"][-1] + 1 == this_episode_data["index"][0]
-                # Concatenate the episode data.
-                episode_data = {k: torch.cat([episode_data[k], this_episode_data[k]]) for k in episode_data}
+                seeds = range(
+                    start_seed + (batch_ix * env.num_envs), start_seed + ((batch_ix + 1) * env.num_envs)
+                )
+            rollout_data = rollout(
+                env=env,
+                policy=policy,
+                env_preprocessor=env_preprocessor,
+                env_postprocessor=env_postprocessor,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                seeds=list(seeds) if seeds else None,
+                return_observations=return_episode_data,
+                render_callback=render_frame if max_episodes_rendered > 0 else None,
+                recording_dir=recording_dir,
+                env_features=env_features,
+                env_features_map=env_features_map,
+                recording_repo_id=recording_repo_id,
+                recording_private=recording_private,
+                predicted_latents_callback=collect_predicted_latents if save_predicted_video else None,
+                _recording_datasets=recording_datasets,
+            )
 
-        # Maybe render video for visualization.
-        if max_episodes_rendered > 0 and len(ep_frames) > 0:
-            batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
-            for stacked_frames, done_index in zip(
-                batch_stacked_frames, done_indices.flatten().tolist(), strict=False
-            ):
-                if n_episodes_rendered >= max_episodes_rendered:
-                    break
+            # Figure out where in each rollout sequence the first done condition was encountered (results after
+            # this won't be included).
+            n_steps = rollout_data["done"].shape[1]
+            # Note: this relies on a property of argmax: that it returns the first occurrence as a tiebreaker.
+            done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
 
+            # Make a mask with shape (batch, n_steps) to mask out rollout data after the first done
+            # (batch-element-wise). Note the `done_indices + 1` to make sure to keep the data from the done step.
+            mask = (torch.arange(n_steps) <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)).int()
+            # Extend metrics.
+            batch_sum_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "sum")
+            sum_rewards.extend(batch_sum_rewards.tolist())
+            batch_max_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "max")
+            max_rewards.extend(batch_max_rewards.tolist())
+            batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
+            all_successes.extend(batch_successes.tolist())
+            if seeds:
+                all_seeds.extend(seeds)
+            else:
+                all_seeds.extend([None] * env.num_envs)
+
+            # FIXME: episode_data is either None or it doesn't exist
+            if return_episode_data:
+                this_episode_data = _compile_episode_data(
+                    rollout_data,
+                    done_indices,
+                    start_episode_index=batch_ix * env.num_envs,
+                    start_data_index=(0 if episode_data is None else (episode_data["index"][-1].item() + 1)),
+                    fps=env.unwrapped.metadata["render_fps"],
+                )
+                if episode_data is None:
+                    episode_data = this_episode_data
+                else:
+                    # Some sanity checks to make sure we are correctly compiling the data.
+                    assert episode_data["episode_index"][-1] + 1 == this_episode_data["episode_index"][0]
+                    assert episode_data["index"][-1] + 1 == this_episode_data["index"][0]
+                    # Concatenate the episode data.
+                    episode_data = {
+                        k: torch.cat([episode_data[k], this_episode_data[k]]) for k in episode_data
+                    }
+
+            # Maybe render video for visualization.
+            if max_episodes_rendered > 0 and len(ep_frames) > 0:
+                batch_stacked_frames = np.stack(ep_frames, axis=1)  # (b, t, *)
+                for stacked_frames, done_index in zip(
+                    batch_stacked_frames, done_indices.flatten().tolist(), strict=False
+                ):
+                    if n_episodes_rendered >= max_episodes_rendered:
+                        break
+
+                    videos_dir.mkdir(parents=True, exist_ok=True)
+                    video_path = videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
+                    video_paths.append(str(video_path))
+                    thread = threading.Thread(
+                        target=write_video,
+                        args=(
+                            str(video_path),
+                            stacked_frames[: done_index + 1],  # + 1 to capture the last observation
+                            env.unwrapped.metadata["render_fps"],
+                        ),
+                    )
+                    thread.start()
+                    threads.append(thread)
+                    n_episodes_rendered += 1
+
+            # Maybe save the policy's predicted (imagined) video for this batch's rollout.
+            if save_predicted_video and len(pred_latents) > 0:
+                predicted_latent = torch.cat(pred_latents, dim=2)
+                decoder = getattr(policy, "decode_predicted_latents", None) or getattr(
+                    policy, "_decode_predicted_video", None
+                )
+                if decoder is None:
+                    raise AttributeError(
+                        "Policy config requested predicted-video saving, but the policy does not expose "
+                        "`decode_predicted_latents` or `_decode_predicted_video`."
+                    )
+                predicted_video = decoder(predicted_latent)
+                if hasattr(predicted_video, "detach"):
+                    predicted_video = predicted_video.detach().to("cpu").numpy()
                 videos_dir.mkdir(parents=True, exist_ok=True)
-                video_path = videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
-                video_paths.append(str(video_path))
+                predicted_video_path = videos_dir / f"pred_episode_{n_predicted_rendered}.mp4"
+                predicted_video_paths.append(str(predicted_video_path))
                 thread = threading.Thread(
                     target=write_video,
                     args=(
-                        str(video_path),
-                        stacked_frames[: done_index + 1],  # + 1 to capture the last observation
+                        str(predicted_video_path),
+                        predicted_video,
                         env.unwrapped.metadata["render_fps"],
                     ),
                 )
                 thread.start()
                 threads.append(thread)
-                n_episodes_rendered += 1
+                n_predicted_rendered += 1
 
-        # Maybe save the policy's predicted (imagined) video for this batch's rollout.
-        if save_predicted_video and len(pred_latents) > 0:
-            predicted_latent = torch.cat(pred_latents, dim=2)
-            decoder = getattr(policy, "decode_predicted_latents", None) or getattr(
-                policy, "_decode_predicted_video", None
+            progbar.set_postfix(
+                {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
             )
-            if decoder is None:
-                raise AttributeError(
-                    "Policy config requested predicted-video saving, but the policy does not expose "
-                    "`decode_predicted_latents` or `_decode_predicted_video`."
-                )
-            predicted_video = decoder(predicted_latent)
-            if hasattr(predicted_video, "detach"):
-                predicted_video = predicted_video.detach().to("cpu").numpy()
-            videos_dir.mkdir(parents=True, exist_ok=True)
-            predicted_video_path = videos_dir / f"pred_episode_{n_predicted_rendered}.mp4"
-            predicted_video_paths.append(str(predicted_video_path))
-            thread = threading.Thread(
-                target=write_video,
-                args=(
-                    str(predicted_video_path),
-                    predicted_video,
-                    env.unwrapped.metadata["render_fps"],
-                ),
-            )
-            thread.start()
-            threads.append(thread)
-            n_predicted_rendered += 1
-
-        progbar.set_postfix(
-            {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
-        )
 
     # Wait till all video rendering threads are done.
     for thread in threads:
@@ -808,6 +835,7 @@ def eval_main(cfg: EvalPipelineConfig):
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             recording_dir=recording_dir,
             env_features=cfg.env.features if cfg.eval.recording else None,
+            env_features_map=cfg.env.features_map if cfg.eval.recording else None,
             recording_repo_id=cfg.eval.recording_repo_id,
             recording_private=cfg.eval.recording_private,
         )
@@ -857,6 +885,7 @@ def eval_one(
     env_features: dict | None = None,
     recording_repo_id: str | None = None,
     recording_private: bool = False,
+    env_features_map: dict[str, str] | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -876,6 +905,7 @@ def eval_one(
         start_seed=start_seed,
         recording_dir=recording_dir,
         env_features=env_features,
+        env_features_map=env_features_map,
         recording_repo_id=recording_repo_id,
         recording_private=recording_private,
     )
@@ -909,6 +939,7 @@ def run_one(
     env_features: dict | None = None,
     recording_repo_id: str | None = None,
     recording_private: bool = False,
+    env_features_map: dict[str, str] | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -941,6 +972,7 @@ def run_one(
         start_seed=start_seed,
         recording_dir=task_recording_dir,
         env_features=env_features,
+        env_features_map=env_features_map,
         recording_repo_id=task_repo_id,
         recording_private=recording_private,
     )
@@ -969,6 +1001,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    env_features_map: dict[str, str] | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1026,6 +1059,7 @@ def eval_policy_all(
         start_seed=start_seed,
         recording_dir=recording_dir,
         env_features=env_features,
+        env_features_map=env_features_map,
         recording_repo_id=recording_repo_id,
         recording_private=recording_private,
     )

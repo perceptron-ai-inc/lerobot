@@ -43,7 +43,6 @@ from lerobot.processor import (
     RobotObservation,
     RobotProcessorPipeline,
     make_default_processors,
-    rename_stats,
 )
 from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
 from lerobot.robots import make_robot_from_config
@@ -518,19 +517,12 @@ def build_rollout_context(
         if dataset is not None:
             logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
 
-        # --- 6. Policy pre/post processors (needs dataset stats if any) ---
-        dataset_stats = None
-        if dataset is not None:
-            dataset_stats = rename_stats(
-                dataset.meta.stats,
-                cfg.rename_map,
-            )
-
+        # Recording is an output sink, never a source of inference normalization.
+        # Only actual fine-tuning callers may install dataset-stat overrides.
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=policy_config,
             pretrained_path=cfg.policy.pretrained_path,
             pretrained_revision=policy_config.pretrained_revision,
-            dataset_stats=dataset_stats,
             preprocessor_overrides={
                 "device_processor": {"device": cfg.device},
                 "rename_observations_processor": {"rename_map": cfg.rename_map},
