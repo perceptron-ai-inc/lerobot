@@ -301,6 +301,9 @@ class TrainPipelineConfig(HubMixin):
                 "Please specify one with `--policy.path` or `--reward_model.path`."
             )
 
+        if self.policy is not None and self.env is not None:
+            self.eval.reconcile_policy_limits(self.policy, max_parallel_tasks=self.env.max_parallel_tasks)
+
         active_cfg = self.trainable_config
         if self.rename_map and active_cfg.pretrained_path is None:
             raise ValueError(

@@ -65,25 +65,10 @@ class EvalPipelineConfig:
                 explicit_fields=parser.get_explicit_override_fields("env"),
             )
 
-        if self.policy is not None and self.policy.max_eval_batch_size is not None:
-            max_batch_size = self.policy.max_eval_batch_size
-            if max_batch_size < 1:
-                raise ValueError(
-                    f"{self.policy.type} declares invalid max_eval_batch_size={max_batch_size}; expected >= 1."
-                )
-            if self.eval.batch_size > max_batch_size:
-                if not self.eval._batch_size_was_auto:
-                    raise ValueError(
-                        f"{self.policy.type} supports eval.batch_size at most {max_batch_size}; "
-                        f"got {self.eval.batch_size}."
-                    )
-                logger.info(
-                    "Capping auto-selected eval.batch_size=%d to %d for policy type '%s'.",
-                    self.eval.batch_size,
-                    max_batch_size,
-                    self.policy.type,
-                )
-                self.eval.batch_size = max_batch_size
+        if self.policy is not None:
+            self.eval.reconcile_policy_limits(
+                self.policy, max_parallel_tasks=self.env.max_parallel_tasks if self.env is not None else 1
+            )
 
         if not self.job_name:
             if self.env is None:

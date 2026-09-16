@@ -725,6 +725,11 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         """ISAAC online history and action queues are per-policy-instance state."""
         return 1
 
+    @property
+    def max_eval_parallel_tasks(self) -> int:
+        """Concurrent tasks cannot share the online history, RNG clock or action queue."""
+        return 1
+
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
             lr=self.optimizer_lr,

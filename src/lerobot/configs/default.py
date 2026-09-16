@@ -15,11 +15,15 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from lerobot.transforms import ImageTransformsConfig
 from lerobot.utils.import_utils import get_safe_default_video_backend
 
 from .video import DEFAULT_DEPTH_UNIT, DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT
+
+if TYPE_CHECKING:
+    from .policies import PreTrainedConfig
 
 
 @dataclass
@@ -95,16 +99,41 @@ class EvalConfig:
     recording_private: bool = False
 
     def __post_init__(self) -> None:
-        # Preserve whether the caller requested auto-tuning before replacing 0 with the
-        # resolved value. Policy-specific evaluation limits can then clamp the default
-        # without silently changing an explicit batch size.
-        self._batch_size_was_auto = self.batch_size == 0
+        # Retain the requested size before auto-selection/episode-count clipping, so
+        # policy limits cap defaults but never hide an unsupported explicit request.
+        self._requested_batch_size = self.batch_size
         if self.recording_repo_id is not None and not self.recording:
             raise ValueError("eval.recording_repo_id requires eval.recording=true.")
         if self.batch_size == 0:
             self.batch_size = self._auto_batch_size()
         if self.batch_size > self.n_episodes:
             self.batch_size = self.n_episodes
+
+    def reconcile_policy_limits(self, policy: "PreTrainedConfig", *, max_parallel_tasks: int = 1) -> None:
+        """Cap only auto batch sizes; reject explicit concurrency outside the policy contract."""
+        limit = policy.max_eval_batch_size
+        if limit is not None:
+            if limit < 1:
+                raise ValueError(
+                    f"{policy.type} declares invalid max_eval_batch_size={limit}; expected >= 1."
+                )
+            if self._requested_batch_size > limit:
+                raise ValueError(
+                    f"{policy.type} supports eval.batch_size at most {limit}; "
+                    f"got {self._requested_batch_size}."
+                )
+            if self.batch_size > limit:
+                if self._requested_batch_size != 0:
+                    raise ValueError(
+                        f"{policy.type} supports eval.batch_size at most {limit}; got {self.batch_size}."
+                    )
+                self.batch_size = limit
+        parallel_limit = policy.max_eval_parallel_tasks
+        if parallel_limit is not None and max_parallel_tasks > parallel_limit:
+            raise ValueError(
+                f"{policy.type} supports env.max_parallel_tasks at most {parallel_limit}; "
+                f"got {max_parallel_tasks}. Concurrent tasks must not share stateful policy instances."
+            )
 
     def _auto_batch_size(self) -> int:
         """Pick batch_size based on CPU cores, capped by n_episodes."""

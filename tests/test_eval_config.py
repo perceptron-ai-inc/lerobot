@@ -7,7 +7,7 @@ from lerobot.configs.eval import EvalPipelineConfig
 
 
 def _policy(*, max_eval_batch_size):
-    return SimpleNamespace(type="test", max_eval_batch_size=max_eval_batch_size)
+    return SimpleNamespace(type="test", max_eval_batch_size=max_eval_batch_size, max_eval_parallel_tasks=None)
 
 
 def test_eval_pipeline_caps_auto_batch_size_to_policy_limit(monkeypatch, tmp_path):

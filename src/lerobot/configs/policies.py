@@ -108,6 +108,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return None
 
     @property
+    def max_eval_parallel_tasks(self) -> int | None:
+        """Maximum concurrent tasks sharing this policy instance, if constrained."""
+        return None
+
+    @property
     @abc.abstractmethod
     def observation_delta_indices(self) -> list | None:  # type: ignore[type-arg] #TODO: No implementation
         raise NotImplementedError

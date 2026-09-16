@@ -72,7 +72,8 @@ from termcolor import colored
 from torch import Tensor, nn
 from tqdm import trange
 
-from lerobot.configs import FeatureType, parser
+from lerobot.configs import FeatureType, PreTrainedConfig, parser
+from lerobot.configs.default import EvalConfig
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.envs import (
@@ -109,6 +110,18 @@ class ExecutedActionRecorder(Protocol):
 
 
 logger = logging.getLogger(__name__)
+
+
+def _reconcile_runtime_eval_limits(
+    policy: nn.Module, batch_size: int, *, max_parallel_tasks: int = 1
+) -> None:
+    # nn.Module callers and PEFT proxies lack a shared static config interface;
+    # inspect only this optional boundary and validate the resulting config type.
+    policy_config = getattr(policy, "config", None)
+    if isinstance(policy_config, PreTrainedConfig):
+        EvalConfig(batch_size=batch_size, n_episodes=batch_size).reconcile_policy_limits(
+            policy_config, max_parallel_tasks=max_parallel_tasks
+        )
 
 
 def _recording_feature_name(key: str, features_map: dict[str, str] | None) -> str:
@@ -259,6 +272,7 @@ def rollout(
         The dictionary described above.
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
+    _reconcile_runtime_eval_limits(policy, env.num_envs)
 
     # Reset the policy and environments.
     policy.reset()
@@ -469,6 +483,8 @@ def eval_policy(
     Returns:
         Dictionary with metrics and data regarding the rollouts.
     """
+    _reconcile_runtime_eval_limits(policy, env.num_envs)
+
     if max_episodes_rendered > 0 and not videos_dir:
         raise ValueError("If max_episodes_rendered > 0, videos_dir must be provided.")
 
@@ -1010,6 +1026,11 @@ def eval_policy_all(
     schema as the single-env evaluator (avg_sum_reward / avg_max_reward / pc_success / timings)
     plus per-task infos.
     """
+    # The runtime entry point also serves in-process trainer and PEFT callers.
+    # Optional config access is the shared nn.Module/plugin compatibility seam.
+    batch_size = max((env.num_envs for group in envs.values() for env in group.values()), default=1)
+    _reconcile_runtime_eval_limits(policy, batch_size, max_parallel_tasks=max_parallel_tasks)
+
     start_t = time.time()
 
     # Flatten envs into list of (task_group, task_id, env)

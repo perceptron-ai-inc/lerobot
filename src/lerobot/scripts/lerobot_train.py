@@ -82,6 +82,8 @@ from .lerobot_eval import eval_policy_all
 @contextmanager
 def _make_eval_envs(cfg: TrainPipelineConfig) -> Iterator[dict[str, dict[int, Any]]]:
     """Create evaluation environments for one run and always dispose of them."""
+    if cfg.policy is not None and cfg.env is not None:
+        cfg.eval.reconcile_policy_limits(cfg.policy, max_parallel_tasks=cfg.env.max_parallel_tasks)
     envs = make_env(
         cfg.env,
         n_envs=cfg.eval.batch_size,
