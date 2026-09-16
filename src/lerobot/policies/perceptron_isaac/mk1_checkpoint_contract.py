@@ -8,6 +8,7 @@ geometry is available solely for explicitly marked CPU test fixtures.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
@@ -171,6 +172,7 @@ class Mk1ActionExpertContract:
     mlp_ratio: float
     timestep_embed_dim: int
     ffn_multiple_of: int
+    native_metadata: tuple[tuple[str, Any], ...] = ()
 
     @property
     def intermediate_size(self) -> int:
@@ -277,6 +279,11 @@ class Mk1CheckpointContract:
         therefore never accept a tiny checkpoint accidentally.
         """
         root = _object(raw_config, "config")
+        native_format = root.get("model_type") == "isaac_0_5"
+        if native_format:
+            root = _normalize_isaac05(root)
+        elif _object_field(_object_field(root, "genesis_vla"), "action_expert").get("type") == "dit":
+            _fail("legacy MK1 requires the molmoact action ABI")
         test_marker = root.get(MK1_TEST_GEOMETRY_MARKER, False)
         if test_marker is not False and test_marker is not True:
             _fail(f"{MK1_TEST_GEOMETRY_MARKER} must be a boolean")
@@ -507,6 +514,13 @@ def read_mk1_config_data(
         raw,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
+    if raw.get("model_type") == "isaac_0_5":
+        artifact = _object_field(raw, "isaac05_artifact")
+        shapes = contract.expected_tensor_shapes()
+        expected_bytes = sum(math.prod(shape) * 4 for shape in shapes.values())
+        if artifact.get("tensor_count") != len(shapes) or artifact.get("tensor_bytes") != expected_bytes:
+            _fail("isaac05_artifact tensor count/bytes disagree with F32 geometry")
+        raw = _normalize_isaac05(raw)
     return raw, contract
 
 
@@ -789,6 +803,100 @@ def finalize_mk1_runtime_checkpoint_layout(model_dir: str | Path) -> None:
         encoding="utf-8",
     )
     temporary_index.replace(index_path)
+
+
+# Isaac05 schema-1 training/sampling semantics are pinned, not discarded aliases.
+_ISAAC05_ACTION_VALUES = {
+    "type": "dit",
+    "schema_version": 1,
+    "num_inference_steps": 10,
+    "timestep_sampling_alpha": 1.5,
+    "timestep_sampling_beta": 1.0,
+    "timestep_sampling_scale": 0.999,
+    "timestep_sampling_offset": 0.001,
+    "train_samples_per_chunk": 8,
+    "rtc_max_delay_steps": 12,
+    "rtc_probability": 0.5,
+    "rtc_delay_sampling": "poisson",
+    "rtc_poisson_mean": 5.0,
+    "mask_padded_action_rows": True,
+    "drop_action_dim_overflow": False,
+    "k_batched_cross_attn": True,
+    "k_batched_cross_attn_backend": "flash_gqa",
+}
+
+
+def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate native metadata before constructing the shared in-tree backbone config."""
+    root = copy.deepcopy(dict(raw))
+    _require_values(
+        root,
+        {
+            "architectures": ["Isaac05ForConditionalGeneration"],
+            "storage_dtype": "float32",
+            "runtime_dtype": "bfloat16",
+            "dtype": "bfloat16",
+        },
+        "isaac05",
+    )
+    text = _object_field(root, "text_config")
+    for name in ("artifact", "coord_tokens", "moe", "vla", "test_only_reduced_geometry"):
+        destination = f"genesis_{name}"
+        if destination in root:
+            _fail(f"isaac05 must not mix legacy field {destination}")
+        source = f"isaac05_{name}"
+        if source not in root:
+            _fail(f"isaac05 missing {source}")
+        root[destination] = root.pop(source)
+    if "genesis_moe" in text:
+        _fail("isaac05 text must not mix legacy genesis_moe")
+    moe = _object_field(root, "genesis_moe")
+    if moe != _object_field(text, "isaac05_moe"):
+        _fail("root and text_config isaac05_moe blocks must be identical")
+    _require_exact_keys(
+        moe, _CUSTOM_MOE_KEYS - {"null_expert_semantics", "shared_expert_mode"}, "isaac05_moe"
+    )
+    normalized_moe = dict(
+        moe,
+        null_expert_semantics="skip_compute_renormalize_real_routes",
+        shared_expert_mode="sigmoid_gated_additive",
+    )
+    root["genesis_moe"] = normalized_moe
+    root["text_config"] = dict(text)
+    root["text_config"].pop("isaac05_moe")
+    root["text_config"]["genesis_moe"] = copy.deepcopy(normalized_moe)
+    vla = _object_field(root, "genesis_vla")
+    _require_exact_keys(vla, _VLA_KEYS - {"backbone_family"}, "isaac05_vla")
+    if _object_field(root, "action_expert") != _object_field(vla, "action_expert"):
+        _fail("root and isaac05_vla action_expert blocks must be identical")
+    vector = _object_field(vla, "vector_encoder")
+    if _integer(root, "vector_max_states") != _integer(vector, "max_states"):
+        _fail("isaac05 vector_max_states disagrees with vector_encoder")
+    if _integer(root, "max_sequence_length") <= 0:
+        _fail("isaac05 max_sequence_length must be positive")
+    _require_values(root, {"vision_token": "<|image_pad|>", "vision_rescale_factor": 1 / 255}, "isaac05")
+    fast = _object_field(root, "isaac05_fast_tokens")
+    _require_exact_keys(fast, {"enabled", "offset", "size", "tokenizer"}, "isaac05_fast_tokens")
+    _require_values(fast, {"enabled": True, "tokenizer": MK1_FAST_TOKENIZER}, "isaac05_fast_tokens")
+    offset, size = _integer(fast, "offset"), _integer(fast, "size")
+    if offset < 0 or size <= 0 or offset + size > _integer(text, "vocab_size"):
+        _fail("isaac05 FAST token range is outside the vocabulary")
+    if root[MK1_TEST_GEOMETRY_MARKER] is False and (offset, size) != (
+        MK1_FAST_TOKEN_OFFSET,
+        MK1_FAST_TOKEN_SIZE,
+    ):
+        _fail("production isaac05 FAST token range differs from the native contract")
+    root["genesis_vla"] = dict(vla, backbone_family=MK1_BACKBONE_FAMILY)
+    artifact = dict(_object_field(root, "genesis_artifact"))
+    for key in ("tensor_count", "tensor_bytes"):
+        if key in artifact:
+            if _integer(artifact, key, "isaac05_artifact") <= 0:
+                _fail(f"isaac05_artifact.{key} must be positive")
+            artifact.pop(key)
+    root["genesis_artifact"] = artifact
+    root["model_type"] = MK1_MODEL_TYPE
+    root["architectures"] = [MK1_ARCHITECTURE]
+    return root
 
 
 def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> Mk1MoeContract:
@@ -1172,6 +1280,17 @@ def _parse_vla(
     vector = Mk1VectorEncoderContract(max_states, hidden_dim, output_dim)
 
     action_raw = _object_field(raw, "action_expert", "genesis_vla")
+    native = action_raw.get("type") == "dit"
+    metadata = tuple(sorted(action_raw.items())) if native else ()
+    if native:
+        _require_exact_keys(
+            action_raw,
+            (_ACTION_KEYS - {"clean_at_0"}) | set(_ISAAC05_ACTION_VALUES),
+            "isaac05_vla.action_expert",
+        )
+        _require_values(action_raw, _ISAAC05_ACTION_VALUES, "isaac05_vla.action_expert")
+        action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
+        action_raw = dict(action_raw, type="molmoact", clean_at_0=False)
     _require_exact_keys(action_raw, _ACTION_KEYS, "genesis_vla.action_expert")
     _require_values(
         action_raw,
@@ -1214,6 +1333,18 @@ def _parse_vla(
         _fail("action expert hidden_dim must be divisible by num_heads")
     if not test_geometry and action != Mk1ActionExpertContract(64, 64, 36, 768, 8, 4.0, 256, 256):
         _fail("production MK1 action expert geometry does not match the 36-layer MolmoAct contract")
+    if native:
+        action = Mk1ActionExpertContract(
+            action.action_dim,
+            action.action_horizon,
+            action.num_layers,
+            action.hidden_dim,
+            action.num_heads,
+            action.mlp_ratio,
+            action.timestep_embed_dim,
+            action.ffn_multiple_of,
+            metadata,
+        )
     return vector, action
 
 

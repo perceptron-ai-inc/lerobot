@@ -18,7 +18,8 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from numbers import Real
+from typing import Any, Literal, Optional
 from collections.abc import Sequence
 
 import torch
@@ -31,6 +32,16 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5Pr
 
 # --- Genesis TensorStream layout / mrope / context-mask utilities ---
 from .checkpoint_integrity import load_json_object
+from .rtc import (
+    DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION,
+    DIT_ACTION_EXPERT_CONFIG_V1_FIELDS,
+    ActionExpertStepModulation,
+    integrate_rtc_euler,
+    materialize_rtc_action_prefix,
+    prepare_rtc_conditioning,
+    project_rtc_modulation,
+    resolve_rtc_action_prefix,
+)
 from .qwen35_checkpoint import (
     QWEN35_CONVERSION_PROVENANCE_FILE,
     QWEN35_IMPORT_PROVENANCE_FILE,
@@ -182,8 +193,21 @@ class MolmoAct2ActionExpertConfig:
     causal_attn: bool = False
 
 
+def _broadcast_action_condition(condition: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    if condition.dim() == actions.dim() - 1:
+        return condition.unsqueeze(1)
+    if condition.dim() == actions.dim():
+        return condition
+    raise ValueError(
+        f"Action conditioning must be [B,D] or [B,H,D]; got {tuple(condition.shape)} "
+        f"for actions {tuple(actions.shape)}."
+    )
+
+
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    shift = _broadcast_action_condition(shift, x)
+    scale = _broadcast_action_condition(scale, x)
+    return x * (1 + scale) + shift
 
 
 def _round_up_multiple(value: int, multiple_of: int) -> int:
@@ -211,13 +235,6 @@ class ActionExpertContext:
     self_mask: torch.Tensor | None
     valid_action: torch.Tensor | None
     rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None
-
-
-@dataclass
-class ActionExpertStepModulation:
-    conditioning: torch.Tensor
-    block_modulations: Sequence[tuple[torch.Tensor, ...]]
-    final_modulation: tuple[torch.Tensor, torch.Tensor]
 
 
 class ActionExpertRMSNorm(nn.Module):
@@ -536,9 +553,24 @@ class ActionExpertBlock(nn.Module):
         is_causal: bool = False,
         modulation: tuple[torch.Tensor, ...] | None = None,
         rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rtc_suffix_conditioning: torch.Tensor | None = None,
+        rtc_prefix_conditioning: torch.Tensor | None = None,
+        rtc_prefix_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if modulation is None:
-            modulation = self.modulation(conditioning).chunk(9, dim=1)
+        if rtc_suffix_conditioning is not None:
+            assert rtc_prefix_conditioning is not None
+            assert rtc_prefix_mask is not None
+            if modulation is not None:
+                raise ValueError("precomputed modulation and RTC conditioning are mutually exclusive.")
+            modulation = project_rtc_modulation(
+                rtc_suffix_conditioning,
+                rtc_prefix_conditioning,
+                rtc_prefix_mask,
+                modulation=self.modulation,
+                chunks=9,
+            )
+        elif modulation is None:
+            modulation = self.modulation(conditioning).chunk(9, dim=-1)
         (
             shift_msa,
             scale_msa,
@@ -550,19 +582,19 @@ class ActionExpertBlock(nn.Module):
             scale_mlp,
             gate_mlp,
         ) = modulation
-        x = x + gate_msa.unsqueeze(1) * self.self_attn(
+        x = x + _broadcast_action_condition(gate_msa, x) * self.self_attn(
             _modulate(self.self_norm(x), shift_msa, scale_msa),
             attn_mask=self_attn_mask,
             is_causal=is_causal,
             rope_cache=rope_cache,
         )
-        x = x + gate_mca.unsqueeze(1) * self.cross_attn(
+        x = x + _broadcast_action_condition(gate_mca, x) * self.cross_attn(
             _modulate(self.cross_norm(x), shift_mca, scale_mca),
             kv_k=cross_kv[0],
             kv_v=cross_kv[1],
             attn_mask=attn_mask,
         )
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(_modulate(self.ff_norm(x), shift_mlp, scale_mlp))
+        x = x + _broadcast_action_condition(gate_mlp, x) * self.mlp(_modulate(self.ff_norm(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -579,9 +611,24 @@ class ActionExpertFinalLayer(nn.Module):
         conditioning: torch.Tensor,
         *,
         modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rtc_suffix_conditioning: torch.Tensor | None = None,
+        rtc_prefix_conditioning: torch.Tensor | None = None,
+        rtc_prefix_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if modulation is None:
-            modulation = self.modulation(conditioning).chunk(2, dim=1)
+        if rtc_suffix_conditioning is not None:
+            assert rtc_prefix_conditioning is not None
+            assert rtc_prefix_mask is not None
+            if modulation is not None:
+                raise ValueError("precomputed modulation and RTC conditioning are mutually exclusive.")
+            modulation = project_rtc_modulation(
+                rtc_suffix_conditioning,
+                rtc_prefix_conditioning,
+                rtc_prefix_mask,
+                modulation=self.modulation,
+                chunks=2,
+            )
+        elif modulation is None:
+            modulation = self.modulation(conditioning).chunk(2, dim=-1)
         shift, scale = modulation
         return self.linear(_modulate(self.norm(x), shift, scale))
 
@@ -592,8 +639,8 @@ class SinusoidalTimeEmbedding(nn.Module):
         self.dim = dim
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        if timesteps.dim() > 1:
-            timesteps = timesteps.view(timesteps.shape[0], -1)[:, 0]
+        timestep_shape = timesteps.shape
+        timesteps = timesteps.reshape(-1)
         half_dim = self.dim // 2
         freq = torch.exp(
             torch.arange(half_dim, device=timesteps.device, dtype=timesteps.dtype)
@@ -603,7 +650,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
-        return emb
+        return emb.reshape(*timestep_shape, self.dim)
 
 
 class ActionExpert(nn.Module):
@@ -709,6 +756,17 @@ class ActionExpert(nn.Module):
             conditioning = module(conditioning)
         return conditioning
 
+    def prepare_rtc_conditioning(
+        self,
+        base_timesteps: torch.Tensor,
+        prefix_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return prepare_rtc_conditioning(
+            base_timesteps,
+            prefix_mask,
+            time_conditioning=self._time_conditioning,
+        )
+
     def _project_kv_tensor(self, x: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
         flat = self.context_norm(proj(x))
         return self._reshape_hidden_to_heads(flat)
@@ -811,8 +869,8 @@ class ActionExpert(nn.Module):
             conditioning = self._time_conditioning(step_t)
             block_modulations = []
             for block in self.blocks:
-                block_modulations.append(tuple(block.modulation(conditioning).chunk(9, dim=1)))
-            final_modulation = tuple(self.final_layer.modulation(conditioning).chunk(2, dim=1))
+                block_modulations.append(tuple(block.modulation(conditioning).chunk(9, dim=-1)))
+            final_modulation = tuple(self.final_layer.modulation(conditioning).chunk(2, dim=-1))
             cache.append(
                 ActionExpertStepModulation(
                     conditioning=conditioning,
@@ -844,17 +902,27 @@ class ActionExpert(nn.Module):
         *,
         context: ActionExpertContext,
         modulation: ActionExpertStepModulation | None = None,
+        rtc_conditioning: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = actions.shape
         if seq_len > self.config.max_action_horizon:
             raise ValueError(
                 f"Action sequence length {seq_len} exceeds configured max_action_horizon={self.config.max_action_horizon}"
             )
-        if modulation is None:
+        if rtc_conditioning is not None:
+            if modulation is not None:
+                raise ValueError("precomputed modulation and RTC conditioning are mutually exclusive.")
+            rtc_suffix_conditioning, rtc_prefix_conditioning, rtc_prefix_mask = rtc_conditioning
+            conditioning = rtc_suffix_conditioning
+            block_modulations = [None] * len(self.blocks)
+            final_modulation = None
+        elif modulation is None:
+            rtc_suffix_conditioning = rtc_prefix_conditioning = rtc_prefix_mask = None
             conditioning = self._time_conditioning(timesteps)
             block_modulations: Sequence[tuple[torch.Tensor, ...] | None] = [None] * len(self.blocks)
             final_modulation = None
         else:
+            rtc_suffix_conditioning = rtc_prefix_conditioning = rtc_prefix_mask = None
             conditioning = modulation.conditioning
             block_modulations = modulation.block_modulations
             final_modulation = modulation.final_modulation
@@ -873,10 +941,20 @@ class ActionExpert(nn.Module):
                 is_causal=self.config.causal_attn,
                 modulation=block_modulation,
                 rope_cache=context.rope_cache,
+                rtc_suffix_conditioning=rtc_suffix_conditioning,
+                rtc_prefix_conditioning=rtc_prefix_conditioning,
+                rtc_prefix_mask=rtc_prefix_mask,
             )
             if context.valid_action is not None:
                 x = x * context.valid_action
-        out = self.final_layer(x, conditioning, modulation=final_modulation)
+        out = self.final_layer(
+            x,
+            conditioning,
+            modulation=final_modulation,
+            rtc_suffix_conditioning=rtc_suffix_conditioning,
+            rtc_prefix_conditioning=rtc_prefix_conditioning,
+            rtc_prefix_mask=rtc_prefix_mask,
+        )
         if context.valid_action is not None:
             out = out * context.valid_action
         return out
@@ -1210,109 +1288,309 @@ class MolmoActExpertHead(ActionExpertHead):
         return torch.stack([_sample_once() for _ in range(sample_count)], dim=0).mean(dim=0)
 
 
+@dataclass
+class DiTActionExpertArgs:
+    """Configuration for the sole Isaac05 continuous-action DiT expert.
+
+    Architecture defaults mirror the released MolmoAct2 ActionExpert. Isaac05 uses a
+    catalog-wide action width and can extend the horizon without changing checkpoint
+    parameter shapes. The objective is always MolmoAct2's clean-at-1 flow convention.
+    """
+
+    action_dim: int = 64
+    action_horizon: int = 30
+    num_layers: int = 36
+    hidden_dim: int = 768
+    num_heads: int = 8
+    mlp_ratio: float = 4.0
+    num_inference_steps: int = 10
+    timestep_sampling_alpha: float = 1.5
+    timestep_sampling_beta: float = 1.0
+    timestep_sampling_scale: float = 0.999
+    timestep_sampling_offset: float = 0.001
+    train_samples_per_chunk: int = 1
+    timestep_embed_dim: int = 256
+    rtc_max_delay_steps: int = 0
+    rtc_probability: float | None = None
+    rtc_delay_sampling: Literal["uniform", "exponential", "poisson"] = "uniform"
+    rtc_poisson_mean: float = 5.0
+    mask_padded_action_rows: bool = False
+    # action_dim=64 spans the catalog (max 54), so no chunk overflows. Keep the
+    # loud-fail safety net (no silent drops). The upstream pretrained 32 dims
+    # load into the first 32; dims 32..63 are fresh-init and learned during adaptation.
+    drop_action_dim_overflow: bool = False
+    ffn_multiple_of: int = 256
+    qk_norm: bool = True
+    qk_norm_eps: float = 1e-6
+    rope: bool = True
+    context_layer_norm: bool = True
+    causal_attn: bool = False
+    # WS4: batch the K flow samples in one pass by folding K into
+    # cross-attention QUERY heads (GQA), keeping the VLM context K/V at batch B (not K*B). Removes the
+    # serial per-sample loop. K=1 is unchanged either way. Default True (validated in the 4B VLA run).
+    k_batched_cross_attn: bool = True
+    # "flash_gqa" (default): FA3 GQA over FA3-varlen ("CrossVarLen") — context K/V stays flat with K (the memory
+    #   win), the production path; bf16/fp16 only, so it transparently falls back to sdpa_gqa for fp32/CPU (see
+    #   ActionExpertCrossAttention.forward). "sdpa_gqa": SDPA(enable_gqa) — mask-correct fp32/CPU reference that
+    #   materializes K/V (memory grows with K). Both are proven equal to the serial loop (see the k-batched tests).
+    k_batched_cross_attn_backend: str = "flash_gqa"
+
+    def __post_init__(self) -> None:
+        integer_fields = (
+            ("action_dim", self.action_dim),
+            ("action_horizon", self.action_horizon),
+            ("num_layers", self.num_layers),
+            ("hidden_dim", self.hidden_dim),
+            ("num_heads", self.num_heads),
+            ("num_inference_steps", self.num_inference_steps),
+            ("train_samples_per_chunk", self.train_samples_per_chunk),
+            ("timestep_embed_dim", self.timestep_embed_dim),
+            ("rtc_max_delay_steps", self.rtc_max_delay_steps),
+            ("ffn_multiple_of", self.ffn_multiple_of),
+        )
+        for field_name, value in integer_fields:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{field_name} must be an int.")
+        boolean_fields = (
+            ("mask_padded_action_rows", self.mask_padded_action_rows),
+            ("drop_action_dim_overflow", self.drop_action_dim_overflow),
+            ("qk_norm", self.qk_norm),
+            ("rope", self.rope),
+            ("context_layer_norm", self.context_layer_norm),
+            ("causal_attn", self.causal_attn),
+            ("k_batched_cross_attn", self.k_batched_cross_attn),
+        )
+        for field_name, value in boolean_fields:
+            if not isinstance(value, bool):
+                raise ValueError(f"{field_name} must be a bool.")
+        numeric_fields = (
+            ("mlp_ratio", self.mlp_ratio),
+            ("qk_norm_eps", self.qk_norm_eps),
+            ("timestep_sampling_alpha", self.timestep_sampling_alpha),
+            ("timestep_sampling_beta", self.timestep_sampling_beta),
+            ("timestep_sampling_scale", self.timestep_sampling_scale),
+            ("timestep_sampling_offset", self.timestep_sampling_offset),
+            ("rtc_poisson_mean", self.rtc_poisson_mean),
+        )
+        for field_name, value in numeric_fields:
+            if not isinstance(value, Real) or isinstance(value, bool) or not math.isfinite(float(value)):
+                raise ValueError(f"{field_name} must be a finite number.")
+        if self.rtc_probability is not None and (
+            not isinstance(self.rtc_probability, Real)
+            or isinstance(self.rtc_probability, bool)
+            or not math.isfinite(float(self.rtc_probability))
+        ):
+            raise ValueError("rtc_probability must be None or a finite number in [0, 1].")
+        if self.hidden_dim < 1 or self.num_heads < 1 or self.timestep_embed_dim < 1:
+            raise ValueError("hidden_dim, num_heads, and timestep_embed_dim must be >= 1.")
+        if self.hidden_dim % self.num_heads != 0:
+            raise ValueError(f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads}).")
+        if self.action_dim < 1 or self.action_horizon < 1:
+            raise ValueError("action_dim and action_horizon must be >= 1.")
+        if self.num_layers < 1 or self.num_inference_steps < 1:
+            raise ValueError("num_layers and num_inference_steps must be >= 1.")
+        if self.timestep_sampling_alpha <= 0 or self.timestep_sampling_beta <= 0:
+            raise ValueError("Beta distribution parameters must be positive.")
+        if self.mlp_ratio <= 0 or self.qk_norm_eps <= 0:
+            raise ValueError("mlp_ratio and qk_norm_eps must be positive.")
+        if self.timestep_sampling_scale <= 0 or self.timestep_sampling_offset < 0:
+            raise ValueError("timestep sampling scale must be positive and offset must be non-negative.")
+        if self.timestep_sampling_offset + self.timestep_sampling_scale > 1:
+            raise ValueError("timestep_sampling_offset + timestep_sampling_scale must be <= 1.")
+        if self.train_samples_per_chunk < 1:
+            raise ValueError("train_samples_per_chunk must be >= 1.")
+        if self.rtc_max_delay_steps < 0:
+            raise ValueError("rtc_max_delay_steps must be >= 0.")
+        if self.rtc_probability is not None and not 0.0 <= self.rtc_probability <= 1.0:
+            raise ValueError("rtc_probability must be None or in [0, 1].")
+        if self.rtc_max_delay_steps == 0 and self.rtc_probability not in (None, 0.0):
+            raise ValueError("rtc_probability > 0 requires rtc_max_delay_steps > 0.")
+        if self.rtc_delay_sampling not in ("uniform", "exponential", "poisson"):
+            raise ValueError("rtc_delay_sampling must be 'uniform', 'exponential', or 'poisson'.")
+        if not math.isfinite(self.rtc_poisson_mean) or self.rtc_poisson_mean <= 0:
+            raise ValueError("rtc_poisson_mean must be finite and > 0.")
+        if self.ffn_multiple_of < 1:
+            raise ValueError("ffn_multiple_of must be >= 1.")
+        if self.k_batched_cross_attn_backend not in ("flash_gqa", "sdpa_gqa"):
+            raise ValueError("k_batched_cross_attn_backend must be 'flash_gqa' or 'sdpa_gqa'.")
+
+    def to_action_expert_config(self) -> MolmoAct2ActionExpertConfig:
+        return MolmoAct2ActionExpertConfig(
+            hidden_size=self.hidden_dim,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            max_action_dim=self.action_dim,
+            max_action_horizon=self.action_horizon,
+            mlp_ratio=self.mlp_ratio,
+            ffn_multiple_of=self.ffn_multiple_of,
+            timestep_embed_dim=self.timestep_embed_dim,
+            attn_dropout=0.0,
+            dropout=0.0,
+            qk_norm=self.qk_norm,
+            qk_norm_eps=self.qk_norm_eps,
+            rope=self.rope,
+            context_layer_norm=self.context_layer_norm,
+            causal_attn=self.causal_attn,
+        )
+
+
+def _validate_action_expert_contract(action_expert_cfg: dict[str, Any]) -> DiTActionExpertArgs:
+    schema_version = action_expert_cfg.get("schema_version")
+    if schema_version != DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION:
+        raise ValueError(
+            "action_expert metadata must carry "
+            f"schema_version={DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION}; got {schema_version!r}. "
+            "Re-export the checkpoint with the current converter."
+        )
+    expert_type = action_expert_cfg.get("type")
+    if expert_type != "dit":
+        raise ValueError(f"only the 'dit' action expert is supported; got {expert_type!r}")
+    required = DIT_ACTION_EXPERT_CONFIG_V1_FIELDS
+    missing = [key for key in required if key not in action_expert_cfg]
+    if missing:
+        raise ValueError(f"action_expert metadata is missing required fields: {missing}.")
+    unexpected = sorted(set(action_expert_cfg) - set(required) - {"schema_version", "type"})
+    if unexpected:
+        raise ValueError(f"action_expert metadata has unexpected fields for schema v1: {unexpected}.")
+    values = {key: action_expert_cfg[key] for key in required}
+    try:
+        return DiTActionExpertArgs(**values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid action_expert metadata: {exc}") from exc
+
+
+class DiTActionExpertHead(MolmoActExpertHead):
+    """Isaac05 DiT/RTC extension of the shared MolmoAct geometry.
+
+    Bounded port from Isaac05's owned modeling_qwen35_vla.py (DiTActionExpertHead),
+    itself derived from MolmoAct2. State keys and clean-at-1 operations are retained.
+    The outer legacy action_expert_type label does not select the RTC semantics.
+    Training prefix sampling/loss orchestration is not implemented by this head.
+    """
+
+    expert_type = "dit"
+
+    def __init__(self, action_expert_cfg: dict[str, Any], vlm_dim: int) -> None:
+        args = _validate_action_expert_contract(action_expert_cfg)
+        super().__init__(action_expert_cfg, vlm_dim)
+        self.args = args
+
+    @torch.no_grad()
+    def sample(
+        self,
+        vlm_activations: torch.Tensor,
+        vlm_mask: torch.Tensor | None = None,
+        num_steps: int | None = None,
+        num_action_steps: int | None = None,
+        action_dim: int | None = None,
+        action_prefix: torch.Tensor | None = None,
+        prefix_length: int | Sequence[int] | torch.Tensor | None = None,
+        num_flow_samples: int = 1,
+        allow_ood_rtc_prefix: bool = False,
+    ) -> torch.Tensor:
+        num_steps = self.num_inference_steps if num_steps is None else int(num_steps)
+        horizon = self.action_horizon if num_action_steps is None else int(num_action_steps)
+        if num_steps < 1:
+            raise ValueError(f"num_steps must be >= 1; got {num_steps}.")
+        if horizon < 1 or horizon > self.action_horizon:
+            raise ValueError(f"num_action_steps must be in [1, {self.action_horizon}]; got {horizon}.")
+        full_dim = self.action_dim
+        batch_size = vlm_activations.shape[0]
+        device = vlm_activations.device
+        model_dtype = vlm_activations.dtype
+        state_dtype = torch.float32
+
+        resolved_prefix = resolve_rtc_action_prefix(
+            action_prefix=action_prefix,
+            prefix_length=prefix_length,
+            action_dim=action_dim,
+            batch_size=batch_size,
+            action_horizon=horizon,
+            expert_action_dim=full_dim,
+            rtc_max_delay_steps=self.args.rtc_max_delay_steps,
+            rtc_probability=self.args.rtc_probability,
+            device=device,
+            allow_ood=bool(allow_ood_rtc_prefix),
+        )
+        out_dim = resolved_prefix.output_dim
+
+        context = self._build_single_context(
+            vlm_activations,
+            vlm_mask,
+            action_mask=None,
+            seq_len=horizon,
+            batch_size=batch_size,
+            device=device,
+            dtype=model_dtype,
+        )
+
+        dim_mask = None
+        if out_dim < full_dim:
+            dim_mask = torch.zeros(1, 1, full_dim, dtype=state_dtype, device=device)
+            dim_mask[:, :, :out_dim] = 1.0
+
+        prefix_tensor, prefix_mask = materialize_rtc_action_prefix(
+            resolved_prefix,
+            action_prefix,
+            batch_size=batch_size,
+            action_horizon=horizon,
+            expert_action_dim=full_dim,
+            device=device,
+            dtype=state_dtype,
+            dim_mask=dim_mask,
+        )
+
+        def velocity_fn(state: torch.Tensor, flow_time: float):
+            # Preserve the released checkpoint path exactly when RTC is not requested:
+            # scalar [B] timesteps and no per-action conditioning tensors.
+            t_tensor = torch.full((batch_size,), flow_time, dtype=model_dtype, device=device)
+            rtc_conditioning = None
+            if prefix_mask is not None:
+                rtc_conditioning = self.action_expert.prepare_rtc_conditioning(
+                    t_tensor,
+                    prefix_mask.squeeze(-1),
+                )
+            return self.action_expert.forward_with_context(
+                state.to(model_dtype),
+                t_tensor,
+                context=context,
+                rtc_conditioning=rtc_conditioning,
+            ).to(state_dtype)
+
+        def sample_once() -> torch.Tensor:
+            x = torch.randn(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
+            return integrate_rtc_euler(
+                x,
+                num_steps=num_steps,
+                velocity_fn=velocity_fn,
+                prefix_tensor=prefix_tensor,
+                prefix_mask=prefix_mask,
+                dim_mask=dim_mask,
+            )
+
+        sample_count = max(1, int(num_flow_samples or 1))
+        if sample_count == 1:
+            return sample_once()
+        return torch.stack([sample_once() for _ in range(sample_count)], dim=0).mean(dim=0)
+
+
 ACTION_EXPERT_HEADS = {
     MolmoActExpertHead.expert_type: MolmoActExpertHead,
+    DiTActionExpertHead.expert_type: DiTActionExpertHead,
 }
-
-# Genesis DiT action-expert contract (genesis/core/rtc.py). Genesis #3402 renamed
-# MolmoActExpertHead -> DiTActionExpertHead and stamps exported checkpoints with
-# type="dit", schema_version=1, and these 27 payload fields. The vendored expert core
-# here is byte-identical to genesis pre-#3402 and samples bit-identically when fed the
-# genesis-stamped contract, so 'dit' is aliased onto the vendored head after strict
-# validation instead of being rejected (or, worse, silently replaced by a default).
-GENESIS_DIT_ACTION_EXPERT_SCHEMA_VERSION = 1
-GENESIS_DIT_ACTION_EXPERT_V1_FIELDS = (
-    "action_dim",
-    "action_horizon",
-    "num_layers",
-    "hidden_dim",
-    "num_heads",
-    "mlp_ratio",
-    "num_inference_steps",
-    "timestep_sampling_alpha",
-    "timestep_sampling_beta",
-    "timestep_sampling_scale",
-    "timestep_sampling_offset",
-    "train_samples_per_chunk",
-    "timestep_embed_dim",
-    "rtc_max_delay_steps",
-    "rtc_probability",
-    "rtc_delay_sampling",
-    "rtc_poisson_mean",
-    "mask_padded_action_rows",
-    "drop_action_dim_overflow",
-    "ffn_multiple_of",
-    "qk_norm",
-    "qk_norm_eps",
-    "rope",
-    "context_layer_norm",
-    "causal_attn",
-    "k_batched_cross_attn",
-    "k_batched_cross_attn_backend",
-)
-
-
-def _normalize_genesis_dit_expert_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Validate a genesis-stamped DiT contract and map it onto the vendored head.
-
-    Fail-loud by design: an unknown schema version or unknown fields are rejected
-    instead of guessed at, and the rtc_* capability fields are honored rather than
-    dropped -- a contract declaring RTC training support is REJECTED, because the
-    vendored sampler conditions every row at a single flow time while genesis's RTC
-    serving conditions prefix rows at clean flow time; accepting a within-budget
-    prefix here would silently run a mathematically different inpainting regime.
-    Training-only fields (timestep sampling, k-batching backend, padded-row masking)
-    are carried through and ignored by the sampling path, which is value-safe:
-    vendored vs genesis heads sample bit-identically on this contract (no prefix).
-    """
-    schema_version = cfg.get("schema_version")
-    if schema_version != GENESIS_DIT_ACTION_EXPERT_SCHEMA_VERSION:
-        raise ValueError(
-            "action_expert type 'dit' requires "
-            f"schema_version={GENESIS_DIT_ACTION_EXPERT_SCHEMA_VERSION}; got "
-            f"{schema_version!r}. The genesis contract moved past what this runtime "
-            "implements."
-        )
-    known = set(GENESIS_DIT_ACTION_EXPERT_V1_FIELDS) | {"schema_version", "type"}
-    unexpected = sorted(set(cfg) - known)
-    if unexpected:
-        raise ValueError(
-            f"action_expert 'dit' contract carries unknown fields {unexpected}; "
-            "refusing to silently ignore contract drift."
-        )
-    rtc_budget = int(cfg.get("rtc_max_delay_steps") or 0)
-    rtc_probability = cfg.get("rtc_probability")
-    if rtc_budget > 0 or rtc_probability not in (None, 0, 0.0):
-        raise ValueError(
-            "action_expert 'dit' contract declares RTC training support "
-            f"(rtc_max_delay_steps={rtc_budget}, rtc_probability={rtc_probability!r}), "
-            "which this runtime cannot faithfully execute: the vendored expert "
-            "conditions all rows at a single flow time, unlike genesis's per-row "
-            "clean-tau RTC conditioning. Refusing to serve a different regime "
-            "silently; use genesis serving for RTC-trained checkpoints."
-        )
-    resolved = dict(cfg)
-    resolved["type"] = MolmoActExpertHead.expert_type
-    # Genesis DiT has no clean_at_0 knob; its convention matches the vendored
-    # clean-at-1 default (clean_at_0=False), verified by bit-identical sampling.
-    resolved.setdefault("clean_at_0", False)
-    return resolved
 
 
 def build_action_expert_head(action_expert_cfg, vlm_dim):
     """Construct the action-expert head selected by ``action_expert_cfg['type']``.
 
-    A genesis-stamped ``type="dit"`` contract (post-#3402 exports) is validated and
-    aliased onto the vendored MolmoAct head, which is weight- and sample-compatible.
+    Schema-v1 DiT metadata selects the native per-row clean-time RTC head.
+    Legacy MolmoAct metadata retains its existing scalar-time sampling path.
     """
     if action_expert_cfg is None:
         return None
     cfg = dict(action_expert_cfg)
     head_type = cfg.get("type", "molmoact")
-    if head_type == "dit":
-        cfg = _normalize_genesis_dit_expert_cfg(cfg)
-        head_type = cfg["type"]
-    elif "schema_version" in cfg:
+    if head_type != "dit" and "schema_version" in cfg:
         raise ValueError(
             f"action_expert type {head_type!r} does not define a schema_version "
             f"contract; got schema_version={cfg['schema_version']!r}."
@@ -1570,11 +1848,10 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
         return actions
 
     def train_forward(self, tensor_stream: TensorStream) -> Any:
-        """Differentiable training forward retained for future native training.
+        """Return differentiable native activations and heads for the policy's joint training loss.
 
-        The LeRobot eval policy does not call this path. It returns a local
-        ``ModelOutput``-compatible container for callers that explicitly wire a
-        native training objective later.
+        Evaluation uses ``sample_action``; training consumes this output through
+        ``perceptron_isaac_training_loss`` without a separate backbone implementation.
         """
         out = self.model(tensor_stream)
         return ModelOutput(

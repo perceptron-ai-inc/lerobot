@@ -140,7 +140,10 @@ def _build_config(
 
     action_expert = dict(normalized["genesis_vla"]["action_expert"])
     # Sampler steps are runtime input to sample_action(), not module geometry.
-    action_expert.pop("num_inference_steps", None)
+    if action_expert.get("type") != "dit":
+        action_expert.pop("num_inference_steps", None)
+    normalized.pop("action_expert", None)
+    normalized.pop("vector_max_states", None)
     config = Mk1Qwen36VLAConfig(
         vector_max_states=contract.vector_encoder.max_states,
         action_expert=action_expert,
@@ -301,14 +304,21 @@ def load_mk1_vla_from_hf(
     attention_backend: Literal["torch_sdpa_v1"] = TORCH_SDPA_ATTENTION_BACKEND,
     route_reduction: Literal["stable_token_segment_sum_v1"] = DETERMINISTIC_ROUTE_REDUCTION,
     allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
+    load_intent: Literal["inference", "training"] = "inference",
 ) -> tuple[Mk1Qwen36VLAForActionGeneration, Mk1Qwen36VLAConfig, Mk1CheckpointContract]:
     """Validate, construct once on meta, and stream an MK1 VLA using the qualified SDPA backend."""
+    if load_intent not in ("inference", "training"):
+        raise ValueError("load_intent must be inference or training")
+    if load_intent == "training" and (dtype != torch.float32 or allowed_storage_dtypes != frozenset({"F32"})):
+        raise ValueError("training load requires lossless F32 storage and runtime")
     _require_qualified_transformers_abi()
     root = Path(model_dir)
     raw, contract = read_mk1_config_data(
         root,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
+    if contract.action_expert.native_metadata and dtype != torch.bfloat16 and load_intent != "training":
+        raise ValueError("Isaac05 F32 runtime requires explicit training load intent")
     _require_qualified_torch_cuda_abi(contract, device)
     inventory = read_and_validate_safetensors_index(root)
     contract.validate_tensor_inventory(inventory, allowed_storage_dtypes=allowed_storage_dtypes)
