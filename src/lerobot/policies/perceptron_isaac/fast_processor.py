@@ -6,10 +6,13 @@ import hashlib
 import json
 import shutil
 import tempfile
-import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import numpy as np
+    from transformers import PreTrainedTokenizerFast
 
 from .checkpoint_integrity import is_hf_snapshot_blob_link
 
@@ -129,14 +132,109 @@ def resolve_pinned_fast_processor_snapshot(*, local_files_only: bool = False) ->
     )
 
 
-def load_fast_action_processor(path: str | Path, *, expected_tree_sha256: str):
+class NativeFastActionProcessor:
+    """In-tree encode/decode for physical-intelligence/fast revision ec4d7aa.
+
+    Independently expressed from the pinned UniversalActionProcessor's data
+    contract: orthonormal DCT-II, nearest-even quantization, character BPE and
+    inverse DCT. No fitting, checkpoint Python, or ProcessorMixin dispatch.
+    Malformed decoded rows retain the original zero-coefficient fallback.
+    Decode geometry overrides persist, matching the pinned processor cache.
+    """
+
+    def __init__(
+        self,
+        bpe_tokenizer: PreTrainedTokenizerFast,
+        scale: float = 10,
+        vocab_size: int = 1024,
+        min_token: int = 0,
+        *,
+        action_dim: int | None = None,
+        time_horizon: int | None = None,
+    ) -> None:
+        import math
+
+        if not math.isfinite(scale) or scale <= 0 or vocab_size <= 0:
+            raise ValueError("FAST scale and vocabulary size must be positive and finite.")
+        self._validate_geometry(time_horizon, action_dim)
+        self.bpe_tokenizer = bpe_tokenizer
+        self.scale = scale
+        self.vocab_size = vocab_size
+        self.min_token = min_token
+        self.time_horizon = time_horizon
+        self.action_dim = action_dim
+        self.called_time_horizon = time_horizon
+        self.called_action_dim = action_dim
+
+    @staticmethod
+    def _validate_geometry(time_horizon: int | None, action_dim: int | None) -> None:
+        for size in (time_horizon, action_dim):
+            if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size <= 0):
+                raise ValueError("FAST geometry must contain positive integer dimensions.")
+
+    def __call__(self, action_chunk: np.ndarray) -> list[list[int]]:
+        import numpy as np
+        from scipy.fft import dct
+
+        actions = np.asarray(action_chunk)
+        if actions.ndim not in (2, 3) or any(size == 0 for size in actions.shape):
+            raise ValueError("FAST actions must have shape [time, dim] or [batch, time, dim].")
+        if not np.issubdtype(actions.dtype, np.number) or np.iscomplexobj(actions):
+            raise ValueError("FAST actions must be real finite numbers.")
+        if not np.isfinite(actions).all():
+            raise ValueError("FAST actions must be real finite numbers.")
+        if actions.ndim == 2:
+            actions = actions[None, :, :]
+        self.called_time_horizon, self.called_action_dim = actions.shape[-2:]
+        character_codes = np.maximum(np.around(dct(actions, axis=1, norm="ortho") * self.scale)
+                                     - self.min_token, 0)
+        if not np.isfinite(character_codes).all() or np.any(character_codes > 0x10FFFF):
+            raise ValueError("FAST quantized coefficients exceed the Unicode character range.")
+        return [
+            self.bpe_tokenizer("".join(chr(int(code)) for code in row.ravel()))["input_ids"]
+            for row in character_codes
+        ]
+
+    def decode(
+        self,
+        tokens: list[list[int]],
+        *,
+        time_horizon: int | None = None,
+        action_dim: int | None = None,
+    ) -> np.ndarray:
+        import numpy as np
+        from scipy.fft import idct
+
+        self._validate_geometry(time_horizon, action_dim)
+        horizon = time_horizon or self.time_horizon or self.called_time_horizon
+        dimension = action_dim or self.action_dim or self.called_action_dim
+        if horizon is None or dimension is None:
+            raise ValueError("FAST decode requires geometry: encode once or provide time_horizon and action_dim.")
+        if not tokens:
+            raise ValueError("FAST decode requires at least one token row.")
+        self.time_horizon = self.called_time_horizon = horizon
+        self.action_dim = self.called_action_dim = dimension
+        rows = []
+        for token_row in tokens:
+            try:
+                decoded = self.bpe_tokenizer.decode(token_row)
+                coefficients = np.array([ord(character) + self.min_token for character in decoded])
+                coefficients = coefficients.reshape(horizon, dimension)
+            except Exception:
+                # Compatibility: fallback is zero DCT coefficients, not min_token.
+                coefficients = np.zeros((horizon, dimension))
+            rows.append(idct(coefficients / self.scale, axis=0, norm="ortho"))
+        return np.stack(rows)
+
+
+def load_fast_action_processor(
+    path: str | Path, *, expected_tree_sha256: str
+) -> NativeFastActionProcessor:
     """Verify and load the exact pinned FAST processor artifact.
 
-    Transformers 5.4's ``AutoProcessor`` no longer reconstructs this legacy
-    remote processor correctly, so load its fully packaged tokenizer and
-    hash-authenticated Python class explicitly. This remains remote-code
-    execution, but only after the complete tree matches the checkpoint-owned
-    digest and the processor metadata matches the reviewed artifact schema.
+    Checkpoint files supply data only. The historical Python file remains part
+    of the immutable tree identity, but is never compiled, imported or executed.
+    Tokenizer JSON is loaded by the native tokenizer constructor below.
     """
     if not expected_tree_sha256 or len(expected_tree_sha256) != 64:
         raise ValueError("FAST processor loading requires a checkpoint-owned tree SHA-256.")
@@ -174,21 +272,7 @@ def load_fast_action_processor(path: str | Path, *, expected_tree_sha256: str):
         clean_up_tokenization_spaces=bool(tokenizer_config.get("clean_up_tokenization_spaces", False)),
         model_max_length=int(tokenizer_config.get("model_max_length", int(1e30))),
     )
-    module_name = f"lerobot_verified_fast_{tree_sha256}"
-    source_path = root / "processing_action_tokenizer.py"
-    module = types.ModuleType(module_name)
-    module.__file__ = str(source_path)
-    module.__package__ = ""
-    # The package tree was authenticated immediately above. Execute those
-    # exact bytes without importlib's SourceFileLoader, which otherwise writes
-    # __pycache__ into the immutable checkpoint tree and invalidates its digest
-    # after the first load.
-    source_bytes = source_path.read_bytes()
-    exec(compile(source_bytes, str(source_path), "exec"), module.__dict__)  # nosec B102 - deliberate remote-code load, gated on the checkpoint-owned tree digest verified above
-    processor_class = getattr(module, "UniversalActionProcessor", None)
-    if processor_class is None:
-        raise ValueError("Verified FAST processor code does not define UniversalActionProcessor.")
-    return processor_class(
+    return NativeFastActionProcessor(
         bpe_tokenizer=tokenizer,
         scale=float(processor_config["scale"]),
         vocab_size=int(processor_config["vocab_size"]),
