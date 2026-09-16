@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import torch
 from huggingface_hub.errors import HFValidationError
 from huggingface_hub.utils import validate_repo_id
 
@@ -21,6 +22,8 @@ from lerobot.utils.import_utils import _peft_available, require_package
 
 if TYPE_CHECKING or _peft_available:
     from peft import PeftConfig, PeftModel
+    from peft.utils.other import ModulesToSaveWrapper
+    from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
 else:
     PeftConfig = None
     PeftModel = None
@@ -118,4 +121,31 @@ def load_peft_policy(
     adapter_kwargs: dict[str, Any] = {"config": peft_config}
     if is_trainable:
         adapter_kwargs["is_trainable"] = True
-    return PeftModel.from_pretrained(policy, adapter_reference, **adapter_kwargs)
+    adapted_policy = PeftModel.from_pretrained(policy, adapter_reference, **adapter_kwargs)
+    _restore_peft_saved_module_precision(adapted_policy, adapter_root)
+    return adapted_policy
+
+
+def _restore_peft_saved_module_precision(model: PeftModel, adapter_root: Path) -> None:
+    """Recover saved module precision before optimizers capture adapter-owned parameters."""
+    saved_modules = [
+        (name, module) for name, module in model.named_modules() if isinstance(module, ModulesToSaveWrapper)
+    ]
+    if not saved_modules:
+        return
+    # Ordinary PEFT loading copies saved heads into the base dtype. Meta/assign
+    # loading is not a substitute: PEFT then rounds LoRA tensors to the base dtype.
+    weights = load_peft_weights(str(adapter_root), device="cpu", local_files_only=True)
+    promoted = False
+    for name, module in saved_modules:
+        tensors = module.state_dict(keep_vars=True)
+        for saved_key, loaded_key in module.adapter_state_dict_load_map("default").items():
+            saved = weights[f"{name}.{saved_key}"]
+            target = tensors[loaded_key]
+            if torch.promote_types(target.dtype, saved.dtype) != target.dtype:
+                # Restore only this saved copy, including intentional FP16/FP64
+                # storage. Never cast original_module or the frozen backbone.
+                target.data = target.data.to(dtype=saved.dtype)
+                promoted = True
+    if promoted:
+        set_peft_model_state_dict(model, weights, adapter_name="default", low_cpu_mem_usage=False)

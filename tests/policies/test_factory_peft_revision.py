@@ -95,7 +95,8 @@ def test_load_peft_policy_resolves_local_sibling_base_and_adapter_sidecars(monke
         base_model_name_or_path="../../step-65000-lerobot",
         revision="base-sha",
     )
-    model_loader = MagicMock(return_value="adapted")
+    adapted = torch.nn.Linear(1, 1)
+    model_loader = MagicMock(return_value=adapted)
     monkeypatch.setattr(peft_loader, "require_package", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         peft_loader,
@@ -107,7 +108,7 @@ def test_load_peft_policy_resolves_local_sibling_base_and_adapter_sidecars(monke
 
     result = peft_loader.load_peft_policy(policy_class, config, adapter)
 
-    assert result == "adapted"
+    assert result is adapted
     resolve_paths.assert_called_once_with(config, adapter)
     policy_from_pretrained.assert_called_once_with(
         pretrained_name_or_path=str(base.resolve()),
@@ -129,7 +130,8 @@ def test_load_local_peft_policy_accepts_single_component_hub_base_and_pins_revis
     policy_from_pretrained = MagicMock(return_value=base_policy)
     policy_class = SimpleNamespace(from_pretrained=policy_from_pretrained)
     peft_config = SimpleNamespace(base_model_name_or_path="gpt2", revision=None)
-    model_loader = MagicMock(return_value="adapted")
+    adapted = torch.nn.Linear(1, 1)
+    model_loader = MagicMock(return_value=adapted)
     resolve_snapshot = MagicMock(side_effect=[adapter, base_snapshot])
     monkeypatch.setattr(peft_loader, "require_package", lambda *args, **kwargs: None)
     monkeypatch.setattr(peft_loader, "resolve_hub_snapshot", resolve_snapshot)
@@ -142,7 +144,7 @@ def test_load_local_peft_policy_accepts_single_component_hub_base_and_pins_revis
 
     result = peft_loader.load_peft_policy(policy_class, config, adapter)
 
-    assert result == "adapted"
+    assert result is adapted
     assert resolve_snapshot.call_args_list == [
         ((str(adapter),), {"revision": None}),
         (("gpt2",), {"revision": None, "force_remote": True}),
@@ -267,10 +269,11 @@ def test_load_peft_policy_resolves_remote_adapter_sidecars_before_base(monkeypat
         "PeftConfig",
         SimpleNamespace(from_pretrained=MagicMock(return_value=peft_config)),
     )
+    adapted = torch.nn.Linear(1, 1)
     monkeypatch.setattr(
         peft_loader,
         "PeftModel",
-        SimpleNamespace(from_pretrained=MagicMock(return_value="adapted")),
+        SimpleNamespace(from_pretrained=MagicMock(return_value=adapted)),
     )
     monkeypatch.setattr(peft_loader, "hub_snapshot_revision", lambda _snapshot: "b" * 40)
     config.native_stats_path = "isaac_stats.json"
@@ -282,7 +285,7 @@ def test_load_peft_policy_resolves_remote_adapter_sidecars_before_base(monkeypat
         adapter_revision="adapter-sha",
     )
 
-    assert result == "adapted"
+    assert result is adapted
     assert resolution_order == [
         (snapshot, "isaac_stats.json"),
         (Path("base-loader"), str(snapshot / "isaac_stats.json")),
@@ -308,20 +311,21 @@ def test_load_peft_policy_retains_adapter_processor_assets_before_loading_adapte
         "PeftConfig",
         SimpleNamespace(from_pretrained=MagicMock(return_value=peft_config)),
     )
+    adapted = torch.nn.Linear(1, 1)
     monkeypatch.setattr(
         peft_loader,
         "PeftModel",
         SimpleNamespace(
             from_pretrained=lambda policy, adapter_path, **kwargs: (
                 call_order.append(("load", Path(adapter_path))),
-                "adapted",
+                adapted,
             )[1]
         ),
     )
 
     result = peft_loader.load_peft_policy(policy_class, config, adapter)
 
-    assert result == "adapted"
+    assert result is adapted
     assert call_order == [("retain", adapter), ("load", adapter)]
 
 

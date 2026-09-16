@@ -1079,6 +1079,13 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._training_parameters_configured = True
         from .modeling_qwen35_vla import setup_qwen35_vla_for_training
 
+        # PEFT already owns freezing (including custom modules_to_save and bias
+        # settings). Native setup must not expand that serialized trainable set.
+        peft_trainability = (
+            [(parameter, parameter.requires_grad) for parameter in self._isaac_model.parameters()]
+            if self.config.use_peft
+            else None
+        )
         setup_qwen35_vla_for_training(
             self._isaac_model,
             train_expert_only=bool(self.config.train_expert_only),
@@ -1088,6 +1095,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             dual_timestep_ratio=float(self.config.flow_dual_timestep_ratio),
             mask_padded_action_rows=bool(self.config.flow_mask_padded_action_rows),
         )
+        if peft_trainability is not None:
+            for parameter, requires_grad in peft_trainability:
+                parameter.requires_grad_(requires_grad)
         if self.config.freeze_input_embeddings:
             input_embeddings = self._isaac_model.get_input_embeddings()
             if input_embeddings is None:
