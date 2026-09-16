@@ -75,7 +75,7 @@ def _flatten_to_cli_args(d: dict, prefix: str = "") -> list[str]:
 
 
 def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> list[str] | None:
-    """Parses arguments from cli at a given nested attribute level.
+    """Extract nested CLI overrides in equals or separate-value form, excluding choice/path options.
 
     For example, supposing the main script was called with:
     python myscript.py --arg1=1 --arg2.subarg1=abc --arg2.subarg2=some/path
@@ -87,11 +87,20 @@ def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> lis
         args = sys.argv[1:]
     attr_level_args = []
     detect_string = f"--{field_name}."
-    exclude_strings = (f"--{field_name}.{draccus.CHOICE_TYPE_KEY}=", f"--{field_name}.{PATH_KEY}=")
-    for arg in args:
-        if arg.startswith(detect_string) and not arg.startswith(exclude_strings):
-            denested_arg = f"--{arg.removeprefix(detect_string)}"
-            attr_level_args.append(denested_arg)
+    for index, arg in enumerate(args):
+        if not arg.startswith(detect_string):
+            continue
+        nested_arg = arg.removeprefix(detect_string)
+        if nested_arg.split("=", 1)[0] in (draccus.CHOICE_TYPE_KEY, PATH_KEY):
+            continue
+        attr_level_args.append(f"--{nested_arg}")
+        if "=" not in arg:
+            # Preserve draccus's separate value tokens, including negative numbers
+            # and structured values, stopping before the next unrelated option.
+            for value in args[index + 1 :]:
+                if value.startswith("--"):
+                    break
+                attr_level_args.append(value)
 
     return attr_level_args
 
@@ -453,6 +462,7 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                         # add the relevant CLI arg to the error message
                         raise PluginLoadError(f"{e}\nFailed plugin CLI Arg: {plugin_cli_arg}") from e
                     cli_args = filter_arg(plugin_cli_arg, cli_args)
+                cli_args_before_path_filter = tuple(cli_args)
                 config_path_cli = parse_arg("config_path", cli_args)
                 if has_method(argtype, "__get_path_fields__"):
                     path_fields = argtype.__get_path_fields__()
@@ -464,7 +474,20 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                         )
                 if has_method(argtype, "from_pretrained") and config_path_cli:
                     cli_args = filter_arg("config_path", cli_args)
-                    cfg = argtype.from_pretrained(config_path_cli, cli_args=cli_args)
+                    pretrained_kwargs: dict[str, Any] = {"cli_args": cli_args}
+                    # Explicit opt-in only; legacy/plugin loaders retain their existing call.
+                    try:
+                        context_parameter = inspect.signature(argtype.from_pretrained).parameters.get(
+                            "cli_args_before_path_filter"
+                        )
+                    except (TypeError, ValueError):
+                        context_parameter = None
+                    if context_parameter is not None and context_parameter.kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    ):
+                        pretrained_kwargs["cli_args_before_path_filter"] = cli_args_before_path_filter
+                    cfg = argtype.from_pretrained(config_path_cli, **pretrained_kwargs)
                 else:
                     if config_path_cli:
                         cli_args = filter_arg("config_path", cli_args)

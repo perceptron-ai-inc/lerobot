@@ -460,11 +460,13 @@ def test_hub_upload_stages_nested_checkpoint_assets(monkeypatch, tmp_path) -> No
         postprocessor=FakeProcessor("policy_postprocessor.json"),
     )
 
-    assert "hf_model/config.json" in upload["files"]
-    assert "fast_processor/processing_action_tokenizer.py" in upload["files"]
-    assert "policy_preprocessor.json" in upload["files"]
-    assert "policy_postprocessor.json" in upload["files"]
-    assert "runtime.log" in upload["files"]
+    uploaded_files = upload["files"]
+    assert isinstance(uploaded_files, set)
+    assert "hf_model/config.json" in uploaded_files
+    assert "fast_processor/processing_action_tokenizer.py" in uploaded_files
+    assert "policy_preprocessor.json" in uploaded_files
+    assert "policy_postprocessor.json" in uploaded_files
+    assert "runtime.log" in uploaded_files
     assert {"policy_preprocessor.json", "policy_postprocessor.json"}.issubset(finalized_snapshots[-1])
     assert upload["allow_patterns"] is None
     assert upload["ignore_patterns"] is None
@@ -728,3 +730,216 @@ def test_remote_peft_finalization_stages_real_processor_runtime_assets(tmp_path)
     )
     assert loaded_preprocessor is not None
     assert loaded_postprocessor is not None
+
+
+@pytest.mark.parametrize("retention", ["runtime", "processors"])
+def test_original_package_processors_bind_retained_instance(tmp_path, retention: str) -> None:
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
+        PerceptronIsaacMharmonyPackProcessorStep,
+    )
+    from lerobot.policies.perceptron_isaac.trained_package import rewrite_trained_processor_paths
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_stats(source / "isaac_stats.json")
+    (source / "fast_processor").mkdir()
+    fast_file = source / "fast_processor" / "processing_action_tokenizer.py"
+    fast_file.write_text("# synthetic inert FAST sidecar\n")
+    config = _config(
+        native_stats_path=str(source / "isaac_stats.json"),
+        fast_processor_path=str(source / "fast_processor"),
+        fast_processor_tree_sha256="0" * 64,
+    )
+    pre, post = make_perceptron_isaac_pre_post_processors(config)
+    pre.save_pretrained(source)
+    post.save_pretrained(source)
+    rewrite_trained_processor_paths(source)
+    (source / "native_render_metadata.json").write_text("{}\n")
+    payload = json.loads((source / "policy_preprocessor.json").read_text())
+    for step in payload["steps"]:
+        if "fast_processor_path" in step["config"]:
+            step["config"]["native_render_metadata_path"] = "native_render_metadata.json"
+            step["config"]["native_stats_path"] = "isaac_stats.json"
+    (source / "policy_preprocessor.json").write_text(json.dumps(payload))
+    before = {
+        str(path.relative_to(source)): file_sha256(path) for path in source.rglob("*") if path.is_file()
+    }
+    policies = []
+    retained_paths: list[str] = []
+    for index in range(2):
+        instance_config = _config(
+            native_stats_path="isaac_stats.json",
+            native_render_metadata_path="native_render_metadata.json",
+            fast_processor_path="fast_processor",
+            fast_processor_tree_sha256="0" * 64,
+        )
+        PerceptronIsaacPolicy._resolve_checkpoint_local_paths(instance_config, source)
+        policy = PerceptronIsaacPolicy(instance_config)
+        policies.append(policy)
+        if retention == "runtime":
+            policy._retain_verified_runtime_assets(source)
+        else:
+            policy.retain_pretrained_processor_assets(source)
+        pre, post = make_pre_post_processors(instance_config, pretrained_path=str(source))
+        pack = next(step for step in pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
+        assert pack.fast_processor_path == instance_config.fast_processor_path
+        assert pack.native_stats_path == instance_config.native_stats_path
+        assert pack.native_render_metadata_path == instance_config.native_render_metadata_path
+        assert pack.fast_processor_tree_sha256 == "0" * 64
+        assert pack._stats is not None
+        assert list(pack._stats.action.q01) == [-1.0, -1.0]
+        assert isinstance(pack.fast_processor_path, str)
+        retained_paths.append(pack.fast_processor_path)
+        destination = tmp_path / f"staged-{index}"
+        destination.mkdir()
+        pre.save_pretrained(destination)
+        post.save_pretrained(destination)
+        stage_trained_processor_assets(destination, instance_config)
+        assert (
+            file_sha256(destination / "fast_processor" / fast_file.name)
+            == before[str(fast_file.relative_to(source))]
+        )
+        assert file_sha256(destination / "isaac_stats.json") == before["isaac_stats.json"]
+        assert (
+            file_sha256(destination / "native_render_metadata.json") == before["native_render_metadata.json"]
+        )
+    assert retained_paths[0] != retained_paths[1]
+    assert before == {
+        str(path.relative_to(source)): file_sha256(path) for path in source.rglob("*") if path.is_file()
+    }
+
+
+@pytest.mark.parametrize(
+    "invalid", ["record", "relative", "root", "absolute", "configured", "traversal", "symlink"]
+)
+def test_resolve_retained_processor_path_rejects_invalid_provenance(tmp_path, invalid: str) -> None:
+    from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
+        _resolve_retained_processor_path,
+    )
+
+    root = tmp_path / "retained"
+    root.mkdir()
+    asset = root / "isaac_stats.json"
+    asset.write_text("{}\n")
+    raw = asset.name
+    configured = str(asset)
+    record = {"relative": raw, "absolute": configured, "root": str(root)}
+    if invalid == "record":
+        record = {"relative": raw}
+    elif invalid == "relative":
+        record["relative"] = "unrelated.json"
+    elif invalid == "root":
+        record["root"] = str(tmp_path / "unrelated")
+    elif invalid == "absolute":
+        record["absolute"] = str(tmp_path / "unrelated.json")
+    elif invalid == "configured":
+        configured = str(tmp_path / "unrelated.json")
+    elif invalid == "traversal":
+        raw = "../secret.json"
+        configured = str(root / raw)
+        record = {"relative": raw, "absolute": configured, "root": str(root)}
+    elif invalid == "symlink":
+        secret = tmp_path / "secret.json"
+        secret.write_text("{}\n")
+        link = root / "linked.json"
+        link.symlink_to(secret)
+        raw = link.name
+        configured = str(link)
+        record = {"relative": raw, "absolute": configured, "root": str(root)}
+    with pytest.raises(RuntimeError, match="retained|Retained"):
+        _resolve_retained_processor_path(raw, configured, record)
+
+
+@pytest.mark.parametrize("retention", ["none", "runtime", "processors"])
+def test_factory_restoration_keeps_checkpoint_stats_over_destination_metadata(
+    tmp_path, retention: str
+) -> None:
+    from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
+        PerceptronIsaacMharmonyPackProcessorStep,
+    )
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_stats(source / "isaac_stats.json")
+    config = _config(native_stats_path=str(source / "isaac_stats.json"))
+    pre, post = make_pre_post_processors(config)
+    probe = torch.full((1, 2), 0.5)
+    expected = post(probe.clone())
+    pre.save_pretrained(source)
+    post.save_pretrained(source)
+    # Older packages may retain a relative fallback alongside inlined stats.
+    payload = json.loads((source / "policy_preprocessor.json").read_text())
+    for step in payload["steps"]:
+        if "native_stats_path" in step["config"]:
+            step["config"]["native_stats_path"] = "isaac_stats.json"
+    (source / "policy_preprocessor.json").write_text(json.dumps(payload))
+    if retention != "none":
+        config.native_stats_path = "isaac_stats.json"
+        PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, source)
+        policy = PerceptronIsaacPolicy(config)
+        if retention == "runtime":
+            policy._retain_verified_runtime_assets(source)
+        else:
+            policy.retain_pretrained_processor_assets(source)
+    destination_stats = {
+        key: {"q01": torch.full((2,), 10.0), "q99": torch.full((2,), 20.0)} for key in (ACTION, OBS_STATE)
+    }
+    # Resume passes metadata, not the explicit fine-tune dataset_stats override.
+    loaded_pre, loaded_post = make_pre_post_processors(
+        config,
+        pretrained_path=str(source),
+        dataset_meta=SimpleNamespace(fps=20, stats=destination_stats),
+    )
+    pack = next(s for s in loaded_pre.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
+    assert pack.native_stats_path == config.native_stats_path
+    assert pack._stats is not None
+    assert list(pack._stats.action.q01) == [-1.0, -1.0]
+    assert list(pack._stats.action.q99) == [1.0, 1.0]
+    assert list(pack._stats.proprio.q01) == [-1.0, -1.0]
+    torch.testing.assert_close(loaded_post(probe.clone()), expected)
+    torch.testing.assert_close(destination_stats[ACTION]["q01"], torch.full((2,), 10.0))
+
+
+@pytest.mark.parametrize("hostile", ["traversal", "symlink", "forged_absolute"])
+def test_factory_processor_sidecars_reject_hostile_paths_at_package_boundary(tmp_path, hostile: str) -> None:
+    from lerobot.policies.factory import make_pre_post_processors
+
+    source = tmp_path / "source"
+    source.mkdir()
+    secret = tmp_path / "secret-fast"
+    secret.mkdir()
+    marker = secret / "processing_action_tokenizer.py"
+    marker.write_text("# inert outside-package marker\n")
+    config = _config()
+    pre, post = make_pre_post_processors(config)
+    pre.save_pretrained(source)
+    post.save_pretrained(source)
+    raw = "../secret-fast"
+    if hostile == "symlink":
+        (source / "linked-fast").symlink_to(secret, target_is_directory=True)
+        raw = "linked-fast"
+    elif hostile == "forged_absolute":
+        raw = str(secret)
+        # Matching a caller-supplied config path is not verified provenance.
+        config.fast_processor_path = raw
+    payload = json.loads((source / "policy_preprocessor.json").read_text())
+    for step in payload["steps"]:
+        if "fast_processor_path" in step["config"]:
+            step["config"]["fast_processor_path"] = raw
+    (source / "policy_preprocessor.json").write_text(json.dumps(payload))
+    if hostile == "forged_absolute":
+        # Legacy absolutes remain untouched by restoration; staging is the trust boundary.
+        pre, post = make_pre_post_processors(config, pretrained_path=str(source))
+        destination = tmp_path / "destination"
+        destination.mkdir()
+        pre.save_pretrained(destination)
+        post.save_pretrained(destination)
+        with pytest.raises(RuntimeError, match="untrusted absolute"):
+            stage_trained_processor_assets(destination, config)
+        assert not (destination / "fast_processor").exists()
+    else:
+        with pytest.raises(RuntimeError, match="escapes its package"):
+            make_pre_post_processors(config, pretrained_path=str(source))
+    assert marker.read_text() == "# inert outside-package marker\n"

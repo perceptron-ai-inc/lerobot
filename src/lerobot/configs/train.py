@@ -16,7 +16,9 @@ import datetime as dt
 import json
 import multiprocessing
 import os
+import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,17 @@ from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
 
 TRAIN_CONFIG_NAME = "train_config.json"
+
+
+@dataclass(frozen=True)
+class _PretrainedConfigSource:
+    """Keep one load's checkpoint source and explicit override precedence out of serialized training state."""
+
+    config_path: str
+    policy_path: str | None
+    reward_model_path: str | None
+    policy_overrides: tuple[str, ...]
+    reward_model_overrides: tuple[str, ...]
 
 
 def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None:
@@ -153,6 +166,10 @@ class TrainPipelineConfig(HubMixin):
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
 
+    def __post_init__(self) -> None:
+        # Runtime provenance, deliberately not a dataclass field: never save it in train_config.json.
+        self._pretrained_source: _PretrainedConfigSource | None = None
+
     @property
     def is_reward_model_training(self) -> bool:
         """True when the config targets a reward model rather than a policy."""
@@ -166,25 +183,34 @@ class TrainPipelineConfig(HubMixin):
         return self.policy  # type: ignore[return-value]
 
     def _resolve_pretrained_from_cli(self) -> None:
-        """Resolve the pretrained source passed on the CLI into a loaded config.
+        """Resolve the pretrained source from this load's provenance, or the CLI for a fresh config.
 
-        The pretrained paths (`--policy.path`, `--reward_model.path`) and
-        `--config_path` are only recoverable by re-reading the CLI args: draccus
-        has already consumed them by the time `validate()` runs, so they are not
-        reflected on `self`. Exactly one source applies, in priority order:
-        reward-model path, policy path, then resume.
+        Deferred path flags are not draccus fields. Loaded configs retain their own
+        invocation rather than consulting a later ambient argv. Exactly one source
+        applies, in priority order: reward-model path, policy path, then resume.
         """
-        reward_model_path = parser.get_path_arg("reward_model")
-        policy_path = parser.get_path_arg("policy")
+        source = self._pretrained_source
+        reward_model_path = (
+            source.reward_model_path if source is not None else parser.get_path_arg("reward_model")
+        )
+        policy_path = source.policy_path if source is not None else parser.get_path_arg("policy")
 
         if reward_model_path:
-            cli_overrides = parser.get_cli_overrides("reward_model")
+            cli_overrides = (
+                list(source.reward_model_overrides)
+                if source is not None
+                else parser.get_cli_overrides("reward_model")
+            )
             self.reward_model = RewardModelConfig.from_pretrained(
                 reward_model_path, cli_overrides=cli_overrides
             )
             self.reward_model.pretrained_path = str(Path(reward_model_path))
         elif policy_path:
-            overrides = parser.get_yaml_overrides("policy") + (parser.get_cli_overrides("policy") or [])
+            overrides = (
+                list(source.policy_overrides)
+                if source is not None
+                else parser.get_yaml_overrides("policy") + (parser.get_cli_overrides("policy") or [])
+            )
             self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=overrides)
             self.policy.pretrained_path = Path(policy_path)
         elif self.resume:
@@ -199,7 +225,11 @@ class TrainPipelineConfig(HubMixin):
         an HF Job (`job.is_remote`): the pod performs it when it runs the resume locally, and
         `submit_to_hf` resolves the source repo for the remote command.
         """
-        config_path = parser.parse_arg("config_path")
+        config_path = (
+            self._pretrained_source.config_path
+            if self._pretrained_source is not None
+            else parser.parse_arg("config_path")
+        )
         if not config_path:
             raise ValueError(
                 f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"
@@ -230,6 +260,15 @@ class TrainPipelineConfig(HubMixin):
             policy_dir = self.checkpoint_path / PRETRAINED_MODEL_DIR
 
         if self.policy is not None:
+            # config.json owns portable policy assets; train_config.json may contain
+            # stale absolute paths from the original process. Keep training state and
+            # explicit policy overrides, not the serialized runtime policy instance.
+            overrides = (
+                list(self._pretrained_source.policy_overrides)
+                if self._pretrained_source is not None
+                else parser.get_yaml_overrides("policy") + (parser.get_cli_overrides("policy") or [])
+            )
+            self.policy = PreTrainedConfig.from_pretrained(policy_dir, cli_overrides=overrides)
             self.policy.pretrained_path = policy_dir
         if self.reward_model is not None:
             self.reward_model.pretrained_path = str(policy_dir)
@@ -334,8 +373,16 @@ class TrainPipelineConfig(HubMixin):
         cache_dir: str | Path | None = None,
         local_files_only: bool = False,
         revision: str | None = None,
+        cli_args_before_path_filter: Sequence[str] | None = None,
         **kwargs: Any,
     ) -> "TrainPipelineConfig":
+        """Load saved training config and retain this call's deferred path/override ownership.
+
+        The native wrapper may supply its original ``cli_args_before_path_filter`` for
+        deferred pretrained loading, alongside cleaned ``cli_args`` for draccus. Direct
+        callers omit that keyword: ``cli_args=[]`` ignores argv; ``None`` selects argv.
+        Neither argument sequence is mutated or serialized into the saved config.
+        """
         model_id = str(pretrained_name_or_path)
         config_file: str | None = None
         if Path(model_id).is_dir():
@@ -383,5 +430,26 @@ class TrainPipelineConfig(HubMixin):
                     json.dump(migrated_config, f)
                     config_file = f.name
 
+        # Snapshot before parsing: a later load/argv mutation must not alter this instance.
+        source_args = cli_args_before_path_filter if cli_args_before_path_filter is not None else cli_args
+        source_args = tuple(sys.argv[1:] if source_args is None else source_args)
+        policy_path = parser.parse_arg("policy.path", source_args)
+        reward_model_path = parser.parse_arg("reward_model.path", source_args)
+        if cli_args_before_path_filter is not None:
+            # Only the wrapper owns the YAML path registry populated by its current parse.
+            policy_path = parser.get_path_arg("policy", source_args)
+            reward_model_path = parser.get_path_arg("reward_model", source_args)
+        pretrained_source = _PretrainedConfigSource(
+            config_path=model_id,
+            policy_path=policy_path,
+            reward_model_path=reward_model_path,
+            policy_overrides=tuple(
+                parser.get_yaml_overrides("policy")
+                + (parser.get_cli_overrides("policy", args=source_args) or [])
+            ),
+            reward_model_overrides=tuple(parser.get_cli_overrides("reward_model", args=source_args) or []),
+        )
         with draccus.config_type("json"):
-            return draccus.parse(cls, config_file, args=cli_args)
+            config = draccus.parse(cls, config_file, args=cli_args)
+        config._pretrained_source = pretrained_source
+        return config

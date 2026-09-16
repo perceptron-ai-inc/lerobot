@@ -1731,6 +1731,33 @@ def _reconcile_training_action_frame_step(
     logging.info("Installed ISAAC v2 training action-frame transform before mharmony normalization.")
 
 
+def _resolve_retained_processor_path(raw: str, configured: str | None, record: Any) -> Path:
+    """Bind only the matching package-relative declaration to its retained owner."""
+    if (
+        not isinstance(record, dict)
+        or not isinstance(record.get("absolute"), str)
+        or not isinstance(record.get("root"), str)
+        or not isinstance(record.get("relative"), str)
+        or record["absolute"] != configured
+        or record["relative"] != raw
+    ):
+        raise RuntimeError(f"Invalid retained processor path record for {raw!r}.")
+    relative = Path(raw)
+    root = Path(record["root"])
+    candidate = root / relative
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or ".." in relative.parts
+        or not root.is_absolute()
+        or str(candidate) != record["absolute"]
+        or not candidate.resolve().is_relative_to(root.resolve())
+        or not candidate.exists()
+    ):
+        raise RuntimeError(f"Retained processor path escapes or mismatches its package: {raw!r}.")
+    return candidate
+
+
 def make_perceptron_isaac_pre_post_processors_from_pretrained(
     config: PerceptronIsaacConfig,
     pretrained_path: str,
@@ -1782,6 +1809,14 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     _reconcile_training_action_frame_step(preprocessor, config)
     _reconcile_normalization_recipe(preprocessor, postprocessor, config)
     package_root = Path(pretrained_path)
+    # Retention records are runtime-only config metadata, not dataclass fields.
+    retained_paths = getattr(config, "_checkpoint_relative_paths", {})
+    configured_paths = {
+        "native_render_metadata_path": config.native_render_metadata_path,
+        "native_stats_path": config.native_stats_path,
+        "stats_path": config.stats_path,
+        "fast_processor_path": config.fast_processor_path,
+    }
     if package_root.is_dir():
         for step in (*preprocessor.steps, *postprocessor.steps):
             for attribute in (
@@ -1794,6 +1829,14 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                 if not raw or Path(str(raw)).is_absolute():
                     continue
                 candidate = package_root / str(raw)
+                if ".." in Path(str(raw)).parts or not candidate.resolve().is_relative_to(
+                    package_root.resolve()
+                ):
+                    raise RuntimeError(f"Serialized processor path {attribute} escapes its package: {raw}.")
+                if attribute in retained_paths:
+                    candidate = _resolve_retained_processor_path(
+                        str(raw), configured_paths[attribute], retained_paths[attribute]
+                    )
                 if candidate.exists():
                     setattr(step, attribute, str(candidate))
         normalization_path = package_root / "policy_normalization.json"

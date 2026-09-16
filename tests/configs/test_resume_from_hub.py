@@ -83,6 +83,7 @@ def test_resolve_resume_checkpoint_accepts_file_or_pretrained_model_dir(tmp_path
 
     cfg = tc.draccus.parse(TrainPipelineConfig, args=["--dataset.repo_id", "u/d"])
     cfg.policy = ACTConfig()
+    cfg.policy.save_pretrained(pretrained_dir)
     cfg.resume = True
     monkeypatch.setattr(tc.parser, "parse_arg", lambda name: str(target) if name == "config_path" else None)
 
@@ -90,3 +91,95 @@ def test_resolve_resume_checkpoint_accepts_file_or_pretrained_model_dir(tmp_path
 
     assert cfg.policy.pretrained_path == pretrained_dir
     assert cfg.checkpoint_path == pretrained_dir.parent
+
+
+def test_resume_reloads_checkpoint_policy_config_and_preserves_overrides(tmp_path, monkeypatch):
+    import sys
+
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.optim.optimizers import AdamWConfig
+    from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
+
+    pretrained = tmp_path / "original" / "pretrained_model"
+    pretrained.mkdir(parents=True)
+    policy = PerceptronIsaacConfig(device="cpu", push_to_hub=False, hf_model_path="hf_model")
+    policy.save_pretrained(pretrained)
+    # The runtime paths in train_config.json are NOT the portable config.json contract.
+    policy.hf_model_path = "/retired/private-runtime/hf_model"
+    policy.apply_offset_norm = True
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="synthetic/resume"),
+        policy=policy,
+        optimizer=AdamWConfig(lr=0.003),
+        steps=2,
+    )
+    cfg.save_pretrained(pretrained)
+    moved = tmp_path / "moved"
+    pretrained.parent.rename(moved)
+    pretrained = moved / "pretrained_model"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lerobot-train",
+            f"--config_path={pretrained / 'train_config.json'}",
+            "--resume=true",
+            "--policy.device=cpu",
+            "--policy.optimizer_lr=0.007",
+        ],
+    )
+    loaded = TrainPipelineConfig.from_pretrained(
+        pretrained,
+        cli_args=["--resume=true", "--steps=3", "--policy.device=cpu", "--policy.optimizer_lr=0.007"],
+    )
+    loaded.validate()
+    assert loaded.policy.hf_model_path == "hf_model"
+    assert loaded.policy.pretrained_path == pretrained
+    assert loaded.policy.optimizer_lr == 0.007
+    assert loaded.optimizer.lr == 0.003
+    assert loaded.steps == 3
+    assert loaded.checkpoint_path == moved
+
+
+def test_reward_model_resume_keeps_training_config_without_policy_config(tmp_path, monkeypatch):
+    """Reward-model resume retains its existing ownership behavior, even without policy config.json."""
+    import sys
+
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.rewards.classifier.configuration_classifier import RewardClassifierConfig
+
+    pretrained = tmp_path / "checkpoint" / "pretrained_model"
+    reward = RewardClassifierConfig(learning_rate=0.004)
+    cfg = TrainPipelineConfig(dataset=DatasetConfig(repo_id="synthetic/reward"), reward_model=reward)
+    cfg.save_pretrained(pretrained)
+    monkeypatch.setattr(sys, "argv", ["lerobot-train", f"--config_path={pretrained}", "--resume=true"])
+    loaded = TrainPipelineConfig.from_pretrained(pretrained, cli_args=["--resume=true"])
+    loaded.validate()
+    assert loaded.policy is None
+    assert loaded.reward_model.learning_rate == 0.004
+    assert loaded.reward_model.pretrained_path == str(pretrained)
+    assert loaded.checkpoint_path == pretrained.parent
+
+
+def test_resume_policy_cli_overrides_take_precedence_over_yaml(tmp_path, monkeypatch):
+    import sys
+
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.policies.act.configuration_act import ACTConfig
+
+    pretrained = tmp_path / "checkpoint" / "pretrained_model"
+    policy = ACTConfig(device="cpu", push_to_hub=False, optimizer_lr=0.001)
+    policy.save_pretrained(pretrained)
+    cfg = TrainPipelineConfig(dataset=DatasetConfig(repo_id="synthetic/overrides"), policy=policy)
+    cfg.save_pretrained(pretrained)
+    monkeypatch.setattr(tc.parser, "get_yaml_overrides", lambda name: ["--optimizer_lr=0.002"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["lerobot-train", f"--config_path={pretrained}", "--resume=true", "--policy.optimizer_lr=0.003"],
+    )
+    loaded = TrainPipelineConfig.from_pretrained(
+        pretrained, cli_args=["--resume=true", "--policy.optimizer_lr=0.003"]
+    )
+    loaded.validate()
+    assert loaded.policy.optimizer_lr == 0.003

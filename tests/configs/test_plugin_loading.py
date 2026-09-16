@@ -83,7 +83,7 @@ def test_load_plugin_failure():
     assert "Failed to load plugin 'nonexistent_plugin'" in str(exc_info.value)
 
 
-def test_wrap_with_plugin(plugin_dir: Path):
+def test_wrap_with_plugin(plugin_dir: Path, monkeypatch: pytest.MonkeyPatch):
     @dataclass
     class Config:
         env: EnvConfig
@@ -93,11 +93,15 @@ def test_wrap_with_plugin(plugin_dir: Path):
         return cfg
 
     # Test loading plugin via CLI args
-    sys.argv = [
-        "dummy_script.py",
-        "--env.discover_packages_path=test_plugin",
-        "--env.type=test_env",
-    ]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "dummy_script.py",
+            "--env.discover_packages_path=test_plugin",
+            "--env.type=test_env",
+        ],
+    )
 
     cfg = dummy_func()
     assert isinstance(cfg, Config)
