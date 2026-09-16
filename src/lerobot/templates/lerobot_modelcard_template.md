@@ -19,6 +19,8 @@
 [π₀ (Pi0)](https://www.physicalintelligence.company/blog/pi0) is a general-purpose robot foundation model from Physical Intelligence: a generalist Vision-Language-Action policy that understands visual inputs, interprets natural language instructions, and controls a variety of different robots across diverse tasks. The LeRobot implementation is adapted from their open-source OpenPI repository.
 {% elif model_name == "pi05" %}
 [π₀.₅ (Pi05)](https://www.physicalintelligence.company/blog/pi05) is a Vision-Language-Action model from Physical Intelligence designed for open-world generalization: it evolves π₀ to generalize to entirely new environments and situations that were never seen during training. The LeRobot implementation is adapted from their open-source OpenPI repository.
+{% elif model_name == "perceptron_isaac" %}
+Perceptron Isaac integrates Qwen3.5 VLA flow-matching policies with native LeRobot training, checkpointing and evaluation. MK1/Isaac-0.5 training is unsupported; deployment requires a validated package and qualified runtime, not merely a passing synthetic fixture.
 {% elif model_name == "molmoact2" %}
 [MolmoAct2](https://allenai.org/blog/molmoact2) is an open robotics foundation model from the Allen Institute for AI (Ai2) that maps camera images and language instructions to robot action chunks. The LeRobot implementation supports training and evaluation of the regular MolmoAct2 model.
 {% elif model_name == "vla_jepa" %}
@@ -76,6 +78,7 @@ This policy has been trained and pushed to the Hub using [LeRobot](https://githu
   "pi0_fast": "pi0fast",
   "pi05": "pi05",
   "molmoact2": "molmoact2",
+  "perceptron_isaac": "perceptron_isaac",
   "vla_jepa": "vla_jepa",
   "eo1": "eo1",
   "groot": "groot",
