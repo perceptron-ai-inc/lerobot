@@ -79,6 +79,30 @@ PyTorch selection.
 Locked uv installation resolves the declared Git source. Developer checkouts and
 untracked local wheels are not supported installation steps.
 
+### pip fallback
+
+pip ignores `[tool.uv.sources]`, and mharmony is not published to PyPI, so
+`pip install 'lerobot[perceptron_isaac]'` on its own fails to resolve
+`mharmony[qwen35]==0.1.0`. Install the same pinned revision explicitly first; the
+Git build reports version `0.1.0`, so it satisfies the extra's pin:
+
+```bash
+pip install "mharmony[qwen35] @ git+https://github.com/perceptron-ai-inc/mharmony.git@9a57efbf8ada2d73641fc40081f4e4fa6ff2ab92"
+pip install -e ".[perceptron_isaac]"
+```
+
+pip 25.1 and newer can read the PEP 735 `perceptron-isaac-mharmony` group that
+carries the same revision, which collapses this to one command:
+
+```bash
+pip install -e ".[perceptron_isaac]" --group perceptron-isaac-mharmony
+```
+
+The Git build compiles a Rust extension, so a Rust toolchain must be on `PATH`;
+pip installs maturin into its own build environment. Like `yam-hardware`, this
+group exists because published metadata cannot carry a direct Git dependency, and
+it is a bridge: delete it once mharmony is available from a registry.
+
 For bimanual YAM support on Linux:
 
 ```bash

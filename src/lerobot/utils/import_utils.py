@@ -106,6 +106,7 @@ _peft_available = is_package_available("peft")
 _scipy_available = is_package_available("scipy")
 _diffusers_available = is_package_available("diffusers")
 _torchdiffeq_available = is_package_available("torchdiffeq")
+_mharmony_available = is_package_available("mharmony")
 
 # Hardware SDKs
 _serial_available = is_package_available("pyserial", import_name="serial")

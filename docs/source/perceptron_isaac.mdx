@@ -26,6 +26,28 @@ source without a sibling checkout. Public PyPI distribution availability is a
 separate concern; pip does not consume uv's Git source mapping. FAST/model
 artifacts and datasets must be supplied separately with their pinned provenance.
 
+### Installing with pip
+
+mharmony is not on PyPI yet, so `pip install 'lerobot[perceptron_isaac]'` alone
+cannot resolve `mharmony[qwen35]==0.1.0`. Install the pinned Git revision first,
+then the extra; the Git build reports version `0.1.0`, so it satisfies the pin:
+
+```bash
+pip install "mharmony[qwen35] @ git+https://github.com/perceptron-ai-inc/mharmony.git@9a57efbf8ada2d73641fc40081f4e4fa6ff2ab92"
+pip install -e ".[perceptron_isaac]"
+```
+
+On pip 25.1 or newer the same revision is available as a PEP 735 group, in one step:
+
+```bash
+pip install -e ".[perceptron_isaac]" --group perceptron-isaac-mharmony
+```
+
+Building mharmony from Git compiles a Rust extension, so a Rust toolchain must be
+on `PATH` (pip fetches maturin itself). The `perceptron-isaac-mharmony` group is a
+bridge: it is removable once mharmony is published to a registry, and it is never
+written into published lerobot metadata.
+
 Qwen3.5 native training is implemented. MK1/Isaac-0.5 training is **unsupported**;
 its qualified inference runtime is Torch 2.10/CUDA 12.8/H100, not the default
 Torch 2.11 lock. See the [policy reference](./policy_perceptron_isaac_README.md)

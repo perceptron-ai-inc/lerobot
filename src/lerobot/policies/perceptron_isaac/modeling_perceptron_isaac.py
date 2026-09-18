@@ -135,6 +135,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
     def __init__(self, config: PerceptronIsaacConfig, **kwargs):
         require_package("transformers", extra="perceptron_isaac")
+        require_package("mharmony", extra="perceptron_isaac")
         super().__init__(config)
         config.validate_features()
         self.config = config
