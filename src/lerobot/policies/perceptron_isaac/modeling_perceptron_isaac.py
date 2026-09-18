@@ -17,7 +17,7 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 import torch
@@ -27,12 +27,7 @@ from torch import Tensor
 from lerobot.lerobot_types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.hub import resolve_hub_snapshot
-from lerobot.utils.import_utils import _transformers_available, require_package
-
-if TYPE_CHECKING or _transformers_available:
-    from transformers import AutoModelForCausalLM
-else:
-    AutoModelForCausalLM = None
+from lerobot.utils.import_utils import require_package
 
 from ..pretrained import PreTrainedPolicy
 from .checkpoint_integrity import (
@@ -932,21 +927,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     def _load_backbone(self, *, training: bool = False) -> None:
         if not self.config.hf_model_path:
             raise RuntimeError("PerceptronIsaacConfig.hf_model_path is required to load the Isaac HF VLA.")
-        model_dir = Path(self.config.hf_model_path)
-        if _is_portable_isaac05_repository(model_dir):
-            if training:
-                self._require_native_training_supported()
-            device = self._resolve_device()
-            self._isaac_model = AutoModelForCausalLM.from_pretrained(
-                model_dir,
-                trust_remote_code=True,
-                local_files_only=True,
-                dtype=torch.bfloat16,
-                device_map={"": str(device)},
-                low_cpu_mem_usage=True,
-                attn_implementation="sdpa",
-            )
-            return
         if not self._config_declares_mk1(self.config):
             from .modeling_qwen35_vla import (
                 _load_qwen35_vla_from_verified_package,
@@ -1003,10 +983,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         model_dtype = torch.bfloat16
         model_dir = Path(self.config.hf_model_path)
         allow_test_geometry = self.config.artifact_kind == "neutral_debug"
+        # Isaac-0.5 exports store F32 source tensors, not an F32 inference runtime.
+        # Keep legacy MK1 storage strict and route both formats through native validation.
+        storage_dtypes = frozenset({"F32" if _is_portable_isaac05_repository(model_dir) else "BF16"})
         try:
             contract, _ = validate_mk1_checkpoint(
                 model_dir,
                 allow_test_only_reduced_geometry=allow_test_geometry,
+                allowed_storage_dtypes=storage_dtypes,
             )
         except Mk1CheckpointContractError as exc:
             raise RuntimeError(f"ISAAC requires a valid MK1 composite checkpoint: {exc}") from exc
@@ -1059,6 +1043,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             allow_test_only_reduced_geometry=allow_test_geometry,
             attention_backend=TORCH_SDPA_ATTENTION_BACKEND,
             route_reduction=DETERMINISTIC_ROUTE_REDUCTION,
+            allowed_storage_dtypes=storage_dtypes,
         )
         if loaded_contract != contract:
             raise RuntimeError("MK1 checkpoint contract changed between preflight and model loading.")

@@ -464,11 +464,29 @@ class GenesisNullSparseMoeBlock(nn.Module):
         return major >= 8
 
     def dispatch_backend(self, hidden_states: torch.Tensor) -> Literal["grouped_mm", "eager"]:
-        """Select the qualified backend and fail closed for production CUDA."""
+        """Keep production inference grouped; allow FP32-storage eager training."""
 
         if self._supports_grouped_mm(hidden_states):
             return "grouped_mm"
         if self._is_production_geometry and hidden_states.device.type == "cuda":
+            # Check module mode, not grad mode: checkpointed training can run under no_grad.
+            # BF16 activations need BF16 autocast for the FP32-weight eager linears.
+            if (
+                self.training
+                and self.experts.gate_up_proj.dtype is torch.float32
+                and self.experts.down_proj.dtype is torch.float32
+                and self.experts.gate_up_proj.device == hidden_states.device
+                and self.experts.down_proj.device == hidden_states.device
+                and (
+                    hidden_states.dtype is torch.float32
+                    or (
+                        hidden_states.dtype is torch.bfloat16
+                        and torch.is_autocast_enabled(hidden_states.device.type)
+                        and torch.get_autocast_dtype(hidden_states.device.type) is torch.bfloat16
+                    )
+                )
+            ):
+                return "eager"
             raise RuntimeError(
                 "Production MK1 null-MoE CUDA inference requires BF16 torch grouped_mm on SM80 or newer; "
                 f"got dtype={hidden_states.dtype}, capability={torch.cuda.get_device_capability(hidden_states.device)}"
@@ -536,7 +554,8 @@ class GenesisNullSparseMoeBlock(nn.Module):
         shared_output: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         routed_output = torch.zeros_like(hidden_states)
-        combined_output = shared_output.clone()
+        # Autocast may make the shared branch BF16 while route accumulation is FP32.
+        combined_output = shared_output.to(dtype=routed_output.dtype, copy=True)
         start = 0
         deterministic_token_indices: list[torch.Tensor] = []
         deterministic_outputs: list[torch.Tensor] = []

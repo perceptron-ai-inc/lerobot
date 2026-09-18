@@ -59,33 +59,119 @@ def _policy(model_path: Path, *, device: str = "cpu") -> PerceptronIsaacPolicy:
     return PerceptronIsaacPolicy(config)
 
 
-def test_policy_loads_portable_repo_through_transformers_autoclass(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def _native_portable_package(tmp_path: Path) -> tuple[Path, PerceptronIsaacConfig, torch.Tensor]:
+    import hashlib
+
+    from lerobot.policies.perceptron_isaac.mharmony_native import IsaacMharmonyRenderMetadata
+    from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+        _write_portable_isaac05_checkpoint,
+    )
+
+    model_path = tmp_path / "model"
+    _, raw, value = _write_portable_isaac05_checkpoint(model_path)
+    # Public tiny geometry keeps the existing neutral-debug opt-in, never a production bypass.
+    raw["isaac05_artifact"].update(artifact_kind="neutral_debug", trained_steps=0)
+    (model_path / "config.json").write_text(json.dumps(raw))
+    policy_path = model_path / "lerobot_policy"
+    policy_path.mkdir()
+    adapter = policy_path / "isaac_deployment_adapter.json"
+    adapter.write_text("{}\n")
+    config = _policy(model_path).config
+    config.hf_model_path = ".."
+    config.artifact_kind = "neutral_debug"
+    config.trained_steps = 0
+    config.vector_max_states = 4
+    config.max_action_dim = 4
+    config.max_action_horizon = 3
+    config.apply_offset_norm = False
+    config.train_storage_fp32 = False
+    config.deployment_adapter_sha256 = hashlib.sha256(adapter.read_bytes()).hexdigest()
+    metadata = IsaacMharmonyRenderMetadata.from_config(config).to_json_dict()
+    metadata["mharmony_reserved_token_groups"] = [{"name": "coord", "offset": 24, "size": 4}]
+    (policy_path / "render.json").write_text(json.dumps(metadata))
+    config.native_render_metadata_path = "render.json"
+    return policy_path, config, value
+
+
+def _forbid_checkpoint_code(*args: object, **kwargs: object) -> None:
+    raise AssertionError("FORBIDDEN_AUTOCLASS_BOUNDARY: checkpoint code must not execute")
+
+
+def test_policy_loads_portable_repo_through_native_mk1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    model_path = _write_portable_repo(tmp_path / "model")
-    loaded_model = nn.Linear(2, 2)
-    call: dict[str, object] = {}
+    from transformers import AutoConfig, AutoProcessor, dynamic_module_utils
 
-    def load_auto(path: Path, **kwargs: object) -> nn.Module:
-        call.update(path=Path(path), **kwargs)
-        return loaded_model
+    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
+    from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import DiTActionExpertHead
 
-    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load_auto)
-    policy = _policy(model_path)
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", _forbid_checkpoint_code)
+    monkeypatch.setattr(AutoConfig, "from_pretrained", _forbid_checkpoint_code)
+    monkeypatch.setattr(AutoProcessor, "from_pretrained", _forbid_checkpoint_code)
+    monkeypatch.setattr(dynamic_module_utils, "get_class_from_dynamic_module", _forbid_checkpoint_code)
+    policy_path, config, source_value = _native_portable_package(tmp_path)
+    assert not torch.cuda.is_initialized()
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+    model = policy._isaac_model
+    assert isinstance(model, Mk1Qwen36VLAForActionGeneration)
+    assert isinstance(model.action_expert, DiTActionExpertHead)
+    assert model.action_expert.args.rtc_max_delay_steps == 12
+    assert model.action_expert.args.rtc_probability == 0.5
+    assert model.config.action_expert["type"] == "dit"
+    assert policy.config.action_expert_type == "molmoact"
+    assert (policy.config.artifact_kind, policy.config.trained_steps) == ("neutral_debug", 0)
+    assert all(parameter.dtype == torch.bfloat16 for parameter in model.parameters())
+    assert all(parameter.device.type == "cpu" for parameter in model.parameters())
+    assert all(buffer.device.type != "meta" for buffer in model.buffers())
+    assert all(
+        torch.equal(parameter, source_value.bfloat16().expand_as(parameter))
+        for parameter in model.parameters()
+    )
+    assert source_value.item() != source_value.bfloat16().float().item()
+    assert not policy.training and not model.training
+    assert not torch.cuda.is_initialized()
+    assert not list(policy_path.parent.glob("*.py"))
 
-    policy._load_backbone()
 
-    assert policy._isaac_model is loaded_model
-    assert call == {
-        "path": model_path,
-        "trust_remote_code": True,
-        "local_files_only": True,
-        "dtype": torch.bfloat16,
-        "device_map": {"": "cpu"},
-        "low_cpu_mem_usage": True,
-        "attn_implementation": "sdpa",
-    }
+@pytest.mark.parametrize("defect", ["adapter", "path", "identity", "metadata", "dtype"])
+def test_native_portable_public_load_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    import lerobot.policies.perceptron_isaac.modeling_mk1_vla as native
+
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", _forbid_checkpoint_code)
+    monkeypatch.setattr(native, "Mk1Qwen36VLAForActionGeneration", _forbid_checkpoint_code)
+    expected = ""
+    if defect == "adapter":
+        config.deployment_adapter_sha256 = "0" * 64
+        expected = "digest mismatch"
+    elif defect == "path":
+        config.hf_model_path = "../.."
+        expected = "escapes the package root"
+    elif defect == "identity":
+        raw_path = policy_path.parent / "config.json"
+        raw = json.loads(raw_path.read_text())
+        raw["isaac05_artifact"].update(artifact_kind="trained_policy", trained_steps=100000)
+        raw_path.write_text(json.dumps(raw))
+        expected = "artifact identity mismatch"
+    elif defect == "metadata":
+        raw_path = policy_path.parent / "config.json"
+        raw = json.loads(raw_path.read_text())
+        raw["action_expert"]["rtc_probability"] = 0.1
+        raw_path.write_text(json.dumps(raw))
+        expected = "identical"
+    else:
+        from safetensors.torch import load_file, save_file
+
+        shard = next(policy_path.parent.glob("model-*.safetensors"))
+        state = load_file(shard)
+        key = next(iter(state))
+        state[key] = state[key].bfloat16()
+        save_file(state, shard)
+        expected = "total_size|dtype"
+    with pytest.raises((RuntimeError, ValueError), match=expected):
+        PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
 
 
 def test_policy_allows_direct_parent_portable_model_repo(tmp_path: Path) -> None:

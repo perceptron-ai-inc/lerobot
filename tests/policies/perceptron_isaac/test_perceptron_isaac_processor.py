@@ -1980,6 +1980,7 @@ def test_native_policy_mk1_loader_is_checkpoint_driven(tmp_path, monkeypatch):
             "allow_test_only_reduced_geometry": False,
             "attention_backend": "torch_sdpa_v1",
             "route_reduction": "stable_token_segment_sum_v1",
+            "allowed_storage_dtypes": frozenset({"BF16"}),
         }
     ]
 

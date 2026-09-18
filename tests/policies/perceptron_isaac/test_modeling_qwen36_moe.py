@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+from unittest.mock import patch
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen35_modeling
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
@@ -809,16 +811,211 @@ def test_grouped_mm_compact_dispatch_backward_is_finite() -> None:
     assert all(torch.isfinite(gradient).all() for gradient in gradients if gradient is not None)
 
 
+def _production_dispatch_fixture(
+    activation_dtype: torch.dtype,
+    gate_up_dtype: torch.dtype = torch.float32,
+    down_dtype: torch.dtype = torch.float32,
+    expert_device: str = "cuda:0",
+) -> tuple[GenesisNullSparseMoeBlock, torch.Tensor]:
+    # Allocate only fake CPU tensors, then model CUDA metadata without initializing CUDA.
+    with FakeTensorMode():
+        block = GenesisNullSparseMoeBlock(
+            _text_config(
+                num_real_experts=256,
+                num_null_experts=256,
+                top_k=8,
+                moe_intermediate_size=8,
+            )
+        )
+        block.experts.gate_up_proj = torch.nn.Parameter(block.experts.gate_up_proj.to(gate_up_dtype))
+        block.experts.down_proj = torch.nn.Parameter(block.experts.down_proj.to(down_dtype))
+        hidden_states = torch.empty(1, 24, dtype=activation_dtype)
+    for parameter in block.parameters():
+        assert isinstance(parameter, FakeTensor)
+        parameter.fake_device = torch.device(expert_device)
+    assert isinstance(hidden_states, FakeTensor)
+    hidden_states.fake_device = torch.device("cuda:0")
+    return block, hidden_states
+
+
+@pytest.mark.parametrize("grad_enabled", [True, False], ids=["grad", "no-grad"])
+@pytest.mark.parametrize(
+    "activation_dtype,autocast_enabled",
+    [
+        pytest.param(torch.float32, False, id="fp32"),
+        pytest.param(torch.bfloat16, True, id="bf16"),
+        pytest.param(torch.float32, True, id="fp32-bf16-autocast"),
+    ],
+)
+def test_production_dispatch_fp32_training_uses_eager(
+    activation_dtype: torch.dtype, autocast_enabled: bool, grad_enabled: bool
+) -> None:
+    block, hidden_states = _production_dispatch_fixture(activation_dtype)
+    block.train()
+    with (
+        torch.set_grad_enabled(grad_enabled),
+        patch("torch.cuda.get_device_capability", return_value=(8, 0)),
+        patch("torch.is_autocast_enabled", return_value=autocast_enabled),
+        patch("torch.get_autocast_dtype", return_value=torch.bfloat16),
+    ):
+        assert block.dispatch_backend(hidden_states) == "eager"
+
+
+@pytest.mark.parametrize("grad_enabled", [True, False], ids=["grad", "no-grad"])
+@pytest.mark.parametrize("activation_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_production_dispatch_fp32_eval_stays_closed(
+    activation_dtype: torch.dtype, grad_enabled: bool
+) -> None:
+    block, hidden_states = _production_dispatch_fixture(activation_dtype)
+    block.eval()
+    with (
+        torch.set_grad_enabled(grad_enabled),
+        patch("torch.cuda.get_device_capability", return_value=(8, 0)),
+        patch("torch.is_autocast_enabled", return_value=True),
+        patch("torch.get_autocast_dtype", return_value=torch.bfloat16),
+        pytest.raises(RuntimeError, match="requires BF16 torch grouped_mm"),
+    ):
+        block.dispatch_backend(hidden_states)
+
+
+@pytest.mark.parametrize(
+    "activation_dtype,gate_up_dtype,down_dtype,expert_device,autocast_enabled,autocast_dtype",
+    [
+        pytest.param(
+            torch.float16, torch.float32, torch.float32, "cuda:0", True, torch.float16, id="fp16-input"
+        ),
+        pytest.param(
+            torch.float32, torch.float16, torch.float16, "cuda:0", False, torch.bfloat16, id="fp16-weights"
+        ),
+        pytest.param(
+            torch.float32, torch.bfloat16, torch.float32, "cuda:0", False, torch.bfloat16, id="bf16-gate-up"
+        ),
+        pytest.param(
+            torch.float32, torch.float32, torch.bfloat16, "cuda:0", False, torch.bfloat16, id="bf16-down"
+        ),
+        pytest.param(
+            torch.float32, torch.float32, torch.float32, "cpu", False, torch.bfloat16, id="cpu-weights"
+        ),
+        pytest.param(
+            torch.float32, torch.float32, torch.float32, "cuda:1", False, torch.bfloat16, id="other-device"
+        ),
+        pytest.param(
+            torch.bfloat16, torch.float32, torch.float32, "cuda:0", False, torch.bfloat16, id="no-autocast"
+        ),
+        pytest.param(
+            torch.bfloat16, torch.float32, torch.float32, "cuda:0", True, torch.float16, id="fp16-autocast"
+        ),
+    ],
+)
+def test_production_dispatch_unsupported_training_stays_closed(
+    activation_dtype: torch.dtype,
+    gate_up_dtype: torch.dtype,
+    down_dtype: torch.dtype,
+    expert_device: str,
+    autocast_enabled: bool,
+    autocast_dtype: torch.dtype,
+) -> None:
+    block, hidden_states = _production_dispatch_fixture(
+        activation_dtype, gate_up_dtype, down_dtype, expert_device
+    )
+    block.train()
+    with (
+        patch("torch.cuda.get_device_capability", return_value=(8, 0)),
+        patch("torch.is_autocast_enabled", return_value=autocast_enabled),
+        patch("torch.get_autocast_dtype", return_value=autocast_dtype),
+        pytest.raises(RuntimeError, match="requires BF16 torch grouped_mm"),
+    ):
+        block.dispatch_backend(hidden_states)
+
+
+@pytest.mark.parametrize("training", [True, False], ids=["train", "eval"])
+@pytest.mark.parametrize("capability", [(8, 0), (7, 0)], ids=["sm80", "sm70"])
+def test_production_dispatch_bf16_preserves_grouped_mm(training: bool, capability: tuple[int, int]) -> None:
+    block, hidden_states = _production_dispatch_fixture(torch.bfloat16, torch.bfloat16, torch.bfloat16)
+    block.train(training)
+    with patch("torch.cuda.get_device_capability", return_value=capability):
+        if capability[0] >= 8:
+            assert block.dispatch_backend(hidden_states) == "grouped_mm"
+        else:
+            with pytest.raises(RuntimeError, match="requires BF16 torch grouped_mm"):
+                block.dispatch_backend(hidden_states)
+
+
+@pytest.mark.parametrize("activation_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("deterministic", [True, False], ids=["segment", "index-add"])
+@pytest.mark.parametrize("real_routes", [2, 1, 0], ids=["real", "mixed", "null"])
+def test_fp32_eager_experts_accept_cpu_bf16_autocast_forward(
+    activation_dtype: torch.dtype, deterministic: bool, real_routes: int
+) -> None:
+    block = GenesisNullSparseMoeBlock(_text_config()).train()
+    block.deterministic_route_reduction = deterministic
+    with torch.no_grad():
+        for parameter in block.parameters():
+            parameter.fill_(0.1)
+        block.shared_expert_gate.weight.zero_()
+        if real_routes != 2:
+            block.gate.weight.zero_()
+            block.gate.weight[:, 0] = torch.tensor([2.0, -10.0, 1.0])
+        if real_routes == 0:
+            block.gate.weight[2, 0] = 10
+            block.experts.gate_up_proj.fill_(torch.nan)
+            block.experts.down_proj.fill_(torch.nan)
+    hidden_states = torch.ones(1, 2, 24, dtype=activation_dtype)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        branches = block.forward_with_branches(hidden_states)
+        # The zero shared gate gives exactly sigmoid(0) = 0.5.
+        expected_shared = block.shared_expert(hidden_states) * 0.5
+        if real_routes:
+            # Both real experts have identical weights; only the route score differs.
+            gate, up = torch.nn.functional.linear(hidden_states, block.experts.gate_up_proj[0]).chunk(
+                2, dim=-1
+            )
+            swiglu = block.experts.act_fn(gate) * up
+            weighted_swiglu = (swiglu.float() / real_routes).to(swiglu.dtype)
+            expected_row = torch.nn.functional.linear(weighted_swiglu, block.experts.down_proj[0])
+
+    assert branches.output.dtype is activation_dtype
+    assert branches.routed_output.dtype is activation_dtype
+    assert branches.shared_expert_output.dtype is torch.bfloat16
+    assert torch.isfinite(branches.output).all()
+    assert all(parameter.dtype is torch.float32 for parameter in block.parameters())
+    selected_real = branches.routing.selected_experts < block.contract.num_real_experts
+    assert torch.all(selected_real.sum(dim=-1) == real_routes)
+    expected_weights = selected_real.float() / max(real_routes, 1)
+    torch.testing.assert_close(branches.routing.real_route_weights, expected_weights, rtol=0, atol=0)
+    torch.testing.assert_close(branches.shared_expert_output, expected_shared, rtol=0, atol=0)
+    assert torch.count_nonzero(branches.shared_expert_output) > 0
+    assert branches.output.data_ptr() != branches.shared_expert_output.data_ptr()
+
+    expected_routed = torch.zeros_like(hidden_states)
+    expected_output = expected_shared.to(activation_dtype, copy=True)
+    for _ in range(real_routes):
+        expected_routed = expected_routed + expected_row.to(activation_dtype)
+        if not deterministic:
+            # Preserve direct scatter into the shared base, including BF16 rounding.
+            expected_output = expected_output + expected_row.to(activation_dtype)
+    if deterministic:
+        expected_output = expected_output + expected_routed
+    torch.testing.assert_close(branches.routed_output, expected_routed, rtol=0, atol=0)
+    torch.testing.assert_close(branches.output, expected_output, rtol=0, atol=0)
+    if real_routes:
+        assert torch.count_nonzero(branches.routed_output) > 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="production backend guard requires a GPU")
 def test_production_cuda_dispatch_fails_closed_without_bf16_grouped_mm() -> None:
-    block = GenesisNullSparseMoeBlock(
-        _text_config(
-            num_real_experts=256,
-            num_null_experts=256,
-            top_k=8,
-            moe_intermediate_size=8,
+    block = (
+        GenesisNullSparseMoeBlock(
+            _text_config(
+                num_real_experts=256,
+                num_null_experts=256,
+                top_k=8,
+                moe_intermediate_size=8,
+            )
         )
-    ).cuda()
+        .cuda()
+        .eval()
+    )
 
     with pytest.raises(RuntimeError, match="requires BF16 torch grouped_mm"):
         block.dispatch_backend(torch.zeros(1, 24, device="cuda", dtype=torch.float32))

@@ -822,13 +822,12 @@ def test_duplicate_json_keys_are_rejected(tmp_path: Path) -> None:
         read_and_validate_safetensors_index(model_dir)
 
 
-def test_portable_isaac05_loads_native_fp32_without_checkpoint_python(tmp_path: Path) -> None:
-    """The historical isaac05 JSON is input data, never executable model code."""
+def _write_portable_isaac05_checkpoint(
+    root: Path,
+) -> tuple[Mk1CheckpointContract, dict, torch.Tensor]:
+    """Write the shared tiny F32 source fixture; no checkpoint code is needed."""
     from safetensors.torch import load_file
 
-    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
-
-    root = tmp_path / "portable"
     native = _config(test_geometry=True, mtp_present=False)
     raw = copy.deepcopy(native)
     raw["model_type"] = "isaac_0_5"
@@ -894,8 +893,17 @@ def test_portable_isaac05_loads_native_fp32_without_checkpoint_python(tmp_path: 
     index_path.write_text(json.dumps(index))
     source_bytes = json.dumps(raw).encode()
     (root / "config.json").write_bytes(source_bytes)
-    for filename in ("configuration_isaac05.py", "modeling_isaac05.py", "processing_isaac05.py"):
-        (root / filename).write_text("raise AssertionError('checkpoint Python executed')\n")
+    return expected, raw, value
+
+
+def test_portable_isaac05_loads_native_fp32_without_checkpoint_python(tmp_path: Path) -> None:
+    """The historical isaac05 JSON is input data, never executable model code."""
+    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
+
+    root = tmp_path / "portable"
+    expected, raw, value = _write_portable_isaac05_checkpoint(root)
+    source_bytes = (root / "config.json").read_bytes()
+    action = raw["action_expert"]
 
     for field, value_override in (("rtc_probability", 0.75), ("unknown_field", True)):
         invalid = copy.deepcopy(raw)
