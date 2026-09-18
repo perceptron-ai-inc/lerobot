@@ -110,7 +110,12 @@ def test_policy_loads_portable_repo_through_native_mk1(
     monkeypatch.setattr(AutoProcessor, "from_pretrained", _forbid_checkpoint_code)
     monkeypatch.setattr(dynamic_module_utils, "get_class_from_dynamic_module", _forbid_checkpoint_code)
     policy_path, config, source_value = _native_portable_package(tmp_path)
-    assert not torch.cuda.is_initialized()
+    # What this test owns is that loading a portable repo never touches CUDA. Asserting an
+    # uninitialized process would instead assert a global property it does not own: in a full
+    # run a sibling test that legitimately exercises CUDA (test_modeling_qwen36_moe.py's [cuda]
+    # cases) boots the context first. So measure a delta across the load instead.
+    cuda_initialized_before = torch.cuda.is_initialized()
+    cuda_allocated_before = torch.cuda.memory_allocated() if cuda_initialized_before else 0
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
     model = policy._isaac_model
     assert isinstance(model, Mk1Qwen36VLAForActionGeneration)
@@ -129,7 +134,9 @@ def test_policy_loads_portable_repo_through_native_mk1(
     )
     assert source_value.item() != source_value.bfloat16().float().item()
     assert not policy.training and not model.training
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_initialized_before
+    if cuda_initialized_before:
+        assert torch.cuda.memory_allocated() == cuda_allocated_before
     assert not list(policy_path.parent.glob("*.py"))
 
 

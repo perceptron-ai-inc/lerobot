@@ -200,10 +200,9 @@ def test_native_qwen35_update_save_reload_resume(tmp_path: Path, monkeypatch, us
     """Real native loss/update and disk checkpoint callers; synthetic stream, not mharmony rendering."""
     import json
     import random
-
-    import numpy as np
     import sys
 
+    import numpy as np
     from accelerate import Accelerator
 
     from lerobot.common.train_utils import load_training_state, save_checkpoint

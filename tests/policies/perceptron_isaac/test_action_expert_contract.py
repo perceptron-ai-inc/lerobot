@@ -7,7 +7,6 @@ pytest.importorskip("transformers", reason="transformers is required (install le
 
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
     DEFAULT_MOLMOACT_EXPERT_CFG,
-    MolmoActExpertHead,
     build_action_expert_head,
     resolve_action_expert_config,
 )
@@ -297,7 +296,8 @@ def test_dit_rtc_analytic_core(case):
         rows = ae.forward_with_context(x, row_times, context=context)
         torch.testing.assert_close(compact, rows)
         assert torch.count_nonzero(rows * (1 - valid[..., None])) == 0
-        altered = vlm.clone(); altered[~vlm_mask.bool()] += 100
+        altered = vlm.clone()
+        altered[~vlm_mask.bool()] += 100
         outputs = head(vlm, vlm_mask, torch.stack([x, x]), torch.stack([1-row_times, 1-row_times]), action_mask=valid)
         torch.testing.assert_close(outputs[0], rows)
         torch.testing.assert_close(outputs[1], rows)
@@ -307,6 +307,8 @@ def test_dit_rtc_analytic_core(case):
         legacy.load_state_dict(head.state_dict(), strict=True)
         x = torch.randn(2, 6, 4)
         torch.testing.assert_close(head(vlm, vlm_mask, x, times), legacy(vlm, vlm_mask, x, times), rtol=0, atol=0)
-        torch.manual_seed(99); actual = head.sample(vlm, vlm_mask)
-        torch.manual_seed(99); expected = legacy.sample(vlm, vlm_mask)
+        torch.manual_seed(99)
+        actual = head.sample(vlm, vlm_mask)
+        torch.manual_seed(99)
+        expected = legacy.sample(vlm, vlm_mask)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)

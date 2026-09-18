@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 
 import gymnasium as gym
+import pytest
 import torch
+
+# lerobot.scripts.lerobot_eval imports lerobot.datasets, which require_package("datasets").
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies.factory import make_pre_post_processors
