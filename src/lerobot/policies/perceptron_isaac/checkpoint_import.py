@@ -173,11 +173,13 @@ _OBSERVATION_KEYS = {
     "clip_window_seconds",
 }
 # Genesis recipe schema v7 (bumped 2 -> 7 by genesis #3404, 2026-08-19) added four
-# conditioning fields to the canonical observation block. Conditioning itself is NOT
-# implemented by this runtime, so the values are validated below and non-zero
-# probabilities are rejected outright -- genesis forces conditioning ON at serving
-# whenever the checkpoint was trained with nonzero support, so accepting such a recipe
-# silently would create a train/serve prompt skew.
+# conditioning fields to the canonical observation block. This runtime never renders
+# conditioning from an imported package, so a non-zero probability is admitted only for a
+# caller that explicitly declares an IsaacConditioningDeployment with both renders_* flags
+# false, and only while genesis still trained an unconditioned mode (probability < 1).
+# Without that declaration the values are rejected outright, because genesis forces
+# conditioning ON at its own serving entry point whenever the checkpoint was trained with
+# nonzero support, and silently accepting the recipe would hide that divergence.
 _CONDITIONING_OBSERVATION_KEYS = {
     "action_conditioning_probability",
     "action_conditioning_role",
@@ -266,6 +268,36 @@ class IsaacCheckpointImportError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class IsaacConditioningDeployment:
+    """What a deployment does with genesis action/mistake conditioning at serving time.
+
+    Genesis samples both conditioning features per training sample behind Bernoulli gates
+    and then forces both ON at its own serving entry points
+    (genesis/core/robotics/inference_recipe.py:335-348 and
+    genesis/inference/flow_matching/observation.py:445-456). That is a genesis serving
+    preference, not a property the checkpoint imposes on other runtimes: for any trained
+    probability strictly below 1 the unconditioned prompt is itself a trained mode, and
+    genesis renders nothing at all in place of the missing conditioning
+    (genesis/core/datasets/augment/trajectory.py:4080-4092 appends the conditioning item
+    only when the gate fires, and genesis/core/datasets/augment/robotics/lowering.py:494-495
+    omits the ``mistake:`` line entirely when no value was sampled).
+
+    A deployment therefore has to state which mode it renders. This importer never sets
+    ``action_conditioning`` or ``mistake_conditioning`` on the emitted policy config, so only
+    the conditioning-free declaration can be honoured.
+    """
+
+    renders_action_conditioning: bool
+    renders_mistake_conditioning: bool
+
+
+CONDITIONING_DISABLED_DEPLOYMENT = IsaacConditioningDeployment(
+    renders_action_conditioning=False,
+    renders_mistake_conditioning=False,
+)
+
+
+@dataclass(frozen=True)
 class AuthenticatedIsaacContracts:
     manifest: dict[str, Any]
     normalization: dict[str, Any]
@@ -276,6 +308,7 @@ class AuthenticatedIsaacContracts:
     authenticated_import_identity_sha256: str | None = None
     contract_authentication: str = "dcp_authenticated"
     artifact_paths: dict[str, Path] | None = None
+    conditioning_deployment: IsaacConditioningDeployment | None = None
 
 
 @dataclass(frozen=True)
@@ -1041,6 +1074,41 @@ def _validate_deployment_profile(
         )
 
 
+def _require_conditioning_free_deployment(
+    deployment: IsaacConditioningDeployment | None,
+    *,
+    key: str,
+    probability: float,
+    location: str,
+) -> None:
+    """Admit conditioning-trained support only for an explicitly conditioning-free deployment."""
+    if deployment is None:
+        raise IsaacCheckpointImportError(
+            f"{location}.{key}={probability} declares "
+            "action/mistake conditioning support, which this runtime does not "
+            "implement (no causal action history or 'mistake:' preamble line is "
+            "rendered, and genesis forces conditioning ON at serving whenever the "
+            "checkpoint was trained with nonzero support). Importing it would "
+            "create a silent train/serve prompt skew; use a checkpoint trained "
+            "without conditioning support, or declare a conditioning-free deployment."
+        )
+    if deployment.renders_action_conditioning or deployment.renders_mistake_conditioning:
+        raise IsaacCheckpointImportError(
+            f"{location}.{key}={probability} needs a conditioning-free deployment: this "
+            "importer never sets action_conditioning or mistake_conditioning on the emitted "
+            "policy config, so a deployment declaring that it renders conditioning cannot be "
+            "satisfied by the imported package."
+        )
+    if probability >= 1.0:
+        raise IsaacCheckpointImportError(
+            f"{location}.{key}={probability} leaves no unconditioned training mode: genesis "
+            "short-circuits its Bernoulli gate at probability >= 1 "
+            "(genesis/core/datasets/augment/trajectory.py:5716 and :3959), so every training "
+            "prompt carried conditioning and a conditioning-free deployment of this "
+            "checkpoint would be out of distribution."
+        )
+
+
 def _validate_recipe_record(
     record: dict[str, Any],
     *,
@@ -1048,6 +1116,7 @@ def _validate_recipe_record(
     schema_version: int,
     manifest: dict[str, Any],
     authorized: set[tuple[str, str, str]],
+    conditioning_deployment: IsaacConditioningDeployment | None,
 ) -> tuple[str, str, str]:
     location = f"inference_recipe.recipes[{index}]"
     _exact_keys(record, _RECIPE_RECORD_KEYS, location=location)
@@ -1178,14 +1247,11 @@ def _validate_recipe_record(
             ("mistake_conditioning_probability", mistake_conditioning),
         ):
             if probability != 0.0:
-                raise IsaacCheckpointImportError(
-                    f"{location}.lowering.observation.{key}={probability} declares "
-                    "action/mistake conditioning support, which this runtime does not "
-                    "implement (no causal action history or 'mistake:' preamble line is "
-                    "rendered, and genesis forces conditioning ON at serving whenever the "
-                    "checkpoint was trained with nonzero support). Importing it would "
-                    "create a silent train/serve prompt skew; use a checkpoint trained "
-                    "without conditioning support."
+                _require_conditioning_free_deployment(
+                    conditioning_deployment,
+                    key=key,
+                    probability=probability,
+                    location=f"{location}.lowering.observation",
                 )
     _require_int(
         observation["reasoning_max_points"],
@@ -1202,13 +1268,23 @@ def _validate_recipe_record(
         minimum=0.0,
     )
     conditioning_wire_keys = sorted(set(wire) & _FLOW_FAST_CONDITIONING_WIRE_KEYS)
-    if conditioning_wire_keys:
+    # Genesis reads these keys only inside its own
+    # ``if float(observation["action_conditioning_probability"]) > 0.0:`` branch
+    # (genesis/core/robotics/inference_recipe.py:373-385) and LeRobot never reads them at all,
+    # so for a declared conditioning-free deployment they are inert recipe metadata.
+    if conditioning_wire_keys and (
+        conditioning_deployment is None
+        or conditioning_deployment.renders_action_conditioning
+        or conditioning_deployment.renders_mistake_conditioning
+    ):
         raise IsaacCheckpointImportError(
             f"{location}.lowering.action_wire carries conditioning keys "
             f"{conditioning_wire_keys}: the recipe requires FAST-tokenized action "
             "conditioning, which this runtime does not implement."
         )
     wire_keys = _FAST_ACTION_WIRE_KEYS if objective == "FAST" else _FLOW_ACTION_WIRE_KEYS
+    if conditioning_wire_keys:
+        wire_keys = wire_keys | _FLOW_FAST_CONDITIONING_WIRE_KEYS
     _exact_keys(wire, wire_keys, location=f"{location}.lowering.action_wire")
     expected_kind = "fast_tokens" if objective == "FAST" else "flow_action"
     if wire["kind"] != expected_kind:
@@ -1373,6 +1449,7 @@ def _validate_recipe(
     normalization: dict[str, Any],
     manifest_digest: str,
     authorized: set[tuple[str, str, str]],
+    conditioning_deployment: IsaacConditioningDeployment | None,
 ) -> dict[str, Any]:
     _exact_keys(raw, _RECIPE_KEYS, location=POLICY_INFERENCE_RECIPE_FILENAME)
     if raw["schema_version"] not in _SUPPORTED_RECIPE_SCHEMA_VERSIONS:
@@ -1399,6 +1476,7 @@ def _validate_recipe(
                 schema_version=schema_version,
                 manifest=manifest,
                 authorized=authorized,
+                conditioning_deployment=conditioning_deployment,
             )
         )
     if identities != sorted(authorized) or len(identities) != len(set(identities)):
@@ -1524,8 +1602,15 @@ def load_hf_identity(hf_export_path: str | Path) -> bytes:
 def authenticate_isaac_checkpoint(
     hf_export_path: str | Path,
     dcp_checkpoint_path: str | Path | None = None,
+    *,
+    conditioning_deployment: IsaacConditioningDeployment | None = None,
 ) -> AuthenticatedIsaacContracts:
-    """Authenticate converter sidecars against an HF-exported and/or DCP-owned identity."""
+    """Authenticate converter sidecars against an HF-exported and/or DCP-owned identity.
+
+    ``conditioning_deployment`` declares what the deployment will render. Left unset, a recipe
+    trained with any conditioning support is refused, which is the only safe default for a
+    caller that has not thought about it.
+    """
     hf_export = Path(hf_export_path)
     dcp_checkpoint = Path(dcp_checkpoint_path) if dcp_checkpoint_path is not None else None
     filenames = (
@@ -1560,6 +1645,7 @@ def authenticate_isaac_checkpoint(
         normalization=normalization,
         manifest_digest=manifest_digest,
         authorized=authorized,
+        conditioning_deployment=conditioning_deployment,
     )
     expected_identity = build_dcp_identity(manifest, normalization, recipe)
     identity_sources = []
@@ -1613,6 +1699,7 @@ def authenticate_isaac_checkpoint(
         authenticated_import_identity_sha256=import_identity_sha256,
         contract_authentication=contract_authentication,
         artifact_paths=artifact_paths,
+        conditioning_deployment=conditioning_deployment,
     )
 
 
@@ -2773,8 +2860,11 @@ def import_authenticated_isaac_checkpoint(
     objective: str = "Flow",
     fast_processor_source: str | Path | None = None,
     allow_fast_remote_code: bool = False,
+    conditioning_deployment: IsaacConditioningDeployment | None = None,
 ) -> ImportedIsaacPackage:
-    contracts = authenticate_isaac_checkpoint(hf_export_path, dcp_checkpoint_path)
+    contracts = authenticate_isaac_checkpoint(
+        hf_export_path, dcp_checkpoint_path, conditioning_deployment=conditioning_deployment
+    )
     return _build_validated_isaac_package(
         hf_export_path,
         output_path,

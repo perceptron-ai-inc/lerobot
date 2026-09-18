@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import argparse
 
-from lerobot.policies.perceptron_isaac.checkpoint_import import import_authenticated_isaac_checkpoint
+from lerobot.policies.perceptron_isaac.checkpoint_import import (
+    CONDITIONING_DISABLED_DEPLOYMENT,
+    import_authenticated_isaac_checkpoint,
+)
 
 
 def main() -> None:
@@ -42,6 +45,17 @@ def main() -> None:
         action="store_true",
         help="Acknowledge that the hash-pinned packaged FAST processor executes reviewed Python code.",
     )
+    parser.add_argument(
+        "--conditioning-free-deployment",
+        action="store_true",
+        help=(
+            "Declare that this deployment renders no causal action history and no 'mistake:' "
+            "preamble line, and therefore forgoes the pi0.7-style quality request genesis makes "
+            "at its own serving entry point. Required to import a checkpoint genesis trained with "
+            "partial action/mistake conditioning support; still refused when the recipe was "
+            "trained with probability 1, because no unconditioned mode exists there."
+        ),
+    )
     args = parser.parse_args()
     result = import_authenticated_isaac_checkpoint(
         args.hf_export,
@@ -52,6 +66,9 @@ def main() -> None:
         deployment_adapter_path=args.deployment_adapter,
         fast_processor_source=args.fast_processor_artifact,
         allow_fast_remote_code=args.allow_fast_remote_code,
+        conditioning_deployment=(
+            CONDITIONING_DISABLED_DEPLOYMENT if args.conditioning_free_deployment else None
+        ),
     )
     print(result.output_path)
 

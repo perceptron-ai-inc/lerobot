@@ -13,6 +13,7 @@ import lerobot.policies.perceptron_isaac.fast_processor as fast_processor
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.perceptron_isaac.checkpoint_import import (
+    CONDITIONING_DISABLED_DEPLOYMENT,
     ISAAC_DEPLOYMENT_ADAPTER_FILENAME,
     POLICY_INFERENCE_RECIPE_FILENAME,
     POLICY_NORMALIZATION_FILENAME,
@@ -21,6 +22,7 @@ from lerobot.policies.perceptron_isaac.checkpoint_import import (
     POLICY_STATE_DCP_IDENTITY_KEY,
     POLICY_STATE_IDENTITY_FILENAME,
     IsaacCheckpointImportError,
+    IsaacConditioningDeployment,
     authenticate_isaac_checkpoint,
     build_dcp_identity,
     canonical_sha256,
@@ -2327,3 +2329,224 @@ def test_authenticate_rejects_conditioning_keys_on_a_v2_recipe(tmp_path):
 
     with pytest.raises(IsaacCheckpointImportError, match="unexpected="):
         authenticate_isaac_checkpoint(hf_export)
+
+
+# --- Conditioning-trained recipes served conditioning-free (genesis schema v7) ---
+#
+# isaac_0_5-step-100000 was trained with action_conditioning_probability=0.5 and
+# mistake_conditioning_probability=0.8075 on every one of its 3028 recipes. Genesis samples
+# both gates per training sample (genesis/core/datasets/augment/trajectory.py:5714-5718 and
+# :3950-3971) and renders nothing extra when a gate misses (:4080-4092, and
+# genesis/core/datasets/augment/robotics/lowering.py:494-495 omits the "mistake:" line when
+# the value is None), so for any probability strictly below 1 the unconditioned prompt is a
+# trained mode that LeRobot reproduces byte-for-byte. Genesis nonetheless forces both ON at
+# its own serving entry point (genesis/core/robotics/inference_recipe.py:335-348,
+# genesis/inference/flow_matching/observation.py:445-456), which is a Genesis serving
+# preference rather than a property of the checkpoint.
+
+
+def _conditioning_trained_recipe(recipe: dict, **overrides) -> dict:
+    """A v7 recipe with the Bernoulli conditioning support isaac_0_5-step-100000 ships."""
+    return _upgrade_recipe_to_schema7(
+        recipe,
+        **{
+            "action_conditioning_probability": 0.5,
+            "mistake_conditioning_probability": 0.8075,
+            **overrides,
+        },
+    )
+
+
+def _attach_flow_conditioning_wire_keys(recipe: dict) -> dict:
+    """Attach the five conditioning_* keys genesis puts on every conditioning-trained Flow wire."""
+    for record in recipe["recipes"]:
+        record["lowering"]["action_wire"].update(
+            {
+                "conditioning_tokenizer_name_or_path": "physical-intelligence/fast",
+                "conditioning_tokenizer_revision": "ec4d7aa71691cac0b8bed6942be45684db2110f4",
+                "conditioning_processor_artifact": {"source": "huggingface_hub"},
+                "conditioning_token_group_key": "token_group",
+                "conditioning_token_group_name": "fast_action",
+            }
+        )
+    recipe["recipes_sha256"] = canonical_sha256(recipe["recipes"])
+    return recipe
+
+
+def test_authenticate_accepts_conditioning_trained_recipe_for_a_conditioning_free_deployment(tmp_path):
+    manifest, normalization, recipe = _make_contracts()
+    recipe = _conditioning_trained_recipe(recipe)
+    hf_export, _dcp_checkpoint, _adapter_path = _write_hf_authenticated_fixture(
+        tmp_path, contracts=(manifest, normalization, recipe)
+    )
+
+    contracts = authenticate_isaac_checkpoint(
+        hf_export, conditioning_deployment=CONDITIONING_DISABLED_DEPLOYMENT
+    )
+
+    observation = contracts.inference_recipe["recipes"][0]["lowering"]["observation"]
+    assert observation["action_conditioning_probability"] == 0.5
+    assert observation["mistake_conditioning_probability"] == 0.8075
+    assert contracts.conditioning_deployment == CONDITIONING_DISABLED_DEPLOYMENT
+
+
+def test_authenticate_accepts_flow_conditioning_wire_keys_for_a_conditioning_free_deployment(tmp_path):
+    manifest, normalization, recipe = _make_contracts()
+    recipe = _attach_flow_conditioning_wire_keys(_conditioning_trained_recipe(recipe))
+    hf_export, _dcp_checkpoint, _adapter_path = _write_hf_authenticated_fixture(
+        tmp_path, contracts=(manifest, normalization, recipe)
+    )
+
+    contracts = authenticate_isaac_checkpoint(
+        hf_export, conditioning_deployment=CONDITIONING_DISABLED_DEPLOYMENT
+    )
+
+    wire = contracts.inference_recipe["recipes"][0]["lowering"]["action_wire"]
+    assert wire["conditioning_token_group_name"] == "fast_action"
+
+
+def test_authenticate_still_refuses_conditioning_trained_recipe_without_a_declaration(tmp_path):
+    """No declaration keeps the historical refusal verbatim; the flag is not a default."""
+    manifest, normalization, recipe = _make_contracts()
+    recipe = _conditioning_trained_recipe(recipe)
+    hf_export, _dcp_checkpoint, _adapter_path = _write_hf_authenticated_fixture(
+        tmp_path, contracts=(manifest, normalization, recipe)
+    )
+
+    with pytest.raises(IsaacCheckpointImportError, match="does not implement"):
+        authenticate_isaac_checkpoint(hf_export)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"action_conditioning_probability": 1.0},
+        {"mistake_conditioning_probability": 1.0},
+    ],
+)
+def test_authenticate_refuses_always_conditioned_training_even_conditioning_free(tmp_path, overrides):
+    """probability >= 1 short-circuits the genesis Bernoulli gate: no unconditioned mode exists."""
+    manifest, normalization, recipe = _make_contracts()
+    recipe = _conditioning_trained_recipe(recipe, **overrides)
+    hf_export, _dcp_checkpoint, _adapter_path = _write_hf_authenticated_fixture(
+        tmp_path, contracts=(manifest, normalization, recipe)
+    )
+
+    with pytest.raises(IsaacCheckpointImportError, match="no unconditioned training mode"):
+        authenticate_isaac_checkpoint(hf_export, conditioning_deployment=CONDITIONING_DISABLED_DEPLOYMENT)
+
+
+@pytest.mark.parametrize(
+    "deployment",
+    [
+        IsaacConditioningDeployment(renders_action_conditioning=True, renders_mistake_conditioning=False),
+        IsaacConditioningDeployment(renders_action_conditioning=False, renders_mistake_conditioning=True),
+    ],
+)
+def test_authenticate_refuses_a_deployment_that_claims_to_render_conditioning(tmp_path, deployment):
+    """The import path never sets config.action_conditioning/mistake_conditioning."""
+    manifest, normalization, recipe = _make_contracts()
+    recipe = _conditioning_trained_recipe(recipe)
+    hf_export, _dcp_checkpoint, _adapter_path = _write_hf_authenticated_fixture(
+        tmp_path, contracts=(manifest, normalization, recipe)
+    )
+
+    with pytest.raises(IsaacCheckpointImportError, match="needs a conditioning-free deployment"):
+        authenticate_isaac_checkpoint(hf_export, conditioning_deployment=deployment)
+
+
+@pytest.mark.parametrize(
+    "deployment",
+    [
+        None,
+        IsaacConditioningDeployment(renders_action_conditioning=True, renders_mistake_conditioning=False),
+    ],
+)
+def test_authenticate_still_refuses_flow_conditioning_wire_keys_undeclared(tmp_path, deployment):
+    """Probabilities stay at zero so the wire-key rule, not the probability gate, is the one probed."""
+    manifest, normalization, recipe = _make_contracts()
+    recipe = _attach_flow_conditioning_wire_keys(_upgrade_recipe_to_schema7(recipe))
+    hf_export, _dcp_checkpoint, _adapter_path = _write_hf_authenticated_fixture(
+        tmp_path, contracts=(manifest, normalization, recipe)
+    )
+
+    with pytest.raises(IsaacCheckpointImportError, match="conditioning keys"):
+        authenticate_isaac_checkpoint(hf_export, conditioning_deployment=deployment)
+
+
+def test_isaac_import_cli_declares_the_conditioning_free_deployment(tmp_path, monkeypatch):
+    """The CLI is the only surface that can declare it: the adapter is immutable and hash-bound."""
+    from lerobot.scripts import lerobot_isaac_import
+
+    captured: dict[str, object] = {}
+
+    def _record_import(*args: object, **kwargs: object):
+        captured.update(kwargs)
+        return checkpoint_import.ImportedIsaacPackage(
+            output_path=tmp_path / "package",
+            policy_state_dataset="cloud/isaac_yam",
+            normalization_scope="libero_spatial",
+            objective="Flow",
+            provenance={},
+        )
+
+    monkeypatch.setattr(lerobot_isaac_import, "import_authenticated_isaac_checkpoint", _record_import)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "lerobot_isaac_import",
+            "--hf-export",
+            str(tmp_path / "export"),
+            "--output",
+            str(tmp_path / "package"),
+            "--policy-state-dataset",
+            "cloud/isaac_yam",
+            "--normalization-scope",
+            "libero_spatial",
+            "--deployment-adapter",
+            str(tmp_path / "adapter.json"),
+            "--conditioning-free-deployment",
+        ],
+    )
+
+    lerobot_isaac_import.main()
+
+    assert captured["conditioning_deployment"] == CONDITIONING_DISABLED_DEPLOYMENT
+
+
+def test_isaac_import_cli_leaves_the_declaration_unset_by_default(tmp_path, monkeypatch):
+    from lerobot.scripts import lerobot_isaac_import
+
+    captured: dict[str, object] = {}
+
+    def _record_import(*args: object, **kwargs: object):
+        captured.update(kwargs)
+        return checkpoint_import.ImportedIsaacPackage(
+            output_path=tmp_path / "package",
+            policy_state_dataset="cloud/isaac_yam",
+            normalization_scope="libero_spatial",
+            objective="Flow",
+            provenance={},
+        )
+
+    monkeypatch.setattr(lerobot_isaac_import, "import_authenticated_isaac_checkpoint", _record_import)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "lerobot_isaac_import",
+            "--hf-export",
+            str(tmp_path / "export"),
+            "--output",
+            str(tmp_path / "package"),
+            "--policy-state-dataset",
+            "cloud/isaac_yam",
+            "--normalization-scope",
+            "libero_spatial",
+            "--deployment-adapter",
+            str(tmp_path / "adapter.json"),
+        ],
+    )
+
+    lerobot_isaac_import.main()
+
+    assert captured["conditioning_deployment"] is None
