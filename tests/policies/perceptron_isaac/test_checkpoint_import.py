@@ -1716,6 +1716,163 @@ def test_import_rejects_normalization_the_runtime_cannot_reproduce(tmp_path, mon
         )
 
 
+def _make_mixed_capability_contracts() -> tuple[dict, dict, dict]:
+    """Authorize one deployable identity plus an identity trained without proprio normalization.
+
+    This is the shape of the real Genesis export: ``policy_normalization.json`` publishes one
+    entry per (dataset, scope, objective) that was ever trained -- the step-100000 bundle carries
+    3004 over 725 datasets -- and a handful of them declare ``proprio_normalized=false``. Those
+    entries are authenticated, sorted and digest-bound like every other entry; they are simply not
+    servable by the native runtime, and are never the identity being deployed.
+    """
+    manifest, normalization, recipe = _make_contracts()
+    compliant_entry = normalization["entries"][0]
+    compliant_recipe = recipe["recipes"][0]
+    compliant_identity = {
+        key: compliant_entry[key] for key in ("policy_state_dataset", "normalization_scope", "objective")
+    }
+    unsupported_identity = {
+        "policy_state_dataset": "cloud/isaac_partial",
+        "normalization_scope": "partial",
+        "objective": "Flow",
+    }
+    # Genesis nulls a channel's epsilon and quantile block when it did not normalize it.
+    unsupported_entry = {
+        **compliant_entry,
+        **unsupported_identity,
+        "proprio_normalized": False,
+        "proprio_normalization_eps": None,
+        "proprio": None,
+    }
+    unsupported_entry["stats_sha256"] = canonical_sha256(
+        {key: value for key, value in unsupported_entry.items() if key != "stats_sha256"}
+    )
+    unsupported_recipe = {**compliant_recipe, **unsupported_identity}
+    manifest["datasets"][unsupported_identity["policy_state_dataset"]] = {
+        **manifest["datasets"][compliant_identity["policy_state_dataset"]],
+        "normalization_identities": [
+            {
+                "normalization_scope": unsupported_identity["normalization_scope"],
+                "objective": unsupported_identity["objective"],
+            }
+        ],
+    }
+    manifest_digest = canonical_sha256(manifest)
+    # Entries and recipes are both ordered by the identity tuple, and "cloud/isaac_partial"
+    # sorts before "cloud/isaac_yam", so the unsupported entry is validated first -- exactly
+    # like index 1158 of the real bundle.
+    entries = [unsupported_entry, compliant_entry]
+    recipes = [unsupported_recipe, compliant_recipe]
+    normalization.update(
+        {
+            "policy_state_manifest_sha256": manifest_digest,
+            "entries": entries,
+            "entries_sha256": canonical_sha256(entries),
+            "coverage": {
+                "complete": True,
+                "observed": [unsupported_identity, compliant_identity],
+                "missing": [],
+            },
+        }
+    )
+    recipe.update(
+        {
+            "policy_state_manifest_sha256": manifest_digest,
+            "recipes": recipes,
+            "recipes_sha256": canonical_sha256(recipes),
+        }
+    )
+    return manifest, normalization, recipe
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ({"proprio_normalized": False}, "must be null when proprio_normalized is false"),
+        ({"action_normalized": False}, "must be null when action_normalized is false"),
+        ({"proprio_normalization_eps": None}, "proprio_normalization_eps must be a finite number"),
+        ({"action": None}, "action must be an object"),
+    ],
+    ids=[
+        "unnormalized_proprio_still_ships_stats",
+        "unnormalized_action_still_ships_stats",
+        "normalized_proprio_without_eps",
+        "normalized_action_without_stats",
+    ],
+)
+def test_authentication_requires_normalization_fields_to_match_their_flags(tmp_path, mutation, match):
+    """Genesis publishes a channel's epsilon and quantile block exactly when it normalized it.
+
+    Both directions must fail closed: a normalized channel without its epsilon or stats is
+    unservable, and an unnormalized channel that still ships them is a malformed artifact.
+    """
+    manifest, normalization, recipe = _make_contracts()
+    entry = {**normalization["entries"][0], **mutation}
+    entry["stats_sha256"] = canonical_sha256(
+        {key: value for key, value in entry.items() if key != "stats_sha256"}
+    )
+    normalization = {
+        **normalization,
+        "entries": [entry],
+        "entries_sha256": canonical_sha256([entry]),
+    }
+    hf_export, dcp_checkpoint, _adapter_path = _write_authenticated_fixture(
+        tmp_path, contracts=(manifest, normalization, recipe)
+    )
+
+    with pytest.raises(IsaacCheckpointImportError, match=match):
+        authenticate_isaac_checkpoint(hf_export, dcp_checkpoint)
+
+
+def test_authentication_accepts_bundle_whose_unselected_entry_is_unservable(tmp_path):
+    """An unrelated unservable entry must not veto authenticating a compliant identity."""
+    hf_export, dcp_checkpoint, adapter_path = _write_authenticated_fixture(
+        tmp_path, contracts=_make_mixed_capability_contracts()
+    )
+
+    contracts = authenticate_isaac_checkpoint(hf_export, dcp_checkpoint)
+
+    assert [entry["policy_state_dataset"] for entry in contracts.normalization["entries"]] == [
+        "cloud/isaac_partial",
+        "cloud/isaac_yam",
+    ]
+    adapter = validate_isaac_deployment_adapter(
+        adapter_path,
+        contracts=contracts,
+        policy_state_dataset="cloud/isaac_yam",
+        normalization_scope="yam",
+        objective="Flow",
+    )
+
+    assert adapter.normalization_entry["normalization_scope"] == "yam"
+    assert adapter.normalization_entry["action_normalized"] is True
+    assert adapter.normalization_entry["proprio_normalized"] is True
+
+
+def test_deployment_adapter_rejects_selected_entry_without_proprio_normalization(tmp_path):
+    """The capability rule still fails closed for the identity actually being deployed."""
+    hf_export, dcp_checkpoint, _compliant_adapter = _write_authenticated_fixture(
+        tmp_path, contracts=_make_mixed_capability_contracts()
+    )
+    adapter_path = _write_deployment_adapter(
+        tmp_path / f"partial_{ISAAC_DEPLOYMENT_ADAPTER_FILENAME}",
+        hf_export,
+        policy_state_dataset="cloud/isaac_partial",
+        normalization_scope="partial",
+        normalization_profile_id="synthetic/partial",
+    )
+    contracts = authenticate_isaac_checkpoint(hf_export, dcp_checkpoint)
+
+    with pytest.raises(IsaacCheckpointImportError, match="proprio_normalized"):
+        validate_isaac_deployment_adapter(
+            adapter_path,
+            contracts=contracts,
+            policy_state_dataset="cloud/isaac_partial",
+            normalization_scope="partial",
+            objective="Flow",
+        )
+
+
 def test_authenticated_import_builds_movable_lerobot_package(tmp_path, monkeypatch):
     manifest, normalization, recipe = _make_contracts()
     hf_export, dcp_checkpoint, adapter_path = _write_hf_authenticated_fixture(

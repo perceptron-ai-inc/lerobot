@@ -749,6 +749,33 @@ def _validate_manifest(raw: dict[str, Any]) -> tuple[dict[str, Any], set[tuple[s
     return raw, authorized
 
 
+def _validate_normalization_channel(
+    *,
+    normalized: Any,
+    eps: Any,
+    stats: Any,
+    expected_dim: int,
+    channel: str,
+    location: str,
+) -> None:
+    """Validate one channel's epsilon and quantile block against that channel's own flag.
+
+    Genesis publishes the epsilon and the effective-stats block for a channel only when it
+    normalized that channel -- the same shape as ``clip_normalized_max`` being null when clipping
+    is disabled -- so both are required when the flag is true and must be absent when it is false.
+    Whether an unnormalized channel can be *served* is a property of the deployment identity, and
+    is enforced for the selected entry by _require_runtime_supported_normalization.
+    """
+    if _require_bool(normalized, location=f"{location}.{channel}_normalized"):
+        _require_float(eps, location=f"{location}.{channel}_normalization_eps", positive=True)
+        _validate_effective_stats_block(stats, expected_dim=expected_dim, location=f"{location}.{channel}")
+    elif eps is not None or stats is not None:
+        raise IsaacCheckpointImportError(
+            f"{location}.{channel}_normalization_eps and {location}.{channel} must be null when "
+            f"{channel}_normalized is false."
+        )
+
+
 def _validate_normalization(
     raw: dict[str, Any],
     *,
@@ -813,31 +840,27 @@ def _validate_normalization(
             location=f"{location}.target_fps",
             positive=True,
         )
-        action_normalized = _require_bool(
-            entry["action_normalized"], location=f"{location}.action_normalized"
+        # Genesis publishes every identity it ever trained in one bundle (3004 entries over 725
+        # datasets at step 100000), including identities it trained without normalizing a
+        # channel. Such an entry is authenticated and digest-bound like any other; it simply
+        # cannot be served, which _require_runtime_supported_normalization decides for the one
+        # identity being deployed. Rejecting the whole bundle here would instead make every
+        # compliant identity in it unimportable.
+        _validate_normalization_channel(
+            normalized=entry["action_normalized"],
+            eps=entry["action_normalization_eps"],
+            stats=entry["action"],
+            expected_dim=action_dim,
+            channel="action",
+            location=location,
         )
-        proprio_normalized = _require_bool(
-            entry["proprio_normalized"], location=f"{location}.proprio_normalized"
-        )
-        if not action_normalized or not proprio_normalized:
-            raise IsaacCheckpointImportError(
-                f"Normalization entry {identity} must normalize both action and proprio for native ISAAC."
-            )
-        _require_float(
-            entry["action_normalization_eps"],
-            location=f"{location}.action_normalization_eps",
-            positive=True,
-        )
-        _require_float(
-            entry["proprio_normalization_eps"],
-            location=f"{location}.proprio_normalization_eps",
-            positive=True,
-        )
-        _validate_effective_stats_block(
-            entry["action"], expected_dim=action_dim, location=f"{location}.action"
-        )
-        _validate_effective_stats_block(
-            entry["proprio"], expected_dim=proprio_dim, location=f"{location}.proprio"
+        _validate_normalization_channel(
+            normalized=entry["proprio_normalized"],
+            eps=entry["proprio_normalization_eps"],
+            stats=entry["proprio"],
+            expected_dim=proprio_dim,
+            channel="proprio",
+            location=location,
         )
         clip_actions = _require_bool(
             entry["clip_normalized_actions"],
@@ -2021,7 +2044,18 @@ def _require_runtime_supported_normalization(entry: dict[str, Any]) -> None:
     hardcoded ``NATIVE_NORMALIZATION_EPS``. Importing such a checkpoint anyway would produce a
     package that unnormalizes deltas and commands them as absolute joint targets, so fail here
     rather than ship a silently wrong package.
+
+    The same applies to the ``action_normalized``/``proprio_normalized`` claims: the native stats
+    runtime always applies quantile normalization, so an identity Genesis trained unnormalized
+    cannot be served faithfully either.
     """
+    for field_name in ("action_normalized", "proprio_normalized"):
+        if entry[field_name] is not True:
+            raise IsaacCheckpointImportError(
+                f"Normalization entry declares {field_name}={entry[field_name]!r}, but the native "
+                "ISAAC runtime always normalizes action and proprio; this identity cannot be "
+                "served faithfully."
+            )
     representation = str(entry.get("action_representation"))
     if representation != "absolute":
         raise IsaacCheckpointImportError(
