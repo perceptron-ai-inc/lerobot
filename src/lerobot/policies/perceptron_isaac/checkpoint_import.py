@@ -1389,7 +1389,7 @@ def _validate_recipe_record(
     groups = rendering["reserved_token_groups"]
     if not isinstance(groups, list) or not groups:
         raise IsaacCheckpointImportError(f"{location}.rendering.reserved_token_groups must be non-empty.")
-    last_end = -1
+    spans: list[tuple[int, int]] = []
     fast_group_count = 0
     for group_index, group in enumerate(groups):
         group_location = f"{location}.rendering.reserved_token_groups[{group_index}]"
@@ -1406,13 +1406,20 @@ def _validate_recipe_record(
         tokenizer = group.get("tokenizer")
         if tokenizer is not None:
             tokenizer = _require_string(tokenizer, location=f"{group_location}.tokenizer")
-        if offset < last_end:
-            raise IsaacCheckpointImportError(
-                f"{location}.rendering.reserved_token_groups must be ordered and non-overlapping."
-            )
-        last_end = offset + size
+        spans.append((offset, offset + size))
         if tokenizer == DEFAULT_FAST_PROCESSOR_REPOSITORY and size == 2048:
             fast_group_count += 1
+    # Overlapping reserved ranges alias token ids and would silently mis-encode actions, so they
+    # stay rejected. Declaration order does not: mHarmony binds every group to its own explicit
+    # offset regardless of list position, and the shipped Isaac-0.5 export lists its FAST block
+    # before its lower-offset coord block. Sorting first is exactly what the canonical reader
+    # (mharmony_native.read_recipe_reserved_token_groups) already does, so the two agree.
+    spans.sort()
+    for (_, previous_end), (current_offset, _) in zip(spans, spans[1:], strict=False):
+        if current_offset < previous_end:
+            raise IsaacCheckpointImportError(
+                f"{location}.rendering.reserved_token_groups must be non-overlapping."
+            )
     if objective == "FAST" and fast_group_count != 1:
         raise IsaacCheckpointImportError(
             f"{location}.rendering for a FAST objective requires exactly one 2048-token "

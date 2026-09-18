@@ -301,7 +301,7 @@ def _write_contract_bundle(
         identity = bytes(len(identity))
     dcp.save(
         {POLICY_STATE_DCP_IDENTITY_KEY: torch.tensor(tuple(identity), dtype=torch.uint8)},
-        checkpoint_id=dcp_checkpoint,
+        storage_writer=dcp.FileSystemWriter(dcp_checkpoint, per_thread_copy_ahead=0),
     )
     for root in (hf_export, dcp_checkpoint):
         for filename, value in zip(_CONTRACT_FILENAMES, contracts, strict=True):
@@ -699,6 +699,56 @@ def test_authenticated_import_accepts_non_fast_reserved_group_for_flow_recipe(tm
     )
 
     authenticate_isaac_checkpoint(hf_export, dcp_checkpoint)
+
+
+def test_authenticated_import_accepts_shipped_fast_before_coord_group_order(tmp_path):
+    """The real Isaac-0.5 export lists its FAST group before its lower-offset coord group.
+
+    Those two blocks are exactly adjacent -- coord [248320, 249321) and FAST [249321, 251369) --
+    so nothing overlaps; only the JSON list order is descending. mHarmony binds each group to its
+    own declared offset regardless of position, so list order carries no meaning, and the shipped
+    checkpoint was trained with precisely these ids (isaac05_coord_tokens / isaac05_fast_tokens in
+    its own config.json, and MK1_FAST_TOKEN_OFFSET in mk1_checkpoint_contract).
+    """
+    manifest, normalization, recipe = _make_contracts()
+    recipe["recipes"][0]["rendering"]["reserved_token_groups"] = [
+        {
+            "name": None,
+            "offset": 249321,
+            "size": 2048,
+            "tokenizer": "physical-intelligence/fast",
+        },
+        {"name": "coord", "offset": 248320, "size": 1001},
+    ]
+    recipe["recipes_sha256"] = canonical_sha256(recipe["recipes"])
+    hf_export, dcp_checkpoint, _adapter_path = _write_authenticated_fixture(
+        tmp_path,
+        contracts=(manifest, normalization, recipe),
+    )
+
+    authenticate_isaac_checkpoint(hf_export, dcp_checkpoint)
+
+
+def test_authenticated_import_rejects_overlapping_reserved_groups(tmp_path):
+    """Overlapping reserved ranges alias token ids, so they must stay rejected in any list order."""
+    manifest, normalization, recipe = _make_contracts()
+    recipe["recipes"][0]["rendering"]["reserved_token_groups"] = [
+        {
+            "name": None,
+            "offset": 249321,
+            "size": 2048,
+            "tokenizer": "physical-intelligence/fast",
+        },
+        {"name": "coord", "offset": 249000, "size": 1001},
+    ]
+    recipe["recipes_sha256"] = canonical_sha256(recipe["recipes"])
+    hf_export, dcp_checkpoint, _adapter_path = _write_authenticated_fixture(
+        tmp_path,
+        contracts=(manifest, normalization, recipe),
+    )
+
+    with pytest.raises(IsaacCheckpointImportError, match="non-overlapping"):
+        authenticate_isaac_checkpoint(hf_export, dcp_checkpoint)
 
 
 def test_authenticated_import_rejects_deployment_profile_hash_drift(tmp_path):
