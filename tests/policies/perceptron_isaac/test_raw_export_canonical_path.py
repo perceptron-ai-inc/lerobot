@@ -32,6 +32,8 @@ from lerobot.policies.perceptron_isaac.isaac_stats import (
 from lerobot.policies.perceptron_isaac.mharmony_native import (
     IsaacMharmonyRenderMetadata,
     load_native_isaac_stats,
+    load_native_render_metadata,
+    read_recipe_reserved_token_groups,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import (
     PerceptronIsaacPolicy,
@@ -338,3 +340,172 @@ def test_settle_branch_keeps_serving_canned_actions_for_a_correct_policy(tmp_pat
     assert action.shape == (1, 7)
     assert torch.isfinite(action).all()
     assert policy._settle_index == 1
+
+
+# What the shipped step-100000 export declares in
+# policy_inference_recipe.json -> recipes[0].rendering.reserved_token_groups: the FAST pool
+# first at 249321 and the coord block second at 248320, i.e. descending offsets.
+SHIPPED_RESERVED_TOKEN_GROUPS = [
+    {"name": None, "offset": 249321, "size": 2048, "tokenizer": "physical-intelligence/fast"},
+    {"name": "coord", "offset": 248320, "size": 1001, "tokenizer": None},
+]
+
+
+def _write_inference_recipe(root: Path, groups: list[dict]) -> Path:
+    path = root / "policy_inference_recipe.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "recipes": [
+                    {
+                        "rendering": {
+                            "mharmony_encoding": "QWEN35_HARMONY",
+                            "reserved_token_groups": groups,
+                            "system_default_hints": [],
+                        }
+                    }
+                ],
+            }
+        )
+    )
+    return path
+
+
+def test_raw_export_render_metadata_takes_reserved_groups_from_the_recipe(tmp_path: Path) -> None:
+    """Item 4: the checkpoint's own recipe, not the config-derived default, names the blocks."""
+    root = tmp_path / "isaac_0_5-export"
+    policy_dir = _write_raw_isaac05_export(root)
+    _write_inference_recipe(root, SHIPPED_RESERVED_TOKEN_GROUPS)
+    config = _config(policy_dir)
+    assert config.native_render_metadata_path is None
+
+    metadata = load_native_render_metadata(config)
+
+    assert config.resolve_native_recipe_path() == str(root / "policy_inference_recipe.json")
+    assert metadata.mharmony_reserved_token_groups == SHIPPED_RESERVED_TOKEN_GROUPS
+    coord_groups = [group for group in metadata.mharmony_reserved_token_groups if group["name"] == "coord"]
+    assert len(coord_groups) == 1
+    assert (coord_groups[0]["offset"], coord_groups[0]["size"]) == (248320, 1001)
+    fast_groups = [
+        group
+        for group in metadata.mharmony_reserved_token_groups
+        if group["tokenizer"] == "physical-intelligence/fast"
+    ]
+    assert len(fast_groups) == 1
+    # The config-derived default omits the offset, which mHarmony bump-allocates to 248087.
+    assert (fast_groups[0]["offset"], fast_groups[0]["size"]) == (249321, 2048)
+
+
+def test_export_without_a_recipe_keeps_the_config_derived_groups(tmp_path: Path) -> None:
+    """Item 4: no recipe beside the package means today's behaviour, unchanged."""
+    root = tmp_path / "isaac_0_5-export"
+    policy_dir = _write_raw_isaac05_export(root)
+    config = _config(policy_dir)
+
+    metadata = load_native_render_metadata(config)
+
+    assert config.resolve_native_recipe_path() is None
+    assert metadata.mharmony_reserved_token_groups == [
+        {"tokenizer": "physical-intelligence/fast", "size": 2048}
+    ]
+
+
+def test_declared_render_metadata_path_still_wins_over_the_recipe(tmp_path: Path) -> None:
+    """Item 4: an importer-written package keeps pointing at its own sidecar."""
+    root = tmp_path / "isaac_0_5-export"
+    policy_dir = _write_raw_isaac05_export(root)
+    _write_inference_recipe(root, SHIPPED_RESERVED_TOKEN_GROUPS)
+    config = _config(policy_dir)
+    sidecar_groups = [{"name": "coord", "offset": 248320, "size": 1001, "tokenizer": None}]
+    sidecar = tmp_path / "native_render_metadata.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                **IsaacMharmonyRenderMetadata.from_config(config).to_json_dict(),
+                "mharmony_reserved_token_groups": sidecar_groups,
+            }
+        )
+    )
+    config.native_render_metadata_path = str(sidecar)
+
+    metadata = load_native_render_metadata(config)
+
+    assert metadata.mharmony_reserved_token_groups == sidecar_groups
+
+
+@pytest.mark.parametrize(
+    ("groups", "match"),
+    [
+        (
+            [
+                {"name": "coord", "offset": 248320, "size": 1001, "tokenizer": None},
+                {"name": "coord", "offset": 250000, "size": 1001, "tokenizer": None},
+            ],
+            "exactly one",
+        ),
+        (
+            [{"name": None, "size": 2048, "tokenizer": "physical-intelligence/fast"}],
+            "explicit offset",
+        ),
+        ([{"name": "coord", "offset": 248320, "size": "1001", "tokenizer": None}], "must be an integer"),
+        ([{"name": "coord", "offset": 248320, "size": 0, "tokenizer": None}], "must be >= 1"),
+        (
+            [
+                {"name": "coord", "offset": 248320, "size": 1001, "tokenizer": None},
+                {"name": None, "offset": 248400, "size": 2048, "tokenizer": "physical-intelligence/fast"},
+            ],
+            "overlap",
+        ),
+        ([], "non-empty list"),
+        (["coord"], "must be an object"),
+        ([{"name": "coord", "offset": 248320, "size": 1001, "extra": 1}], "unsupported keys"),
+    ],
+)
+def test_ambiguous_recipe_reserved_groups_are_refused(tmp_path: Path, groups, match: str) -> None:
+    """Item 4: a malformed or ambiguous group set never falls back to the default."""
+    root = tmp_path / "isaac_0_5-export"
+    policy_dir = _write_raw_isaac05_export(root)
+    recipe = _write_inference_recipe(root, groups)
+    config = _config(policy_dir)
+
+    with pytest.raises(ValueError, match=match):
+        read_recipe_reserved_token_groups(recipe)
+    with pytest.raises(ValueError, match=match):
+        load_native_render_metadata(config)
+
+
+def test_recipe_groups_stay_subject_to_the_checkpoint_cross_check(tmp_path: Path) -> None:
+    """Item 4: the recipe is read verbatim so config.json remains the independent check.
+
+    The reserved groups are reused from the canonical MK1 contract test rather than
+    rebuilt, because the cross-check being exercised is that contract's own rule.
+    """
+    from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
+        Mk1CheckpointContract,
+        Mk1CheckpointContractError,
+    )
+    from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config as _mk1_config
+
+    root = tmp_path / "isaac_0_5-export"
+    policy_dir = _write_raw_isaac05_export(root)
+    wrong_coord_range = [
+        {"name": None, "offset": 249321, "size": 2048, "tokenizer": "physical-intelligence/fast"},
+        {"name": "coord", "offset": 247000, "size": 1001, "tokenizer": None},
+    ]
+    _write_inference_recipe(root, wrong_coord_range)
+    config = _config(policy_dir)
+    contract = Mk1CheckpointContract.parse_allowlisted(_mk1_config(test_geometry=False))
+
+    metadata = load_native_render_metadata(config)
+
+    assert metadata.mharmony_reserved_token_groups == wrong_coord_range
+    with pytest.raises(Mk1CheckpointContractError, match="disagrees"):
+        contract.validate_coord_reserved_token_groups(metadata.mharmony_reserved_token_groups)
+
+    good_root = tmp_path / "good-export"
+    good_policy_dir = _write_raw_isaac05_export(good_root)
+    _write_inference_recipe(good_root, SHIPPED_RESERVED_TOKEN_GROUPS)
+    accepted = load_native_render_metadata(_config(good_policy_dir))
+
+    contract.validate_coord_reserved_token_groups(accepted.mharmony_reserved_token_groups)

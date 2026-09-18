@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,9 @@ DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS = (
         "size": 2048,
     },
 )
+# Genesis names the coordinate block by this exact marker
+# (genesis/data/mharmony/encoding_cache.py::COORD_GROUP_NAME).
+COORD_TOKEN_GROUP_NAME = "coord"  # nosec B105 - reserved-token group label, not a credential
 GENESIS_TEXT_TYPE_TAG = "genesis_text_type"
 GENESIS_TEXT_TYPE_TIMESTAMP = "timestamp"
 GENESIS_TEXT_TYPE_ACTION = "action"
@@ -394,6 +398,115 @@ def _validate_training_proprio_contract(
         raise ValueError("ISAAC training proprio components must cover the state exactly once.")
 
 
+RECIPE_RESERVED_GROUP_KEYS = frozenset({"name", "offset", "size", "tokenizer"})
+
+
+@dataclass(frozen=True)
+class ReservedTokenGroup:
+    """One mHarmony reserved-token block as a checkpoint's inference recipe declares it.
+
+    ``offset`` is required: mHarmony bump-allocates a group that omits it, so an
+    offset-less group does not name a fixed id range and cannot be checked against a
+    checkpoint's trained layout.
+    """
+
+    name: str | None
+    offset: int
+    size: int
+    tokenizer: str | None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "offset": self.offset, "size": self.size, "tokenizer": self.tokenizer}
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.size
+
+
+def _recipe_int(group: Mapping[str, Any], key: str, location: str, *, minimum: int) -> int:
+    value = group.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{location}.{key} must be an integer, got {value!r}.")
+    if value < minimum:
+        raise ValueError(f"{location}.{key} must be >= {minimum}, got {value}.")
+    return value
+
+
+def _recipe_optional_string(group: Mapping[str, Any], key: str, location: str) -> str | None:
+    value = group.get(key)
+    if value is None or isinstance(value, str):
+        return value
+    raise ValueError(f"{location}.{key} must be a string or null, got {value!r}.")
+
+
+def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
+    """Read the reserved-token groups a checkpoint's inference recipe declares.
+
+    Every malformed or ambiguous layout raises instead of falling back to a default:
+    a wrong group set is not a cosmetic problem. The config-derived default
+    (``DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS``) carries no coord block and no offset, so
+    mHarmony bump-allocates its FAST pool to id 248087 while an Isaac-0.5 checkpoint is
+    trained with that pool at 249321 -- a 1234-id shift that would silently mis-encode
+    every FAST action token if it were ever used in place of the real declaration.
+
+    Ordering is deliberately not constrained here: mHarmony resolves explicit offsets
+    order-independently, and the shipped export lists its FAST group before its coord
+    group. The checkpoint-range cross-check stays with
+    ``Mk1CheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
+    an artifact independent of this recipe.
+    """
+    location = "policy_inference_recipe.json"
+    raw = json.loads(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise ValueError(f"{location} must be a JSON object, got {type(raw).__name__}.")
+    recipes = raw.get("recipes")
+    if not isinstance(recipes, list) or not recipes or not isinstance(recipes[0], Mapping):
+        raise ValueError(f"{location}.recipes must be a non-empty list of objects.")
+    rendering = recipes[0].get("rendering")
+    if not isinstance(rendering, Mapping):
+        raise ValueError(f"{location}.recipes[0].rendering must be an object.")
+    raw_groups = rendering.get("reserved_token_groups")
+    if not isinstance(raw_groups, list) or not raw_groups:
+        raise ValueError(f"{location}.recipes[0].rendering.reserved_token_groups must be a non-empty list.")
+
+    groups: list[ReservedTokenGroup] = []
+    for index, raw_group in enumerate(raw_groups):
+        group_location = f"{location}.recipes[0].rendering.reserved_token_groups[{index}]"
+        if not isinstance(raw_group, Mapping):
+            raise ValueError(f"{group_location} must be an object.")
+        unknown = sorted(set(raw_group) - RECIPE_RESERVED_GROUP_KEYS)
+        if unknown:
+            raise ValueError(f"{group_location} has unsupported keys {unknown}.")
+        if "offset" not in raw_group:
+            raise ValueError(
+                f"{group_location} must declare an explicit offset; an offset-less group is "
+                "bump-allocated by mHarmony and so names no fixed id range."
+            )
+        groups.append(
+            ReservedTokenGroup(
+                name=_recipe_optional_string(raw_group, "name", group_location),
+                offset=_recipe_int(raw_group, "offset", group_location, minimum=0),
+                size=_recipe_int(raw_group, "size", group_location, minimum=1),
+                tokenizer=_recipe_optional_string(raw_group, "tokenizer", group_location),
+            )
+        )
+
+    coord_groups = [group for group in groups if group.name == COORD_TOKEN_GROUP_NAME]
+    if len(coord_groups) > 1:
+        raise ValueError(
+            f"{location} declares {len(coord_groups)} {COORD_TOKEN_GROUP_NAME!r} reserved-token "
+            "groups; exactly one names the coordinate block."
+        )
+    ordered = sorted(groups, key=lambda group: group.offset)
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        if current.offset < previous.end:
+            raise ValueError(
+                f"{location} reserved-token groups overlap: "
+                f"[{previous.offset}, {previous.end}) and [{current.offset}, {current.end})."
+            )
+    return [group.to_json_dict() for group in groups]
+
+
 def load_native_render_metadata(
     config: PerceptronIsaacConfig, *, stats_fps: float | None = None
 ) -> IsaacMharmonyRenderMetadata:
@@ -401,6 +514,12 @@ def load_native_render_metadata(
         metadata = IsaacMharmonyRenderMetadata.from_json_file(config.native_render_metadata_path)
     else:
         metadata = IsaacMharmonyRenderMetadata.from_config(config, stats_fps=stats_fps)
+        recipe_path = config.resolve_native_recipe_path()
+        if recipe_path is not None:
+            metadata = replace(
+                metadata,
+                mharmony_reserved_token_groups=read_recipe_reserved_token_groups(recipe_path),
+            )
     if stats_fps is not None and metadata.target_fps is None:
         metadata = replace(metadata, target_fps=float(stats_fps))
     metadata.validate_for_config(config)

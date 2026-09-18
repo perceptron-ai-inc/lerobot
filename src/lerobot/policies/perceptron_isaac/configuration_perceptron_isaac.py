@@ -29,6 +29,10 @@ from .mharmony_contract import SUPPORTED_MHARMONY_VERSION, normalize_mharmony_ve
 # self-contained and relocatable.
 NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
 
+# The inference recipe a Genesis export ships at its root. Its rendering block is the
+# checkpoint's own declaration of the mHarmony reserved-token layout it was trained with.
+NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
+
 
 def is_portable_isaac05_repository(model_dir: Path) -> bool:
     """True when ``model_dir`` is the root of a raw Isaac-0.5 export.
@@ -525,6 +529,20 @@ class PerceptronIsaacConfig(PreTrainedConfig):
             return str(declared)
         for root in self.checkpoint_asset_roots():
             candidate = root / NATIVE_STATS_EXPORT_FILENAME
+            if candidate.is_file():
+                return str(candidate)
+        return None
+
+    def resolve_native_recipe_path(self) -> str | None:
+        """Return the inference recipe shipped beside the package this config was loaded from.
+
+        A raw export keeps ``policy_inference_recipe.json`` at its root, next to the
+        ``lerobot_policy/`` package, exactly like ``isaac_stats.json``. An importer-written
+        package ships ``native_render_metadata.json`` instead, and a config with no
+        ``pretrained_path`` has no checkpoint to read, so both return ``None`` here.
+        """
+        for root in self.checkpoint_asset_roots():
+            candidate = root / NATIVE_RECIPE_EXPORT_FILENAME
             if candidate.is_file():
                 return str(candidate)
         return None
