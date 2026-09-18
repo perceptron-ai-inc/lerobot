@@ -509,3 +509,119 @@ def test_recipe_groups_stay_subject_to_the_checkpoint_cross_check(tmp_path: Path
     accepted = load_native_render_metadata(_config(good_policy_dir))
 
     contract.validate_coord_reserved_token_groups(accepted.mharmony_reserved_token_groups)
+
+
+RETAINED_TREE_SHA256 = "0" * 64
+
+
+def _retained_record(*, relative: str, root: Path, absolute: Path) -> dict[str, str]:
+    """Reproduce the retention-record shape ``_resolve_checkpoint_local_paths`` writes."""
+    return {"absolute": str(absolute), "relative": relative, "root": str(root)}
+
+
+def test_raw_export_resolves_a_retained_sibling_fast_processor_record(tmp_path: Path) -> None:
+    """lerobot_eval order: make_policy resolves and records the sibling asset first, so the
+    processor factory has to honour that record instead of re-refusing the '..' spelling."""
+    root = tmp_path / "isaac_0_5-export"
+    policy_dir = _write_raw_isaac05_export(root)
+    _save_packaged_pipelines(
+        policy_dir,
+        stats_path=root / "isaac_stats.json",
+        pack_overrides={"fast_processor_path": SIBLING_FAST_PROCESSOR_PATH},
+    )
+    config = _config(
+        policy_dir,
+        fast_processor_path=SIBLING_FAST_PROCESSOR_PATH,
+        fast_processor_tree_sha256=RETAINED_TREE_SHA256,
+    )
+    # The real producer of the record, called exactly as the policy load path calls it.
+    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, policy_dir)
+    record = config._checkpoint_relative_paths["fast_processor_path"]
+    assert record["relative"] == SIBLING_FAST_PROCESSOR_PATH
+    assert Path(record["absolute"]) == (root / "fast_processor_pinned").resolve()
+
+    preprocessor, _ = make_pre_post_processors(config, pretrained_path=str(policy_dir))
+
+    resolved = Path(_pack_step(preprocessor).fast_processor_path)
+    assert resolved.resolve() == (root / "fast_processor_pinned").resolve()
+    assert resolved.is_dir()
+
+
+def test_retained_record_still_refuses_a_sibling_asset_in_a_plain_package(tmp_path: Path) -> None:
+    """Guard: outside the raw-export layout the package root stays the only bound."""
+    policy_dir = tmp_path / "package"
+    policy_dir.mkdir()
+    sibling = tmp_path / "fast_processor_pinned"
+    sibling.mkdir()
+    stats_path = tmp_path / "isaac_stats.json"
+    _write_isaac_stats(stats_path)
+    _save_packaged_pipelines(
+        policy_dir,
+        stats_path=stats_path,
+        pack_overrides={"fast_processor_path": SIBLING_FAST_PROCESSOR_PATH},
+    )
+    config = _config(
+        policy_dir,
+        fast_processor_path=str(sibling.resolve()),
+        fast_processor_tree_sha256=RETAINED_TREE_SHA256,
+    )
+    config._checkpoint_relative_paths = {
+        "fast_processor_path": _retained_record(
+            relative=SIBLING_FAST_PROCESSOR_PATH, root=policy_dir, absolute=sibling.resolve()
+        )
+    }
+
+    with pytest.raises(RuntimeError, match="escapes its package"):
+        make_pre_post_processors(config, pretrained_path=str(policy_dir))
+
+
+def test_retained_record_still_refuses_a_target_outside_the_export_root(tmp_path: Path) -> None:
+    """Guard: a record cannot buy passage out of the raw export's own root."""
+    root = tmp_path / "isaac_0_5-export"
+    policy_dir = _write_raw_isaac05_export(root)
+    outside = tmp_path / "outside_fast_processor"
+    outside.mkdir()
+    _save_packaged_pipelines(
+        policy_dir,
+        stats_path=root / "isaac_stats.json",
+        pack_overrides={"fast_processor_path": "../../outside_fast_processor"},
+    )
+    config = _config(
+        policy_dir,
+        fast_processor_path=str(outside.resolve()),
+        fast_processor_tree_sha256=RETAINED_TREE_SHA256,
+    )
+    config._checkpoint_relative_paths = {
+        "fast_processor_path": _retained_record(
+            relative="../../outside_fast_processor", root=policy_dir, absolute=outside.resolve()
+        )
+    }
+
+    with pytest.raises(RuntimeError, match="escapes its package"):
+        make_pre_post_processors(config, pretrained_path=str(policy_dir))
+
+
+def test_retained_record_that_disagrees_with_the_config_is_refused(tmp_path: Path) -> None:
+    """Guard: the record must still describe the value the config actually carries."""
+    root = tmp_path / "isaac_0_5-export"
+    policy_dir = _write_raw_isaac05_export(root)
+    _save_packaged_pipelines(
+        policy_dir,
+        stats_path=root / "isaac_stats.json",
+        pack_overrides={"fast_processor_path": SIBLING_FAST_PROCESSOR_PATH},
+    )
+    config = _config(
+        policy_dir,
+        fast_processor_path=str((root / "fast_processor_pinned").resolve()),
+        fast_processor_tree_sha256=RETAINED_TREE_SHA256,
+    )
+    config._checkpoint_relative_paths = {
+        "fast_processor_path": _retained_record(
+            relative=SIBLING_FAST_PROCESSOR_PATH,
+            root=policy_dir,
+            absolute=root / "some_other_directory",
+        )
+    }
+
+    with pytest.raises(RuntimeError, match="Invalid retained processor path record"):
+        make_pre_post_processors(config, pretrained_path=str(policy_dir))

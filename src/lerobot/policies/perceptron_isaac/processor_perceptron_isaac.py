@@ -1734,8 +1734,16 @@ def _reconcile_training_action_frame_step(
     logging.info("Installed ISAAC v2 training action-frame transform before mharmony normalization.")
 
 
-def _resolve_retained_processor_path(raw: str, configured: str | None, record: Any) -> Path:
-    """Bind only the matching package-relative declaration to its retained owner."""
+def _resolve_retained_processor_path(raw: str, configured: str | None, record: Any, asset_root: Path) -> Path:
+    """Bind only the matching package-relative declaration to its retained owner.
+
+    Containment is checked against ``asset_root`` (the export root for a raw Isaac-0.5
+    layout, the package directory otherwise), the same bound the caller already applied,
+    and the record's stored absolute is compared in resolved form because the loader
+    records the resolved target of a sibling-relative declaration. For a non-portable
+    package ``asset_root`` is the package directory, so a sibling or outside target is
+    still refused.
+    """
     if (
         not isinstance(record, dict)
         or not isinstance(record.get("absolute"), str)
@@ -1751,11 +1759,10 @@ def _resolve_retained_processor_path(raw: str, configured: str | None, record: A
     if (
         relative.is_absolute()
         or not relative.parts
-        or ".." in relative.parts
         or not root.is_absolute()
-        or str(candidate) != record["absolute"]
-        or not candidate.resolve().is_relative_to(root.resolve())
         or not candidate.exists()
+        or candidate.resolve() != Path(record["absolute"]).resolve()
+        or not candidate.resolve().is_relative_to(asset_root.resolve())
     ):
         raise RuntimeError(f"Retained processor path escapes or mismatches its package: {raw!r}.")
     return candidate
@@ -1854,7 +1861,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                     raise RuntimeError(f"Serialized processor path {attribute} escapes its package: {raw}.")
                 if attribute in retained_paths:
                     candidate = _resolve_retained_processor_path(
-                        str(raw), configured_paths[attribute], retained_paths[attribute]
+                        str(raw), configured_paths[attribute], retained_paths[attribute], asset_root
                     )
                 if candidate.exists():
                     setattr(step, attribute, str(candidate))
