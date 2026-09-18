@@ -848,7 +848,7 @@ def test_resolve_retained_processor_path_rejects_invalid_provenance(tmp_path, in
         configured = str(link)
         record = {"relative": raw, "absolute": configured, "root": str(root)}
     with pytest.raises(RuntimeError, match="retained|Retained"):
-        _resolve_retained_processor_path(raw, configured, record)
+        _resolve_retained_processor_path(raw, configured, record, root)
 
 
 @pytest.mark.parametrize("retention", ["none", "runtime", "processors"])

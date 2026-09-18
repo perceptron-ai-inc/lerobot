@@ -416,6 +416,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                         "root": str(owner_snapshot.root),
                     }
             self.config._checkpoint_relative_paths = rebound_paths
+            self.config._pretrained_processor_root = str(snapshot.root)
             self._set_checkpoint_local_vocab_path(self.config, force=True)
         except BaseException:
             snapshot.cleanup()
