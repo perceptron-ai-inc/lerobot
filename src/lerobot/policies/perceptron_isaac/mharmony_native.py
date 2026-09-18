@@ -424,7 +424,7 @@ class IsaacMharmonyContentPlan:
 
 
 def load_native_isaac_stats(config: PerceptronIsaacConfig) -> IsaacNormalizationStats:
-    stats_path = config.native_stats_path or config.stats_path
+    stats_path = config.resolve_native_stats_path()
     if not stats_path:
         raise RuntimeError(
             "Perceptron Isaac inference_backend='native_mharmony' requires native_stats_path "

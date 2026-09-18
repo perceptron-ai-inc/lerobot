@@ -45,7 +45,10 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-from .configuration_perceptron_isaac import PerceptronIsaacConfig
+from .configuration_perceptron_isaac import (
+    PerceptronIsaacConfig,
+    is_portable_isaac05_repository,
+)
 from .fast_processor import load_fast_action_processor
 from .isaac_stats import (
     IsaacNormalizationStats,
@@ -1430,7 +1433,7 @@ def make_perceptron_isaac_pre_post_processors(
     render_step_class: type[PerceptronIsaacRenderProcessorStep] = PerceptronIsaacMharmonyPackProcessorStep
     render_step_kwargs = {
         "native_render_metadata_path": config.native_render_metadata_path,
-        "native_stats_path": config.native_stats_path,
+        "native_stats_path": config.resolve_native_stats_path(),
         "fast_processor_path": config.fast_processor_path,
         "fast_processor_tree_sha256": config.fast_processor_tree_sha256,
         "mharmony_version": config.mharmony_version,
@@ -1601,7 +1604,7 @@ def _require_restored_stats_match_config_paths(
                 f"{name_a} and {name_b} serialized different stats values: {'; '.join(diffs)}."
             )
 
-    stats_path = config.native_stats_path or config.stats_path
+    stats_path = config.resolve_native_stats_path()
     if not stats_path:
         return
     path = Path(str(stats_path))
@@ -1758,6 +1761,23 @@ def _resolve_retained_processor_path(raw: str, configured: str | None, record: A
     return candidate
 
 
+def _package_asset_root(pretrained_path: str | Path) -> Path:
+    """Return the directory that actually holds a loaded package's assets.
+
+    A raw Isaac-0.5 export stores ``fast_processor_pinned/``,  ``isaac_stats.json``
+    and ``policy_normalization.json`` beside ``lerobot_policy/``, which is why its
+    serialized processor paths are sibling-relative. Resolution therefore uses the
+    export root for that layout and the package directory for every other one; the
+    containment check below is applied to whichever root is in force, so paths that
+    leave it are still refused.
+    """
+    package_root = Path(pretrained_path)
+    export_root = package_root.parent
+    if is_portable_isaac05_repository(export_root):
+        return export_root
+    return package_root
+
+
 def make_perceptron_isaac_pre_post_processors_from_pretrained(
     config: PerceptronIsaacConfig,
     pretrained_path: str,
@@ -1809,6 +1829,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     _reconcile_training_action_frame_step(preprocessor, config)
     _reconcile_normalization_recipe(preprocessor, postprocessor, config)
     package_root = Path(pretrained_path)
+    asset_root = _package_asset_root(package_root)
     # Retention records are runtime-only config metadata, not dataclass fields.
     retained_paths = getattr(config, "_checkpoint_relative_paths", {})
     configured_paths = {
@@ -1829,9 +1850,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                 if not raw or Path(str(raw)).is_absolute():
                     continue
                 candidate = package_root / str(raw)
-                if ".." in Path(str(raw)).parts or not candidate.resolve().is_relative_to(
-                    package_root.resolve()
-                ):
+                if not candidate.resolve().is_relative_to(asset_root.resolve()):
                     raise RuntimeError(f"Serialized processor path {attribute} escapes its package: {raw}.")
                 if attribute in retained_paths:
                     candidate = _resolve_retained_processor_path(
@@ -1839,7 +1858,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                     )
                 if candidate.exists():
                     setattr(step, attribute, str(candidate))
-        normalization_path = package_root / "policy_normalization.json"
+        normalization_path = asset_root / "policy_normalization.json"
         for step in preprocessor.steps:
             if (
                 not isinstance(step, PerceptronIsaacMharmonyPackProcessorStep)

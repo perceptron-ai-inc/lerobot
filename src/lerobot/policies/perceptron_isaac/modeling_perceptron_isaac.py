@@ -37,7 +37,10 @@ from .checkpoint_integrity import (
     require_sha256,
     snapshot_directory,
 )
-from .configuration_perceptron_isaac import PerceptronIsaacConfig
+from .configuration_perceptron_isaac import (
+    PerceptronIsaacConfig,
+    is_portable_isaac05_repository,
+)
 from .isaac_stats import (
     IsaacNormalizationStats,
     normalize_isaac_actions,
@@ -122,17 +125,6 @@ def _verify_sha256(
             mismatch_error = mismatch_error(expected, actual)
         raise RuntimeError(mismatch_error or f"{context} mismatch: expected {expected}, found {actual}.")
     return expected
-
-
-def _is_portable_isaac05_repository(model_dir: Path) -> bool:
-    config_path = model_dir / "config.json"
-    if not config_path.is_file():
-        return False
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    return isinstance(config, dict) and config.get("model_type") == "isaac_0_5"
 
 
 class PerceptronIsaacPolicy(PreTrainedPolicy):
@@ -985,7 +977,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         allow_test_geometry = self.config.artifact_kind == "neutral_debug"
         # Isaac-0.5 exports store F32 source tensors, not an F32 inference runtime.
         # Keep legacy MK1 storage strict and route both formats through native validation.
-        storage_dtypes = frozenset({"F32" if _is_portable_isaac05_repository(model_dir) else "BF16"})
+        storage_dtypes = frozenset({"F32" if is_portable_isaac05_repository(model_dir) else "BF16"})
         try:
             contract, _ = validate_mk1_checkpoint(
                 model_dir,
@@ -1142,6 +1134,25 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 self.config,
                 stats_fps=self._stats.target_fps,
             )
+        self._require_render_asset_prerequisites()
+
+    def _require_render_asset_prerequisites(self) -> None:
+        """Reject a renderer whose configured assets are missing, on the first call.
+
+        The settle branch returns a canned idle action without touching the renderer,
+        so a policy configured with an unresolvable render asset would otherwise serve
+        ``num_settle_steps`` plausible-looking actions before the first genuine forward
+        discovered the problem. Every serving entry point runs this method first, so
+        the failure now lands on call #0 while settle behaviour for a correctly
+        configured policy is unchanged.
+        """
+        fast_processor_path = self.config.fast_processor_path
+        if fast_processor_path is None or Path(fast_processor_path).is_dir():
+            return
+        raise RuntimeError(
+            "Perceptron Isaac renderer cannot serve an action: configured "
+            f"fast_processor_path={fast_processor_path!r} is not a directory."
+        )
 
     def _ensure_renderer(self) -> None:
         """Compatibility hook for callers/tests: rendering is owned by processors."""
@@ -1684,7 +1695,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             previous_qwen_package.cleanup()
             delattr(config, "_qwen35_verified_package")
         model_path = getattr(config, "hf_model_path", None)
-        if model_path is not None and _is_portable_isaac05_repository(Path(model_path)):
+        if model_path is not None and is_portable_isaac05_repository(Path(model_path)):
             expected_adapter = getattr(config, "deployment_adapter_sha256", None)
             if not expected_adapter:
                 raise RuntimeError("Portable Isaac-0.5 package requires deployment_adapter_sha256.")
@@ -2407,7 +2418,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 if (
                     expected_portable_path is not None
                     and resolved_portable_path == expected_portable_path
-                    and _is_portable_isaac05_repository(portable_parent)
+                    and is_portable_isaac05_repository(portable_parent)
                 ):
                     absolute = str(resolved_portable_path)
                     relative_paths[attr] = {

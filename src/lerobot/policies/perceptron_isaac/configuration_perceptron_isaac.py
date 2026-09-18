@@ -6,6 +6,7 @@ the joint text/FAST/flow training loss. Genesis bridge rendering and loss paths
 are intentionally unsupported.
 """
 
+import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,25 @@ from .mharmony_contract import SUPPORTED_MHARMONY_VERSION, normalize_mharmony_ve
 # PerceptronIsaacPolicy.resolve_checkpoint_config_paths), keeping the package
 # self-contained and relocatable.
 NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
+
+
+def is_portable_isaac05_repository(model_dir: Path) -> bool:
+    """True when ``model_dir`` is the root of a raw Isaac-0.5 export.
+
+    Such an export nests the LeRobot policy package in ``lerobot_policy/`` and keeps
+    its documented assets (``fast_processor_pinned/``, ``isaac_stats.json``,
+    ``policy_normalization.json``) at this root, so anything resolving paths for a
+    package loaded from ``<root>/lerobot_policy`` has to recognise the root.
+    """
+    config_path = model_dir / "config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(config, dict) and config.get("model_type") == "isaac_0_5"
+
 
 # Per-suite routing tables, copied next to config.json at save time for the same reason and
 # resolved by the same hook. Training-time inputs rather than serving sidecars, but a config
@@ -474,6 +494,40 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                     f"expected={expected}, got={names}. Only reviewed semantic aliases are accepted; "
                     "different layouts require an explicit dataset transform."
                 )
+
+    def checkpoint_asset_roots(self) -> tuple[Path, ...]:
+        """Directories that can hold this policy's checkpoint-local sidecars.
+
+        ``pretrained_path`` is the policy package, which for a raw Isaac-0.5 export is
+        ``<root>/lerobot_policy`` while the documented sidecars sit at ``<root>``.
+        """
+        if self.pretrained_path is None:
+            return ()
+        package_root = Path(self.pretrained_path)
+        if not package_root.is_dir():
+            return ()
+        export_root = package_root.parent
+        if is_portable_isaac05_repository(export_root):
+            return (package_root, export_root)
+        return (package_root,)
+
+    def resolve_native_stats_path(self) -> str | None:
+        """Return the normalization stats path this config can actually load.
+
+        The declared fields win, so an importer-written package keeps pointing at its
+        own sidecar. A raw export declares neither, so fall back to the conventional
+        ``isaac_stats.json`` beside the package it was loaded from: the same filename
+        ``_save_pretrained`` writes, carrying the same quantiles the packaged
+        processor state file holds.
+        """
+        declared = self.native_stats_path or self.stats_path
+        if declared:
+            return str(declared)
+        for root in self.checkpoint_asset_roots():
+            candidate = root / NATIVE_STATS_EXPORT_FILENAME
+            if candidate.is_file():
+                return str(candidate)
+        return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
         """Write config.json, exporting checkpoint-local sidecars when known.
