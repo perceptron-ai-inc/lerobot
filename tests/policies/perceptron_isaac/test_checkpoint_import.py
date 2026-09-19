@@ -38,6 +38,7 @@ from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     PerceptronIsaacActionUnnormalizeProcessorStep,
     PerceptronIsaacMharmonyPackProcessorStep,
 )
+from lerobot.policies.perceptron_isaac.qwen35_checkpoint import QWEN35_IMPORT_PROVENANCE_SCHEMA
 from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
     _config as _mk1_config,
     _write_checkpoint as _write_mk1_checkpoint,
@@ -1925,6 +1926,107 @@ def test_deployment_adapter_rejects_selected_entry_without_proprio_normalization
         )
 
 
+def _camera_profile(observation_keys: list[str], prompt_views: list[str]) -> dict:
+    """A deployment profile that differs from the fixture only in its camera arity."""
+    return {
+        "robot_type": "franka",
+        "camera": {"observation_keys": observation_keys, "prompt_views": prompt_views},
+        "state_action_schema": {
+            "name": "gripper_7",
+            "control_mode": "ee",
+            "components": ["world_vector", "rotation_delta", "gripper_closedness_action"],
+        },
+        "normalization": None,
+    }
+
+
+def _validate_camera_profile(observation_keys: list[str], prompt_views: list[str]) -> None:
+    profile = _camera_profile(observation_keys, prompt_views)
+    checkpoint_import._validate_deployment_profile(
+        profile,
+        manifest_record={"deployment_profile_hash": canonical_sha256(profile)},
+        location="inference_recipe.recipes[1148].deployment_profile",
+    )
+
+
+def test_deployment_profile_accepts_cameras_sharing_one_deduplicated_prompt_view():
+    # The real berkeley_cable_routing record: wrist225_image and wrist45_image share the
+    # mount label "wrist", which genesis deduplicates into a single prompt view.
+    _validate_camera_profile(
+        ["image", "top_image", "wrist225_image", "wrist45_image"],
+        ["primary", "external_high", "wrist"],
+    )
+
+
+def test_deployment_profile_rejects_more_prompt_views_than_cameras():
+    with pytest.raises(IsaacCheckpointImportError, match="more prompt views than camera"):
+        _validate_camera_profile(
+            ["image", "top_image", "wrist225_image", "wrist45_image"],
+            ["primary", "external_high", "wrist", "left_wrist", "right_wrist"],
+        )
+
+
+def test_deployment_profile_rejects_duplicate_prompt_views():
+    with pytest.raises(IsaacCheckpointImportError, match="prompt_views must not contain duplicates"):
+        _validate_camera_profile(
+            ["image", "top_image", "wrist225_image", "wrist45_image"],
+            ["primary", "wrist", "wrist"],
+        )
+
+
+def _validate_normalization_profile(normalization: dict | None) -> None:
+    profile = _camera_profile(["image", "wrist_image"], ["primary", "wrist"])
+    profile["normalization"] = normalization
+    checkpoint_import._validate_deployment_profile(
+        profile,
+        manifest_record={"deployment_profile_hash": canonical_sha256(profile)},
+        location="inference_recipe.recipes[2754].deployment_profile",
+    )
+
+
+def test_deployment_profile_accepts_boolean_normalization_switches():
+    # The real nitrogen_shuffled record: genesis emits the switches as booleans.
+    _validate_normalization_profile({"action": False, "proprio": False})
+
+
+def test_deployment_profile_accepts_null_normalization_switches():
+    _validate_normalization_profile({"action": None, "proprio": None})
+
+
+def test_deployment_profile_rejects_string_normalization_switches():
+    with pytest.raises(IsaacCheckpointImportError, match="normalization.action must be a boolean"):
+        _validate_normalization_profile({"action": "q01_q99", "proprio": False})
+
+
+def test_authenticated_import_records_a_declared_conditioning_free_deployment(tmp_path, monkeypatch):
+    manifest, normalization, recipe = _make_contracts()
+    hf_export, dcp_checkpoint, adapter_path = _write_hf_authenticated_fixture(
+        tmp_path, contracts=(manifest, normalization, recipe)
+    )
+    output = tmp_path / "isaac_lerobot_conditioning_free"
+
+    fast_artifact = _write_fast_processor_fixture(tmp_path)
+    _allow_synthetic_fast_artifact(monkeypatch, fast_artifact)
+    import_authenticated_isaac_checkpoint(
+        hf_export,
+        dcp_checkpoint,
+        output,
+        policy_state_dataset="cloud/isaac_yam",
+        normalization_scope="yam",
+        deployment_adapter_path=adapter_path,
+        fast_processor_source=fast_artifact,
+        allow_fast_remote_code=True,
+        conditioning_deployment=CONDITIONING_DISABLED_DEPLOYMENT,
+    )
+
+    provenance = json.loads((output / "isaac_import_provenance.json").read_text())
+    assert provenance["schema"] == QWEN35_IMPORT_PROVENANCE_SCHEMA
+    assert provenance["conditioning_deployment"] == {
+        "renders_action_conditioning": False,
+        "renders_mistake_conditioning": False,
+    }
+
+
 def test_authenticated_import_builds_movable_lerobot_package(tmp_path, monkeypatch):
     manifest, normalization, recipe = _make_contracts()
     hf_export, dcp_checkpoint, adapter_path = _write_hf_authenticated_fixture(
@@ -1981,6 +2083,10 @@ def test_authenticated_import_builds_movable_lerobot_package(tmp_path, monkeypat
     assert json.loads((output / "hf_model/vocab.json").read_text()) == {"!": 0, '"': 1}
     assert fast_processor_tree_identity(output / "fast_processor")[0] == config.fast_processor_tree_sha256
     provenance = json.loads((output / "isaac_import_provenance.json").read_text())
+    assert provenance["schema"] == QWEN35_IMPORT_PROVENANCE_SCHEMA
+    # No declaration was required for this recipe, which the record states as null rather
+    # than as a conditioning-free declaration the caller never made.
+    assert provenance["conditioning_deployment"] is None
     assert provenance["contract_authentication"] == "hf_and_dcp_identity_authenticated"
     assert provenance["policy_state_identity_source"] == "hf_and_dcp_identity_authenticated"
     assert len(provenance["source_artifact_manifest_sha256"]) == 64

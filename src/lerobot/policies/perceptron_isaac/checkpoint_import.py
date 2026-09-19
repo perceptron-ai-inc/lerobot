@@ -290,6 +290,13 @@ class IsaacConditioningDeployment:
     renders_action_conditioning: bool
     renders_mistake_conditioning: bool
 
+    def to_provenance_record(self) -> dict[str, bool]:
+        """Return the closed two-flag record written into the imported package's provenance."""
+        return {
+            "renders_action_conditioning": self.renders_action_conditioning,
+            "renders_mistake_conditioning": self.renders_mistake_conditioning,
+        }
+
 
 CONDITIONING_DISABLED_DEPLOYMENT = IsaacConditioningDeployment(
     renders_action_conditioning=False,
@@ -613,6 +620,10 @@ def _require_bool(value: Any, *, location: str) -> bool:
     if not isinstance(value, bool):
         raise IsaacCheckpointImportError(f"{location} must be a boolean.")
     return value
+
+
+def _require_optional_bool(value: Any, *, location: str) -> bool | None:
+    return None if value is None else _require_bool(value, location=location)
 
 
 def _require_int(value: Any, *, location: str, minimum: int | None = None) -> int:
@@ -1043,9 +1054,20 @@ def _validate_deployment_profile(
             location=f"{location}.camera.prompt_views",
             nonempty=True,
         )
-        if len(observation_keys) != len(prompt_views):
+        # Genesis labels each camera with ``view.mount or view.name`` and then deduplicates
+        # with ``unique_strs_in_order``
+        # (genesis/core/datasets/augment/robotics/config.py:367-377, emitted into the profile
+        # at :1265-1267), so two cameras sharing one mount collapse into a single label.
+        # prompt_views is therefore a deduplicated label set, not a per-camera channel, and
+        # equal length is only a coincidence of distinct mounts. Nothing downstream pairs the
+        # two positionally: the renderer iterates camera_order for images and emits the views
+        # as one flat ``camera_views: [...]`` prompt line. The served embodiment still requires
+        # strict 1:1, enforced against the reviewed adapter in
+        # ``validate_isaac_deployment_adapter``. Uniqueness of the labels is already
+        # required by ``_require_string_list`` above.
+        if len(prompt_views) > len(observation_keys):
             raise IsaacCheckpointImportError(
-                f"{location}.camera observation keys and prompt views must have equal length."
+                f"{location}.camera declares more prompt views than camera observation keys."
             )
     schema = raw["state_action_schema"]
     if not isinstance(schema, dict):
@@ -1063,8 +1085,12 @@ def _validate_deployment_profile(
         if not isinstance(normalization, dict):
             raise IsaacCheckpointImportError(f"{location}.normalization must be null or an object.")
         _exact_keys(normalization, {"action", "proprio"}, location=f"{location}.normalization")
-        _require_optional_string(normalization["action"], location=f"{location}.normalization.action")
-        _require_optional_string(normalization["proprio"], location=f"{location}.normalization.proprio")
+        # Genesis declares both switches as ``bool | None`` and coerces any non-bool to None
+        # (genesis/core/datasets/augment/robotics/config.py:285-287 and :817-826), so a string
+        # is unrepresentable here. The value states whether the stream was normalized; the
+        # served normalization itself comes from the separate normalization bundle.
+        _require_optional_bool(normalization["action"], location=f"{location}.normalization.action")
+        _require_optional_bool(normalization["proprio"], location=f"{location}.normalization.proprio")
     if not hmac.compare_digest(
         canonical_sha256(raw),
         manifest_record["deployment_profile_hash"],
@@ -2785,6 +2811,13 @@ def _build_validated_isaac_package_from_snapshot(
             "policy_state_dataset": policy_state_dataset,
             "normalization_scope": normalization_scope,
             "objective": objective,
+            # Null records that this recipe required no declaration at all, which is a
+            # different fact from an explicit conditioning-free deployment.
+            "conditioning_deployment": (
+                None
+                if contracts.conditioning_deployment is None
+                else contracts.conditioning_deployment.to_provenance_record()
+            ),
             "source_hashes": contracts.source_hashes,
             "deployment_adapter": {
                 "filename": ISAAC_DEPLOYMENT_ADAPTER_FILENAME,

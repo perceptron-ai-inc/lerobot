@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,10 @@ QWEN35_IMPORT_PROVENANCE_FILE = "isaac_import_provenance.json"
 QWEN35_CONVERSION_PROVENANCE_FILE = "rmsnorm_conversion.json"
 QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE = "source_rmsnorm_conversion.json"
 QWEN35_WEIGHT_CONVENTION_FILE = "qwen35_weight_convention.json"
-QWEN35_IMPORT_PROVENANCE_SCHEMA = "perceptron_isaac_import_provenance_v2"
+# v3 adds the importing caller's conditioning declaration. v2 packages predate that field
+# and stay loadable; every accepted version keeps its own closed, exhaustively checked key set.
+QWEN35_IMPORT_PROVENANCE_SCHEMA_V2 = "perceptron_isaac_import_provenance_v2"
+QWEN35_IMPORT_PROVENANCE_SCHEMA = "perceptron_isaac_import_provenance_v3"
 QWEN35_CONVERSION_PROVENANCE_SCHEMA = "perceptron_isaac_rmsnorm_conversion_v2"
 QWEN35_WEIGHT_CONVENTION_SCHEMA = "perceptron_isaac_qwen35_weight_convention_v1"
 QWEN35_NATIVE_RMSNORM_CONVENTION = "native_unit_offset"
@@ -65,7 +68,7 @@ QWEN35_IMPORTED_RUNTIME_ROOT_ENTRIES = frozenset(
     }
 )
 
-_IMPORT_PROVENANCE_KEYS = {
+_IMPORT_PROVENANCE_KEYS_V2 = {
     "schema",
     "contract_authentication",
     "dcp_identity_sha256",
@@ -80,6 +83,11 @@ _IMPORT_PROVENANCE_KEYS = {
     "rmsnorm_conversion",
     "fast_processor",
 }
+_IMPORT_PROVENANCE_KEYS_BY_SCHEMA: Mapping[str, set[str]] = {
+    QWEN35_IMPORT_PROVENANCE_SCHEMA_V2: _IMPORT_PROVENANCE_KEYS_V2,
+    QWEN35_IMPORT_PROVENANCE_SCHEMA: _IMPORT_PROVENANCE_KEYS_V2 | {"conditioning_deployment"},
+}
+_CONDITIONING_DEPLOYMENT_KEYS = {"renders_action_conditioning", "renders_mistake_conditioning"}
 _CONVERSION_PROVENANCE_KEYS = {
     "schema",
     "algorithm",
@@ -317,6 +325,22 @@ def _canonical_hf_model(package_root: str | Path, hf_model_dir: str | Path | Non
     return root, hf_model
 
 
+def _validate_conditioning_deployment(value: Any, *, context: str) -> None:
+    """Validate a v3 conditioning declaration: null, or a closed pair of boolean flags.
+
+    Null records that the imported recipe required no declaration. That is a different
+    fact from an explicitly conditioning-free deployment, so the two are never collapsed.
+    """
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{context} must be null or an object.")
+    _exact_keys(value, _CONDITIONING_DEPLOYMENT_KEYS, context=context)
+    for key in sorted(_CONDITIONING_DEPLOYMENT_KEYS):
+        if not isinstance(value[key], bool):
+            raise RuntimeError(f"{context} {key} must be a boolean.")
+
+
 def verify_qwen35_imported_package(
     package_root: str | Path,
     *,
@@ -337,9 +361,19 @@ def verify_qwen35_imported_package(
     except ValueError as exc:
         raise RuntimeError(f"Malformed Qwen3.5 import provenance: {exc}") from exc
 
-    _exact_keys(provenance, _IMPORT_PROVENANCE_KEYS, context="Qwen3.5 import provenance")
-    if provenance["schema"] != QWEN35_IMPORT_PROVENANCE_SCHEMA:
+    schema = provenance.get("schema")
+    if not isinstance(schema, str) or schema not in _IMPORT_PROVENANCE_KEYS_BY_SCHEMA:
         raise RuntimeError(f"Unsupported Qwen3.5 import provenance at {provenance_path}.")
+    _exact_keys(
+        provenance,
+        _IMPORT_PROVENANCE_KEYS_BY_SCHEMA[schema],
+        context="Qwen3.5 import provenance",
+    )
+    if schema == QWEN35_IMPORT_PROVENANCE_SCHEMA:
+        _validate_conditioning_deployment(
+            provenance["conditioning_deployment"],
+            context="Qwen3.5 import provenance conditioning_deployment",
+        )
     authentication = provenance["contract_authentication"]
     if authentication not in _CONTRACT_AUTHENTICATION_VALUES:
         raise RuntimeError("Qwen3.5 import provenance has invalid contract_authentication.")

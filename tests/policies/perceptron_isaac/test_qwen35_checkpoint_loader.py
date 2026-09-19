@@ -18,6 +18,7 @@ from lerobot.policies.perceptron_isaac.qwen35_checkpoint import (
     QWEN35_CONVERSION_PROVENANCE_SCHEMA,
     QWEN35_IMPORT_PROVENANCE_FILE,
     QWEN35_IMPORT_PROVENANCE_SCHEMA,
+    QWEN35_IMPORT_PROVENANCE_SCHEMA_V2,
     QWEN35_PACKAGED_SOURCE_FILENAMES,
     QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
     QWEN35_VOCAB_ALGORITHM,
@@ -136,6 +137,7 @@ def _write_imported_package(root: Path) -> Path:
         "policy_state_dataset": "fixture/qwen35",
         "normalization_scope": "fixture",
         "objective": "Flow",
+        "conditioning_deployment": None,
         "source_hashes": source_hashes,
         "deployment_adapter": {
             "filename": adapter.name,
@@ -424,7 +426,7 @@ def test_direct_loader_rejects_unbound_model_entry_before_snapshot_copy(tmp_path
         load_qwen35_vla_from_hf(hf_model)
 
 
-def test_import_provenance_requires_complete_v2_schema(tmp_path: Path) -> None:
+def test_import_provenance_requires_every_key_of_its_schema(tmp_path: Path) -> None:
     _write_imported_package(tmp_path)
     provenance_path = tmp_path / QWEN35_IMPORT_PROVENANCE_FILE
     provenance = json.loads(provenance_path.read_text())
@@ -432,6 +434,87 @@ def test_import_provenance_requires_complete_v2_schema(tmp_path: Path) -> None:
     provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
 
     with pytest.raises(RuntimeError, match="keys mismatch.*dcp_identity_sha256"):
+        verify_qwen35_imported_package(tmp_path)
+
+
+def _rewrite_provenance(root: Path, provenance: dict) -> None:
+    (root / QWEN35_IMPORT_PROVENANCE_FILE).write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def _load_provenance(root: Path) -> dict:
+    return json.loads((root / QWEN35_IMPORT_PROVENANCE_FILE).read_text())
+
+
+def test_import_provenance_accepts_a_legacy_v2_record_without_a_conditioning_field(
+    tmp_path: Path,
+) -> None:
+    _write_imported_package(tmp_path)
+    provenance = _load_provenance(tmp_path)
+    provenance["schema"] = QWEN35_IMPORT_PROVENANCE_SCHEMA_V2
+    del provenance["conditioning_deployment"]
+    _rewrite_provenance(tmp_path, provenance)
+
+    verify_qwen35_imported_package(tmp_path)
+
+
+def test_import_provenance_rejects_a_conditioning_field_in_a_v2_record(tmp_path: Path) -> None:
+    _write_imported_package(tmp_path)
+    provenance = _load_provenance(tmp_path)
+    provenance["schema"] = QWEN35_IMPORT_PROVENANCE_SCHEMA_V2
+    _rewrite_provenance(tmp_path, provenance)
+
+    with pytest.raises(RuntimeError, match="keys mismatch.*conditioning_deployment"):
+        verify_qwen35_imported_package(tmp_path)
+
+
+def test_import_provenance_accepts_a_declared_conditioning_free_deployment(tmp_path: Path) -> None:
+    _write_imported_package(tmp_path)
+    provenance = _load_provenance(tmp_path)
+    provenance["conditioning_deployment"] = {
+        "renders_action_conditioning": False,
+        "renders_mistake_conditioning": False,
+    }
+    _rewrite_provenance(tmp_path, provenance)
+
+    verify_qwen35_imported_package(tmp_path)
+
+
+def test_import_provenance_rejects_an_unknown_conditioning_key(tmp_path: Path) -> None:
+    _write_imported_package(tmp_path)
+    provenance = _load_provenance(tmp_path)
+    provenance["conditioning_deployment"] = {
+        "renders_action_conditioning": False,
+        "renders_mistake_conditioning": False,
+        "renders_scene_conditioning": False,
+    }
+    _rewrite_provenance(tmp_path, provenance)
+
+    with pytest.raises(RuntimeError, match="keys mismatch.*renders_scene_conditioning"):
+        verify_qwen35_imported_package(tmp_path)
+
+
+def test_import_provenance_rejects_a_non_boolean_conditioning_flag(tmp_path: Path) -> None:
+    _write_imported_package(tmp_path)
+    provenance = _load_provenance(tmp_path)
+    provenance["conditioning_deployment"] = {
+        "renders_action_conditioning": "false",
+        "renders_mistake_conditioning": False,
+    }
+    _rewrite_provenance(tmp_path, provenance)
+
+    with pytest.raises(RuntimeError, match="renders_action_conditioning must be a boolean"):
+        verify_qwen35_imported_package(tmp_path)
+
+
+def test_import_provenance_rejects_an_unknown_schema_version(tmp_path: Path) -> None:
+    _write_imported_package(tmp_path)
+    provenance = _load_provenance(tmp_path)
+    provenance["schema"] = "perceptron_isaac_import_provenance_v4"
+    _rewrite_provenance(tmp_path, provenance)
+
+    with pytest.raises(RuntimeError, match="Unsupported Qwen3.5 import provenance"):
         verify_qwen35_imported_package(tmp_path)
 
 

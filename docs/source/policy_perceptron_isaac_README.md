@@ -146,6 +146,14 @@ uv run lerobot-isaac-import \
   --allow-fast-remote-code
 ```
 
+A checkpoint that Genesis trained with partial action or mistake conditioning
+support (`action_conditioning_probability` or `mistake_conditioning_probability`
+between 0 and 1) is refused until the operator adds
+`--conditioning-free-deployment`, which states that this deployment renders no
+causal action history and no `mistake:` preamble line. The choice is recorded in
+the package as `isaac_import_provenance.json -> conditioning_deployment`; that
+field is `null` when the recipe required no declaration.
+
 Pass `--dcp-checkpoint /path/to/dcp-checkpoint` as an optional independent
 cross-check. If both identity sources are present, the importer requires both
 to match the contract JSONs exactly.
