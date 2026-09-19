@@ -23,6 +23,7 @@ from lerobot.policies.perceptron_isaac.checkpoint_import import (
     POLICY_STATE_IDENTITY_FILENAME,
     IsaacCheckpointImportError,
     IsaacConditioningDeployment,
+    ValidatedIsaacDeploymentAdapter,
     authenticate_isaac_checkpoint,
     build_dcp_identity,
     canonical_sha256,
@@ -328,6 +329,7 @@ def _write_deployment_adapter(path: Path, contract_root: Path, **overrides) -> P
         "n_action_steps": 30,
         "num_inference_steps": 10,
         "num_flow_samples": 1,
+        "flow_seed_base": None,
         "clip_action_pose": False,
         "gripper_binary_to_signed": False,
         "num_settle_steps": 0,
@@ -816,6 +818,99 @@ def test_deployment_adapter_specializes_legacy_generic_libero_profile(tmp_path):
     )
 
     assert adapter.payload["robot_type"] == "libero"
+
+
+def _fixture_adapter_payload(tmp_path: Path) -> tuple[Path, Path, Path, dict]:
+    """Build an authenticated fixture and hand back its adapter payload for editing."""
+    hf_export, dcp_checkpoint, adapter_path = _write_authenticated_fixture(tmp_path)
+    return hf_export, dcp_checkpoint, adapter_path, json.loads(adapter_path.read_text())
+
+
+def _validate_fixture_adapter(
+    hf_export: Path,
+    dcp_checkpoint: Path,
+    adapter_path: Path,
+    payload: dict,
+) -> ValidatedIsaacDeploymentAdapter:
+    _write_json(adapter_path, payload)
+    return validate_isaac_deployment_adapter(
+        adapter_path,
+        contracts=authenticate_isaac_checkpoint(hf_export, dcp_checkpoint),
+        policy_state_dataset="cloud/isaac_yam",
+        normalization_scope="yam",
+        objective="Flow",
+    )
+
+
+def test_deployment_adapter_accepts_a_declared_flow_seed_base(tmp_path):
+    hf_export, dcp_checkpoint, adapter_path, payload = _fixture_adapter_payload(tmp_path)
+    payload["flow_seed_base"] = 20260826
+
+    adapter = _validate_fixture_adapter(hf_export, dcp_checkpoint, adapter_path, payload)
+
+    assert adapter.payload["flow_seed_base"] == 20260826
+
+
+def test_deployment_adapter_accepts_a_null_flow_seed_base(tmp_path):
+    """Null is the adapter declaring "do not reseed", matching the config field default."""
+    hf_export, dcp_checkpoint, adapter_path, payload = _fixture_adapter_payload(tmp_path)
+    payload["flow_seed_base"] = None
+
+    adapter = _validate_fixture_adapter(hf_export, dcp_checkpoint, adapter_path, payload)
+
+    assert adapter.payload["flow_seed_base"] is None
+
+
+@pytest.mark.parametrize("value", ["20260826", 20260826.0, True, [20260826]])
+def test_deployment_adapter_rejects_a_non_integer_flow_seed_base(tmp_path, value):
+    hf_export, dcp_checkpoint, adapter_path, payload = _fixture_adapter_payload(tmp_path)
+    payload["flow_seed_base"] = value
+
+    with pytest.raises(IsaacCheckpointImportError, match="flow_seed_base must be an integer"):
+        _validate_fixture_adapter(hf_export, dcp_checkpoint, adapter_path, payload)
+
+
+def test_deployment_adapter_rejects_a_negative_flow_seed_base(tmp_path):
+    hf_export, dcp_checkpoint, adapter_path, payload = _fixture_adapter_payload(tmp_path)
+    payload["flow_seed_base"] = -1
+
+    with pytest.raises(IsaacCheckpointImportError, match="flow_seed_base must be >= 0"):
+        _validate_fixture_adapter(hf_export, dcp_checkpoint, adapter_path, payload)
+
+
+def test_deployment_adapter_requires_a_declared_flow_seed_base(tmp_path):
+    """The key set stays exact: an adapter that omits the key is rejected, never defaulted."""
+    hf_export, dcp_checkpoint, adapter_path, payload = _fixture_adapter_payload(tmp_path)
+    payload.pop("flow_seed_base")
+
+    with pytest.raises(IsaacCheckpointImportError, match=r"missing=\['flow_seed_base'\]"):
+        _validate_fixture_adapter(hf_export, dcp_checkpoint, adapter_path, payload)
+
+
+def test_authenticated_import_carries_the_adapter_flow_seed_base_into_the_package_config(
+    tmp_path, monkeypatch
+):
+    hf_export, dcp_checkpoint, adapter_path = _write_hf_authenticated_fixture(tmp_path)
+    payload = json.loads(adapter_path.read_text())
+    payload["flow_seed_base"] = 20260826
+    _write_json(adapter_path, payload)
+    fast_artifact = _write_fast_processor_fixture(tmp_path)
+    _allow_synthetic_fast_artifact(monkeypatch, fast_artifact)
+    output = tmp_path / "isaac_lerobot_seeded"
+
+    import_authenticated_isaac_checkpoint(
+        hf_export,
+        dcp_checkpoint,
+        output,
+        policy_state_dataset="cloud/isaac_yam",
+        normalization_scope="yam",
+        deployment_adapter_path=adapter_path,
+        fast_processor_source=fast_artifact,
+        allow_fast_remote_code=True,
+    )
+
+    assert json.loads((output / "config.json").read_text())["flow_seed_base"] == 20260826
+    assert PreTrainedConfig.from_pretrained(output).flow_seed_base == 20260826
 
 
 def _strict_yam_config(**overrides) -> PerceptronIsaacConfig:

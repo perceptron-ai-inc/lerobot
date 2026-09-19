@@ -246,6 +246,7 @@ _DEPLOYMENT_ADAPTER_KEYS = {
     "n_action_steps",
     "num_inference_steps",
     "num_flow_samples",
+    "flow_seed_base",
     "clip_action_pose",
     "gripper_binary_to_signed",
     "num_settle_steps",
@@ -2364,6 +2365,16 @@ def validate_isaac_deployment_adapter(
         location="deployment_adapter.num_flow_samples",
         minimum=1,
     )
+    # Flow noise is a deployment concern, not a checkpoint one: this base seed is the only
+    # knob that varies it on the policy path (modeling_perceptron_isaac.py reseeds the device
+    # RNG with flow_seed_base + chunk index inside fork_rng). The key is required like every
+    # other key in this closed set; null is the explicit "do not reseed" declaration and
+    # matches PerceptronIsaacConfig.flow_seed_base's default.
+    _require_optional_int(
+        payload["flow_seed_base"],
+        location="deployment_adapter.flow_seed_base",
+        minimum=0,
+    )
     for key in ("clip_action_pose", "gripper_binary_to_signed", "normalize_task_text"):
         _require_bool(payload[key], location=f"deployment_adapter.{key}")
     _require_int(
@@ -2748,6 +2759,11 @@ def _build_validated_isaac_package_from_snapshot(
             apply_offset_norm=False,
             num_inference_steps=int(adapter_payload["num_inference_steps"]),
             num_flow_samples=int(adapter_payload["num_flow_samples"]),
+            flow_seed_base=_require_optional_int(
+                adapter_payload["flow_seed_base"],
+                location="deployment_adapter.flow_seed_base",
+                minimum=0,
+            ),
             clip_normalized_max=float(stats["clip_normalized_max"]),
             clip_action_pose=bool(adapter_payload["clip_action_pose"]),
             gripper_binary_to_signed=bool(adapter_payload["gripper_binary_to_signed"]),
