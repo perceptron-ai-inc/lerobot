@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -287,6 +288,122 @@ def test_policy_refuses_dense_training_at_optimizer_construction(tmp_path: Path)
     config.train_expert_only = False
     config.use_peft = False
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+
+    with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
+        policy.get_optim_params()
+
+
+@dataclass(frozen=True)
+class _StubFsdpPlugin:
+    """Stands in for accelerate's FullyShardedDataParallelPlugin sharding surface."""
+
+    fsdp_version: int
+    sharding_strategy: object
+    reshard_after_forward: object
+
+
+@dataclass(frozen=True)
+class _StubAcceleratorState:
+    distributed_type: object
+    fsdp_plugin: object | None
+
+
+def _install_distributed_state(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    world_size: int,
+    state: object | None,
+) -> None:
+    """Make `detect_full_shard_topology` observe a chosen live topology.
+
+    `state=None` means accelerate's state reports itself uninitialised.
+    """
+    import accelerate.state as accelerate_state
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(accelerate_state, "is_initialized", lambda: state is not None)
+    monkeypatch.setattr(accelerate_state, "AcceleratorState", lambda *a, **k: state)
+
+
+def test_policy_admits_dense_training_under_fsdp_full_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dense full-parameter training is admitted when the live state is FSDP FULL_SHARD."""
+    from accelerate.utils.dataclasses import DistributedType
+    from torch.distributed.fsdp import ShardingStrategy
+
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    config.train_expert_only = False
+    config.use_peft = False
+    config.train_storage_fp32 = False
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+    _install_distributed_state(
+        monkeypatch,
+        world_size=16,
+        state=_StubAcceleratorState(
+            distributed_type=DistributedType.FSDP,
+            fsdp_plugin=_StubFsdpPlugin(
+                fsdp_version=1,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                reshard_after_forward=True,
+            ),
+        ),
+    )
+
+    groups = policy.get_optim_params()
+
+    trainable = {
+        name for name, parameter in policy._isaac_model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable
+    assert any(".mlp.experts." in name for name in trainable)
+    assert {id(parameter) for group in groups for parameter in group["params"]}
+
+
+def test_policy_refuses_dense_training_under_ddp_multi_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DDP replicates parameters, so the capacity refusal stands even at world_size 16."""
+    from accelerate.utils.dataclasses import DistributedType
+
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    config.train_expert_only = False
+    config.use_peft = False
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+    _install_distributed_state(
+        monkeypatch,
+        world_size=16,
+        state=_StubAcceleratorState(distributed_type=DistributedType.MULTI_GPU, fsdp_plugin=None),
+    )
+
+    with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
+        policy.get_optim_params()
+
+
+def test_policy_refuses_dense_training_when_shard_strategy_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail closed: an FSDP state whose sharding surface is not FULL_SHARD is refused."""
+    from accelerate.utils.dataclasses import DistributedType
+
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    config.train_expert_only = False
+    config.use_peft = False
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+    _install_distributed_state(
+        monkeypatch,
+        world_size=16,
+        state=_StubAcceleratorState(
+            distributed_type=DistributedType.FSDP,
+            fsdp_plugin=_StubFsdpPlugin(
+                fsdp_version=1,
+                sharding_strategy="SHARD_GRAD_OP",
+                reshard_after_forward=False,
+            ),
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
         policy.get_optim_params()

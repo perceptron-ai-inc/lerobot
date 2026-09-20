@@ -16,8 +16,9 @@ import shutil
 from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import numpy as np
 import torch
@@ -125,6 +126,101 @@ def _verify_sha256(
             mismatch_error = mismatch_error(expected, actual)
         raise RuntimeError(mismatch_error or f"{context} mismatch: expected {expected}, found {actual}.")
     return expected
+
+
+@dataclass(frozen=True)
+class FullShardTopology:
+    """Runtime-observed evidence that this process's parameters are FSDP full-shard sharded."""
+
+    world_size: int
+    fsdp_version: int
+    sharding_strategy: str
+
+
+class FullyShardedPluginSurface(Protocol):
+    """The part of accelerate's ``FullyShardedDataParallelPlugin`` this module reads."""
+
+    fsdp_version: int
+    sharding_strategy: object
+    reshard_after_forward: object
+
+
+def _read_full_shard_strategy(
+    plugin: FullyShardedPluginSurface, world_size: int
+) -> FullShardTopology | None:
+    """Read accelerate's plugin sharding surface; ``None`` when it is not full-shard.
+
+    The pinned accelerate (1.14) dataclass carries BOTH the FSDP1 ``sharding_strategy`` and
+    the FSDP2 ``reshard_after_forward`` fields, so both are handled and ``fsdp_version``
+    selects between them. A plugin object that does not expose those fields -- a future or
+    replaced accelerate -- raises ``AttributeError`` and is refused rather than guessed at.
+    """
+    from torch.distributed.fsdp import ShardingStrategy
+
+    try:
+        fsdp_version = int(plugin.fsdp_version)
+        if fsdp_version == 1:
+            strategy = plugin.sharding_strategy
+        elif fsdp_version == 2:
+            strategy = plugin.reshard_after_forward
+        else:
+            return None
+    except AttributeError:
+        # Deliberate: `plugin` is an EXTERNAL accelerate object whose surface is version
+        # dependent. A missing field is ambiguity, and ambiguity must fail closed.
+        return None
+
+    if fsdp_version == 1:
+        if isinstance(strategy, ShardingStrategy):
+            name = strategy.name
+        elif isinstance(strategy, str):
+            name = strategy
+        else:
+            return None
+        if name != ShardingStrategy.FULL_SHARD.name:
+            return None
+        return FullShardTopology(world_size=world_size, fsdp_version=1, sharding_strategy=name)
+
+    if strategy is not True:
+        return None
+    return FullShardTopology(
+        world_size=world_size, fsdp_version=2, sharding_strategy="reshard_after_forward=True"
+    )
+
+
+def detect_full_shard_topology() -> FullShardTopology | None:
+    """Return the live FSDP full-shard topology, or ``None`` when it cannot be established.
+
+    Fails closed by construction. Only POSITIVE evidence -- an initialised process group of
+    world size >= 2, an initialised accelerate state whose ``distributed_type`` is FSDP, and
+    a plugin that reads back as FULL_SHARD -- returns a topology. Accelerate missing, its
+    state uninitialised, a DDP/MULTI_GPU state (DDP replicates parameters rather than
+    sharding them, so the capacity argument is untouched), or an unreadable plugin all
+    return ``None``.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    world_size = int(torch.distributed.get_world_size())
+    if world_size < 2:
+        return None
+    try:
+        from accelerate.state import AcceleratorState, is_initialized
+        from accelerate.utils.dataclasses import DistributedType
+    except ImportError:
+        return None
+    if not is_initialized():
+        return None
+    state = AcceleratorState()
+    try:
+        # Deliberate: accelerate's AcceleratorState binds its attributes through a shared
+        # state dict, so a field can be absent on an incompletely initialised state.
+        distributed_type = state.distributed_type
+        plugin = state.fsdp_plugin
+    except AttributeError:
+        return None
+    if distributed_type is not DistributedType.FSDP or plugin is None:
+        return None
+    return _read_full_shard_strategy(plugin, world_size)
 
 
 class PerceptronIsaacPolicy(PreTrainedPolicy):
@@ -1104,10 +1200,18 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         by ``_promote_trainable_parameters_to_fp32``. This check asserts that boundedness
         alone -- it does not, and cannot from config, promise that a bounded set fits on any
         particular device; an allocation that does not fit still fails at allocation time.
+
+        Dense full-parameter training is admitted in exactly one further case: a process whose
+        parameters are demonstrably FSDP full-shard sharded (``detect_full_shard_topology``),
+        read from the live distributed/accelerate state rather than declared by config. That
+        branch promises nothing about fit either -- sharded dense may still OOM, which is
+        allocation's job to report, not this guard's to predict.
         """
         if not (self.config.hf_model_path and self._config_declares_mk1(self.config)):
             return
         if self.config.train_expert_only or self.config.use_peft:
+            return
+        if detect_full_shard_topology() is not None:
             return
         raise RuntimeError(
             "Isaac-0.5 dense full-parameter training is unsupported on this path. Its 35.7B "
