@@ -1092,12 +1092,33 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._promote_trainable_parameters_to_fp32(self._isaac_model)
 
     def _require_native_training_supported(self) -> None:
-        if self.config.hf_model_path and self._config_declares_mk1(self.config):
-            raise RuntimeError(
-                "Isaac-0.5 training is not supported yet: production training requires FP32 "
-                "parameter storage, while the grouped_mm null-MoE dispatcher requires BF16. "
-                "Use the training repository for now; LeRobot Isaac-0.5 remains inference-only."
-            )
+        """Refuse the one Isaac-0.5 training shape this path cannot serve: unsharded dense.
+
+        There is no FP32/BF16 dispatch conflict to refuse. ``GenesisNullSparseMoeBlock``
+        (``modeling_qwen36_moe.dispatch_backend``) already routes FP32-storage training to
+        its eager expert loop and keeps ``grouped_mm`` for inference, and BF16 ``grouped_mm``
+        is differentiable, so a trainable BF16 MoE stays on the production dispatch.
+
+        A bounded trainable set (``train_expert_only`` or PEFT) leaves the 32.2B fused MoE
+        expert weights frozen in BF16, so only the small trainable set is promoted to FP32
+        by ``_promote_trainable_parameters_to_fp32``. This check asserts that boundedness
+        alone -- it does not, and cannot from config, promise that a bounded set fits on any
+        particular device; an allocation that does not fit still fails at allocation time.
+        """
+        if not (self.config.hf_model_path and self._config_declares_mk1(self.config)):
+            return
+        if self.config.train_expert_only or self.config.use_peft:
+            return
+        raise RuntimeError(
+            "Isaac-0.5 dense full-parameter training is unsupported on this path. Its 35.7B "
+            "parameters need 126.5 GiB of BF16 weights+gradients -- 133.1 GiB with FP32 "
+            "storage, before optimizer state -- on a single device, against 79.65 GiB on an "
+            "H100, and DDP replicates parameters rather than sharding them. LeRobot consumes "
+            "an externally configured accelerate FSDP plugin but configures none itself, so "
+            "sharded dense training is UNVERIFIED on this path rather than impossible. "
+            "Bounded trainable sets are supported: set train_expert_only=true or "
+            "use_peft=true."
+        )
 
     def _maybe_adopt_serving_stats(self, batch: dict[str, Any]) -> None:
         """Adopt checkpoint-serialized normalization stats handed over by the pack step.

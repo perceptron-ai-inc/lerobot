@@ -2168,7 +2168,9 @@ def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(tmp_path, 
     assert calls[0]["dtype"] is torch.float32
 
 
-def test_native_mk1_training_is_rejected_before_checkpoint_or_model_allocation(tmp_path, monkeypatch):
+def test_native_mk1_dense_training_is_rejected_before_checkpoint_or_model_allocation(
+    tmp_path, monkeypatch
+):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     hf_dir = tmp_path / "hf"
@@ -2189,18 +2191,52 @@ def test_native_mk1_training_is_rejected_before_checkpoint_or_model_allocation(t
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
     assert cfg.train_storage_fp32 is True
+    assert not cfg.train_expert_only and not cfg.use_peft
 
     policy = PerceptronIsaacPolicy(cfg)
     assert policy._isaac_model is None
     assert calls == []
 
-    with pytest.raises(RuntimeError, match="FP32 parameter storage.*grouped_mm.*BF16"):
+    with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
         policy._load_backbone(training=True)
     assert calls == []
 
     policy._isaac_model = MagicMock()
-    with pytest.raises(RuntimeError, match="inference-only"):
+    with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
         policy.forward({})
+
+
+def test_native_mk1_bounded_trainable_set_reaches_the_checkpoint_load(tmp_path, monkeypatch):
+    """The refusal is scoped to dense: expert-only training gets past the guard to the loader."""
+    stats_path = tmp_path / "stats.json"
+    _write_native_stats(stats_path)
+    hf_dir = tmp_path / "hf"
+    calls = []
+
+    def fake_load_mk1_vla_from_hf(model_dir, **kwargs):
+        calls.append({"model_dir": model_dir, **kwargs})
+        return MagicMock(), SimpleNamespace(), contract
+
+    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
+    cfg = PerceptronIsaacConfig(
+        device="cpu",
+        hf_model_path=str(hf_dir),
+        native_stats_path=str(stats_path),
+        apply_offset_norm=False,
+        mk1_model_import_sha256="0" * 64,
+        train_expert_only=True,
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+
+    policy = PerceptronIsaacPolicy(cfg)
+    policy._configure_training_parameters = lambda: None
+    policy._load_backbone(training=True)
+
+    assert len(calls) == 1
+    # The frozen 32.2B MoE experts stay BF16, which is what keeps the production
+    # grouped_mm dispatch in use during training.
+    assert calls[0]["dtype"] is torch.bfloat16
 
 
 def test_expert_only_training_keeps_frozen_base_bf16_and_promotes_trainables(tmp_path, monkeypatch):

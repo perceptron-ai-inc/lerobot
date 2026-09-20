@@ -226,10 +226,11 @@ def test_portable_package_verifies_adapter_without_legacy_manifest(tmp_path: Pat
     PerceptronIsaacPolicy._verify_packaged_contract_digests(config, policy_path)
 
 
-def test_policy_keeps_portable_training_fail_closed(
+def test_policy_refuses_unsharded_dense_portable_training(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Dense full-parameter Isaac-0.5 training is refused for the capacity reason, not a dtype one."""
     model_path = _write_portable_repo(tmp_path / "model")
     called = False
 
@@ -240,7 +241,52 @@ def test_policy_keeps_portable_training_fail_closed(
 
     monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load_auto)
     policy = _policy(model_path)
+    assert not policy.config.train_expert_only and not policy.config.use_peft
 
-    with pytest.raises(RuntimeError, match="Isaac-0.5 training is not supported yet"):
+    with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported") as refusal:
         policy._load_backbone(training=True)
+    message = str(refusal.value)
+    # The retired message blamed an FP32/BF16 dispatcher conflict that no longer exists.
+    assert "grouped_mm" not in message
+    assert "DDP replicates" in message
+    assert "UNVERIFIED" in message
+    assert "train_expert_only=true or use_peft=true" in message
     assert not called
+
+
+def test_policy_admits_expert_only_portable_training(tmp_path: Path) -> None:
+    """A bounded trainable set trains: FP32 storage for the expert, BF16 frozen MoE experts."""
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    config.train_expert_only = True
+    config.train_storage_fp32 = True
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+
+    groups = policy.get_optim_params()
+
+    parameters = dict(policy._isaac_model.named_parameters())
+    trainable = {name for name, parameter in parameters.items() if parameter.requires_grad}
+    assert trainable
+    assert all(name.startswith("model.action_expert.") for name in trainable)
+    assert all(
+        parameter.dtype is torch.float32 for group in groups for parameter in group["params"]
+    )
+    assert {id(parameter) for group in groups for parameter in group["params"]} == {
+        id(parameters[name]) for name in trainable
+    }
+    fused_expert_names = [name for name in parameters if ".mlp.experts." in name]
+    assert fused_expert_names
+    # The 32.2B fused MoE experts stay frozen in BF16, so training keeps the production
+    # grouped_mm dispatch instead of the FP32 eager expert loop.
+    assert all(parameters[name].dtype is torch.bfloat16 for name in fused_expert_names)
+    assert not any(parameters[name].requires_grad for name in fused_expert_names)
+
+
+def test_policy_refuses_dense_training_at_optimizer_construction(tmp_path: Path) -> None:
+    """The refusal fires at get_optim_params, the site LeRobot reaches before the first forward."""
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    config.train_expert_only = False
+    config.use_peft = False
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+
+    with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
+        policy.get_optim_params()
