@@ -1059,10 +1059,29 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             )
         return stream
 
+    def _batch_validity_collective_device(self) -> torch.device:
+        """Device the batch-validity all_reduce must use for the active process group.
+
+        `self.device` cannot decide this: it is a DATA-placement field defaulting to "cpu",
+        and NCCL registers no backend for CPU tensors, so reducing one raises
+        "No backend type associated with device type cpu" and no distributed run of this
+        policy can start. Any group with a NCCL component therefore reduces on the
+        accelerator this rank already owns, while gloo/mpi/ucc-only groups stay on CPU so a
+        CPU-only run is never forced to create a CUDA context.
+        """
+        backend = str(torch.distributed.get_backend()).lower()
+        if "nccl" not in backend:
+            return torch.device("cpu")
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "The ISAAC batch-validity collective needs a CUDA device because the process "
+                f"group backend is {backend!r}, but torch.cuda.is_available() is False."
+            )
+        return torch.device("cuda", torch.cuda.current_device())
+
     def _all_distributed_ranks_have_usable_samples(self, locally_usable: bool) -> bool:
         """Collectively decide batch validity on a backend-compatible device."""
-        backend = str(torch.distributed.get_backend()).lower()
-        status_device = torch.device(self.device) if "nccl" in backend else torch.device("cpu")
+        status_device = self._batch_validity_collective_device()
         status = torch.tensor(int(locally_usable), device=status_device, dtype=torch.int32)
         torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN)
         return bool(status.item())

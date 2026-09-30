@@ -3440,3 +3440,63 @@ def test_dataset_state_feature_names_reach_gripper_masks(tmp_path, load_saved_pr
         "post:action.mask": [6],
         "post:proprio.mask": [6],
     }
+
+
+# --- The batch-validity collective must reduce on a device the process-group backend owns.
+# PerceptronIsaacRenderProcessorStep.device is a DATA-placement field defaulting to "cpu";
+# handing that CPU tensor to a NCCL group raises
+# "No backend type associated with device type cpu", which is what blocks distributed
+# training for this policy. These tests pin the device the collective actually uses.
+
+
+class _RecordingAllReduce:
+    """Stand-in for torch.distributed.all_reduce that records the reduced tensor's device."""
+
+    def __init__(self, peer_value: int) -> None:
+        self.peer_value = peer_value
+        self.devices: list[torch.device] = []
+
+    def __call__(self, tensor, op=None, group=None, async_op: bool = False) -> None:
+        self.devices.append(tensor.device)
+        tensor.fill_(min(int(tensor.item()), self.peer_value))
+
+
+def _patch_batch_validity_collective(monkeypatch, backend: str, recorder: _RecordingAllReduce) -> None:
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group=None: backend)
+    monkeypatch.setattr(torch.distributed, "all_reduce", recorder)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a NCCL process group needs a CUDA device")
+@pytest.mark.parametrize("backend", ["nccl", "cpu:gloo,cuda:nccl"])
+def test_batch_validity_collective_runs_on_the_accelerator_under_nccl(monkeypatch, backend):
+    recorder = _RecordingAllReduce(peer_value=1)
+    _patch_batch_validity_collective(monkeypatch, backend, recorder)
+    step = PerceptronIsaacRenderProcessorStep(enabled=True)
+    assert step.device == "cpu", "data placement stays on CPU; only the collective device changes"
+
+    assert step._all_distributed_ranks_have_usable_samples(True) is True
+
+    assert [device.type for device in recorder.devices] == ["cuda"]
+    assert recorder.devices[0].index == torch.cuda.current_device()
+
+
+@pytest.mark.parametrize("backend", ["gloo", "mpi", "ucc"])
+def test_batch_validity_collective_stays_on_cpu_without_nccl(monkeypatch, backend):
+    recorder = _RecordingAllReduce(peer_value=1)
+    _patch_batch_validity_collective(monkeypatch, backend, recorder)
+    step = PerceptronIsaacRenderProcessorStep(enabled=True)
+
+    assert step._all_distributed_ranks_have_usable_samples(True) is True
+
+    assert [device.type for device in recorder.devices] == ["cpu"]
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl"])
+def test_batch_validity_collective_keeps_min_semantics(monkeypatch, backend):
+    if backend == "nccl" and not torch.cuda.is_available():
+        pytest.skip("a NCCL process group needs a CUDA device")
+    recorder = _RecordingAllReduce(peer_value=0)
+    _patch_batch_validity_collective(monkeypatch, backend, recorder)
+    step = PerceptronIsaacRenderProcessorStep(enabled=True)
+
+    assert step._all_distributed_ranks_have_usable_samples(True) is False
