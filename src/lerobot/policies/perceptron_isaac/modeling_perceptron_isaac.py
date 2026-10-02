@@ -39,6 +39,7 @@ from .checkpoint_integrity import (
     snapshot_directory,
 )
 from .configuration_perceptron_isaac import (
+    NATIVE_RECIPE_EXPORT_FILENAME,
     PerceptronIsaacConfig,
     is_portable_isaac05_repository,
 )
@@ -703,6 +704,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 "_export_mk1_source_model_import_sha256",
                 self.config.mk1_source_model_import_sha256,
             )
+            if not model_import_digest:
+                self._finalize_portable_isaac05_package(root)
+                return
             finalize_canonical_trained_package(
                 self.config,
                 root,
@@ -711,6 +715,31 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             )
             return
         finalize_canonical_trained_package(self.config, root, family="qwen35")
+
+    def _finalize_portable_isaac05_package(self, root: Path) -> None:
+        """Close a package saved from a raw Isaac-0.5 export on the identity it carries.
+
+        A raw export ships no ``mk1_model_import.json``, so there is no source model-import
+        identity for a canonical MK1 manifest to bind, and claiming one would be a manifest
+        that names a record the package does not contain. ``_verify_packaged_contract_digests``
+        authenticates exactly this package shape -- the export's model assets embedded as a
+        portable ``hf_model/`` -- by ``deployment_adapter_sha256``, so finalize verifies that
+        same record here. Every other MK1 package with no model-import digest is still refused,
+        and no reader check is relaxed: the load path decides which record it requires.
+        """
+        if not is_portable_isaac05_repository(root / "hf_model"):
+            raise RuntimeError("Cannot finalize an MK1 package without source model-import identity.")
+        adapter_path = root / "isaac_deployment_adapter.json"
+        if not self._is_package_file(root, adapter_path):
+            raise RuntimeError(
+                "A portable Isaac-0.5 trained package is missing its deployment adapter: "
+                f"{adapter_path}."
+            )
+        _verify_sha256(
+            self.config.deployment_adapter_sha256,
+            "portable Isaac-0.5 trained package deployment_adapter_sha256",
+            adapter_path,
+        )
 
     def hub_delete_patterns(self) -> str:
         """Mirror the exact authenticated ISAAC package inventory on every Hub push."""
@@ -865,6 +894,16 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             }
 
         shutil.copytree(export_root, model_root, dirs_exist_ok=True, ignore=ignore)
+        # The export declares its mHarmony reserved-token groups in a root-level
+        # ``policy_inference_recipe.json``, and ``checkpoint_asset_roots`` only ever looks at the
+        # package root (plus a portable parent, which a checkpoint does not have). Embedding the
+        # export under ``hf_model/`` therefore leaves the recipe where no load will look, and the
+        # config-derived default carries no ``name="coord"`` group, so the written checkpoint
+        # fails its own coordinate contract at load. Keep one copy at the package root, where the
+        # checkpoint resolves it exactly as the export it was saved from does.
+        recipe = export_root / NATIVE_RECIPE_EXPORT_FILENAME
+        if recipe.is_file():
+            shutil.copyfile(recipe, destination / NATIVE_RECIPE_EXPORT_FILENAME)
 
         declared = load_json_object(verified_source / "config.json")
         checkpoint_local: dict[str, str] = {"hf_model_path": "hf_model"}

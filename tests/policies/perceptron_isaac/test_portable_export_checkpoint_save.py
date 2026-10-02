@@ -31,12 +31,14 @@ import pytest
 
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
-from lerobot.policies.perceptron_isaac.checkpoint_integrity import snapshot_directory
+from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256, snapshot_directory
+from lerobot.policies.perceptron_isaac.mharmony_native import read_recipe_reserved_token_groups
 from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
     Mk1CheckpointContractError,
     finalize_mk1_runtime_checkpoint_layout,
 )
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import (
+    NATIVE_RECIPE_EXPORT_FILENAME,
     PerceptronIsaacConfig,
     is_portable_isaac05_repository,
 )
@@ -46,6 +48,17 @@ from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import (
 )
 
 PACKAGE_DIRECTORY_NAME = "lerobot_policy"
+
+# The shipped Isaac-0.5 export declares its FAST pool at an explicit offset and names the
+# coordinate block "coord"; these are the values in the base export's
+# policy_inference_recipe.json. DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS has neither, which is
+# precisely the fallback a written checkpoint must never reach.
+EXPORT_GROUPS = (
+    {"name": None, "offset": 249321, "size": 2048, "tokenizer": "physical-intelligence/fast"},
+    {"name": "coord", "offset": 248320, "size": 1001, "tokenizer": None},
+)
+COORD_OFFSET = 248320
+COORD_SIZE = 1001
 
 
 def _write_raw_export(root: Path) -> Path:
@@ -57,6 +70,17 @@ def _write_raw_export(root: Path) -> Path:
         encoding="utf-8",
     )
     (root / "modeling_isaac05.py").write_text("# model code\n", encoding="utf-8")
+    (root / NATIVE_RECIPE_EXPORT_FILENAME).write_text(
+        json.dumps(
+            {
+                "recipes": [
+                    {"rendering": {"reserved_token_groups": [dict(group) for group in EXPORT_GROUPS]}}
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}) + "\n")
     (root / "model-00001-of-00002.safetensors").write_bytes(b"stale-shard-one")
     (root / "model-00002-of-00002.safetensors").write_bytes(b"stale-shard-two")
@@ -277,3 +301,139 @@ def test_finalize_still_refuses_a_config_with_no_vla_block(tmp_path: Path) -> No
 
     with pytest.raises(Mk1CheckpointContractError, match="missing its MTP contract"):
         finalize_mk1_runtime_checkpoint_layout(model_root)
+
+
+def test_written_checkpoint_resolves_the_export_reserved_token_groups(tmp_path: Path) -> None:
+    """DEFECT 6: the checkpoint resolves the export's coord block, not the coord-less default.
+
+    ``checkpoint_asset_roots`` looks at the package root and a portable parent only, and a
+    written checkpoint has neither above it. Embedding the export under ``hf_model/`` left
+    ``policy_inference_recipe.json`` somewhere no load would look, so
+    ``load_native_render_metadata`` fell back to ``DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS`` and
+    ``Mk1CheckpointContract.validate_coord_reserved_token_groups`` refused the package the save
+    had just written: "reserved-token groups must contain exactly one name='coord' entry".
+    """
+    package = _write_raw_export(tmp_path / "export")
+    destination = tmp_path / "checkpoint"
+    destination.mkdir()
+    overrides = PerceptronIsaacPolicy._materialize_portable_export_assets(package, destination)
+    config = _config(**overrides, pretrained_path=destination)
+
+    recipe_path = config.resolve_native_recipe_path()
+
+    assert recipe_path == str(destination / NATIVE_RECIPE_EXPORT_FILENAME)
+    groups = read_recipe_reserved_token_groups(recipe_path)
+    coord_groups = [group for group in groups if group.get("name") == "coord"]
+    assert len(coord_groups) == 1
+    assert (coord_groups[0]["offset"], coord_groups[0]["size"]) == (COORD_OFFSET, COORD_SIZE)
+
+
+def test_written_checkpoint_recipe_is_resolved_from_the_package_it_moves_with(
+    tmp_path: Path,
+) -> None:
+    """The recipe is found relative to wherever the checkpoint currently lives."""
+    package = _write_raw_export(tmp_path / "export")
+    destination = tmp_path / "checkpoint"
+    destination.mkdir()
+    overrides = PerceptronIsaacPolicy._materialize_portable_export_assets(package, destination)
+    moved = tmp_path / "relocated" / "ckpt"
+    moved.parent.mkdir()
+    destination.rename(moved)
+    config = _config(**overrides, pretrained_path=moved)
+
+    assert config.resolve_native_recipe_path() == str(moved / NATIVE_RECIPE_EXPORT_FILENAME)
+
+
+def _portable_checkpoint(root: Path) -> Path:
+    """Write the non-weight shape of a checkpoint saved from a raw Isaac-0.5 export."""
+    model_root = root / "hf_model"
+    model_root.mkdir(parents=True)
+    (model_root / "config.json").write_text(
+        json.dumps({"model_type": "isaac_0_5"}) + "\n", encoding="utf-8"
+    )
+    adapter = root / "isaac_deployment_adapter.json"
+    adapter.write_text(json.dumps({"schema": "isaac_deployment_adapter_v1"}) + "\n", encoding="utf-8")
+    return adapter
+
+
+def _unstarted_policy(config: PerceptronIsaacConfig, save_root: Path) -> PerceptronIsaacPolicy:
+    """A policy object for the finalize path alone: no weights, no backbone, no CUDA.
+
+    ``finalize_pretrained_package`` reads only the config and the recorded save root, so
+    building the 35.7 B-parameter module to exercise it would test the loader, not the save.
+    """
+    policy = PerceptronIsaacPolicy.__new__(PerceptronIsaacPolicy)
+    policy.config = config
+    policy._canonical_inner_save_root = str(save_root.resolve())
+    return policy
+
+
+def test_finalize_closes_a_portable_export_package_on_its_adapter_identity(tmp_path: Path) -> None:
+    """DEFECT 5: a save from a raw export finalizes instead of dying on a missing identity.
+
+    The export carries no ``mk1_model_import.json``, so ``mk1_source_model_import_sha256`` is
+    None and ``finalize_canonical_trained_package(family="mk1")`` raised "Cannot finalize an MK1
+    package without source model-import identity" -- after the 133 GiB package was already on
+    disk, leaving it incomplete. ``_verify_packaged_contract_digests`` authenticates this package
+    shape by its deployment adapter, which is the record finalize verifies here.
+    """
+    checkpoint = tmp_path / "checkpoint"
+    adapter = _portable_checkpoint(checkpoint)
+    config = _config(
+        hf_model_path=str(checkpoint / "hf_model"),
+        deployment_adapter_sha256=file_sha256(adapter),
+    )
+    policy = _unstarted_policy(config, checkpoint)
+
+    policy.finalize_pretrained_package(checkpoint)
+
+    # No canonical manifest is written, because the package has no identity to bind one to.
+    assert not (checkpoint / "mk1_trained_package_manifest.json").exists()
+
+
+def test_finalize_refuses_a_portable_package_whose_adapter_digest_disagrees(tmp_path: Path) -> None:
+    """The adapter record is verified, not merely assumed present."""
+    checkpoint = tmp_path / "checkpoint"
+    adapter = _portable_checkpoint(checkpoint)
+    config = _config(hf_model_path=str(checkpoint / "hf_model"), deployment_adapter_sha256="a" * 64)
+    policy = _unstarted_policy(config, checkpoint)
+    assert file_sha256(adapter) != "a" * 64
+
+    with pytest.raises(RuntimeError, match="deployment_adapter_sha256 mismatch"):
+        policy.finalize_pretrained_package(checkpoint)
+
+
+def test_finalize_refuses_a_portable_package_with_no_deployment_adapter(tmp_path: Path) -> None:
+    """A missing adapter is a missing identity, not a package to publish."""
+    checkpoint = tmp_path / "checkpoint"
+    adapter = _portable_checkpoint(checkpoint)
+    digest = file_sha256(adapter)
+    adapter.unlink()
+    config = _config(hf_model_path=str(checkpoint / "hf_model"), deployment_adapter_sha256=digest)
+    policy = _unstarted_policy(config, checkpoint)
+
+    with pytest.raises(RuntimeError, match="missing its deployment adapter"):
+        policy.finalize_pretrained_package(checkpoint)
+
+
+def test_finalize_still_refuses_an_mk1_package_that_is_not_a_portable_export(tmp_path: Path) -> None:
+    """The identity requirement survives the fix for every non-portable MK1 package."""
+    checkpoint = tmp_path / "checkpoint"
+    model_root = checkpoint / "hf_model"
+    model_root.mkdir(parents=True)
+    (model_root / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5_moe",
+                "genesis_vla": {"backbone_family": "mk1_qwen3_6_moe"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = _config(hf_model_path=str(model_root))
+    assert PerceptronIsaacPolicy._config_declares_mk1(config)
+    policy = _unstarted_policy(config, checkpoint)
+
+    with pytest.raises(RuntimeError, match="without source model-import identity"):
+        policy.finalize_pretrained_package(checkpoint)
