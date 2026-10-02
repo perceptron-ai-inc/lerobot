@@ -583,11 +583,26 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     else:
         if is_main_process:
             logging.info("Creating policy")
-        policy = make_policy(
-            cfg=cfg.policy,
-            ds_meta=dataset.meta,
-            rename_map=cfg.rename_map,
-        )
+        # make_policy device-places the whole policy before it returns (`policy.to(cfg.device)`),
+        # so under FSDP every rank materialises every parameter on its own GPU BEFORE
+        # `accelerator.prepare` can shard them -- 35.7B parameters need 77.21 GiB on a 79.19 GiB
+        # card and the load OOMs. FSDP moves and shards one wrapped unit at a time during
+        # prepare, so host RAM is the correct place to materialise: no rank ever holds the whole
+        # model on one device. The requested device is restored immediately, so the processors
+        # built below and the config written into checkpoints keep it. Non-FSDP runs (DDP,
+        # single process, and every inference/eval path, which never build an FSDP accelerator)
+        # keep the existing device placement exactly.
+        requested_policy_device = cfg.policy.device
+        if accelerator.distributed_type == DistributedType.FSDP:
+            cfg.policy.device = "cpu"
+        try:
+            policy = make_policy(
+                cfg=cfg.policy,
+                ds_meta=dataset.meta,
+                rename_map=cfg.rename_map,
+            )
+        finally:
+            cfg.policy.device = requested_policy_device
 
     if cfg.peft is not None:
         if cfg.is_reward_model_training:
