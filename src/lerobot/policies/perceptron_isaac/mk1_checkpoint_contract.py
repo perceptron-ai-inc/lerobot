@@ -755,9 +755,15 @@ def finalize_mk1_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     root = Path(model_dir)
     config_path = root / "config.json"
     raw = _read_json_object(config_path)
-    genesis_vla = raw.get("genesis_vla")
+    # A raw Isaac-0.5 export stores the VLA block under ``isaac05_vla``; ``_normalize_isaac05``
+    # renames it to ``genesis_vla``, but only in the dict it returns, so both spellings are
+    # valid on disk. Read whichever the saved config actually uses.
+    vla = next(
+        (raw[name] for name in ("genesis_vla", "isaac05_vla") if isinstance(raw.get(name), dict)),
+        None,
+    )
     text_config = raw.get("text_config")
-    mtp = genesis_vla.get("mtp") if isinstance(genesis_vla, dict) else None
+    mtp = vla.get("mtp") if isinstance(vla, dict) else None
     if not isinstance(mtp, dict) or not isinstance(text_config, dict):
         _fail("MK1 runtime checkpoint config is missing its MTP contract")
     if mtp.get("present") is True:

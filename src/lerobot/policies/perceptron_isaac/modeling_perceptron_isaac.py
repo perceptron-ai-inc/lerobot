@@ -223,6 +223,16 @@ def detect_full_shard_topology() -> FullShardTopology | None:
     return _read_full_shard_strategy(plugin, world_size)
 
 
+def _package_storage_dtypes(model_dir: Path) -> frozenset[str]:
+    """Storage dtypes an MK1 model directory is allowed to hold.
+
+    One rule for both ends: the loader validates a package it is about to read, and
+    ``_save_canonical_inner_weights`` validates the package it has just written. Isaac-0.5
+    export assets store F32 source tensors, every other MK1 package stores BF16.
+    """
+    return frozenset({"F32" if is_portable_isaac05_repository(model_dir) else "BF16"})
+
+
 class PerceptronIsaacPolicy(PreTrainedPolicy):
     """LeRobot training/eval wrapper for checkpoint-selected native ISAAC VLAs."""
 
@@ -271,13 +281,17 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             raise RuntimeError("Perceptron ISAAC dense saves require a loaded checkpoint package.")
         with self._verified_checkpoint_source(source_root) as verified_source:
             self._copy_checkpoint_package(verified_source, save_directory)
+            checkpoint_local_paths = self._materialize_portable_export_assets(
+                verified_source, save_directory
+            )
         self.config._export_apply_offset_norm = False
         if self._config_declares_mk1(self.config):
             self.config._export_mk1_source_model_import_sha256 = (
                 self.config.mk1_model_import_sha256 or self.config.mk1_source_model_import_sha256
             )
             self.config._export_mk1_model_import_sha256 = None
-        self.config._save_pretrained(save_directory)
+        with self._checkpoint_local_path_records(checkpoint_local_paths, save_directory):
+            self.config._save_pretrained(save_directory)
         self._save_canonical_inner_weights(save_directory, state_dict)
         self._canonical_inner_save_root = str(save_directory.resolve())
 
@@ -538,27 +552,27 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._config_declares_mk1(self.config):
             from lerobot.configs import PreTrainedConfig
 
-            with snapshot_directory(source_root, prefix="lerobot-mk1-save-") as snapshot:
-                source_config = PreTrainedConfig.from_pretrained(snapshot.root)
-                self._resolve_checkpoint_local_paths(source_config, snapshot.root)
-                self._verify_packaged_contract_digests(source_config, snapshot.root)
-                yield snapshot.root
+            with self._snapshot_save_source(source_root, prefix="lerobot-mk1-save-") as package_root:
+                source_config = PreTrainedConfig.from_pretrained(package_root)
+                self._resolve_checkpoint_local_paths(source_config, package_root)
+                self._verify_packaged_contract_digests(source_config, package_root)
+                yield package_root
             return
 
         verified_package = getattr(self.config, "_qwen35_verified_package", None)
         if verified_package is None:
             from lerobot.configs import PreTrainedConfig
 
-            with snapshot_directory(source_root, prefix="lerobot-qwen35-save-") as snapshot:
-                source_config = PreTrainedConfig.from_pretrained(snapshot.root)
-                self._resolve_checkpoint_local_paths(source_config, snapshot.root)
+            with self._snapshot_save_source(source_root, prefix="lerobot-qwen35-save-") as package_root:
+                source_config = PreTrainedConfig.from_pretrained(package_root)
+                self._resolve_checkpoint_local_paths(source_config, package_root)
                 if source_config.qwen35_trained_package_manifest_sha256 is not None:
-                    self._verify_qwen35_trained_package_manifest(source_config, snapshot.root)
+                    self._verify_qwen35_trained_package_manifest(source_config, package_root)
                 else:
-                    self._verify_packaged_contract_digests(source_config, snapshot.root)
+                    self._verify_packaged_contract_digests(source_config, package_root)
                 nested_verified = getattr(source_config, "_qwen35_verified_package", None)
                 if nested_verified is None:
-                    yield snapshot.root
+                    yield package_root
                     return
                 try:
                     yield nested_verified.root
@@ -615,6 +629,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 validate_mk1_checkpoint(
                     model_root,
                     allow_test_only_reduced_geometry=bool(inner_config.get(MK1_TEST_GEOMETRY_MARKER, False)),
+                    # The same rule the load path applies. FSDP's full-state-dict gather
+                    # upcasts, so a package saved from an F32 export is itself F32; validating
+                    # it as BF16 rejected an inventory this method had just written.
+                    allowed_storage_dtypes=_package_storage_dtypes(model_root),
                 )
             except (ValueError, Mk1CheckpointContractError) as exc:
                 raise RuntimeError(f"Saved MK1 runtime checkpoint is invalid: {exc}") from exc
@@ -776,6 +794,137 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             }
 
         shutil.copytree(source_root, destination, dirs_exist_ok=True, ignore=ignore)
+
+    @staticmethod
+    def _portable_export_root(package_root: Path) -> Path | None:
+        """Return the raw Isaac-0.5 export that owns ``package_root``, when it is nested in one."""
+        parent = package_root.parent
+        return parent if is_portable_isaac05_repository(parent) else None
+
+    @classmethod
+    @contextmanager
+    def _snapshot_save_source(cls, source_root: Path, *, prefix: str):
+        """Snapshot a save source without detaching a raw export package from its root.
+
+        A package inside a raw Isaac-0.5 export points at the model with ``hf_model_path=".."``,
+        which only resolves because the package's PARENT is the export. Copying the package
+        alone leaves that parent behind, so ``_resolve_checkpoint_local_paths`` sees a path
+        leaving its root and refuses it. That refusal is correct, which is why the guard is
+        untouched and the snapshot is what changes: snapshotting the export and yielding the
+        package inside it keeps the ".." resolvable without widening what the guard accepts.
+
+        Both weight inventories are left out of the snapshot. The save replaces them, and at
+        this model size copying them would cost more than the whole checkpoint.
+        """
+        export_root = cls._portable_export_root(source_root)
+        if export_root is None:
+            with snapshot_directory(source_root, prefix=prefix) as snapshot:
+                yield snapshot.root
+            return
+        retained = {
+            path.name
+            for path in export_root.iterdir()
+            if not cls._is_checkpoint_weight_name(path.name)
+        }
+        with snapshot_directory(export_root, prefix=prefix, root_entries=retained) as snapshot:
+            package_root = snapshot.root / source_root.name
+            if not package_root.is_dir():
+                raise RuntimeError(
+                    f"Raw Isaac-0.5 export snapshot lost its policy package: {source_root.name}."
+                )
+            yield package_root
+
+    @classmethod
+    def _materialize_portable_export_assets(
+        cls, verified_source: Path, destination: Path
+    ) -> dict[str, str]:
+        """Embed a raw export's non-weight assets in the checkpoint, returning the names to record.
+
+        A written checkpoint has no export root above it, so the ".." its source config uses
+        would have nothing to resolve against. The assets are laid down as ``hf_model/`` and
+        recorded relative-and-downward: the layout ``checkpoint_import`` already writes
+        (``hf_model_path="hf_model"``) and the one ``_save_canonical_inner_weights`` already
+        writes its trained tensors into. Both weight inventories stay behind, because the save
+        replaces them.
+
+        Returns an empty mapping for an already self-contained source, which needs nothing.
+        """
+        export_root = cls._portable_export_root(verified_source)
+        if export_root is None:
+            return {}
+        package_name = verified_source.name
+        model_root = destination / "hf_model"
+
+        def ignore(directory: str, names: list[str]) -> set[str]:
+            at_export_root = Path(directory).resolve() == export_root
+            return {
+                name
+                for name in names
+                if cls._is_checkpoint_weight_name(name)
+                or (at_export_root and name == package_name)
+            }
+
+        shutil.copytree(export_root, model_root, dirs_exist_ok=True, ignore=ignore)
+
+        declared = load_json_object(verified_source / "config.json")
+        checkpoint_local: dict[str, str] = {"hf_model_path": "hf_model"}
+        raw = declared.get("fast_processor_path")
+        remainder = cls._export_relative_remainder(raw)
+        if remainder is not None:
+            # One spelling of the written-package convention, shared with the importer.
+            canonical, _is_directory = PROCESSOR_PACKAGE_PATHS["fast_processor_path"]
+            shutil.copytree(export_root / remainder, destination / canonical, dirs_exist_ok=True)
+            checkpoint_local["fast_processor_path"] = canonical
+        return checkpoint_local
+
+    @staticmethod
+    def _export_relative_remainder(declared: object) -> Path | None:
+        """Return the export-root-relative part of a ``"../x"`` declaration, else None.
+
+        Anything else -- absolute, package-local, or a deeper ``..`` -- is left declared as
+        it is, so the loader's escape guard refuses it loudly rather than this save quietly
+        rebasing a path nobody has reviewed.
+        """
+        if not isinstance(declared, str) or not declared.strip():
+            return None
+        relative = Path(declared)
+        if relative.is_absolute() or relative.parts[:1] != ("..",):
+            return None
+        remainder = relative.relative_to("..")
+        return None if ".." in remainder.parts else remainder
+
+    @contextmanager
+    def _checkpoint_local_path_records(self, relative_by_attr: dict[str, str], destination: Path):
+        """Record checkpoint-local relatives for one config save, leaving the live config alone.
+
+        ``PerceptronIsaacConfig._save_pretrained`` writes the relative half of every
+        ``_checkpoint_relative_paths`` record whose absolute still matches the live field, so
+        rebinding those records is how a save declares a different layout. The live
+        ``hf_model_path`` keeps pointing at the loaded package, so training continues from it
+        after the checkpoint is written.
+        """
+        original = dict(getattr(self.config, "_checkpoint_relative_paths", {}))
+        if not relative_by_attr:
+            yield
+            return
+        rebound = dict(original)
+        for attr, relative in relative_by_attr.items():
+            record = original.get(attr)
+            if not isinstance(record, dict) or not isinstance(record.get("absolute"), str):
+                raise RuntimeError(
+                    f"Checkpoint-local {attr} cannot be rebound: "
+                    "the loaded package left no resolved path record."
+                )
+            rebound[attr] = {
+                "absolute": record["absolute"],
+                "relative": relative,
+                "root": str(destination),
+            }
+        self.config._checkpoint_relative_paths = rebound
+        try:
+            yield
+        finally:
+            self.config._checkpoint_relative_paths = original
 
     @staticmethod
     def _package_file_digests(root: Path) -> dict[str, str]:
@@ -1075,7 +1224,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         allow_test_geometry = self.config.artifact_kind == "neutral_debug"
         # Isaac-0.5 exports store F32 source tensors, not an F32 inference runtime.
         # Keep legacy MK1 storage strict and route both formats through native validation.
-        storage_dtypes = frozenset({"F32" if is_portable_isaac05_repository(model_dir) else "BF16"})
+        storage_dtypes = _package_storage_dtypes(model_dir)
         try:
             contract, _ = validate_mk1_checkpoint(
                 model_dir,

@@ -35,12 +35,16 @@ NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
 
 
 def is_portable_isaac05_repository(model_dir: Path) -> bool:
-    """True when ``model_dir`` is the root of a raw Isaac-0.5 export.
+    """True when ``model_dir`` holds a raw Isaac-0.5 export's model assets.
 
     Such an export nests the LeRobot policy package in ``lerobot_policy/`` and keeps
     its documented assets (``fast_processor_pinned/``, ``isaac_stats.json``,
     ``policy_normalization.json``) at this root, so anything resolving paths for a
     package loaded from ``<root>/lerobot_policy`` has to recognise the root.
+
+    A checkpoint written from such an export embeds those same model assets as
+    ``hf_model/`` and keeps storing F32 tensors, so it answers True here as well. That is
+    what callers want: this predicate selects the F32 storage contract, not a directory shape.
     """
     config_path = model_dir / "config.json"
     if not config_path.is_file():
