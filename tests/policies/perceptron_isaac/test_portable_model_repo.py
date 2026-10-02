@@ -306,6 +306,9 @@ class _StubFsdpPlugin:
 class _StubAcceleratorState:
     distributed_type: object
     fsdp_plugin: object | None
+    # Accelerate upcasts the sharded FSDP flat parameters to FP32 only when its own mixed
+    # precision is on, so the FP32-master decision reads this field off the live state.
+    mixed_precision: str = "bf16"
 
 
 def _install_distributed_state(
@@ -407,3 +410,94 @@ def test_policy_refuses_dense_training_when_shard_strategy_is_unreadable(
 
     with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
         policy.get_optim_params()
+def _full_shard_state(sharding_strategy: object, mixed_precision: str) -> _StubAcceleratorState:
+    """A live accelerate state that reports FSDP FULL_SHARD at a chosen mixed precision."""
+    from accelerate.utils.dataclasses import DistributedType
+
+    return _StubAcceleratorState(
+        distributed_type=DistributedType.FSDP,
+        fsdp_plugin=_StubFsdpPlugin(
+            fsdp_version=1,
+            sharding_strategy=sharding_strategy,
+            reshard_after_forward=True,
+        ),
+        mixed_precision=mixed_precision,
+    )
+
+
+def test_fp32_masters_are_not_materialized_before_fsdp_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering defect: FP32 promotion must not run on the unsharded model.
+
+    Every ``_promote_trainable_parameters_to_fp32`` call site runs before
+    ``accelerator.prepare``, so upcasting there holds the whole model in FP32 on every rank
+    -- 133.1 GiB of host RAM per rank for Isaac-0.5's 35,723,506,864 parameters, against
+    66.5 GiB for the BF16 model it replaces. FSDP FULL_SHARD makes the same masters cost
+    133.1/world_size GiB per rank, so under a live FULL_SHARD topology the parameters must
+    still be BF16 when the optimizer groups are collected; accelerate upcasts each sharded
+    flat parameter afterwards.
+    """
+    from torch.distributed.fsdp import ShardingStrategy
+
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    config.train_expert_only = False
+    config.use_peft = False
+    config.train_storage_fp32 = True
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+    _install_distributed_state(
+        monkeypatch,
+        world_size=16,
+        state=_full_shard_state(ShardingStrategy.FULL_SHARD, "bf16"),
+    )
+
+    groups = policy.get_optim_params()
+
+    assert groups
+    trainable = [
+        (name, parameter)
+        for name, parameter in policy._isaac_model.named_parameters()
+        if parameter.requires_grad
+    ]
+    assert trainable
+    upcast_before_sharding = [name for name, parameter in trainable if parameter.dtype is torch.float32]
+    assert upcast_before_sharding == []
+    assert all(parameter.dtype is torch.bfloat16 for _, parameter in trainable)
+
+
+def test_fp32_masters_refuse_full_shard_without_accelerate_mixed_precision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deferring to FSDP is only sound while accelerate still performs the per-shard upcast.
+
+    ``Accelerator.prepare_model`` upcasts each sharded flat parameter to FP32 only when its
+    own mixed precision is on. With it off, deferring would leave BF16 masters while the
+    config claims FP32 storage, so the policy refuses instead of honouring that silently.
+    """
+    from torch.distributed.fsdp import ShardingStrategy
+
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    config.train_expert_only = False
+    config.use_peft = False
+    config.train_storage_fp32 = True
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+    _install_distributed_state(
+        monkeypatch,
+        world_size=16,
+        state=_full_shard_state(ShardingStrategy.FULL_SHARD, "no"),
+    )
+
+    with pytest.raises(RuntimeError, match="needs accelerate mixed precision enabled"):
+        policy.get_optim_params()
+
+
+def test_fp32_masters_are_materialized_eagerly_without_sharding(tmp_path: Path) -> None:
+    """Unsharded training keeps the existing eager promotion: there is no shard to defer to."""
+    policy_path, config, _ = _native_portable_package(tmp_path)
+    config.train_expert_only = True
+    config.train_storage_fp32 = True
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+
+    groups = policy.get_optim_params()
+
+    assert all(parameter.dtype is torch.float32 for group in groups for parameter in group["params"])

@@ -224,6 +224,26 @@ def detect_full_shard_topology() -> FullShardTopology | None:
     return _read_full_shard_strategy(plugin, world_size)
 
 
+def read_accelerate_mixed_precision() -> str:
+    """Return accelerate's live mixed-precision setting, or ``"no"`` when it cannot be read.
+
+    Fails closed, like ``detect_full_shard_topology``: the only caller uses this to decide
+    whether accelerate will upcast the sharded FSDP masters to FP32, and an unreadable state
+    must be treated as "it will not".
+    """
+    try:
+        from accelerate.state import AcceleratorState
+    except ImportError:
+        return "no"
+    state = AcceleratorState()
+    try:
+        # Deliberate: accelerate's AcceleratorState binds its attributes through a shared
+        # state dict, so a field can be absent on an incompletely initialised state.
+        return str(state.mixed_precision)
+    except AttributeError:
+        return "no"
+
+
 def _package_storage_dtypes(model_dir: Path) -> frozenset[str]:
     """Storage dtypes an MK1 model directory is allowed to hold.
 
@@ -262,6 +282,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         # Set once, outside reset(): parameter freezing must happen before the model is
         # wrapped for distributed training and must not be re-applied per step.
         self._training_parameters_configured = False
+        self._fp32_masters_verified = False
 
         self.reset()
 
@@ -1142,6 +1163,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         """Keep optimizer-owned parameters in FP32 without expanding the frozen backbone."""
         if not self.config.train_storage_fp32:
             return
+        topology = detect_full_shard_topology()
+        if topology is not None:
+            self._defer_fp32_masters_to_the_shard(topology)
+            return
         for parameter in module.parameters():
             if parameter.requires_grad and parameter.is_floating_point() and parameter.dtype != torch.float32:
                 # This runs before optimizer/FSDP/DDP construction, so replacing parameter storage is safe.
@@ -1154,6 +1179,89 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         ]
         if non_fp32:
             raise RuntimeError(f"ISAAC trainable parameters must use FP32 storage; first: {non_fp32[:5]}")
+
+    def _defer_fp32_masters_to_the_shard(self, topology: FullShardTopology) -> None:
+        """Leave FP32 master promotion to FSDP, which pays for it one shard at a time.
+
+        Every call site of ``_promote_trainable_parameters_to_fp32`` runs BEFORE
+        ``accelerator.prepare``, while the model is still unsharded on every rank, so
+        promoting here replaces the BF16 model with an FP32 one in full: 35,723,506,864
+        parameters are 66.5 GiB at BF16 and 133.1 GiB at FP32, per rank, against roughly
+        1.48 TiB of host RAM shared by the 8 ranks on a node. Under FULL_SHARD the same
+        masters cost 133.1 / ``world_size`` GiB per rank -- 8.3 GiB at world_size 16 --
+        because each rank keeps only its shard. The memory exists; the ordering is wrong.
+
+        Accelerate performs exactly that per-shard promotion. After FSDP has wrapped and
+        sharded the model, ``Accelerator.prepare_model`` upcasts each unit's ``_flat_param``
+        -- the local shard the optimizer reads and writes between steps -- to FP32 and
+        records ``_orig_param_dtype``, gated on accelerate's own mixed-precision setting.
+        With mixed precision off that upcast never runs and the masters would stay BF16
+        while this config claims FP32 storage, so that combination is refused rather than
+        silently honoured. ``_verify_fp32_masters_once`` checks the realised dtype on the
+        sharded handles at the first training step.
+        """
+        mixed_precision = read_accelerate_mixed_precision()
+        if mixed_precision == "no":
+            raise RuntimeError(
+                "ISAAC train_storage_fp32=true needs accelerate mixed precision enabled under "
+                f"FSDP {topology.sharding_strategy} (world_size={topology.world_size}): the FP32 "
+                "masters are created when Accelerator.prepare_model upcasts each sharded FSDP "
+                "flat parameter, and that upcast is skipped when mixed_precision is 'no'. "
+                "Promoting the whole unsharded model here instead would need 133.1 GiB of host "
+                f"RAM per rank; the sharded masters need {133.1 / topology.world_size:.1f} GiB. "
+                "Set policy dtype bfloat16 (LeRobot maps it to accelerate mixed_precision=bf16)."
+            )
+
+    def _verify_fp32_masters_once(self) -> None:
+        """Assert once, after sharding, that the FSDP masters really are FP32.
+
+        ``_defer_fp32_masters_to_the_shard`` hands promotion to FSDP, so the FP32 claim can
+        only be checked once the parameters are sharded. The check reads each FSDP handle's
+        flat parameter -- the local shard the optimizer owns -- and not ``named_parameters()``,
+        because with ``use_orig_params=True`` the named parameters are views that point at the
+        BF16 all-gathered copy for the duration of a forward. ``_fqns`` names the original
+        parameters each shard carries, so the failure names parameters, not offsets.
+
+        Only units FSDP wrapped below this policy are visible from here; the root unit wraps
+        this policy itself and is not reachable from ``self.modules()``.
+        """
+        if self._fp32_masters_verified or not self.config.train_storage_fp32:
+            return
+        if detect_full_shard_topology() is None:
+            return
+        from torch.distributed.fsdp import FullyShardedDataParallel
+
+        self._fp32_masters_verified = True
+        shard_elements = 0
+        units = 0
+        low_precision: list[str] = []
+        sampled: list[str] = []
+        for unit in FullyShardedDataParallel.fsdp_modules(self):
+            if not unit._has_params:
+                continue
+            shard = unit._flat_param
+            if not shard.requires_grad:
+                continue
+            units += 1
+            shard_elements += int(shard.numel())
+            names = list(shard._fqns)
+            if shard.dtype is not torch.float32:
+                low_precision.extend(f"{name}:{shard.dtype}" for name in names[:2])
+            elif len(sampled) < 4:
+                sampled.append(f"{names[0]}:{shard.dtype}")
+        if low_precision:
+            raise RuntimeError(
+                "ISAAC trainable parameters must use FP32 storage; the FSDP shard masters are "
+                f"still low precision, first: {low_precision[:5]}"
+            )
+        logging.info(
+            "ISAAC FP32 masters verified after sharding: %d FSDP units, %d shard elements "
+            "(%.2f GiB at FP32) on this rank, sample %s",
+            units,
+            shard_elements,
+            shard_elements * 4 / 1024**3,
+            sampled,
+        )
 
     def _resolve_device(self) -> str:
         """Per-rank CUDA device under accelerate multi-GPU, else config.device."""
@@ -1879,6 +1987,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._isaac_model is None:
             self._load_backbone(training=True)
         self._configure_training_parameters()
+        self._verify_fp32_masters_once()
         stream = stream.to(device=self._resolve_device(), dtype=self._model_dtype())
         model_output = self._isaac_model.train_forward(stream)
         flow_fixture_tensors = self._aligned_flow_fixture_tensors(batch, len(stream.streams))
