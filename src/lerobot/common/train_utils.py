@@ -283,6 +283,8 @@ def save_checkpoint(
             preprocessor.save_pretrained(pretrained_dir)
         if postprocessor is not None:
             postprocessor.save_pretrained(pretrained_dir)
+        # Last writer in the directory: lets a policy bind its package over every file above.
+        policy_to_save.finalize_pretrained_package(pretrained_dir)
 
     save_training_state(
         checkpoint_dir, step, cfg, optimizer, scheduler, accelerator, sharded=sharded, model=policy_to_save
