@@ -252,7 +252,9 @@ def test_verified_runtime_assets_preserve_adapter_owned_sidecars(monkeypatch, tm
         fast_processor_tree_sha256="0" * 64,
     )
 
-    PerceptronIsaacPolicy.resolve_checkpoint_config_paths(config, adapter)
+    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(
+        config, adapter, allow_missing_relative=True, record_source_root=False
+    )
     PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, base)
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     policy = PerceptronIsaacPolicy(config)
@@ -274,58 +276,7 @@ def test_verified_runtime_assets_preserve_adapter_owned_sidecars(monkeypatch, tm
 
 
 @pytest.mark.parametrize("unsafe_kind", ["absolute", "traversal"])
-def test_processor_retention_rejects_untrusted_serialized_sidecars(tmp_path, unsafe_kind) -> None:
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    secret = tmp_path / "secret.json"
-    secret.write_text('{"secret": true}\n')
-    raw = str(secret) if unsafe_kind == "absolute" else "../secret.json"
-    (adapter / "policy_preprocessor.json").write_text(
-        json.dumps({"steps": [{"config": {"native_stats_path": raw}}]})
-    )
-    policy = PerceptronIsaacPolicy(_config())
-
-    with pytest.raises(RuntimeError, match="untrusted|escapes"):
-        policy.retain_pretrained_processor_assets(adapter)
-
-    assert secret.read_text() == '{"secret": true}\n'
-
-
-def test_processor_retention_accepts_trusted_base_owned_absolute_sidecar(tmp_path) -> None:
-    base = tmp_path / "base"
-    base.mkdir()
-    (base / "isaac_stats.json").write_text('{"owner": "base"}\n')
-    config = _config(native_stats_path="isaac_stats.json")
-    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, base)
-
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    (adapter / "policy_preprocessor.json").write_text(
-        json.dumps(
-            {
-                "steps": [
-                    {
-                        "config": {"native_stats_path": str(base / "isaac_stats.json")},
-                    }
-                ]
-            }
-        )
-    )
-    policy = PerceptronIsaacPolicy(config)
-
-    policy.retain_pretrained_processor_assets(adapter)
-    retained_stats = Path(config.native_stats_path)
-    retained_config = Path(config._pretrained_processor_root) / "policy_preprocessor.json"
-    base.rename(tmp_path / "retired-base")
-    adapter.rename(tmp_path / "retired-adapter")
-
-    assert retained_stats.read_text() == '{"owner": "base"}\n'
-    serialized = json.loads(retained_config.read_text())
-    assert serialized["steps"][0]["config"]["native_stats_path"] == str(retained_stats)
-
-
-@pytest.mark.parametrize("unsafe_kind", ["absolute", "traversal"])
-def test_peft_asset_staging_rejects_untrusted_serialized_sidecars(tmp_path, unsafe_kind) -> None:
+def test_asset_staging_rejects_untrusted_serialized_sidecars(tmp_path, unsafe_kind) -> None:
     package = tmp_path / "adapter"
     package.mkdir()
     retained = tmp_path / "retained"
@@ -418,8 +369,7 @@ def test_outer_sharded_weights_are_loaded_only_from_the_index(tmp_path) -> None:
         PerceptronIsaacPolicy._maybe_load_finetuned_weights(policy, tmp_path, strict=True)
 
 
-@pytest.mark.parametrize("retention", ["runtime", "processors"])
-def test_original_package_processors_bind_retained_instance(tmp_path, retention: str) -> None:
+def test_original_package_processors_bind_retained_instance(tmp_path) -> None:
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
         PerceptronIsaacMharmonyPackProcessorStep,
@@ -463,10 +413,7 @@ def test_original_package_processors_bind_retained_instance(tmp_path, retention:
         PerceptronIsaacPolicy._resolve_checkpoint_local_paths(instance_config, source)
         policy = PerceptronIsaacPolicy(instance_config)
         policies.append(policy)
-        if retention == "runtime":
-            policy._retain_verified_runtime_assets(source)
-        else:
-            policy.retain_pretrained_processor_assets(source)
+        policy._retain_verified_runtime_assets(source)
         pre, post = make_pre_post_processors(instance_config, pretrained_path=str(source))
         pack = next(step for step in pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
         assert pack.fast_processor_path == instance_config.fast_processor_path
@@ -537,7 +484,7 @@ def test_resolve_retained_processor_path_rejects_invalid_provenance(tmp_path, in
         _resolve_retained_processor_path(raw, configured, record, root)
 
 
-@pytest.mark.parametrize("retention", ["none", "runtime", "processors"])
+@pytest.mark.parametrize("retention", ["none", "runtime"])
 def test_factory_restoration_keeps_checkpoint_stats_over_destination_metadata(
     tmp_path, retention: str
 ) -> None:
@@ -565,10 +512,7 @@ def test_factory_restoration_keeps_checkpoint_stats_over_destination_metadata(
         config.native_stats_path = "isaac_stats.json"
         PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, source)
         policy = PerceptronIsaacPolicy(config)
-        if retention == "runtime":
-            policy._retain_verified_runtime_assets(source)
-        else:
-            policy.retain_pretrained_processor_assets(source)
+        policy._retain_verified_runtime_assets(source)
     destination_stats = {
         key: {"q01": torch.full((2,), 10.0), "q99": torch.full((2,), 20.0)} for key in (ACTION, OBS_STATE)
     }

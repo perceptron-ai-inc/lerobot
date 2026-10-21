@@ -26,7 +26,7 @@ from huggingface_hub import save_torch_state_dict
 from torch import Tensor
 
 from lerobot.lerobot_types import TransitionKey
-from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
 from ..pretrained import PreTrainedPolicy
@@ -51,7 +51,6 @@ from .loss_perceptron_isaac import (
     ISAAC_FLOW_LOSS_MASK_KEY,
     ISAAC_FLOW_NOISE_KEY,
     ISAAC_FLOW_TIMESTEPS_KEY,
-    perceptron_isaac_loss_denominators,
     perceptron_isaac_training_loss,
 )
 from .mharmony_native import (
@@ -75,10 +74,8 @@ from .trained_package import (
     MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
     MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
     MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA,
-    PROCESSOR_PACKAGE_PATHS,
     finalize_canonical_trained_package,
     rewrite_trained_processor_paths,
-    stage_trained_processor_assets,
     verify_trained_package_manifest,
 )
 
@@ -350,8 +347,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._native_render_metadata: IsaacMharmonyRenderMetadata | None = None
         self._verified_runtime_assets: DirectorySnapshot | None = None
         self._verified_external_runtime_assets: list[DirectorySnapshot] = []
-        self._verified_processor_assets: DirectorySnapshot | None = None
-        self._verified_external_processor_assets: list[DirectorySnapshot] = []
         # Checkpoint-serialized normalization stats adopted from the restored
         # preprocessor pipeline (see _maybe_adopt_serving_stats). Set once per loaded
         # checkpoint and deliberately NOT cleared by reset(): the checkpoint identity
@@ -441,157 +436,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             or name == "model.safetensors.index.json"
             or (name.startswith("model-") and name.endswith(".safetensors"))
         )
-
-    def _processor_snapshot_entries(self, root: Path) -> set[str]:
-        """Return adapter-root entries needed to restore both processor pipelines."""
-        entries: set[str] = set()
-        relative_paths = dict(getattr(self.config, "_checkpoint_relative_paths", {}))
-
-        def trusted_processor_path(key: str, raw: str) -> Path | None:
-            path = Path(raw)
-            if not path.parts or ".." in path.parts:
-                raise RuntimeError(f"Serialized processor path {key} escapes its package: {raw}.")
-            if not path.is_absolute():
-                return root / path
-            record = relative_paths.get(key)
-            if not isinstance(record, dict):
-                raise RuntimeError(f"Serialized processor path {key} is untrusted: {raw}.")
-            relative = record.get("relative")
-            owner = record.get("root")
-            absolute = record.get("absolute")
-            if not isinstance(relative, str) or not isinstance(owner, str) or not isinstance(absolute, str):
-                raise RuntimeError(f"Serialized processor path {key} is untrusted: {raw}.")
-            relative_path = Path(relative)
-            if relative_path.is_absolute() or not relative_path.parts or ".." in relative_path.parts:
-                raise RuntimeError(f"Serialized processor path {key} is untrusted: {raw}.")
-            owner_root = Path(owner)
-            expected = owner_root / relative_path
-            if str(expected) != absolute or absolute != raw:
-                raise RuntimeError(f"Serialized processor path {key} is untrusted: {raw}.")
-            # Adapter-owned assets belong in its processor snapshot. Verified
-            # base-owned assets are retained separately by records_by_owner.
-            return expected if owner_root == root else None
-
-        def collect(value: Any) -> None:
-            if isinstance(value, list):
-                for item in value:
-                    collect(item)
-                return
-            if not isinstance(value, dict):
-                return
-            state_file = value.get("state_file")
-            if isinstance(state_file, str) and state_file.strip():
-                state_path = Path(state_file)
-                if state_path.is_absolute() or not state_path.parts or ".." in state_path.parts:
-                    raise RuntimeError(f"Serialized processor state_file escapes its package: {state_file}.")
-                if not (root / state_path).is_file():
-                    raise RuntimeError(f"Serialized processor state_file is missing: {state_file}.")
-                entries.add(state_path.parts[0])
-            for key, item in value.items():
-                if key in PROCESSOR_PACKAGE_PATHS and isinstance(item, str) and item.strip():
-                    path = trusted_processor_path(key, item)
-                    if path is not None and path.exists():
-                        entries.add(path.relative_to(root).parts[0])
-                collect(item)
-
-        for path in sorted(root.iterdir()):
-            if not (
-                path.is_file()
-                and path.name.startswith(("policy_preprocessor", "policy_postprocessor"))
-                and path.suffix == ".json"
-            ):
-                continue
-            entries.add(path.name)
-            try:
-                collect(load_json_object(path))
-            except ValueError as exc:
-                raise RuntimeError(f"Cannot retain serialized processor config: {exc}") from exc
-        if (root / "policy_normalization.json").is_file():
-            entries.add("policy_normalization.json")
-        return entries
-
-    def retain_pretrained_processor_assets(self, checkpoint_root: str | Path) -> None:
-        """Keep adapter processors and their sidecars alive beyond a mutable source path."""
-        root = Path(checkpoint_root).resolve(strict=True)
-        entries = self._processor_snapshot_entries(root)
-        relative_paths = dict(getattr(self.config, "_checkpoint_relative_paths", {}))
-        processor_path_attrs = set(PROCESSOR_PACKAGE_PATHS) | {"config_toml_path", "stats_path"}
-        records_by_owner: dict[Path, list[tuple[str, dict[str, str]]]] = {}
-        for attr, record in relative_paths.items():
-            if attr not in processor_path_attrs or not isinstance(record, dict):
-                continue
-            relative = record.get("relative")
-            owner_value = record.get("root")
-            if not isinstance(relative, str) or not isinstance(owner_value, str):
-                continue
-            owner = Path(owner_value).resolve()
-            records_by_owner.setdefault(owner, []).append((attr, record))
-            if owner == root:
-                entries.add(Path(relative).parts[0])
-
-        snapshot = snapshot_directory(root, prefix="lerobot-isaac-processors-", root_entries=entries)
-        external_snapshots = []
-        replacements: dict[str, str] = {}
-        try:
-            updated_paths = dict(relative_paths)
-            for owner, records in records_by_owner.items():
-                if owner == root:
-                    owner_snapshot = snapshot
-                else:
-                    owner_snapshot = snapshot_directory(
-                        owner,
-                        prefix="lerobot-isaac-processor-sidecars-",
-                        root_entries={Path(record["relative"]).parts[0] for _, record in records},
-                    )
-                    external_snapshots.append(owner_snapshot)
-                for attr, record in records:
-                    candidate = owner_snapshot.root / record["relative"]
-                    if not candidate.exists():
-                        raise RuntimeError(f"Retained processor path {attr} disappeared from its package.")
-                    absolute = str(candidate)
-                    replacements[str(record.get("absolute", ""))] = absolute
-                    setattr(self.config, attr, absolute)
-                    updated_paths[attr] = {
-                        "absolute": absolute,
-                        "relative": record["relative"],
-                        "root": str(owner_snapshot.root),
-                    }
-
-            stable_paths = {
-                key: str(getattr(self.config, key))
-                for key in processor_path_attrs
-                if getattr(self.config, key, None)
-            }
-
-            def rewrite(value: Any) -> Any:
-                if isinstance(value, list):
-                    return [rewrite(item) for item in value]
-                if not isinstance(value, dict):
-                    return replacements.get(value, value) if isinstance(value, str) else value
-                return {
-                    key: stable_paths[key] if key in stable_paths and isinstance(item, str) else rewrite(item)
-                    for key, item in value.items()
-                }
-
-            for config_path in sorted(snapshot.root.glob("policy_*processor*.json")):
-                payload = rewrite(load_json_object(config_path))
-                config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-            self.config._checkpoint_relative_paths = updated_paths
-            self.config._pretrained_processor_root = str(snapshot.root)
-        except BaseException:
-            snapshot.cleanup()
-            for external in external_snapshots:
-                external.cleanup()
-            raise
-
-        previous = self._verified_processor_assets
-        previous_external = self._verified_external_processor_assets
-        self._verified_processor_assets = snapshot
-        self._verified_external_processor_assets = external_snapshots
-        if previous is not None:
-            previous.cleanup()
-        for external in previous_external:
-            external.cleanup()
 
     def _retain_verified_runtime_assets(self, verified_root: Path) -> None:
         """Keep verified sidecars stable without retaining a second copy of model weights."""
@@ -772,13 +616,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 "written. Train Perceptron Isaac with checkpoint_format=safetensors (the default) "
                 f"or safetensors_dcp. Directory: {root}."
             )
-        adapter_config_path = root / "adapter_config.json"
-        if self.config.use_peft and adapter_config_path.is_file():
-            stage_trained_processor_assets(root, self.config)
         rewrite_trained_processor_paths(root)
-        if self.config.use_peft and adapter_config_path.is_file():
-            self._finalize_local_peft_base(root, adapter_config_path)
-            return
         if getattr(self, "_canonical_inner_save_root", None) != str(root.resolve()):
             return
         if self._config_declares_mk1(self.config):
@@ -795,63 +633,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             )
             return
         raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
-
-    def hub_delete_patterns(self) -> str:
-        """Mirror the exact authenticated ISAAC package inventory on every Hub push."""
-        return "*"
-
-    def hub_ignore_patterns(self) -> None:
-        """Upload the exact file inventory authenticated by the outer package manifest."""
-        return None
-
-    def _finalize_local_peft_base(self, root: Path, adapter_config_path: Path) -> None:
-        try:
-            adapter_config = load_json_object(adapter_config_path)
-        except ValueError as exc:
-            raise RuntimeError(f"Cannot finalize PEFT adapter config: {exc}") from exc
-
-        def write_adapter_config() -> None:
-            temporary = adapter_config_path.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(adapter_config, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            temporary.replace(adapter_config_path)
-
-        embed_base = getattr(self.config, "_embed_base_on_save", None)
-        if embed_base is False:
-            original_reference = getattr(self.config, "_peft_base_reference", None)
-            if not original_reference:
-                raise RuntimeError("Remote PEFT base provenance is missing its Hub repo ID.")
-            embedded = root / "base_model"
-            if embedded.is_symlink() or (embedded.exists() and not embedded.is_dir()):
-                raise RuntimeError("Stale embedded PEFT base_model is not a regular directory.")
-            if embedded.is_dir():
-                shutil.rmtree(embedded)
-            adapter_config["base_model_name_or_path"] = str(original_reference)
-            adapter_config["revision"] = getattr(self.config, "_peft_base_revision", None)
-            write_adapter_config()
-            return
-
-        source_root = self._local_checkpoint_source_root()
-        if source_root is None:
-            raise RuntimeError("PEFT package finalization requires the resolved base checkpoint package.")
-        embedded = root / "base_model"
-        if embedded.is_symlink() or (embedded.exists() and not embedded.is_dir()):
-            raise RuntimeError("Existing embedded PEFT base_model must be a regular directory.")
-        with self._verified_checkpoint_source(source_root) as verified_source:
-            if embedded.is_dir():
-                self._verify_saved_package(embedded)
-                if self._package_file_digests(verified_source) != self._package_file_digests(embedded):
-                    raise RuntimeError(
-                        "Existing embedded PEFT base does not match the configured source package."
-                    )
-            else:
-                shutil.copytree(verified_source, embedded)
-        self._verify_saved_package(embedded)
-        adapter_config["base_model_name_or_path"] = "base_model"
-        adapter_config["revision"] = None
-        write_adapter_config()
 
     @staticmethod
     def _copy_checkpoint_package(source_root: Path, destination: Path) -> None:
@@ -915,72 +696,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     f"Raw Isaac-0.5 export snapshot lost its policy package: {source_root.name}."
                 )
             yield package_root
-
-    @staticmethod
-    def _package_file_digests(root: Path) -> dict[str, str]:
-        return {
-            path.relative_to(root).as_posix(): file_sha256(path)
-            for path in sorted(root.rglob("*"))
-            if path.is_file()
-        }
-
-    def adapt_async_observation(
-        self, observation: dict[str, Any], *, timestep: int, fps: float
-    ) -> dict[str, Any]:
-        """Anchor the policy's prompt clock to episode time for chunk-rate serving.
-
-        The async policy server runs one predict per chunk (~1/s at 30 actions),
-        so the policy's internal frame clock (one frame per predict call) would
-        advance ~30x slower than episode time. The observation timestep (index
-        of the last executed action) over the control fps is the episode-relative,
-        monotonic model time the checkpoint was trained with. Called by the
-        policy server through a policy-independent hook before preprocessing.
-        """
-        adapted = dict(observation)
-        adapted[PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY] = [max(int(timestep), 0) / float(fps)]
-        return adapted
-
-    def validate_async_features(self, lerobot_features: dict[str, Any]) -> None:
-        """Validate the robot handshake against the checkpoint contract at load.
-
-        Fails the async server's readiness path immediately (instead of at the
-        first render) when mharmony is absent or the robot's state/action width,
-        camera count, or image size do not match the serialized checkpoint.
-        """
-        from .mharmony_adapter import assert_mharmony_available
-
-        assert_mharmony_available()
-
-        problems: list[str] = []
-
-        state = lerobot_features.get(OBS_STATE)
-        if state is None:
-            problems.append(f"missing {OBS_STATE} feature")
-        elif tuple(state.get("shape", ())) != (self.config.proprio_dim,):
-            problems.append(
-                f"{OBS_STATE} shape {tuple(state.get('shape', ()))} != ({self.config.proprio_dim},)"
-            )
-
-        action = lerobot_features.get(ACTION)
-        if action is None:
-            problems.append("missing action feature in handshake")
-        elif tuple(action.get("shape", ())) != (self.config.action_dim,):
-            problems.append(f"action shape {tuple(action.get('shape', ()))} != ({self.config.action_dim},)")
-
-        image_keys = sorted(key for key in lerobot_features if key.startswith(OBS_IMAGES))
-        if len(image_keys) != len(self.config.camera_order):
-            problems.append(
-                f"expected {len(self.config.camera_order)} camera features "
-                f"({self.config.camera_order}), got {image_keys}"
-            )
-        height, width = (int(value) for value in self.config.image_size)
-        for key in image_keys:
-            shape = tuple(lerobot_features[key].get("shape", ()))
-            if shape not in ((height, width, 3), (3, height, width)):
-                problems.append(f"{key} shape {shape} incompatible with image_size ({height}, {width})")
-
-        if problems:
-            raise ValueError("perceptron_isaac checkpoint contract validation failed: " + "; ".join(problems))
 
     def reset(self):
         """Clear per-episode action state."""
@@ -1827,25 +1542,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._record_action_for_history = bool(self.config.action_conditioning and not has_stream)
         return selected_action
 
-    def get_loss_denominators(self, batch: dict[str, Any]) -> dict[str, Tensor]:
-        """Return local valid counts before model forward for exact update-wide normalization."""
-        stream = batch.get(PERCEPTRON_ISAAC_STREAM_KEY)
-        if stream is None:
-            raise ValueError(
-                f"ISAAC training requires the native preprocessor output {PERCEPTRON_ISAAC_STREAM_KEY!r}."
-            )
-        flow_fixture_tensors = self._aligned_flow_fixture_tensors(batch, len(stream.streams))
-        return perceptron_isaac_loss_denominators(
-            stream,
-            loss_plan=str(self.config.loss_plan),
-            action_dim=int(self.config.max_action_dim),
-            action_horizon=int(self.config.chunk_size),
-            train_samples_per_chunk=int(self.config.train_samples_per_chunk),
-            flow_mask_padded_action_rows=bool(self.config.flow_mask_padded_action_rows),
-            exclude_non_agent_roles=bool(self.config.exclude_non_agent_roles),
-            flow_loss_mask=flow_fixture_tensors[ISAAC_FLOW_LOSS_MASK_KEY],
-        )
-
     def forward(
         self,
         batch: dict[str, Tensor],
@@ -1938,7 +1634,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         **kwargs,
     ) -> T:
         """Load a local or Hub-hosted LeRobot checkpoint and its checkpoint-local assets."""
-        config_was_provided = config is not None
         if config is None:
             from lerobot.configs import PreTrainedConfig
 
@@ -1961,11 +1656,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             local_files_only=local_files_only,
             revision=revision,
         )
-        cls._resolve_checkpoint_local_paths(
-            config,
-            checkpoint_root,
-            allow_pre_resolved_absolute=config_was_provided,
-        )
+        cls._resolve_checkpoint_local_paths(config, checkpoint_root)
         cls._verify_packaged_contract_digests(config, checkpoint_root)
         cls._set_checkpoint_local_vocab_path(config)
         policy = cls(config)
@@ -2517,34 +2208,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 f"{pretrained_name_or_path}"
             ) from exc
 
-    @classmethod
-    def resolve_checkpoint_config_paths(
-        cls, config: PerceptronIsaacConfig, checkpoint_root: str | Path
-    ) -> None:
-        """Resolve the config's relative sidecar paths against a checkpoint root.
-
-        Public hook for PEFT loaders: ``from_pretrained`` runs against the BASE
-        package (``peft_config.base_model_name_or_path``), so the adapter config's
-        relative paths must be resolved against the ADAPTER checkpoint root first.
-        Without this, a relative ``native_stats_path: isaac_stats.json`` in a
-        finetune's config.json resolves to the base package's stats file and
-        silently reinstates the serving-stats split-brain. Resolution is
-        idempotent: paths made absolute here are left untouched by the later
-        base-root pass inside ``from_pretrained``.
-        """
-        cls._resolve_checkpoint_local_paths(
-            config,
-            checkpoint_root,
-            allow_missing_relative=True,
-            record_source_root=False,
-        )
-
     @staticmethod
     def _resolve_checkpoint_local_paths(
         config: PerceptronIsaacConfig,
         pretrained_name_or_path: str | Path,
         *,
-        allow_pre_resolved_absolute: bool = False,
         allow_missing_relative: bool = False,
         record_source_root: bool = True,
     ) -> None:
@@ -2584,10 +2252,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             if path.is_absolute():
                 record = relative_paths.get(attr)
                 if isinstance(record, dict) and record.get("absolute") == str(path):
-                    continue
-                if allow_pre_resolved_absolute and getattr(
-                    config, "_allow_trusted_absolute_checkpoint_paths", False
-                ):
                     continue
                 raise RuntimeError(f"Checkpoint-local path {attr} must be relative, got {path}.")
             unresolved_candidate = root / path

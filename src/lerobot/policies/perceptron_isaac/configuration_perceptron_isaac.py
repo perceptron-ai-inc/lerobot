@@ -24,10 +24,7 @@ from .isaac_stats import require_closed_loop_safe_isaac_profile
 from .mharmony_contract import SUPPORTED_MHARMONY_VERSION, normalize_mharmony_version_marker
 from .processor_utils import flatten_feature_names
 
-# Checkpoint-local stats sidecar written next to config.json at save time. Relative on
-# purpose: PEFT loaders resolve it against the adapter checkpoint root first (see
-# PerceptronIsaacPolicy.resolve_checkpoint_config_paths), keeping the package
-# self-contained and relocatable.
+# Checkpoint-local stats sidecar, saved relative to keep native packages relocatable.
 NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
 
 # The inference recipe a Genesis export ships at its root. Its rendering block is the
@@ -830,16 +827,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                     f"Perceptron Isaac {label} feature width must match {width_name}={width}; "
                     f"got shape={tuple(feature.shape)}."
                 )
-
-    @property
-    def max_eval_batch_size(self) -> int:
-        """ISAAC online history and action queues are per-policy-instance state."""
-        return 1
-
-    @property
-    def max_eval_parallel_tasks(self) -> int:
-        """Concurrent tasks cannot share the online history, RNG clock or action queue."""
-        return 1
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

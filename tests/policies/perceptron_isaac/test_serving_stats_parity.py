@@ -411,12 +411,11 @@ def test_config_save_exports_checkpoint_local_stats_with_relative_path(tmp_path)
     # on every path-load, so a maskless JSON would silently normalize the grippers.
     assert reloaded.proprio.mask is not None and not bool(reloaded.proprio.mask[-1])
 
-    # Issue-3 contract: PEFT loaders resolve the relative path against the ADAPTER
-    # root through the public hook, and an already-absolute path is left untouched.
+    # Resolved paths keep their checkpoint ownership when another root is considered.
     fresh = _config(tmp_path, native_stats_path="isaac_stats.json")
-    PerceptronIsaacPolicy.resolve_checkpoint_config_paths(fresh, save_dir)
+    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(fresh, save_dir, allow_missing_relative=True)
     assert fresh.native_stats_path == str(save_dir / "isaac_stats.json")
-    PerceptronIsaacPolicy.resolve_checkpoint_config_paths(fresh, tmp_path)
+    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(fresh, tmp_path, allow_missing_relative=True)
     assert fresh.native_stats_path == str(save_dir / "isaac_stats.json")
 
 
@@ -474,15 +473,14 @@ def test_config_save_carries_per_suite_tables_checkpoint_local(tmp_path):
     assert cfg.suite_stats_path == str(suite_stats)
     assert cfg.suite_by_task_index_path == str(suite_map)
 
-    # And the loader resolves them back against the checkpoint root, like every other
-    # sidecar -- including through the PEFT hook, which runs against the ADAPTER root.
+    # Loading resolves each table against the checkpoint root, like every other sidecar.
     fresh = _config(
         tmp_path,
         native_stats_path="isaac_stats.json",
         suite_stats_path="isaac_suite_stats.json",
         suite_by_task_index_path="isaac_suite_by_task_index.json",
     )
-    PerceptronIsaacPolicy.resolve_checkpoint_config_paths(fresh, save_dir)
+    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(fresh, save_dir, allow_missing_relative=True)
     assert fresh.suite_stats_path == str(save_dir / "isaac_suite_stats.json")
     assert fresh.suite_by_task_index_path == str(save_dir / "isaac_suite_by_task_index.json")
 

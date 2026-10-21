@@ -160,7 +160,3 @@ def test_validate_features_rejects_widths_mutated_after_config_load(feature_grou
 
     with pytest.raises(ValueError, match="feature width must match"):
         config.validate_features()
-
-
-def test_config_declares_single_environment_eval_limit() -> None:
-    assert PerceptronIsaacConfig(device="cpu").max_eval_batch_size == 1
