@@ -873,7 +873,7 @@ class IsaacNativeMharmonyRenderer:
                         role=None,
                     )
                 )
-            padded.append(create_stream(events, sample.priority, schedule=False))
+            padded.append(create_stream(events, sample.priority))
         return TensorStream(padded)
 
     def _render_plan_to_tensor_stream(

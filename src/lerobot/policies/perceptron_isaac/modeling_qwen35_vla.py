@@ -1711,7 +1711,7 @@ class Qwen35VLAModel(Qwen3_5Model):
         are stored in sequence order, so the concat IS the interleave).
         """
         flat_stream = tensor_stream.flat_stream()
-        per_modality_stream = group_streams(flat_stream, group_fn=lambda ev: ev.type, schedule=False)
+        per_modality_stream = group_streams(flat_stream, group_fn=lambda ev: ev.type)
         per_modality_compact = {k: v.compact() for k, v in per_modality_stream.items()}
 
         # Per-event spatial grids for vision events: dims(virtual=False) == [T, H, W].

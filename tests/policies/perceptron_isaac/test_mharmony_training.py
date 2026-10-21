@@ -37,11 +37,14 @@ from lerobot.policies.perceptron_isaac.mharmony_native import (
 )
 from lerobot.policies.perceptron_isaac.tensor_stream import (
     Event,
+    ModalityType,
     Stream,
     TensorStream,
     TextType,
     VectorType,
     VisionType,
+    create_stream,
+    group_streams,
 )
 from lerobot.policies.perceptron_isaac.tensor_stream_utils import (
     build_action_context_mask,
@@ -460,6 +463,37 @@ def test_public_rendered_stream_lowering_rejects_invalid_pixel_shuffle_grid():
 
     with pytest.raises(ValueError, match="not divisible"):
         rendered_stream_to_local_tensor_stream(rendered, device="cpu", dtype=torch.float32)
+
+
+def test_stream_construction_keeps_render_order_and_owns_event_lists() -> None:
+    late = Event.from_text_tokens(torch.tensor([11]), time=(3.0, 3.0))
+    early = Event.from_text_tokens(torch.tensor([12]), time=(0.0, 0.0), type=TextType.control)
+    last = Event.from_text_tokens(torch.tensor([13]), time=(1.0, 1.0))
+    events = [late, early, last]
+    priority: list[ModalityType] = [TextType.control, TextType.text]
+    stream = create_stream(events, priority)
+    events.clear()
+    assert stream.events == [late, early, last]
+    grouped = group_streams(stream, lambda event: event.type)
+    assert list(grouped) == [TextType.text, TextType.control]
+    assert grouped[TextType.text].events == [late, last]
+    assert grouped[TextType.control].events == [early]
+    assert grouped[TextType.text].priority == priority
+    grouped[TextType.text].events.clear()
+    assert stream.events == [late, early, last]
+    mapped = stream.map(lambda _event: {})
+    assert all(left is right for left, right in zip(mapped.events, stream.events, strict=True))
+    flat = TensorStream([stream]).flat_stream()
+    flat.events.clear()
+    assert stream.events == [late, early, last]
+    short = TensorStream([create_stream([early], priority)])
+    padded = IsaacNativeMharmonyRenderer.collate([TensorStream([stream]), short])
+    assert padded.shape == (2, 3)
+    assert padded.streams[0].events == [late, early, last]
+    assert padded.streams[1].events[0] is early
+    assert padded.streams[1].events[-1].type == TextType.padding
+    torch.testing.assert_close(padded.streams[1].events[-1].data, torch.zeros(2, 1, dtype=torch.long))
+    assert short.streams[0].events == [early]
 
 
 @pytest.mark.parametrize("dtype", [None, torch.float64])

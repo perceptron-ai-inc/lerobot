@@ -407,5 +407,5 @@ def rendered_stream_to_local_tensor_stream(
             raise ValueError(f"Unsupported ISAAC event type {event_type!r}.")
         events.append(event)
 
-    stream = create_stream(events, priority=list(_ISAAC_PRIORITY), schedule=False)
+    stream = create_stream(events, priority=list(_ISAAC_PRIORITY))
     return TensorStream([stream]).to(device=device, dtype=dtype, non_blocking=True)

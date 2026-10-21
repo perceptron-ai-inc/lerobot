@@ -390,9 +390,7 @@ def set_data(
     device = st_tensor.device
     data = torch.zeros_like(st_tensor, device=device)
     set_data_mask = torch.zeros_like(st_tensor, dtype=torch.bool, device=device)
-    per_modality_stream = group_streams(
-        tensor_stream.flat_stream(), group_fn=lambda ev: ev.type, schedule=False
-    )
+    per_modality_stream = group_streams(tensor_stream.flat_stream(), group_fn=lambda ev: ev.type)
     requested_stream_types = tuple(stream_types)
     per_modality_compact_stream = {
         st: per_modality_stream[st].compact() for st in requested_stream_types if st in per_modality_stream
@@ -470,6 +468,6 @@ def slice(tensor_stream: TensorStream, start: int, end: int) -> TensorStream:
 
             curr_global_index = global_ev_end
 
-        sliced_streams.append(create_stream(new_events, stream.priority, schedule=False))
+        sliced_streams.append(create_stream(new_events, stream.priority))
 
     return TensorStream(sliced_streams)
