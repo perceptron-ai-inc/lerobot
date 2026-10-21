@@ -43,7 +43,7 @@ def _config() -> PerceptronIsaacConfig:
 def _policy_with_tiny_model() -> PerceptronIsaacPolicy:
     policy = PerceptronIsaacPolicy(_config())
     policy._isaac_model = TinyIsaacModel()
-    policy._configure_training_parameters = lambda: None
+    policy._training_parameters_configured = True
     return policy
 
 

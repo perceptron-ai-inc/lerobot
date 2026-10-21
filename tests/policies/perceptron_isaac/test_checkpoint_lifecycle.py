@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -28,7 +29,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 
 def _config(**overrides) -> PerceptronIsaacConfig:
-    values = {
+    values: dict[str, Any] = {
         "device": "cpu",
         "n_obs_steps": 1,
         "chunk_size": 2,
@@ -218,6 +219,7 @@ def test_dense_save_is_self_contained_after_move_and_preserves_fp32_trainables(m
     reloaded._load_backbone(training=True)
 
     assert load_modes == [True]
+    assert reloaded._isaac_model is not None
     assert reloaded._isaac_model.lm_head.weight.dtype == torch.float32
     expected = torch.full_like(reloaded._isaac_model.lm_head.weight, 1.2500001192092896)
     torch.testing.assert_close(reloaded._isaac_model.lm_head.weight, expected, rtol=0, atol=0)
@@ -232,6 +234,8 @@ def test_verified_runtime_sidecars_survive_source_mutation_without_weight_snapsh
     policy._isaac_model = _load_native_fixture(config)
 
     policy._retain_verified_runtime_assets(source)
+    assert config.native_stats_path is not None
+    assert config.hf_model_path is not None
     retained_stats = Path(config.native_stats_path)
     retained_vocab = Path(config.hf_model_path) / "vocab.json"
     (source / "isaac_stats.json").write_text('{"changed": true}\n')
@@ -282,6 +286,10 @@ def test_verified_runtime_assets_preserve_adapter_owned_sidecars(monkeypatch, tm
     (adapter / "native_render_metadata.json").write_text('{"changed": true}\n')
     (adapter / "fast_processor" / "processing_action_tokenizer.py").write_text("# changed\n")
 
+    assert config.hf_model_path is not None
+    assert config.native_stats_path is not None
+    assert config.native_render_metadata_path is not None
+    assert config.fast_processor_path is not None
     assert Path(config.hf_model_path, "vocab.json").read_text() == '{"owner": "base"}\n'
     assert Path(config.native_stats_path).read_text() == '{"owner": "adapter"}\n'
     assert Path(config.native_render_metadata_path).read_text() == '{"owner": "adapter"}\n'
@@ -318,6 +326,7 @@ def test_native_base_save_verifies_a_fresh_snapshot_config(monkeypatch, tmp_path
     config = _source_package(source)
     policy = PerceptronIsaacPolicy(config)
     policy._retain_verified_runtime_assets(source)
+    assert config.hf_model_path is not None
     live_model_path = Path(config.hf_model_path)
     verified: list[Path] = []
 

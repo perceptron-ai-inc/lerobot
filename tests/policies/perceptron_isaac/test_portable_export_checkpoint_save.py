@@ -54,10 +54,13 @@ def _write_raw_export(root: Path) -> Path:
     return package
 
 
-def _config(**overrides: object) -> PerceptronIsaacConfig:
-    if "fast_processor_path" in overrides:
-        overrides.setdefault("fast_processor_tree_sha256", "0" * 64)
-    return PerceptronIsaacConfig(device="cpu", **overrides)
+def _config(*, hf_model_path: str, fast_processor_path: str | None = None) -> PerceptronIsaacConfig:
+    return PerceptronIsaacConfig(
+        device="cpu",
+        hf_model_path=hf_model_path,
+        fast_processor_path=fast_processor_path,
+        fast_processor_tree_sha256="0" * 64 if fast_processor_path is not None else None,
+    )
 
 
 def _unstarted_policy(config: PerceptronIsaacConfig, save_root: Path) -> PerceptronIsaacPolicy:
@@ -133,8 +136,8 @@ def test_snapshot_save_source_keeps_the_export_root(tmp_path: Path) -> None:
         assert package_root.name == PACKAGE_DIRECTORY_NAME
         assert is_portable_isaac05_repository(package_root.parent)
         PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, package_root)
-        assert Path(config.hf_model_path) == package_root.parent
-        assert Path(config.fast_processor_path) == package_root.parent / "fast_processor_pinned"
+        assert config.hf_model_path == str(package_root.parent)
+        assert config.fast_processor_path == str(package_root.parent / "fast_processor_pinned")
         assert not list(package_root.parent.glob("model-*.safetensors"))
         assert not (package_root.parent / "model.safetensors.index.json").exists()
 

@@ -422,6 +422,7 @@ def test_native_fp32_masters_keep_source_bits_before_fsdp2_shards(
     groups = policy.get_optim_params()
 
     assert groups
+    assert policy._isaac_model is not None
     trainable = [
         (name, parameter)
         for name, parameter in policy._isaac_model.named_parameters()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import tomllib
 from pathlib import Path
 
@@ -16,6 +17,7 @@ def test_perceptron_isaac_extra_installs_standalone_mharmony() -> None:
 
 def test_mharmony_boundary_does_not_import_genesis(monkeypatch) -> None:
     from lerobot.policies.perceptron_isaac import mharmony_adapter
+    from lerobot.policies.perceptron_isaac.mharmony_contract import SUPPORTED_MHARMONY_VERSION
 
     imported: list[str] = []
 
@@ -26,9 +28,9 @@ def test_mharmony_boundary_does_not_import_genesis(monkeypatch) -> None:
     monkeypatch.setattr(
         mharmony_adapter,
         "_validate_installed_mharmony_version",
-        lambda: mharmony_adapter.SUPPORTED_MHARMONY_VERSION,
+        lambda: SUPPORTED_MHARMONY_VERSION,
     )
-    monkeypatch.setattr(mharmony_adapter.importlib, "import_module", record_import)
+    monkeypatch.setattr(importlib, "import_module", record_import)
 
     mharmony_adapter.load_mharmony()
 

@@ -1,4 +1,5 @@
 import json
+from typing import Any
 
 import pytest
 
@@ -9,10 +10,10 @@ from lerobot.policies.perceptron_isaac.mharmony_contract import SUPPORTED_MHARMO
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
-@pytest.mark.parametrize("mode", ["use_peft", "train_expert_only"])
-def test_config_rejects_deferred_training_modes(mode: str) -> None:
+@pytest.mark.parametrize(("use_peft", "train_expert_only"), [(True, False), (False, True)])
+def test_config_rejects_deferred_training_modes(use_peft: bool, train_expert_only: bool) -> None:
     with pytest.raises(ValueError, match="supports only dense training"):
-        PerceptronIsaacConfig(**{mode: True})
+        PerceptronIsaacConfig(use_peft=use_peft, train_expert_only=train_expert_only)
 
 
 def test_image_preprocessing_defaults_to_legacy_stretch() -> None:
@@ -99,7 +100,7 @@ def test_config_rejects_nonpositive_action_steps(n_action_steps) -> None:
     ],
 )
 def test_config_rejects_noncanonical_checkpoint_digests(field_name) -> None:
-    values = {field_name: "A" * 64}
+    values: dict[str, Any] = {field_name: "A" * 64}
     if field_name == "fast_processor_tree_sha256":
         values["fast_processor_path"] = "FAST"
 

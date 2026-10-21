@@ -274,6 +274,7 @@ def test_fsdp2_dense_training_never_writes_the_read_only_package(tmp_path, monke
     _live_fsdp2(monkeypatch)
     policy.get_optim_params()
 
+    assert policy._isaac_model is not None
     with torch.no_grad():
         for param in policy._isaac_model.parameters():
             param.add_(1.0)
@@ -849,6 +850,7 @@ def test_inference_load_is_unchanged(tmp_path, monkeypatch) -> None:
         "cpu",
     )
     assert call.get("runtime_device", call["device"]) == call["device"]
+    assert policy._isaac_model is not None
     assert {p.dtype for p in policy._isaac_model.parameters()} == {torch.bfloat16}
 
 
