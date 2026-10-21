@@ -1055,8 +1055,8 @@ class GenesisQwen36VisionModel(Qwen3_5MoeVisionModel):
         grid_ws = [row[2] for row in grid_thw_list]
         device = self.pos_embed.weight.device
 
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
+        idx_list: list[list[int]] = [[] for _ in range(4)]
+        weight_list: list[list[float]] = [[] for _ in range(4)]
         for _t, height, width in grid_thw_list:
             height_indices = torch.linspace(0, self.num_grid_per_side - 1, height)
             width_indices = torch.linspace(0, self.num_grid_per_side - 1, width)

@@ -19,6 +19,7 @@ from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import (
     GenesisNullSparseMoeBlock,
     GenesisNullTopKRouter,
     GenesisQwen36Attention,
+    GenesisQwen36AttentionTrace,
     GenesisQwen36DecoderLayer,
     GenesisQwen36GatedDeltaNet,
     GenesisQwen36Model,
@@ -323,7 +324,7 @@ def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> 
         return original_sdpa(query, key, value, **kwargs)
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", recording_sdpa)
-    traces = []
+    traces: list[GenesisQwen36AttentionTrace] = []
     attention.trace_observer = traces.append
     with torch.no_grad():
         actual, weights = attention(hidden_states, position_embeddings, None)
@@ -1143,8 +1144,17 @@ def test_hybrid_attention_is_causal_and_left_padding_preserves_valid_tokens() ->
             use_cache=False,
         ).last_hidden_state
 
-    torch.testing.assert_close(original_output[:, :2], changed_output[:, :2], rtol=0, atol=0)
+    # Future routes change expert GEMM batch sizes, causing FP32 roundoff even
+    # for identical prefix rows. The gradient oracle below tests exact causality.
+    torch.testing.assert_close(original_output[:, :2], changed_output[:, :2], rtol=0, atol=1e-6)
     torch.testing.assert_close(original_output, padded_output[:, -3:], rtol=1e-5, atol=1e-6)
+
+    embeddings = model.embed_tokens(original).detach().requires_grad_()
+    output = model(inputs_embeds=embeddings, use_cache=False).last_hidden_state
+    coefficients = torch.arange(1, 49).reshape(1, 2, 24)
+    gradient = torch.autograd.grad((output[:, :2] * coefficients).sum(), embeddings)[0]
+    assert torch.count_nonzero(gradient[:, :2]) > 0
+    assert torch.count_nonzero(gradient[:, 2:]) == 0
 
 
 def test_hybrid_text_model_constructs_directly_on_meta() -> None:
