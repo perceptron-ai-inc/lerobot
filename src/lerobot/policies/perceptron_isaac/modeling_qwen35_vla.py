@@ -1104,19 +1104,6 @@ class MolmoActExpertHead(ActionExpertHead):
         tau = beta * a.timestep_sampling_scale + a.timestep_sampling_offset
         return tau.to(device=device, dtype=dtype)
 
-    # -- horizon embedding unused (MolmoAct2 positions come from RoPE); zeros placeholder --
-    def horizon_embeddings(
-        self,
-        horizons: int | Sequence[int],
-        *,
-        h_max: int | None = None,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        real = [horizons] if isinstance(horizons, int) else list(horizons)
-        h = max(real) if h_max is None else h_max
-        return torch.zeros(len(real), h, self.hidden_dim, device=device, dtype=dtype)
-
     def forward(
         self,
         vlm_activations: torch.Tensor,
@@ -1389,25 +1376,6 @@ class DiTActionExpertArgs:
             raise ValueError("ffn_multiple_of must be >= 1.")
         if self.k_batched_cross_attn_backend not in ("flash_gqa", "sdpa_gqa"):
             raise ValueError("k_batched_cross_attn_backend must be 'flash_gqa' or 'sdpa_gqa'.")
-
-    def to_action_expert_config(self) -> MolmoAct2ActionExpertConfig:
-        return MolmoAct2ActionExpertConfig(
-            hidden_size=self.hidden_dim,
-            num_layers=self.num_layers,
-            num_heads=self.num_heads,
-            max_action_dim=self.action_dim,
-            max_action_horizon=self.action_horizon,
-            mlp_ratio=self.mlp_ratio,
-            ffn_multiple_of=self.ffn_multiple_of,
-            timestep_embed_dim=self.timestep_embed_dim,
-            attn_dropout=0.0,
-            dropout=0.0,
-            qk_norm=self.qk_norm,
-            qk_norm_eps=self.qk_norm_eps,
-            rope=self.rope,
-            context_layer_norm=self.context_layer_norm,
-            causal_attn=self.causal_attn,
-        )
 
 
 def _validate_action_expert_contract(action_expert_cfg: dict[str, Any]) -> DiTActionExpertArgs:
