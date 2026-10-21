@@ -9,6 +9,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+pytest.importorskip("transformers", reason="install lerobot[perceptron_isaac]")
+
 import lerobot.policies.perceptron_isaac.modeling_mk1_vla as modeling_mk1_vla
 import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as modeling_qwen35_vla
 from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
 import torch
+
+pytest.importorskip("transformers", reason="install lerobot[perceptron_isaac]")
+pytest.importorskip("mharmony", reason="install lerobot[perceptron_isaac]")
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
