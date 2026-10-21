@@ -423,9 +423,6 @@ class GenesisNullSparseMoeBlock(nn.Module):
                 f"Unsupported MK1 route reduction {route_reduction!r}; "
                 f"expected {DETERMINISTIC_ROUTE_REDUCTION!r}."
             )
-        # Grouped GEMMs remain unchanged; only repeated-token accumulation uses
-        # the stable segment reducer qualified by the Step-0 parity workflow.
-        self.deterministic_route_reduction = True
         self.dispatch_trace_observer: Callable[[GenesisNullDispatchTrace], None] | None = None
 
     @property
@@ -520,16 +517,12 @@ class GenesisNullSparseMoeBlock(nn.Module):
         offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
 
         unscaled_scores = expert_scores / self.contract.route_scale
-        if self.deterministic_route_reduction:
-            selected_unscaled_scores = selected_scores / self.contract.route_scale
-            real_mass = torch.where(
-                real_mask,
-                selected_unscaled_scores,
-                torch.zeros_like(selected_unscaled_scores),
-            ).sum(dim=-1)
-        else:
-            real_mass = unscaled_scores.new_zeros(num_tokens)
-            real_mass.index_add_(0, token_indices, unscaled_scores)
+        selected_unscaled_scores = selected_scores / self.contract.route_scale
+        real_mass = torch.where(
+            real_mask,
+            selected_unscaled_scores,
+            torch.zeros_like(selected_unscaled_scores),
+        ).sum(dim=-1)
         expert_scores = (
             unscaled_scores / real_mass.clamp_min(1e-6)[token_indices]
         ) * self.contract.route_scale
@@ -576,14 +569,8 @@ class GenesisNullSparseMoeBlock(nn.Module):
             weighted_swiglu = (swiglu.float() * expert_scores[:, None]).to(swiglu.dtype)
             current_output = functional.linear(weighted_swiglu, self.experts.down_proj[expert_index])
             current_output = current_output.to(routed_output.dtype)
-            if self.deterministic_route_reduction:
-                deterministic_token_indices.append(token_indices)
-                deterministic_outputs.append(current_output)
-            else:
-                routed_output.index_add_(0, token_indices, current_output)
-                # Genesis scatters route rows directly into the shared-expert base.
-                # Keeping that accumulation order avoids an extra BF16 rounding step.
-                combined_output.index_add_(0, token_indices, current_output)
+            deterministic_token_indices.append(token_indices)
+            deterministic_outputs.append(current_output)
             start = end
         if deterministic_outputs:
             all_token_indices = torch.cat(deterministic_token_indices)
@@ -620,16 +607,10 @@ class GenesisNullSparseMoeBlock(nn.Module):
             self.experts.down_proj.transpose(-2, -1),
             offs=routes.offsets,
         ).to(routed_output.dtype)
-        if self.deterministic_route_reduction:
-            routed_output = deterministic_token_segment_sum(
-                routed_output, routes.token_indices, current_output
-            )
-            combined_output = deterministic_token_segment_sum(
-                combined_output, routes.token_indices, current_output
-            )
-        else:
-            routed_output.index_add_(0, routes.token_indices, current_output)
-            combined_output.index_add_(0, routes.token_indices, current_output)
+        routed_output = deterministic_token_segment_sum(routed_output, routes.token_indices, current_output)
+        combined_output = deterministic_token_segment_sum(
+            combined_output, routes.token_indices, current_output
+        )
         return routed_output, combined_output
 
     def _dispatch_real_experts(

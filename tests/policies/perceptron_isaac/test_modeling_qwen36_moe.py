@@ -158,9 +158,8 @@ def test_deterministic_route_reducer_is_bitwise_stable_and_preserves_ordered_sum
 
 def test_null_moe_defaults_to_qualified_stable_route_reduction() -> None:
     config = _text_config()
-    block = GenesisNullSparseMoeBlock(config)
+    GenesisNullSparseMoeBlock(config)
 
-    assert block.deterministic_route_reduction is True
     config._mk1_route_reduction = "repeated_index_add"
     with pytest.raises(ValueError, match="Unsupported MK1 route reduction"):
         GenesisNullSparseMoeBlock(config)
@@ -181,7 +180,6 @@ def test_deterministic_null_moe_block_is_bitwise_stable_on_cuda() -> None:
         for parameter in block.parameters():
             parameter.uniform_(-0.02, 0.02)
         block.gate.weight.zero_()
-    block.deterministic_route_reduction = True
     block.eval()
     x = torch.linspace(-1.0, 1.0, steps=5 * 24, device="cuda", dtype=torch.bfloat16).reshape(1, 5, 24)
 
@@ -476,7 +474,6 @@ def test_multimodal_model_installs_explicit_sdpa_for_text_and_vision() -> None:
     assert isinstance(model.language_model.layers[0].self_attn, GenesisQwen36Attention)
     assert isinstance(model.visual, GenesisQwen36VisionModel)
     assert all(isinstance(block.attn, GenesisQwen36VisionAttention) for block in model.visual.blocks)
-    assert all(layer.mlp.deterministic_route_reduction for layer in model.language_model.layers)
     assert DETERMINISTIC_ROUTE_REDUCTION == "stable_token_segment_sum_v1"
 
 
@@ -943,13 +940,11 @@ def test_production_dispatch_bf16_preserves_grouped_mm(training: bool, capabilit
 
 
 @pytest.mark.parametrize("activation_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-@pytest.mark.parametrize("deterministic", [True, False], ids=["segment", "index-add"])
 @pytest.mark.parametrize("real_routes", [2, 1, 0], ids=["real", "mixed", "null"])
 def test_fp32_eager_experts_accept_cpu_bf16_autocast_forward(
-    activation_dtype: torch.dtype, deterministic: bool, real_routes: int
+    activation_dtype: torch.dtype, real_routes: int
 ) -> None:
     block = GenesisNullSparseMoeBlock(_text_config()).train()
-    block.deterministic_route_reduction = deterministic
     with torch.no_grad():
         for parameter in block.parameters():
             parameter.fill_(0.1)
@@ -992,11 +987,7 @@ def test_fp32_eager_experts_accept_cpu_bf16_autocast_forward(
     expected_output = expected_shared.to(activation_dtype, copy=True)
     for _ in range(real_routes):
         expected_routed = expected_routed + expected_row.to(activation_dtype)
-        if not deterministic:
-            # Preserve direct scatter into the shared base, including BF16 rounding.
-            expected_output = expected_output + expected_row.to(activation_dtype)
-    if deterministic:
-        expected_output = expected_output + expected_routed
+    expected_output = expected_output + expected_routed
     torch.testing.assert_close(branches.routed_output, expected_routed, rtol=0, atol=0)
     torch.testing.assert_close(branches.output, expected_output, rtol=0, atol=0)
     if real_routes:
