@@ -21,10 +21,7 @@ from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import Perceptr
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     make_perceptron_isaac_pre_post_processors,
 )
-from lerobot.policies.perceptron_isaac.trained_package import (
-    finalize_canonical_trained_package,
-    stage_trained_processor_assets,
-)
+from lerobot.policies.perceptron_isaac.trained_package import finalize_canonical_trained_package
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -300,27 +297,6 @@ def test_verified_runtime_assets_preserve_adapter_owned_sidecars(monkeypatch, tm
     assert Path(config.hf_model_path).parent != Path(config.native_stats_path).parent
 
 
-@pytest.mark.parametrize("unsafe_kind", ["absolute", "traversal"])
-def test_asset_staging_rejects_untrusted_serialized_sidecars(tmp_path, unsafe_kind) -> None:
-    package = tmp_path / "adapter"
-    package.mkdir()
-    retained = tmp_path / "retained"
-    retained.mkdir()
-    secret = tmp_path / "secret.json"
-    secret.write_text('{"secret": true}\n')
-    raw = str(secret) if unsafe_kind == "absolute" else "../secret.json"
-    (package / "policy_preprocessor.json").write_text(
-        json.dumps({"steps": [{"config": {"native_stats_path": raw}}]})
-    )
-    config = _config()
-    config._pretrained_processor_root = str(retained)
-
-    with pytest.raises(RuntimeError, match="untrusted|escapes"):
-        stage_trained_processor_assets(package, config)
-
-    assert not (package / "isaac_stats.json").exists()
-
-
 def test_native_base_save_verifies_a_fresh_snapshot_config(monkeypatch, tmp_path) -> None:
     source = tmp_path / "source"
     config = _source_package(source)
@@ -450,11 +426,12 @@ def test_original_package_processors_bind_retained_instance(tmp_path) -> None:
         assert list(pack._stats.action.q01) == [-1.0, -1.0]
         assert isinstance(pack.fast_processor_path, str)
         retained_paths.append(pack.fast_processor_path)
-        destination = tmp_path / f"staged-{index}"
-        destination.mkdir()
+        destination = tmp_path / f"saved-{index}"
+        assert policy._verified_runtime_assets is not None
+        policy._copy_checkpoint_package(policy._verified_runtime_assets.root, destination)
         pre.save_pretrained(destination)
         post.save_pretrained(destination)
-        stage_trained_processor_assets(destination, instance_config)
+        rewrite_trained_processor_paths(destination)
         assert (
             file_sha256(destination / "fast_processor" / fast_file.name)
             == before[str(fast_file.relative_to(source))]
@@ -558,7 +535,7 @@ def test_factory_restoration_keeps_checkpoint_stats_over_destination_metadata(
     torch.testing.assert_close(destination_stats[ACTION]["q01"], torch.full((2,), 10.0))
 
 
-@pytest.mark.parametrize("hostile", ["traversal", "symlink", "forged_absolute"])
+@pytest.mark.parametrize("hostile", ["traversal", "symlink"])
 def test_factory_processor_sidecars_reject_hostile_paths_at_package_boundary(tmp_path, hostile: str) -> None:
     from lerobot.policies.factory import make_pre_post_processors
 
@@ -576,26 +553,11 @@ def test_factory_processor_sidecars_reject_hostile_paths_at_package_boundary(tmp
     if hostile == "symlink":
         (source / "linked-fast").symlink_to(secret, target_is_directory=True)
         raw = "linked-fast"
-    elif hostile == "forged_absolute":
-        raw = str(secret)
-        # Matching a caller-supplied config path is not verified provenance.
-        config.fast_processor_path = raw
     payload = json.loads((source / "policy_preprocessor.json").read_text())
     for step in payload["steps"]:
         if "fast_processor_path" in step["config"]:
             step["config"]["fast_processor_path"] = raw
     (source / "policy_preprocessor.json").write_text(json.dumps(payload))
-    if hostile == "forged_absolute":
-        # Legacy absolutes remain untouched by restoration; staging is the trust boundary.
-        pre, post = make_pre_post_processors(config, pretrained_path=str(source))
-        destination = tmp_path / "destination"
-        destination.mkdir()
-        pre.save_pretrained(destination)
-        post.save_pretrained(destination)
-        with pytest.raises(RuntimeError, match="untrusted absolute"):
-            stage_trained_processor_assets(destination, config)
-        assert not (destination / "fast_processor").exists()
-    else:
-        with pytest.raises(RuntimeError, match="escapes its package"):
-            make_pre_post_processors(config, pretrained_path=str(source))
+    with pytest.raises(RuntimeError, match="escapes its package"):
+        make_pre_post_processors(config, pretrained_path=str(source))
     assert marker.read_text() == "# inert outside-package marker\n"

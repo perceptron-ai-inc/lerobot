@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hmac
 import json
-import shutil
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,131 +46,6 @@ def _processor_configs(root: Path) -> list[Path]:
         and path.name.startswith(("policy_preprocessor", "policy_postprocessor"))
         and path.suffix == ".json"
     ]
-
-
-def _processor_path_values(value: Any, found: dict[str, set[str]]) -> None:
-    if isinstance(value, list):
-        for item in value:
-            _processor_path_values(item, found)
-        return
-    if not isinstance(value, dict):
-        return
-    for key, item in value.items():
-        if key in PROCESSOR_PACKAGE_PATHS and isinstance(item, str) and item.strip():
-            found[key].add(item)
-        _processor_path_values(item, found)
-
-
-def stage_trained_processor_assets(package_root: str | Path, config: Any) -> None:
-    """Materialize the runtime sidecars declared by a saved PEFT processor pair.
-
-    PEFT saves only adapter tensors. Unlike a dense policy save, it therefore does
-    not copy the base package before the processor JSON is finalized. Copy the
-    small processor-owned runtime assets from their retained source first so the
-    adapter remains portable while its (potentially remote) base stays a pinned
-    Hub reference.
-    """
-    root = Path(package_root).resolve()
-    declared: dict[str, set[str]] = {key: set() for key in PROCESSOR_PACKAGE_PATHS}
-    for config_path in _processor_configs(root):
-        try:
-            _processor_path_values(load_json_object(config_path), declared)
-        except ValueError as exc:
-            raise RuntimeError(f"Cannot stage serialized processor assets: {exc}") from exc
-
-    retained_records = dict(getattr(config, "_checkpoint_relative_paths", {}))
-    trusted_paths: dict[str, str] = {}
-    for key in PROCESSOR_PACKAGE_PATHS:
-        record = retained_records.get(key)
-        configured = getattr(config, key, None)
-        if (
-            not isinstance(record, dict)
-            or not isinstance(record.get("absolute"), str)
-            or record["absolute"] != str(configured or "")
-            or not isinstance(record.get("root"), str)
-            or not isinstance(record.get("relative"), str)
-        ):
-            continue
-        relative_path = Path(record["relative"])
-        record_root = Path(record["root"])
-        if (
-            relative_path.is_absolute()
-            or not relative_path.parts
-            or ".." in relative_path.parts
-            or str(record_root / relative_path) != record["absolute"]
-        ):
-            continue
-        trusted_paths[key] = record["absolute"]
-
-    for key, values in declared.items():
-        for raw in values:
-            path = Path(raw)
-            if ".." in path.parts:
-                raise RuntimeError(f"Serialized processor path {key} escapes its package: {raw}.")
-            if path.is_absolute() and raw != trusted_paths.get(key):
-                raise RuntimeError(f"Serialized processor path {key} is an untrusted absolute path: {raw}.")
-
-    source_roots = [
-        Path(str(value)).resolve()
-        for value in (
-            getattr(config, "_pretrained_processor_root", None),
-            getattr(config, "_checkpoint_source_root", None),
-        )
-        if value and Path(str(value)).is_dir()
-    ]
-
-    def resolve_source(raw: str, *, is_directory: bool) -> Path | None:
-        path = Path(raw)
-        candidates = [path] if path.is_absolute() else [source / path for source in source_roots]
-        for candidate in candidates:
-            if candidate.is_dir() if is_directory else candidate.is_file():
-                return candidate.resolve()
-        return None
-
-    for key, (relative, is_directory) in PROCESSOR_PACKAGE_PATHS.items():
-        destination = root / relative
-        if destination.exists():
-            if destination.is_symlink() or destination.is_dir() != is_directory:
-                expected = "directory" if is_directory else "file"
-                raise RuntimeError(f"PEFT processor asset {relative} must be a regular {expected}.")
-            continue
-
-        candidates = []
-        configured = getattr(config, key, None)
-        if trusted_paths.get(key) == str(configured or ""):
-            candidates.append(str(configured))
-        candidates.extend(raw for raw in sorted(declared[key]) if not Path(raw).is_absolute())
-        source = next(
-            (
-                resolved
-                for raw in candidates
-                if (resolved := resolve_source(raw, is_directory=is_directory)) is not None
-            ),
-            None,
-        )
-        if source is None:
-            if declared[key] or configured:
-                raise RuntimeError(
-                    f"Cannot stage PEFT processor asset {relative}; no verified retained source exists."
-                )
-            continue
-        if is_directory:
-            shutil.copytree(source, destination)
-        else:
-            shutil.copyfile(source, destination)
-
-    normalization_destination = root / "policy_normalization.json"
-    if not normalization_destination.exists():
-        normalization_source = next(
-            (
-                source / normalization_destination.name
-                for source in source_roots
-                if (source / normalization_destination.name).is_file()
-            ),
-            None,
-        )
-        if normalization_source is not None:
-            shutil.copyfile(normalization_source, normalization_destination)
 
 
 def rewrite_trained_processor_paths(package_root: str | Path) -> None:
