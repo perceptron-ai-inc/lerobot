@@ -13,7 +13,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 
@@ -57,6 +57,14 @@ ACTION_MESSAGE_STOP_TOKEN = "return"  # nosec B105 - harmony control-token name,
 DEFAULT_INFERENCE_FPS = 20.0
 DEFAULT_ANCHOR_TIMESTAMP_SECONDS = 30.0
 QWEN_TIMESTAMP_PRECISION = 2
+
+
+class _ImagePreprocessConfig(TypedDict):
+    patch_size: int
+    max_num_patches: int | None
+    min_num_patches: int | None
+    pixel_shuffle_scale: int
+    temporal_patch_size: int
 
 
 class IsaacActionOutlierError(ValueError):
@@ -525,11 +533,6 @@ def load_native_render_metadata(
     return metadata
 
 
-def assert_native_mharmony_available() -> None:
-    """Compatibility name for the public native renderer preflight."""
-    load_mharmony()
-
-
 @dataclass(frozen=True)
 class IsaacMharmonyContentPlan:
     """Serializable Isaac prompt plan before mharmony objects are constructed."""
@@ -926,7 +929,7 @@ class IsaacNativeMharmonyRenderer:
         effective_min_num_patches = min_num_patches
         if effective_min_num_patches is None:
             effective_min_num_patches = self.metadata.min_num_patches
-        preprocess_config = {
+        preprocess_config: _ImagePreprocessConfig = {
             "patch_size": patch_size or self.metadata.patch_size,
             "max_num_patches": effective_max_num_patches,
             "min_num_patches": effective_min_num_patches,
@@ -1461,22 +1464,3 @@ def _maybe_swap_final_assistant_footer(
             data["Tokens"] = [replacement]
             break
     return rendered
-
-
-def _content_from_dict(types, raw: dict[str, Any]):
-    kind = str(raw.get("kind") or "text")
-    if kind == "text":
-        return types.MHText(str(raw.get("text") or ""))
-    if kind == "tokens":
-        return types.MHTokens(tokens=[int(token) for token in raw.get("tokens", [])], tags=raw.get("tags"))
-    if kind == "vector":
-        values = np.asarray(raw.get("values"), dtype=np.float32).reshape(-1).tolist()
-        shape = [int(x) for x in (raw.get("shape") or [len(values)])]
-        return types.MHVector(
-            values=values,
-            shape=shape,
-            dtype=str(raw.get("dtype") or "float32"),
-            metadata=raw.get("metadata"),
-            name=raw.get("name"),
-        )
-    raise ValueError(f"Unsupported Isaac mharmony content kind {kind!r}.")
