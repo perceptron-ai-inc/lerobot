@@ -52,7 +52,6 @@ from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import (  # noq
 )
 from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import GenesisQwen36GatedDeltaNet  # noqa: E402
 from tests.policies.perceptron_isaac.test_portable_model_repo import (  # noqa: E402
-    _full_shard_state,
     _install_distributed_state,
     _native_portable_package,
     _StubAcceleratorState,
@@ -853,38 +852,48 @@ def test_inference_load_is_unchanged(tmp_path, monkeypatch) -> None:
     assert {p.dtype for p in policy._isaac_model.parameters()} == {torch.bfloat16}
 
 
-def test_expert_only_fsdp2_training_load_is_unchanged(tmp_path, monkeypatch) -> None:
-    """Control: a bounded trainable set keeps the BF16 load."""
+@pytest.mark.parametrize(("train_expert_only", "use_peft"), [(True, False), (False, True)])
+def test_deferred_training_modes_refuse_before_backbone_load(
+    tmp_path, monkeypatch, train_expert_only: bool, use_peft: bool
+) -> None:
     policy_path, config, _, _ = _f32_package(tmp_path)
-    config.train_expert_only = True
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+    config.train_expert_only = train_expert_only
+    config.use_peft = use_peft
     calls = _record_loader_calls(monkeypatch)
     _live_fsdp2(monkeypatch)
 
-    policy.get_optim_params()
+    with pytest.raises(RuntimeError, match="PEFT and expert-only training are unsupported"):
+        policy.get_optim_params()
 
-    assert (calls[0]["dtype"], calls[0].get("load_intent", "inference")) == (torch.bfloat16, "inference")
+    assert calls == []
 
 
-def test_fsdp1_dense_training_load_is_unchanged(tmp_path, monkeypatch) -> None:
-    """Control: FSDP1 builds BF16 on the run device and upcasts each flat shard after wrapping."""
+def test_fsdp1_training_refuses_before_backbone_load(tmp_path, monkeypatch) -> None:
+    from accelerate.utils.dataclasses import DistributedType
     from torch.distributed.fsdp import ShardingStrategy
 
     policy_path, config, _, _ = _f32_package(tmp_path)
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
     calls = _record_loader_calls(monkeypatch)
     _install_distributed_state(
-        monkeypatch, world_size=16, state=_full_shard_state(ShardingStrategy.FULL_SHARD, "bf16")
+        monkeypatch,
+        world_size=16,
+        state=_StubAcceleratorState(
+            distributed_type=DistributedType.FSDP,
+            fsdp_plugin=_StubFsdpPlugin(
+                fsdp_version=1,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                reshard_after_forward=True,
+            ),
+            mixed_precision="bf16",
+        ),
     )
 
-    policy.get_optim_params()
+    with pytest.raises(RuntimeError, match="FSDP1 training is unsupported"):
+        policy.get_optim_params()
 
-    call = calls[0]
-    assert (call["dtype"], call.get("load_intent", "inference"), call["device"]) == (
-        torch.bfloat16,
-        "inference",
-        "cpu",
-    )
+    assert calls == []
 
 
 def test_bf16_storage_package_fsdp2_training_load_is_unchanged(tmp_path, monkeypatch) -> None:
@@ -914,18 +923,3 @@ def test_bf16_storage_package_fsdp2_training_load_is_unchanged(tmp_path, monkeyp
 
     assert (calls[0]["dtype"], calls[0].get("load_intent", "inference")) == (torch.bfloat16, "inference")
     assert calls[0]["allowed_storage_dtypes"] == frozenset({"BF16"})
-
-
-def test_peft_fsdp2_training_load_is_unchanged(tmp_path, monkeypatch) -> None:
-    """Control: PEFT keeps the BF16 load (the loader call is recorded and stopped)."""
-    pytest.importorskip("peft")
-    policy_path, config, _, _ = _f32_package(tmp_path)
-    config.use_peft = True
-    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
-    calls = _record_loader_calls(monkeypatch, stop=True)
-    _live_fsdp2(monkeypatch)
-
-    with pytest.raises(_LoaderStoppedError, match="recorded"):
-        policy.get_optim_params()
-
-    assert (calls[0]["dtype"], calls[0].get("load_intent", "inference")) == (torch.bfloat16, "inference")
