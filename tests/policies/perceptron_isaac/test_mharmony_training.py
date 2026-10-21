@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 import pytest
@@ -49,6 +49,21 @@ from lerobot.policies.perceptron_isaac.tensor_stream_utils import (
     interleave_partial_mask,
     set_data,
 )
+
+
+class _RenderInputs(TypedDict):
+    observation_window: list[dict[str, Any]]
+    prompt: str
+    max_num_patches: int
+    device: str
+    dtype: torch.dtype
+    anchor_timestamp_seconds: float
+
+
+class _ActionInputs(TypedDict):
+    action_chunk: np.ndarray
+    action_is_pad: list[bool]
+    fast_processor: Any
 
 
 def _stats():
@@ -789,8 +804,8 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
 
 
 def test_real_cached_fast_and_mharmony_render_joint_training_stream(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pytest.importorskip("mharmony")
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     try:
@@ -825,22 +840,25 @@ def test_real_cached_fast_and_mharmony_render_joint_training_stream(
     )
     renderer = IsaacNativeMharmonyRenderer(metadata=metadata, stats=stats)
 
-    stream = renderer.build_training(
-        observation_window=[
+    common_inputs: _RenderInputs = {
+        "observation_window": [
             {
                 "images": {"image": np.zeros((256, 256, 3), dtype=np.uint8)},
                 "proprio": np.zeros(2, dtype=np.float32),
             }
         ],
-        prompt="pick up the block",
-        action_chunk=np.asarray([[0.25, -0.5], [0.75, 1.0]], dtype=np.float32),
-        action_is_pad=[False, True],
-        fast_processor=processor,
-        max_num_patches=256,
-        device="cpu",
-        dtype=torch.float32,
-        anchor_timestamp_seconds=0.0,
-    )
+        "prompt": "pick up the block",
+        "max_num_patches": 256,
+        "device": "cpu",
+        "dtype": torch.float32,
+        "anchor_timestamp_seconds": 0.0,
+    }
+    action_inputs: _ActionInputs = {
+        "action_chunk": np.asarray([[0.25, -0.5], [0.75, 1.0]], dtype=np.float32),
+        "action_is_pad": [False, True],
+        "fast_processor": processor,
+    }
+    stream = renderer.build_training(**common_inputs, **action_inputs)
 
     events = stream.streams[0].events
     flow = [event for event in events if event.type == TextType.action_c]
@@ -872,36 +890,8 @@ def test_real_cached_fast_and_mharmony_render_joint_training_stream(
     # <|return|>. Only an explicitly terminal chunk keeps <|end|>.
     assert final_control_id(stream) == return_id
 
-    terminal_stream = renderer.build_training(
-        observation_window=[
-            {
-                "images": {"image": np.zeros((256, 256, 3), dtype=np.uint8)},
-                "proprio": np.zeros(2, dtype=np.float32),
-            }
-        ],
-        prompt="pick up the block",
-        action_chunk=np.asarray([[0.25, -0.5], [0.75, 1.0]], dtype=np.float32),
-        action_is_pad=[False, True],
-        fast_processor=processor,
-        max_num_patches=256,
-        device="cpu",
-        dtype=torch.float32,
-        anchor_timestamp_seconds=0.0,
-        terminal=True,
-    )
+    terminal_stream = renderer.build_training(**common_inputs, **action_inputs, terminal=True)
     assert final_control_id(terminal_stream) == end_id
 
-    inference_stream = renderer.build(
-        observation_window=[
-            {
-                "images": {"image": np.zeros((256, 256, 3), dtype=np.uint8)},
-                "proprio": np.zeros(2, dtype=np.float32),
-            }
-        ],
-        prompt="pick up the block",
-        max_num_patches=256,
-        device="cpu",
-        dtype=torch.float32,
-        anchor_timestamp_seconds=0.0,
-    )
+    inference_stream = renderer.build(**common_inputs)
     assert final_control_id(inference_stream) == return_id
