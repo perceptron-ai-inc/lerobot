@@ -358,6 +358,7 @@ all = [
     "lerobot[dm05]",
     "lerobot[fineart_vla]",
     "lerobot[molmoact2]",
+    "lerobot[perceptron_isaac]",
     "lerobot[smolvla]",
     "lerobot[fastwam]",
     "lerobot[flux3]",

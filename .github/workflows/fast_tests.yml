@@ -25,6 +25,7 @@ on:
   pull_request:
     branches:
       - main
+      - phil/lerobot-upstream-base
     paths:
       - "src/**"
       - "tests/**"
@@ -128,3 +129,16 @@ jobs:
 
       - name: "Tier 4 — Test: viz"
         run: uv run pytest tests -vv --maxfail=10
+
+      - name: "Tier 5 — Install: Isaac"
+        run: uv sync --locked --extra test --extra dataset --extra training --extra perceptron_isaac
+
+      - name: "Tier 5 — Test: Isaac CPU contracts"
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          OMP_NUM_THREADS: "2"
+          MKL_NUM_THREADS: "2"
+          HF_HUB_OFFLINE: "1"
+          HF_DATASETS_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: uv run --no-sync pytest tests/policies/perceptron_isaac tests/common/test_checkpoint_save_resume.py -vv --maxfail=10
