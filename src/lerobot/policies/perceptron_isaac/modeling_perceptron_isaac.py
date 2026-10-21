@@ -1123,65 +1123,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         """Create the stateless pack/render processor used after policy-owned online windowing."""
         device = self._resolve_device()
         if self._online_render_step is None:
-            # Forward the FULL normalization/render contract, mirroring
-            # make_perceptron_isaac_pre_post_processors. Dropping fields here is not
-            # benign: a missing normalize_gripper/feature-name pair silently
-            # normalizes gripper dimensions the checkpoint expects raw, and a missing
-            # target_fps disables the wrong-stats-file fps check.
-            self._online_render_step = PerceptronIsaacMharmonyPackProcessorStep(
-                enabled=True,
-                inference_backend=str(self.config.inference_backend),
-                config_toml_path=self.config.config_toml_path,
-                stats_path=self.config.stats_path,
-                native_render_metadata_path=self.config.native_render_metadata_path,
+            self._online_render_step = PerceptronIsaacMharmonyPackProcessorStep.from_config(
+                self.config,
                 native_stats_path=self.config.native_stats_path,
-                fast_processor_path=self.config.fast_processor_path,
-                fast_processor_tree_sha256=self.config.fast_processor_tree_sha256,
-                mharmony_version=self.config.mharmony_version,
-                action_dim=int(self.config.action_dim),
-                proprio_dim=int(self.config.proprio_dim),
-                vector_max_states=int(self.config.vector_max_states),
-                dataset_name=str(self.config.dataset_name),
-                robot_type=str(self.config.robot_type),
-                action_conditioning=bool(self.config.action_conditioning),
-                action_conditioning_role=str(self.config.action_conditioning_role),
-                mistake_conditioning=bool(self.config.mistake_conditioning),
-                camera_order=list(self.config.camera_order),
-                image_size=tuple(self.config.image_size),
-                image_preprocessing=str(self.config.image_preprocessing),
-                image_keys=[f"observation.images.{cam}" for cam in self.config.camera_order],
-                allow_image_key_fallback=bool(self.config.allow_image_key_fallback),
-                normalize_language=bool(self.config.normalize_task_text),
-                n_obs_steps=int(self.config.n_obs_steps),
-                chunk_size=int(self.config.chunk_size),
-                objective=str(self.config.objective),
-                patch_size=int(self.config.render_patch_size),
-                max_num_patches=self.config.render_max_num_patches,
-                min_num_patches=self.config.render_min_num_patches,
-                pixel_shuffle_scale=int(self.config.render_pixel_shuffle_scale),
-                temporal_patch_size=int(self.config.render_temporal_patch_size),
                 device=device,
-                dtype="bfloat16",
-                target_fps=self.config.target_fps,
-                normalization_profile_id=self.config.normalization_profile_id,
-                normalization_profile_scope=self.config.normalization_profile_scope,
-                normalization_validation_status=self.config.normalization_validation_status,
-                render_metadata=(
-                    IsaacMharmonyRenderMetadata.from_json_file(
-                        self.config.native_render_metadata_path
-                    ).to_json_dict()
-                    if self.config.native_render_metadata_path
-                    and Path(self.config.native_render_metadata_path).is_file()
-                    else None
-                ),
-                train_clip_normalized_actions=bool(self.config.train_clip_normalized_actions),
-                clip_normalized_max=float(self.config.clip_normalized_max),
-                fast_clip_normalized_max=float(self.config.fast_clip_normalized_max),
-                train_skip_outlier_threshold=float(self.config.train_skip_outlier_threshold),
-                train_max_sequence_length=int(self.config.train_max_sequence_length),
-                normalize_gripper=bool(self.config.normalize_gripper),
-                action_feature_names=list(self.config.action_feature_names or []) or None,
-                state_feature_names=list(self.config.state_feature_names or []) or None,
             )
             if self._adopted_serving_stats is not None:
                 # The checkpoint's serialized stats outrank any config-path load,
