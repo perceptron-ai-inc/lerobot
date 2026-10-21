@@ -599,6 +599,32 @@ def test_qwen35_processor_factory_uses_public_root_export(monkeypatch):
     assert calls == [{"patch_size": 16}]
 
 
+def test_pinned_renderer_serializes_without_mutating_the_final_assistant_message() -> None:
+    mharmony = pytest.importorskip("mharmony")
+    encoding = load_mharmony_encoding("QWEN35_HARMONY")
+    conversation = mharmony.Conversation(
+        messages=[
+            mharmony.Message(
+                author=mharmony.Author(role=mharmony.Role("user")),
+                content=[mharmony.TextContent(text="pick up the block")],
+            ),
+            mharmony.Message(
+                author=mharmony.Author(role=mharmony.Role("assistant")),
+                content=[mharmony.TokensContent(tokens=[0])],
+                channel="final",
+            ),
+        ]
+    )
+    before = conversation.to_json()
+    rendered = encoding.render_conversation_multimodal_with_processors(conversation)
+    assert conversation.to_json() == before
+    footer = rendered["stream"]["events"][-1]
+    assert footer["role"] == "assistant"
+    assert footer["channel"] == "final"
+    assert footer["modality"] == "special_token"
+    assert footer["data"]["Tokens"] == encoding.encode("<|end|>", allowed_special={"<|end|>"})
+
+
 def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch):
     class _Model:
         def __init__(self, **kwargs):

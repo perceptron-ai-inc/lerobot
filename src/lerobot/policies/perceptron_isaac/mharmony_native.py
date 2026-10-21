@@ -955,7 +955,6 @@ class IsaacNativeMharmonyRenderer:
         if rewrite_final_assistant_footer:
             rendered = _maybe_swap_final_assistant_footer(
                 rendered,
-                harmony_conv=conversation,
                 stop_token=self.metadata.message_stop_token,
                 encoding=encoding,
             )
@@ -1431,22 +1430,12 @@ def _image_to_png_b64(image: Any) -> str:
 def _maybe_swap_final_assistant_footer(
     rendered: dict[str, Any],
     *,
-    harmony_conv,
     stop_token: str | None,
     encoding,
 ) -> dict[str, Any]:
     if not stop_token:
         return rendered
-    messages = getattr(harmony_conv, "messages", None)
-    if not messages:
-        return rendered
-    last_message = messages[-1]
-    last_role = getattr(getattr(last_message, "author", None), "role", None)
-    if getattr(last_role, "value", last_role) != "assistant":
-        return rendered
-    if getattr(last_message, "channel", None) != "final":
-        return rendered
-
+    # The sole caller constructs a final assistant message; mharmony serializes it without mutation.
     events = rendered.get("stream", {}).get("events", [])
     if not isinstance(events, list):
         return rendered
