@@ -347,6 +347,32 @@ class ZeroVelocityActionExpert:
         return torch.zeros_like(x)
 
 
+def _tiny_policy(
+    root: Path,
+    model: FakeIsaacModel | FakeMixedPrecisionIsaacModel | None = None,
+    *,
+    action_q01: float = -1.0,
+    action_q99: float = 1.0,
+    train_storage_fp32: bool = True,
+    num_flow_samples: int = 4,
+    flow_seed_base: int | None = None,
+) -> PerceptronIsaacPolicy:
+    stats_path = root / "stats.json"
+    _write_native_stats(stats_path, action_q01=action_q01, action_q99=action_q99)
+    config = PerceptronIsaacConfig(
+        device="cpu",
+        native_stats_path=str(stats_path),
+        train_storage_fp32=train_storage_fp32,
+        num_flow_samples=num_flow_samples,
+        flow_seed_base=flow_seed_base,
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+    policy = PerceptronIsaacPolicy(config)
+    policy._isaac_model = model
+    return policy
+
+
 def _features():
     return {
         "observation.images.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
@@ -1653,16 +1679,7 @@ def test_isaac_stats_state_dict_round_trips_empty_string_labels():
 
 
 def test_policy_reset_clears_flow_seed_index_and_has_no_policy_side_renderer(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeIsaacModel()
+    policy = _tiny_policy(tmp_path, FakeIsaacModel())
     policy._flow_seed_index = 12
     policy._frame_index = 3
     policy._last_external_timestamp_seconds = 0.15
@@ -1685,16 +1702,7 @@ def test_policy_reset_clears_flow_seed_index_and_has_no_policy_side_renderer(tmp
 
 
 def test_native_policy_without_stream_requires_raw_online_observation(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeIsaacModel()
+    policy = _tiny_policy(tmp_path, FakeIsaacModel())
 
     with pytest.raises(ValueError, match="at least one image observation"):
         policy.predict_action_chunk({"task": "pick up the mug"})
@@ -2144,16 +2152,7 @@ def test_isaac_compute_dtype_is_explicitly_bfloat16():
 
 
 def test_native_policy_consumes_processor_stream_and_returns_normalized_actions(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path, action_q01=0.0, action_q99=2.0)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeIsaacModel(value=0.0)
+    policy = _tiny_policy(tmp_path, FakeIsaacModel(value=0.0), action_q01=0.0, action_q99=2.0)
     stream = FakePackedStream()
 
     actions = policy.predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: stream, "task": "pick up the mug"})
@@ -2166,16 +2165,7 @@ def test_native_policy_consumes_processor_stream_and_returns_normalized_actions(
 
 
 def test_native_policy_rejects_non_finite_normalized_actions(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeIsaacModel(value=float("nan"))
+    policy = _tiny_policy(tmp_path, FakeIsaacModel(value=float("nan")))
 
     with pytest.raises(RuntimeError, match="non-finite normalized actions"):
         policy.predict_action_chunk(
@@ -2184,17 +2174,7 @@ def test_native_policy_rejects_non_finite_normalized_actions(tmp_path):
 
 
 def test_native_policy_autocasts_bf16_compute_with_fp32_master_weights(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        train_storage_fp32=True,
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeMixedPrecisionIsaacModel()
+    policy = _tiny_policy(tmp_path, FakeMixedPrecisionIsaacModel(), train_storage_fp32=True)
 
     actions = policy.predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
 
@@ -2204,17 +2184,7 @@ def test_native_policy_autocasts_bf16_compute_with_fp32_master_weights(tmp_path)
 
 
 def test_native_policy_requests_model_side_flow_sample_averaging(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        num_flow_samples=3,
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeFlowAveragingIsaacModel()
+    policy = _tiny_policy(tmp_path, FakeFlowAveragingIsaacModel(), num_flow_samples=3)
 
     actions = policy.predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
 
@@ -2224,25 +2194,15 @@ def test_native_policy_requests_model_side_flow_sample_averaging(tmp_path):
 
 
 def test_native_policy_uses_configured_flow_seed_base_without_environment(monkeypatch, tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-
-    def _policy():
-        cfg = PerceptronIsaacConfig(
-            device="cpu",
-            native_stats_path=str(stats_path),
-            num_flow_samples=4,
-            flow_seed_base=1234,
-            input_features=_features(),
-            output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-        )
-        policy = PerceptronIsaacPolicy(cfg)
-        policy._isaac_model = FakeRandomFlowIsaacModel()
-        return policy
-
     monkeypatch.delenv("ISAAC_FLOW_SEED_BASE", raising=False)
-    first = _policy().predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
-    second = _policy().predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
+    first_policy = _tiny_policy(tmp_path, FakeRandomFlowIsaacModel(), flow_seed_base=1234)
+    second_policy = _tiny_policy(tmp_path, FakeRandomFlowIsaacModel(), flow_seed_base=1234)
+    first = first_policy.predict_action_chunk(
+        {PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"}
+    )
+    second = second_policy.predict_action_chunk(
+        {PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"}
+    )
 
     torch.testing.assert_close(first, second)
 
@@ -2334,15 +2294,7 @@ def test_native_settle_action_is_normalized_for_postprocessor(tmp_path):
 
 
 def test_policy_training_requires_rendered_stream_and_checkpoint(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
+    policy = _tiny_policy(tmp_path)
 
     with pytest.raises(ValueError, match="requires the native preprocessor output"):
         policy.forward({})
