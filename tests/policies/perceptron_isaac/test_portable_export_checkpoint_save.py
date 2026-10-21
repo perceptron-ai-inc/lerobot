@@ -13,10 +13,7 @@ import pytest
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256
-from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import (
-    PerceptronIsaacConfig,
-    is_portable_isaac05_repository,
-)
+from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
 from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
     Mk1CheckpointContractError,
     finalize_mk1_runtime_checkpoint_layout,
@@ -127,29 +124,6 @@ def test_resolve_refuses_a_sideways_escape_out_of_an_export(tmp_path: Path) -> N
     config = _config(hf_model_path="../elsewhere")
     with pytest.raises(RuntimeError, match="escapes the package root"):
         PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, package)
-
-
-def test_snapshot_save_source_keeps_the_export_root(tmp_path: Path) -> None:
-    package = _write_raw_export(tmp_path / "export")
-    config = _config(hf_model_path="..", fast_processor_path="../fast_processor_pinned")
-    with PerceptronIsaacPolicy._snapshot_save_source(package, prefix="test-export-") as package_root:
-        assert package_root.name == PACKAGE_DIRECTORY_NAME
-        assert is_portable_isaac05_repository(package_root.parent)
-        PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, package_root)
-        assert config.hf_model_path == str(package_root.parent)
-        assert config.fast_processor_path == str(package_root.parent / "fast_processor_pinned")
-        assert not list(package_root.parent.glob("model-*.safetensors"))
-        assert not (package_root.parent / "model.safetensors.index.json").exists()
-
-
-def test_snapshot_save_source_leaves_a_self_contained_package_alone(tmp_path: Path) -> None:
-    package = tmp_path / "imported"
-    package.mkdir()
-    (package / "config.json").write_text('{"type": "perceptron_isaac"}\n')
-    (package / "hf_model").mkdir()
-    with PerceptronIsaacPolicy._snapshot_save_source(package, prefix="test-imported-") as package_root:
-        assert package_root.name == "snapshot"
-        assert (package_root / "hf_model").is_dir()
 
 
 def test_embedded_model_assets_keep_the_export_storage_contract(tmp_path: Path) -> None:

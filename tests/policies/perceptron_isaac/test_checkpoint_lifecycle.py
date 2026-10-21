@@ -319,8 +319,11 @@ def test_native_base_save_verifies_a_fresh_snapshot_config(monkeypatch, tmp_path
 
     with policy._verified_checkpoint_source(source) as stable_source:
         assert stable_source == verified[0]
+        assert stable_source != source
         assert (stable_source / "hf_model" / "config.json").is_file()
 
+    assert not stable_source.exists()
+    assert (source / "hf_model" / "config.json").is_file()
     assert verified
 
 

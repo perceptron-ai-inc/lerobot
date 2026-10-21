@@ -511,9 +511,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if runtime_assets is not None and source_root == runtime_assets.root:
             yield runtime_assets.root
             return
-        with self._snapshot_save_source(source_root, prefix="lerobot-mk1-save-") as package_root:
-            self._verify_saved_package(package_root)
-            yield package_root
+        with snapshot_directory(source_root, prefix="lerobot-mk1-save-") as snapshot:
+            self._verify_saved_package(snapshot.root)
+            yield snapshot.root
 
     def _save_canonical_inner_weights(
         self,
@@ -653,30 +653,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         """Return the raw Isaac-0.5 export that owns ``package_root``, when it is nested in one."""
         parent = package_root.parent
         return parent if is_portable_isaac05_repository(parent) else None
-
-    @classmethod
-    @contextmanager
-    def _snapshot_save_source(cls, source_root: Path, *, prefix: str):
-        """Own a source snapshot without detaching raw packages from their export parent.
-
-        The raw-layout branch retains the documented parent-relative paths and
-        excludes stale outer weights. Native self-contained sources keep their layout.
-        """
-        export_root = cls._portable_export_root(source_root)
-        if export_root is None:
-            with snapshot_directory(source_root, prefix=prefix) as snapshot:
-                yield snapshot.root
-            return
-        retained = {
-            path.name for path in export_root.iterdir() if not cls._is_checkpoint_weight_name(path.name)
-        }
-        with snapshot_directory(export_root, prefix=prefix, root_entries=retained) as snapshot:
-            package_root = snapshot.root / source_root.name
-            if not package_root.is_dir():
-                raise RuntimeError(
-                    f"Raw Isaac-0.5 export snapshot lost its policy package: {source_root.name}."
-                )
-            yield package_root
 
     def reset(self):
         """Clear per-episode action state."""
