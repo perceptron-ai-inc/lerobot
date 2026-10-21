@@ -676,8 +676,9 @@ def test_qwen35_processor_factory_uses_public_root_export(monkeypatch):
     assert calls == [{"patch_size": 16}]
 
 
-def test_pinned_renderer_serializes_without_mutating_the_final_assistant_message() -> None:
+def test_pinned_renderer_serializes_without_mutating_the_final_assistant_message(monkeypatch) -> None:
     mharmony = pytest.importorskip("mharmony")
+    monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     encoding = load_mharmony_encoding("QWEN35_HARMONY")
     conversation = mharmony.Conversation(
         messages=[
