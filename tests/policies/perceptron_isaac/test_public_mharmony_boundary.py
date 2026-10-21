@@ -23,6 +23,11 @@ def test_mharmony_boundary_does_not_import_genesis(monkeypatch) -> None:
         imported.append(module_name)
         return object()
 
+    monkeypatch.setattr(
+        mharmony_adapter,
+        "_validate_installed_mharmony_version",
+        lambda: mharmony_adapter.SUPPORTED_MHARMONY_VERSION,
+    )
     monkeypatch.setattr(mharmony_adapter.importlib, "import_module", record_import)
 
     mharmony_adapter.load_mharmony()
