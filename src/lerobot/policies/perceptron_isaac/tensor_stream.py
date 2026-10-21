@@ -146,7 +146,6 @@ def _prod_dims(dims: list[int]) -> int:
 
 
 _LONG_TOKEN_MODALITIES = frozenset({TextType, SyntheticType})
-_BULK_LONG_TRANSFER_MIN_TENSORS = 4
 
 
 # @dataclass
@@ -508,57 +507,6 @@ class TensorStream:
     def device(self):
         return self._device
 
-    def _bulk_move_long_token_events(
-        self,
-        *,
-        target_device: torch.device,
-        non_blocking: bool,
-    ) -> set[int]:
-        if target_device.type != "cuda":
-            return set()
-
-        long_token_events: list[Event] = []
-        total_numel = 0
-        for stream in self.streams:
-            for ev in stream:
-                if (
-                    ev.type.modality in _LONG_TOKEN_MODALITIES
-                    and isinstance(ev.data, torch.Tensor)
-                    and ev.data.device.type == "cpu"
-                    and ev.data.ndim == 1
-                    and ev.data.is_contiguous()
-                ):
-                    long_token_events.append(ev)
-                    total_numel += ev.data.numel()
-
-        if len(long_token_events) < _BULK_LONG_TRANSFER_MIN_TENSORS or total_numel == 0:
-            return set()
-
-        # Many tiny token copies show up as TensorStream.to overhead in steady-state
-        # profiling. Flattening only the 1D long-token case keeps semantics unchanged
-        # while collapsing those H2D copies into one pinned transfer.
-        flat_cpu = torch.empty(total_numel, dtype=torch.long, pin_memory=True)
-        offset = 0
-        lengths: list[int] = []
-        original_shapes: list[torch.Size] = []
-        for ev in long_token_events:
-            length = ev.data.numel()
-            flat_cpu[offset : offset + length].copy_(ev.data.reshape(-1))
-            lengths.append(length)
-            original_shapes.append(ev.data.shape)
-            offset += length
-
-        flat_gpu = flat_cpu.to(device=target_device, non_blocking=non_blocking)
-
-        moved_event_ids: set[int] = set()
-        offset = 0
-        for ev, length, original_shape in zip(long_token_events, lengths, original_shapes, strict=False):
-            ev.data = flat_gpu.narrow(0, offset, length).view(original_shape)
-            moved_event_ids.add(id(ev))
-            offset += length
-
-        return moved_event_ids
-
     @property
     def shape(self):
         seq_lens = [sum([ev.num_tokens() for ev in stream]) for stream in self.streams]
@@ -590,16 +538,8 @@ class TensorStream:
         dtype unless an explicit *dtype* argument is supplied.
         """
         target_device = torch.device(device)
-        bulk_moved_event_ids = self._bulk_move_long_token_events(
-            target_device=target_device,
-            non_blocking=non_blocking,
-        )
-
         for stream in self.streams:
             for ev in stream:
-                if id(ev) in bulk_moved_event_ids:
-                    continue
-
                 # ------------------------------------------------------------------
                 # Decide the dtype for *this* event.
                 # ------------------------------------------------------------------

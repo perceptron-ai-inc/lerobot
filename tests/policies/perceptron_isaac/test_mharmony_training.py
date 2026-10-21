@@ -443,6 +443,35 @@ def test_public_rendered_stream_lowering_rejects_invalid_pixel_shuffle_grid():
         rendered_stream_to_local_tensor_stream(rendered, device="cpu", dtype=torch.float32)
 
 
+@pytest.mark.parametrize("dtype", [None, torch.float64])
+def test_stream_transfer_preserves_tokens_padding_float_values_and_autograd(
+    dtype: torch.dtype | None,
+) -> None:
+    text_events = [
+        Event.from_text_tokens(torch.tensor([11, 12], dtype=torch.int32), time=(0.0, 0.0), type=kind)
+        for kind in (TextType.text, TextType.control, TextType.timestamp, TextType.padding, TextType.action)
+    ]
+    vector = torch.tensor([[-0.0, 1.5]], requires_grad=True)
+    image = torch.tensor([[2.0, -3.0]], requires_grad=True)
+    float_events = [
+        Event(data=data, time=(0.0, 0.0), type=kind, dims_virtual=[1], dims_real=[1], idx_range=(0, 1))
+        for data, kind in [(vector, VectorType.vector), (image, VisionType.I)]
+    ]
+    stream = TensorStream([Stream(text_events + float_events, [])])
+    assert all(event.data.shape == (2, 1) for event in text_events)
+    assert stream.to("cpu", dtype=dtype, non_blocking=False) is stream
+    for event in text_events:
+        torch.testing.assert_close(event.data, torch.tensor([[11], [12]], dtype=torch.long))
+        assert event.idx_range == (0, 2)
+    for event, expected in zip(float_events, ([[-0.0, 1.5]], [[2.0, -3.0]]), strict=True):
+        torch.testing.assert_close(event.data, torch.tensor(expected, dtype=dtype or torch.float32))
+        assert event.data.requires_grad
+    assert torch.signbit(float_events[0].data[0, 0])
+    (float_events[0].data.sum() + float_events[1].data.sum()).backward()
+    torch.testing.assert_close(vector.grad, torch.ones_like(vector))
+    torch.testing.assert_close(image.grad, torch.ones_like(image))
+
+
 def test_stream_metadata_preserves_partial_tokens_roles_context_and_mrope() -> None:
     events = [
         Event.from_text_tokens(
