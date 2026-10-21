@@ -638,11 +638,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 if (at_package_root and name == "config.json")
                 or (
                     (at_package_root or at_model_root)
-                    and (
-                        name == "model.safetensors"
-                        or name == "model.safetensors.index.json"
-                        or (name.startswith("model-") and name.endswith(".safetensors"))
-                    )
+                    and PerceptronIsaacPolicy._is_checkpoint_weight_name(name)
                 )
             }
 
