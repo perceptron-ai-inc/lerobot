@@ -131,18 +131,8 @@ class VectorType(ModalityType):
 
 
 # maps idx -> type (sorted by value to maintain ALL_TYPES[t.value] == t invariant)
-ALL_TYPES = sorted(
-    [
-        tp
-        for types in [
-            list(VisionType),
-            list(AudioType),
-            list(SyntheticType),
-            list(TextType),
-            list(VectorType),
-        ]
-        for tp in types
-    ],
+ALL_TYPES: list[ModalityType] = sorted(
+    [*VisionType, *AudioType, *SyntheticType, *TextType, *VectorType],
     key=lambda t: t.value,
 )
 assert all(ALL_TYPES[t.value] == t for t in ALL_TYPES), "ALL_TYPES must preserve enum value -> type lookup"
@@ -766,9 +756,10 @@ def group_streams(
     for ev in stream:
         group = group_fn(ev)
         split_streams[group].append(ev)
-    for g, events in split_streams.items():
-        split_streams[g] = create_stream(events, stream.priority, schedule=schedule)
-    return dict(split_streams)  # type: ignore[no-matching-overload]
+    return {
+        group: create_stream(events, stream.priority, schedule=schedule)
+        for group, events in split_streams.items()
+    }
 
 
 # Define Category for clarity
