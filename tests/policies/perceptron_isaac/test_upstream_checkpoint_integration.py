@@ -8,7 +8,6 @@ DCP-only ``checkpoint_format``. These tests pin how the Isaac policy behaves on 
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +17,7 @@ import lerobot.distributed.utils as distributed_utils
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy  # noqa: E402
+from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _source_package  # noqa: E402
 
 
 class _GatherRecorder:
@@ -36,7 +36,7 @@ def test_non_main_rank_joins_the_gather_and_then_writes_nothing(tmp_path: Path, 
     gather = _GatherRecorder(result={})
     monkeypatch.setattr(distributed_checkpoint, "full_model_state_dict", gather)
     monkeypatch.setattr(distributed_utils, "is_main_process", lambda: False)
-    policy = SimpleNamespace()  # any attribute read past the rank gate raises AttributeError
+    policy = PerceptronIsaacPolicy(_source_package(tmp_path / "source"))
     save_directory = tmp_path / "pretrained_model"
     save_directory.mkdir()
 
@@ -50,7 +50,7 @@ def test_finalize_refuses_a_dcp_only_checkpoint_that_skipped_the_isaac_package(t
     pretrained_dir = tmp_path / "pretrained_model"
     (pretrained_dir / "pytorch_model_fsdp_0").mkdir(parents=True)
     (pretrained_dir / "config.json").write_text("{}\n")
-    policy = SimpleNamespace(config=SimpleNamespace(use_peft=False))
+    policy = PerceptronIsaacPolicy(_source_package(tmp_path / "source"))
 
     with pytest.raises(RuntimeError, match="checkpoint_format=safetensors"):
         PerceptronIsaacPolicy.finalize_pretrained_package(policy, pretrained_dir)
