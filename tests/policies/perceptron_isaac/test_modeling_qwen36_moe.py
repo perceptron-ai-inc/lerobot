@@ -6,6 +6,9 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+pytest.importorskip("transformers")
+
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen35_modeling
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,

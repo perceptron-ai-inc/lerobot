@@ -923,6 +923,7 @@ def _write_portable_isaac05_checkpoint(
 
 def test_portable_isaac05_loads_native_fp32_without_checkpoint_python(tmp_path: Path) -> None:
     """The historical isaac05 JSON is input data, never executable model code."""
+    pytest.importorskip("transformers")
     from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
 
     root = tmp_path / "portable"
