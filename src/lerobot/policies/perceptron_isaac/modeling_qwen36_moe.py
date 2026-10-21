@@ -46,13 +46,6 @@ DETERMINISTIC_ROUTE_REDUCTION = "stable_token_segment_sum_v1"
 GENESIS_ROTARY_PRECISION = "checkpoint_bf16_inv_freq_fp32_phase_v1"
 
 
-class _ExplicitRepeatKvSdpaResult(NamedTuple):
-    output: torch.Tensor
-    repeated_key: torch.Tensor
-    repeated_value: torch.Tensor
-    raw_output: torch.Tensor
-
-
 def _genesis_layout_repeat_kv(hidden_states: torch.Tensor, num_repetitions: int) -> torch.Tensor:
     """Repeat KV heads in Genesis' [batch, length, heads, dim] layout."""
     batch, sequence_length, num_key_value_heads, head_dim = hidden_states.shape
@@ -75,12 +68,12 @@ def _sdpa_with_repeated_kv(
     dropout: float,
     scaling: float | None,
     is_causal: bool | None = None,
-) -> _ExplicitRepeatKvSdpaResult:
+) -> torch.Tensor:
     causal = is_causal if is_causal is not None else bool(getattr(module, "is_causal", True))
     causal = query.shape[2] > 1 and attention_mask is None and causal
     if torch.jit.is_tracing() and isinstance(causal, torch.Tensor):
         causal = bool(causal.item())
-    raw_output = functional.scaled_dot_product_attention(
+    return functional.scaled_dot_product_attention(
         query,
         repeated_key,
         repeated_value,
@@ -88,40 +81,6 @@ def _sdpa_with_repeated_kv(
         dropout_p=dropout,
         scale=scaling,
         is_causal=causal,
-    )
-    return _ExplicitRepeatKvSdpaResult(
-        output=raw_output.transpose(1, 2).contiguous(),
-        repeated_key=repeated_key,
-        repeated_value=repeated_value,
-        raw_output=raw_output,
-    )
-
-
-def _explicit_repeat_kv_sdpa_components(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    *,
-    dropout: float = 0.0,
-    scaling: float | None = None,
-    is_causal: bool | None = None,
-) -> _ExplicitRepeatKvSdpaResult:
-    num_key_value_groups = getattr(module, "num_key_value_groups", None)
-    if not isinstance(num_key_value_groups, int) or num_key_value_groups <= 0:
-        raise ValueError("MK1 SDPA requires a positive integer num_key_value_groups")
-    repeated_key = qwen35_modeling.repeat_kv(key, num_key_value_groups)
-    repeated_value = qwen35_modeling.repeat_kv(value, num_key_value_groups)
-    return _sdpa_with_repeated_kv(
-        module,
-        query,
-        repeated_key=repeated_key,
-        repeated_value=repeated_value,
-        attention_mask=attention_mask,
-        dropout=dropout,
-        scaling=scaling,
-        is_causal=is_causal,
     )
 
 
@@ -137,16 +96,25 @@ def explicit_repeat_kv_sdpa(
     is_causal: bool | None = None,
 ) -> torch.Tensor:
     """Run the qualified MK1 SDPA path after materializing grouped KV heads."""
-    return _explicit_repeat_kv_sdpa_components(
-        module,
-        query,
-        key,
-        value,
-        attention_mask,
-        dropout=dropout,
-        scaling=scaling,
-        is_causal=is_causal,
-    ).output
+    num_key_value_groups = getattr(module, "num_key_value_groups", None)
+    if not isinstance(num_key_value_groups, int) or num_key_value_groups <= 0:
+        raise ValueError("MK1 SDPA requires a positive integer num_key_value_groups")
+    repeated_key = qwen35_modeling.repeat_kv(key, num_key_value_groups)
+    repeated_value = qwen35_modeling.repeat_kv(value, num_key_value_groups)
+    return (
+        _sdpa_with_repeated_kv(
+            module,
+            query,
+            repeated_key=repeated_key,
+            repeated_value=repeated_value,
+            attention_mask=attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            is_causal=is_causal,
+        )
+        .transpose(1, 2)
+        .contiguous()
+    )
 
 
 def deterministic_token_segment_sum(
@@ -878,7 +846,7 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
                 self.num_key_value_groups,
             ).transpose(1, 2)
 
-        sdpa = _sdpa_with_repeated_kv(
+        raw_sdpa_output = _sdpa_with_repeated_kv(
             self,
             sdpa_query,
             repeated_key,
@@ -887,7 +855,7 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
         )
-        post_transpose_output = sdpa.output
+        post_transpose_output = raw_sdpa_output.transpose(1, 2).contiguous()
         attention_output = post_transpose_output.reshape(*input_shape, -1).contiguous()
         gated_output = attention_output * torch.sigmoid(gate)
         token_mixer = self.o_proj(gated_output)
@@ -903,9 +871,9 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
                     rotary_query=rotary_query,
                     rotary_key=rotary_key,
                     sdpa_query=sdpa_query,
-                    repeated_key=sdpa.repeated_key,
-                    repeated_value=sdpa.repeated_value,
-                    raw_sdpa_output=sdpa.raw_output,
+                    repeated_key=repeated_key,
+                    repeated_value=repeated_value,
+                    raw_sdpa_output=raw_sdpa_output,
                     post_transpose_output=post_transpose_output,
                     gated_output=gated_output,
                     token_mixer=token_mixer,

@@ -311,8 +311,9 @@ def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> 
             scale=attention.scaling,
             is_causal=True,
         )
-        expected = expected.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-        expected = attention.o_proj(expected * torch.sigmoid(gate))
+        expected_raw_output = expected
+        expected_transposed = expected.transpose(1, 2).contiguous()
+        expected = attention.o_proj(expected_transposed.reshape(*input_shape, -1) * torch.sigmoid(gate))
 
     calls = []
     original_sdpa = torch.nn.functional.scaled_dot_product_attention
@@ -343,6 +344,14 @@ def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> 
     assert trace.rotary_query.shape == (1, 4, 2, 12)
     assert trace.sdpa_query.shape == trace.repeated_key.shape == (1, 2, 4, 12)
     assert trace.repeated_value.shape == (1, 2, 4, 12)
+    assert trace.repeated_key.stride() == key.stride()
+    assert trace.repeated_value.stride() == value.stride()
+    assert trace.raw_sdpa_output.stride() == expected_raw_output.stride()
+    assert trace.post_transpose_output.is_contiguous()
+    torch.testing.assert_close(trace.repeated_key, key, rtol=0, atol=0)
+    torch.testing.assert_close(trace.repeated_value, value, rtol=0, atol=0)
+    torch.testing.assert_close(trace.raw_sdpa_output, expected_raw_output, rtol=0, atol=0)
+    torch.testing.assert_close(trace.post_transpose_output, expected_transposed, rtol=0, atol=0)
     torch.testing.assert_close(trace.token_mixer, actual, rtol=0, atol=0)
 
 
