@@ -15,7 +15,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Never
 
 MK1_MODEL_TYPE = "qwen3_5_moe"
 MK1_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
@@ -441,8 +441,8 @@ class Mk1CheckpointContract:
         )
         if bad_dtypes:
             first = bad_dtypes[0]
-            expected = "/".join(sorted(allowed_storage_dtypes))
-            _fail(f"tensor {first!r} has dtype {inventory.tensors[first].dtype}, expected {expected}")
+            expected_dtype = "/".join(sorted(allowed_storage_dtypes))
+            _fail(f"tensor {first!r} has dtype {inventory.tensors[first].dtype}, expected {expected_dtype}")
 
     def validate_coord_reserved_token_groups(self, groups: Any) -> None:
         """Cross-check the checkpoint coordinate range against mHarmony metadata.
@@ -968,7 +968,7 @@ def _parse_artifact(raw: Mapping[str, Any]) -> Mk1ArtifactContract:
 
 def _validate_standard_runtime_fields(raw: Mapping[str, Any], *, path: str) -> None:
     """Pin optional Transformers flags whose defaults can change execution."""
-    common = {
+    common: dict[str, Any] = {
         "output_attentions": False,
         "output_hidden_states": False,
         "return_dict": True,
@@ -1650,5 +1650,5 @@ def _same_json_value(actual: Any, expected: Any) -> bool:
     return type(actual) is type(expected) and actual == expected
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> Never:
     raise Mk1CheckpointContractError(message)
