@@ -56,7 +56,7 @@ def flow_stream(*, action_is_pad=None) -> TensorStream:
         _event([8, 9], event_type=TextType.action, role="assistant"),
         _event([2], event_type=TextType.control, role="assistant"),
     ]
-    return TensorStream([create_stream(events, list(TextType), schedule=False)])
+    return TensorStream([create_stream(events, list(TextType))])
 
 
 class TinyIsaacModel(nn.Module):

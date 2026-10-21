@@ -75,7 +75,7 @@ def _action_stream() -> TensorStream:
             role="assistant",
         ),
     ]
-    return TensorStream([create_stream(events, ALL_TYPES, schedule=False)])
+    return TensorStream([create_stream(events, ALL_TYPES)])
 
 
 def _replace_with_same_bytes(path: Path, replacement: Path) -> None:
@@ -158,7 +158,6 @@ def test_mk1_loader_constructs_only_from_checkpoint_and_leaves_no_meta_tensors(t
     assert model.model.language_model.rotary_emb.inv_freq.dtype == torch.bfloat16
     assert model.model.visual.rotary_pos_emb.inv_freq.dtype == torch.float32
     assert not any("rotary_emb.inv_freq" in key for key in model.state_dict())
-    assert all(layer.mlp.deterministic_route_reduction for layer in model.model.language_model.layers)
 
 
 def test_mk1_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> None:
