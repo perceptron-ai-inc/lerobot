@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -99,7 +100,6 @@ def _source_package(root: Path) -> PerceptronIsaacConfig:
     finalize_canonical_trained_package(
         config,
         root,
-        family="mk1",
         mk1_source_model_import_sha256=config.mk1_source_model_import_sha256,
     )
     PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, root)
@@ -143,6 +143,23 @@ def _write_stats(path: Path, *, action_dim: int = 2, proprio_dim: int = 2) -> No
         )
         + "\n"
     )
+
+
+def test_native_manifest_hashes_actual_bytes_and_rejects_changed_inventory(tmp_path: Path) -> None:
+    source = tmp_path / "native"
+    config = _source_package(source)
+    manifest_path = source / "mk1_trained_package_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    expected = {
+        path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source.rglob("*")
+        if path.is_file() and path not in {source / "config.json", manifest_path}
+    }
+    assert manifest["files_sha256"] == expected
+    PerceptronIsaacPolicy._verify_trained_package_manifest(config, source)
+    (source / "isaac_stats.json").write_text('{"tampered": true}\n')
+    with pytest.raises(RuntimeError, match="digest mismatch for isaac_stats.json"):
+        PerceptronIsaacPolicy._verify_trained_package_manifest(config, source)
 
 
 def test_dense_save_is_self_contained_after_move_and_preserves_fp32_trainables(monkeypatch, tmp_path) -> None:

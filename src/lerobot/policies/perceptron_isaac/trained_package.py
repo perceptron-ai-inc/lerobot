@@ -7,7 +7,7 @@ import json
 import shutil
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from .checkpoint_integrity import (
     canonical_json_sha256,
@@ -17,18 +17,16 @@ from .checkpoint_integrity import (
     require_sha256,
 )
 
+if TYPE_CHECKING:
+    from .configuration_perceptron_isaac import PerceptronIsaacConfig
+
 TRAINED_PACKAGE_INERT_HUB_METADATA = frozenset({".gitattributes", "README.md"})
-QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME = "qwen35_trained_package_manifest.json"
-QWEN35_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_qwen35_trained_package_manifest_v1"
-QWEN35_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD = "qwen35_trained_package_manifest_sha256"
 MK1_TRAINED_PACKAGE_MANIFEST_FILENAME = "mk1_trained_package_manifest.json"
 MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_trained_package_manifest_v1"
 MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD = "mk1_trained_package_manifest_sha256"
 MK1_MODEL_IMPORT_FILENAME = "mk1_model_import.json"
-MK1_TRAINED_PACKAGE_INERT_HUB_METADATA = TRAINED_PACKAGE_INERT_HUB_METADATA
 MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_canonical_trained_package_manifest_v2"
 CANONICAL_INNER_MODEL_STORAGE = "canonical_inner"
-AUTHENTICATED_IMPORT_MODEL_STORAGE = "authenticated_import"
 
 PackageFilePredicate = Callable[[Path, Path], bool]
 
@@ -74,7 +72,7 @@ def stage_trained_processor_assets(package_root: str | Path, config: Any) -> Non
     Hub reference.
     """
     root = Path(package_root).resolve()
-    declared = {key: set() for key in PROCESSOR_PACKAGE_PATHS}
+    declared: dict[str, set[str]] = {key: set() for key in PROCESSOR_PACKAGE_PATHS}
     for config_path in _processor_configs(root):
         try:
             _processor_path_values(load_json_object(config_path), declared)
@@ -289,7 +287,6 @@ def write_trained_package_manifest(
     identity: Mapping[str, Any],
     metadata: Mapping[str, Any] | None = None,
     delegated_directory: str | None = "hf_model",
-    precomputed_files_sha256: Mapping[str, str] | None = None,
 ) -> str:
     """Write an exhaustive outer-package manifest and return its raw digest."""
     root = Path(package_root).resolve(strict=True)
@@ -318,20 +315,7 @@ def write_trained_package_manifest(
         delegated_directory=delegated_directory,
         label=label,
     )
-    precomputed = dict(precomputed_files_sha256 or {})
-    if unknown := set(precomputed) - set(files):
-        raise RuntimeError(f"{label} precomputed digests contain unknown files: {sorted(unknown)}.")
-    try:
-        files_sha256 = {
-            relative: (
-                require_sha256(precomputed[relative], context=f"{label} precomputed digest for {relative}")
-                if relative in precomputed
-                else file_sha256(path)
-            )
-            for relative, path in files.items()
-        }
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
+    files_sha256 = {relative: file_sha256(path) for relative, path in files.items()}
     manifest = {
         "schema": manifest_schema,
         **identity,
@@ -465,90 +449,48 @@ def verify_trained_package_manifest(
     return manifest
 
 
-def finalize_trained_package_config(
-    config: Any,
+def finalize_canonical_trained_package(
+    config: PerceptronIsaacConfig,
     package_root: str | Path,
     *,
-    label: str,
-    manifest_filename: str,
-    manifest_schema: str,
-    digest_field: str,
-    identity: Mapping[str, Any],
-    metadata: Mapping[str, Any] | None = None,
-    delegated_directory: str | None = "hf_model",
-    precomputed_files_sha256: Mapping[str, str] | None = None,
+    mk1_source_model_import_sha256: str | None,
 ) -> str:
-    """Save a canonical config, write its manifest once, then close the digest cycle."""
+    """Bind native inner weights to their source identity and close the config digest cycle."""
+    if not mk1_source_model_import_sha256:
+        raise RuntimeError("Cannot finalize an MK1 package without source model-import identity.")
     root = Path(package_root).resolve(strict=True)
-    setattr(config, digest_field, None)
+    config.mk1_trained_package_manifest_sha256 = None
     config._save_pretrained(root)
     digest = write_trained_package_manifest(
         root,
-        label=label,
-        manifest_filename=manifest_filename,
-        manifest_schema=manifest_schema,
-        digest_field=digest_field,
-        identity=identity,
-        metadata=metadata,
-        delegated_directory=delegated_directory,
-        precomputed_files_sha256=precomputed_files_sha256,
+        label="MK1 canonical trained package",
+        manifest_filename=MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
+        manifest_schema=MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+        digest_field=MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
+        identity={
+            "artifact_kind": config.artifact_kind,
+            "trained_steps": config.trained_steps,
+            "mk1_source_model_import_sha256": mk1_source_model_import_sha256,
+        },
+        metadata={"model_storage": CANONICAL_INNER_MODEL_STORAGE},
+        delegated_directory=None,
     )
-    setattr(config, digest_field, digest)
+    config.mk1_trained_package_manifest_sha256 = digest
     config._save_pretrained(root)
 
     try:
         raw_config = load_json_object(root / "config.json")
-        manifest = load_json_object(root / manifest_filename)
+        manifest = load_json_object(root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME)
     except ValueError as exc:
-        raise RuntimeError(f"Cannot re-read finalized {label}: {exc}") from exc
+        raise RuntimeError(f"Cannot re-read finalized MK1 canonical trained package: {exc}") from exc
     canonical_config = dict(raw_config)
-    canonical_config[digest_field] = None
+    canonical_config[MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD] = None
     if (
-        raw_config.get(digest_field) != digest
-        or file_sha256(root / manifest_filename) != digest
+        raw_config.get(MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD) != digest
+        or file_sha256(root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME) != digest
         or manifest.get("config_sha256") != canonical_json_sha256(canonical_config)
     ):
-        raise RuntimeError(f"{label} config/manifest binding changed before publication.")
+        raise RuntimeError(
+            "MK1 canonical trained package config/manifest binding changed before publication."
+        )
     return digest
-
-
-def finalize_canonical_trained_package(
-    config: Any,
-    package_root: str | Path,
-    *,
-    family: Literal["mk1", "qwen35"],
-    mk1_source_model_import_sha256: str | None = None,
-    precomputed_files_sha256: Mapping[str, str] | None = None,
-) -> str:
-    """Finalize one canonical inner-weight package using its family-owned manifest contract."""
-    identity = {
-        "artifact_kind": config.artifact_kind,
-        "trained_steps": config.trained_steps,
-    }
-    if family == "mk1":
-        if not mk1_source_model_import_sha256:
-            raise RuntimeError("Cannot finalize an MK1 package without source model-import identity.")
-        identity["mk1_source_model_import_sha256"] = mk1_source_model_import_sha256
-        label = "MK1 canonical trained package"
-        manifest_filename = MK1_TRAINED_PACKAGE_MANIFEST_FILENAME
-        manifest_schema = MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA
-        digest_field = MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD
-    elif family == "qwen35":
-        label = "Qwen3.5 canonical trained package"
-        manifest_filename = QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME
-        manifest_schema = QWEN35_TRAINED_PACKAGE_MANIFEST_SCHEMA
-        digest_field = QWEN35_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD
-    else:
-        raise ValueError(f"Unsupported Perceptron ISAAC checkpoint family: {family!r}.")
-    return finalize_trained_package_config(
-        config,
-        package_root,
-        label=label,
-        manifest_filename=manifest_filename,
-        manifest_schema=manifest_schema,
-        digest_field=digest_field,
-        identity=identity,
-        metadata={"model_storage": CANONICAL_INNER_MODEL_STORAGE},
-        delegated_directory=None,
-        precomputed_files_sha256=precomputed_files_sha256,
-    )

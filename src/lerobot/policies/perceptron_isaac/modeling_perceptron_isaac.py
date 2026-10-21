@@ -87,22 +87,11 @@ logger = logging.getLogger(__name__)
 _MK1_BASE_VOCAB_SIZE = 248_044
 
 
-def _load_json_object(
-    path: Path,
-    label: str,
-    duplicate_context: str,
-    object_error: str | None = None,
-) -> dict[str, Any]:
+def _load_json_object(path: Path, label: str) -> dict[str, Any]:
+    """Keep the package context and original JSON failure without parsing error text."""
     try:
         return load_json_object(path)
     except ValueError as exc:
-        message = str(exc)
-        if "duplicate JSON key" in message or "contains duplicate key" in message:
-            marker = "duplicate JSON key" if "duplicate JSON key" in message else "contains duplicate key"
-            duplicate = message.split(marker, 1)[1].split(" in JSON", 1)[0].rstrip(".")
-            raise RuntimeError(f"{duplicate_context} contains duplicate key{duplicate}.") from exc
-        if "must contain an object" in message:
-            raise RuntimeError(object_error or f"{label} must contain a JSON object.") from exc
         raise RuntimeError(f"Cannot read {label}: {exc}") from exc
 
 
@@ -628,7 +617,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             finalize_canonical_trained_package(
                 self.config,
                 root,
-                family="mk1",
                 mk1_source_model_import_sha256=model_import_digest,
             )
             return
@@ -1894,7 +1882,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             verified_record_digest = file_sha256(record_path)
         _verify_sha256(expected_record_digest, f"{context} record digest", verified_record_digest)
 
-        record = _load_json_object(record_path, record_name, f"{context} JSON")
+        record = _load_json_object(record_path, record_name)
         record_keys = {
             "schema",
             "algorithm",
@@ -1972,9 +1960,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 f"packaged_missing={sorted(missing_required)}, source_missing={sorted(missing_source)}."
             )
 
-        index = _load_json_object(
-            model_root / "model.safetensors.index.json", "model.safetensors.index.json", f"{context} JSON"
-        )
+        index = _load_json_object(model_root / "model.safetensors.index.json", "model.safetensors.index.json")
         weight_map = index.get("weight_map")
         if not isinstance(weight_map, dict) or not weight_map:
             raise RuntimeError("MK1 model index must contain a non-empty weight_map.")
@@ -2050,7 +2036,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             or config.trained_steps <= 0
         ):
             raise RuntimeError("MK1 model import artifact identity disagrees with the package config.")
-        raw_config = _load_json_object(model_root / "config.json", "MK1 config.json", f"{context} JSON")
+        raw_config = _load_json_object(model_root / "config.json", "MK1 config.json")
         if raw_config.get("genesis_artifact") != artifact:
             raise RuntimeError("MK1 inner config artifact identity disagrees with its import record.")
 
@@ -2080,12 +2066,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if not PerceptronIsaacPolicy._is_package_file(root, manifest_path):
             raise RuntimeError(f"Neutral-debug package is missing {manifest_name}.")
 
-        manifest = _load_json_object(
-            manifest_path,
-            context.lower(),
-            context,
-            f"{context} fields do not match schema version 1.",
-        )
+        manifest = _load_json_object(manifest_path, context.lower())
         expected_keys = {
             "schema_version",
             "artifact_kind",

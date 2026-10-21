@@ -39,6 +39,17 @@ def test_policy_rejects_generic_qwen_packages_before_model_loading(
             PerceptronIsaacPolicy(config)._load_backbone()
 
 
+@pytest.mark.parametrize("payload", ['{"outer": {"key": 1, "key": 2}}', "[]", "{broken", "\\udcff"])
+def test_policy_json_boundary_rejects_invalid_objects_with_context(tmp_path: Path, payload: str) -> None:
+    from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import _load_json_object
+
+    path = tmp_path / "package.json"
+    path.write_bytes(payload.encode("utf-8", errors="surrogateescape"))
+    with pytest.raises(RuntimeError, match="test package") as failure:
+        _load_json_object(path, "test package")
+    assert isinstance(failure.value.__cause__, ValueError)
+
+
 def _write_indexed_checkpoint(root: Path) -> None:
     shard_names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
     save_file({"weight": torch.ones(1)}, root / shard_names[0])
