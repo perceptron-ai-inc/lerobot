@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -803,6 +804,28 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
     assert stream.streams[0].events[0].role == "agent"
 
 
+def test_cached_renderer_does_not_skip_fast_resolver_defects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mharmony")
+
+    def broken_resolver(*, local_files_only: bool) -> Path:
+        assert local_files_only
+        raise ValueError("FAST resolver defect")
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "resolve_pinned_fast_processor_snapshot",
+        broken_resolver,
+    )
+    with pytest.raises(ValueError, match="FAST resolver defect"):
+        try:
+            test_real_cached_fast_and_mharmony_render_joint_training_stream(tmp_path, monkeypatch)
+        except pytest.skip.Exception as exc:
+            pytest.fail(f"A resolver defect must fail, not skip: {exc}")
+
+
 def test_real_cached_fast_and_mharmony_render_joint_training_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -810,7 +833,7 @@ def test_real_cached_fast_and_mharmony_render_joint_training_stream(
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     try:
         source = resolve_pinned_fast_processor_snapshot(local_files_only=True)
-    except Exception as exc:  # pragma: no cover - cache is host-specific
+    except FileNotFoundError as exc:  # pragma: no cover - cache is host-specific
         pytest.skip(f"pinned FAST processor is not cached: {exc}")
     artifact = materialize_pinned_fast_processor_snapshot(source, tmp_path / "fast_processor")
     identity_before = fast_processor_tree_identity(artifact.path)
