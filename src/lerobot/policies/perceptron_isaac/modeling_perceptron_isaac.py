@@ -18,7 +18,7 @@ from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 import numpy as np
 import torch
@@ -31,6 +31,7 @@ from lerobot.utils.import_utils import require_package
 
 from ..pretrained import PreTrainedPolicy
 from .checkpoint_integrity import (
+    DirectorySnapshot,
     file_sha256,
     is_hf_snapshot_blob_link,
     load_json_object,
@@ -69,7 +70,6 @@ from .processor_perceptron_isaac import (
     PerceptronIsaacMharmonyPackProcessorStep,
 )
 from .trained_package import (
-    AUTHENTICATED_IMPORT_MODEL_STORAGE,
     CANONICAL_INNER_MODEL_STORAGE,
     MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
     MK1_MODEL_IMPORT_FILENAME,
@@ -77,14 +77,14 @@ from .trained_package import (
     MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
     MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA,
     PROCESSOR_PACKAGE_PATHS,
-    QWEN35_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
-    QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME,
-    QWEN35_TRAINED_PACKAGE_MANIFEST_SCHEMA,
     finalize_canonical_trained_package,
     rewrite_trained_processor_paths,
     stage_trained_processor_assets,
     verify_trained_package_manifest,
 )
+
+if TYPE_CHECKING:
+    from .modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
 
 T = TypeVar("T", bound="PerceptronIsaacPolicy")
 logger = logging.getLogger(__name__)
@@ -122,6 +122,7 @@ def _verify_sha256(
         raise RuntimeError(str(exc)) from exc
     if isinstance(actual, Path):
         actual = file_sha256(actual)
+    assert actual is None or isinstance(actual, str)
     if actual is not None and not hmac.compare_digest(actual, expected):
         if callable(mismatch_error):
             mismatch_error = mismatch_error(expected, actual)
@@ -345,13 +346,13 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        self._isaac_model = None
-        self._stats = None
-        self._native_render_metadata = None
-        self._verified_runtime_assets = None
-        self._verified_external_runtime_assets = []
-        self._verified_processor_assets = None
-        self._verified_external_processor_assets = []
+        self._isaac_model: Mk1Qwen36VLAForActionGeneration | None = None
+        self._stats: IsaacNormalizationStats | None = None
+        self._native_render_metadata: IsaacMharmonyRenderMetadata | None = None
+        self._verified_runtime_assets: DirectorySnapshot | None = None
+        self._verified_external_runtime_assets: list[DirectorySnapshot] = []
+        self._verified_processor_assets: DirectorySnapshot | None = None
+        self._verified_external_processor_assets: list[DirectorySnapshot] = []
         # Checkpoint-serialized normalization stats adopted from the restored
         # preprocessor pipeline (see _maybe_adopt_serving_stats). Set once per loaded
         # checkpoint and deliberately NOT cleared by reset(): the checkpoint identity
@@ -443,7 +444,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             relative = record.get("relative")
             owner = record.get("root")
             absolute = record.get("absolute")
-            if not all(isinstance(value, str) for value in (relative, owner, absolute)):
+            if not isinstance(relative, str) or not isinstance(owner, str) or not isinstance(absolute, str):
                 raise RuntimeError(f"Serialized processor path {key} is untrusted: {raw}.")
             relative_path = Path(relative)
             if relative_path.is_absolute() or not relative_path.parts or ".." in relative_path.parts:
@@ -662,42 +663,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if runtime_assets is not None and source_root == runtime_assets.root:
             yield runtime_assets.root
             return
-        if self._config_declares_mk1(self.config):
-            from lerobot.configs import PreTrainedConfig
-
-            with self._snapshot_save_source(source_root, prefix="lerobot-mk1-save-") as package_root:
-                source_config = PreTrainedConfig.from_pretrained(package_root)
-                self._resolve_checkpoint_local_paths(source_config, package_root)
-                self._verify_packaged_contract_digests(source_config, package_root)
-                yield package_root
-            return
-
-        verified_package = getattr(self.config, "_qwen35_verified_package", None)
-        if verified_package is None:
-            from lerobot.configs import PreTrainedConfig
-
-            with self._snapshot_save_source(source_root, prefix="lerobot-qwen35-save-") as package_root:
-                source_config = PreTrainedConfig.from_pretrained(package_root)
-                self._resolve_checkpoint_local_paths(source_config, package_root)
-                if source_config.qwen35_trained_package_manifest_sha256 is not None:
-                    self._verify_qwen35_trained_package_manifest(source_config, package_root)
-                else:
-                    self._verify_packaged_contract_digests(source_config, package_root)
-                nested_verified = getattr(source_config, "_qwen35_verified_package", None)
-                if nested_verified is None:
-                    yield package_root
-                    return
-                try:
-                    yield nested_verified.root
-                finally:
-                    nested_verified.cleanup()
-            return
-        try:
-            yield verified_package.root
-        finally:
-            verified_package.cleanup()
-            if getattr(self.config, "_qwen35_verified_package", None) is verified_package:
-                delattr(self.config, "_qwen35_verified_package")
+        with self._snapshot_save_source(source_root, prefix="lerobot-mk1-save-") as package_root:
+            self._verify_saved_package(package_root)
+            yield package_root
 
     def _save_canonical_inner_weights(
         self,
@@ -741,7 +709,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 inner_config = load_json_object(model_root / "config.json")
                 validate_mk1_checkpoint(
                     model_root,
-                    allow_test_only_reduced_geometry=bool(inner_config.get(MK1_TEST_GEOMETRY_MARKER, False)),
+                    allow_test_only_reduced_geometry=bool(
+                        inner_config.get(MK1_TEST_GEOMETRY_MARKER, False)
+                        or inner_config.get("isaac05_test_only_reduced_geometry", False)
+                    ),
                     # The same rule the load path applies. FSDP's full-state-dict gather
                     # upcasts, so a package saved from an F32 export is itself F32; validating
                     # it as BF16 rejected an inventory this method had just written.
@@ -757,27 +728,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 (model_root / "mk1_model_import.json", model_root / "source_mk1_model_import.json"),
             )
         else:
-            from .qwen35_checkpoint import (
-                QWEN35_CONVERSION_PROVENANCE_FILE,
-                QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
-                write_qwen35_weight_convention,
-            )
-
-            write_qwen35_weight_convention(model_root)
-            lineage = (
-                (
-                    save_directory / "isaac_import_provenance.json",
-                    save_directory / "source_isaac_import_provenance.json",
-                ),
-                (
-                    save_directory / "isaac_export_provenance.json",
-                    save_directory / "source_isaac_export_provenance.json",
-                ),
-                (
-                    model_root / QWEN35_CONVERSION_PROVENANCE_FILE,
-                    model_root / QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
-                ),
-            )
+            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
         for source, destination in lineage:
             if source.is_file():
                 destination.unlink(missing_ok=True)
@@ -789,13 +740,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         saved_config = PreTrainedConfig.from_pretrained(root)
         cls._resolve_checkpoint_local_paths(saved_config, root)
-        if (
-            not cls._config_declares_mk1(saved_config)
-            and saved_config.qwen35_trained_package_manifest_sha256 is not None
-        ):
-            cls._verify_qwen35_trained_package_manifest(saved_config, Path(root))
-        else:
-            cls._verify_packaged_contract_digests(saved_config, Path(root))
+        cls._verify_packaged_contract_digests(saved_config, Path(root))
         return saved_config
 
     def finalize_pretrained_package(self, save_directory: str | Path) -> None:
@@ -836,7 +781,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 mk1_source_model_import_sha256=model_import_digest,
             )
             return
-        finalize_canonical_trained_package(self.config, root, family="qwen35")
+        raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
 
     def _finalize_portable_isaac05_package(self, root: Path) -> None:
         """Close a package saved from a raw Isaac-0.5 export on the identity it carries.
@@ -1181,6 +1126,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             raise ValueError(f"Executed action must have shape {expected_shape}, got {action_array.shape}.")
         if not np.isfinite(action_vector).all():
             raise ValueError("Executed action must contain only finite values.")
+        assert self._stats is not None
         normalized = normalize_isaac_actions(action_vector[None, :], self._stats.action)[0]
         clip_max = float(self.config.fast_clip_normalized_max)
         self._pending_executed_action = np.clip(normalized, -clip_max, clip_max).astype(
@@ -1194,6 +1140,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._isaac_model is None:
             self._load_backbone(training=True)
         self._configure_training_parameters()
+        assert self._isaac_model is not None
         if self.config.use_peft:
             # PEFT is applied in-place to this lazy inner model. Reassert the final
             # contract here, immediately before optimizer groups are collected.
@@ -1425,6 +1372,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
     def _model_dtype(self) -> torch.dtype:
         """Dtype of the loaded backbone, falling back to bf16 for parameterless stand-ins."""
+        if self._isaac_model is None:
+            return torch.bfloat16
         try:
             return next(p.dtype for p in self._isaac_model.parameters() if p.is_floating_point())
         except (AttributeError, StopIteration):
@@ -1465,51 +1414,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if not self.config.hf_model_path:
             raise RuntimeError("PerceptronIsaacConfig.hf_model_path is required to load the Isaac HF VLA.")
         if not self._config_declares_mk1(self.config):
-            from .modeling_qwen35_vla import (
-                _load_qwen35_vla_from_verified_package,
-                load_qwen35_vla_from_hf,
-            )
-
-            # Serving knobs only. A checkpoint-stamped action_expert block is
-            # authoritative for expert geometry; historical checkpoints fall back
-            # to the loader's default contract.
-            action_expert_overrides = {
-                "action_horizon": int(self.config.chunk_size),
-                "num_inference_steps": int(self.config.num_inference_steps),
-            }
-            dense_fp32_training = (
-                training and self.config.train_storage_fp32 and not self.config.train_expert_only
-            )
-            model_dtype = torch.float32 if dense_fp32_training else torch.bfloat16
-            model_path = Path(self.config.hf_model_path).resolve()
-            verified_package = getattr(self.config, "_qwen35_verified_package", None)
-            load_options = {
-                "vector_max_states": self.config.vector_max_states,
-                "action_expert_overrides": action_expert_overrides,
-                "dtype": model_dtype,
-                "device": self._resolve_device(),
-                "strict": True,
-                "apply_offset_norm": bool(getattr(self.config, "apply_offset_norm", True)),
-            }
-            if verified_package is None:
-                model, _ = load_qwen35_vla_from_hf(model_path, **load_options)
-            else:
-                try:
-                    self._retain_verified_runtime_assets(verified_package.root)
-                except BaseException:
-                    verified_package.cleanup()
-                    delattr(self.config, "_qwen35_verified_package")
-                    raise
-                delattr(self.config, "_qwen35_verified_package")
-                model, _ = _load_qwen35_vla_from_verified_package(
-                    verified_package,
-                    action_expert=None,
-                    **load_options,
-                )
-            self._isaac_model = model
-            if training:
-                self._configure_training_parameters()
-            return
+            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
 
         if training:
             self._require_native_training_supported()
@@ -1706,6 +1611,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._stats is None:
             self._stats = self._adopted_serving_stats or load_native_isaac_stats(self.config)
         if self._native_render_metadata is None:
+            assert self._stats is not None
             self._native_render_metadata = load_native_render_metadata(
                 self.config,
                 stats_fps=self._stats.target_fps,
@@ -1918,7 +1824,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             pad_count = target_steps - len(image_values)
             image_values = [image_values[0]] * pad_count + image_values
             state_values = [state_values[0]] * pad_count + state_values
-            action_values = [None] * pad_count + action_values
+            missing_actions: list[np.ndarray | None] = [None] * pad_count
+            action_values = missing_actions + action_values
         image_window = np.stack(image_values, axis=0)
         state_window = np.stack(state_values, axis=0)
         observation = {
@@ -2070,6 +1977,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             self._ensure_native_metadata()
             idle = np.zeros((1, self.config.action_dim), dtype=np.float32)
             idle[:, -1] = float(self.config.settle_gripper)
+            assert self._stats is not None
             idle_norm = normalize_isaac_actions(idle, self._stats.action)
             return torch.from_numpy(idle_norm).float()
 
@@ -2140,6 +2048,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._isaac_model is None:
             self._load_backbone(training=True)
         self._configure_training_parameters()
+        assert self._isaac_model is not None
         self._verify_fp32_masters_once()
         stream = stream.to(device=self._resolve_device(), dtype=self._model_dtype())
         model_output = self._isaac_model.train_forward(stream)
@@ -2259,18 +2168,12 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         config: PerceptronIsaacConfig,
         checkpoint_root: Path | None,
     ) -> None:
-        """Verify the checkpoint-family-specific integrity record before allocation.
-
-        Existing Qwen3.5 packages retain the PR #4 import/export provenance
-        contract. MK1 packages use their exhaustive package and model manifests.
-        """
+        """Verify native checkpoint integrity before model allocation."""
+        if not PerceptronIsaacPolicy._config_declares_mk1(config):
+            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
         if checkpoint_root is None:
             return
         root = Path(checkpoint_root).resolve()
-        previous_qwen_package = getattr(config, "_qwen35_verified_package", None)
-        if previous_qwen_package is not None:
-            previous_qwen_package.cleanup()
-            delattr(config, "_qwen35_verified_package")
         model_path = getattr(config, "hf_model_path", None)
         if model_path is not None and is_portable_isaac05_repository(Path(model_path)):
             expected_adapter = getattr(config, "deployment_adapter_sha256", None)
@@ -2308,106 +2211,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     root_weights_bound=True,
                 )
             return
-
-        checkpoint_root = Path(checkpoint_root)
-
-        if config.qwen35_trained_package_manifest_sha256 is not None:
-            from .qwen35_checkpoint import _snapshot_verified_qwen35_trained_package
-
-            configured_model = Path(str(config.hf_model_path))
-            if not configured_model.is_absolute():
-                configured_model = root / configured_model
-
-            def verify_snapshot(snapshot_root: Path) -> tuple[str | Path, bool]:
-                from lerobot.configs import PreTrainedConfig
-
-                snapshot_config = PreTrainedConfig.from_pretrained(snapshot_root)
-                PerceptronIsaacPolicy._resolve_checkpoint_local_paths(snapshot_config, snapshot_root)
-                PerceptronIsaacPolicy._verify_qwen35_trained_package_manifest(snapshot_config, snapshot_root)
-                return snapshot_config.hf_model_path, bool(snapshot_config.apply_offset_norm)
-
-            config._qwen35_verified_package = _snapshot_verified_qwen35_trained_package(
-                root,
-                hf_model_dir=configured_model,
-                verify_snapshot=verify_snapshot,
-            )
-            return
-
-        import_provenance = checkpoint_root / "isaac_import_provenance.json"
-        export_provenance = checkpoint_root / "isaac_export_provenance.json"
-        if import_provenance.is_file() and export_provenance.is_file():
-            raise RuntimeError("ISAAC package cannot contain both import and export provenance.")
-        if import_provenance.is_file() or export_provenance.is_file():
-            kind = "imported" if import_provenance.is_file() else "exported"
-            raise RuntimeError(
-                f"Qwen3.5 {kind} Perceptron packages require the exhaustive outer trained-package "
-                "manifest; its config digest or manifest is missing."
-            )
-        if getattr(config, "deployment_adapter_sha256", None):
-            raise RuntimeError(
-                "Qwen3.5 ISAAC package has deployment identity but no authenticated package provenance."
-            )
-
-    @staticmethod
-    def _verify_qwen35_trained_package_manifest(
-        config: PerceptronIsaacConfig,
-        root: Path,
-    ) -> None:
-        from .qwen35_checkpoint import (
-            validate_qwen35_hf_model_entries,
-            verify_qwen35_weight_convention,
-        )
-
-        try:
-            manifest = load_json_object(root / QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME)
-        except ValueError as exc:
-            raise RuntimeError(f"Cannot read Qwen3.5 trained package manifest: {exc}") from exc
-        model_storage = manifest.get("model_storage")
-        if model_storage not in {CANONICAL_INNER_MODEL_STORAGE, AUTHENTICATED_IMPORT_MODEL_STORAGE}:
-            raise RuntimeError("Qwen3.5 trained package has unsupported model_storage metadata.")
-        model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(
-            config,
-            root,
-            context="Qwen3.5",
-        )
-        validate_qwen35_hf_model_entries(
-            model_root,
-            allow_source_lineage=model_storage == CANONICAL_INNER_MODEL_STORAGE,
-        )
-        if model_storage == CANONICAL_INNER_MODEL_STORAGE:
-            verify_qwen35_weight_convention(model_root)
-        verify_trained_package_manifest(
-            root,
-            label="Qwen3.5 trained package",
-            manifest_filename=QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME,
-            manifest_schema=QWEN35_TRAINED_PACKAGE_MANIFEST_SCHEMA,
-            digest_field=QWEN35_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
-            manifest_digest=config.qwen35_trained_package_manifest_sha256,
-            identity={
-                "artifact_kind": config.artifact_kind,
-                "trained_steps": config.trained_steps,
-            },
-            metadata={"model_storage": model_storage},
-            is_package_file=PerceptronIsaacPolicy._is_package_file,
-            delegated_directory=("hf_model" if model_storage == AUTHENTICATED_IMPORT_MODEL_STORAGE else None),
-        )
-        expected_adapter_digest = _verify_sha256(
-            config.deployment_adapter_sha256,
-            "Qwen3.5 trained package deployment_adapter_sha256",
-        )
-        _verify_sha256(
-            expected_adapter_digest,
-            "Qwen3.5 trained package deployment_adapter_sha256",
-            root / "isaac_deployment_adapter.json",
-        )
-        if model_storage == AUTHENTICATED_IMPORT_MODEL_STORAGE:
-            from .qwen35_checkpoint import verify_qwen35_imported_package
-
-            verify_qwen35_imported_package(root, hf_model_dir=model_root)
-        elif (root / "isaac_import_provenance.json").exists() or (
-            root / "hf_model" / "rmsnorm_conversion.json"
-        ).exists():
-            raise RuntimeError("Canonical Qwen3.5 trained weights retain stale import provenance.")
 
     @staticmethod
     def _require_canonical_hf_model_path(
@@ -2478,11 +2281,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             PerceptronIsaacPolicy._require_canonical_hf_model_path(config, root, context="MK1")
             return None
 
-        expected_adapter_digest = getattr(config, "deployment_adapter_sha256", None)
-        if not expected_adapter_digest:
+        if not config.deployment_adapter_sha256:
             raise RuntimeError("A trained MK1 Perceptron Isaac package requires deployment_adapter_sha256.")
         expected_adapter_digest = _verify_sha256(
-            expected_adapter_digest, f"{context} deployment_adapter_sha256"
+            config.deployment_adapter_sha256, f"{context} deployment_adapter_sha256"
         )
         adapter_path = root / "isaac_deployment_adapter.json"
         if not PerceptronIsaacPolicy._is_package_file(root, adapter_path):
@@ -3045,17 +2847,13 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         """Publish the package vocab only after its integrity record has passed."""
         import os
 
-        verified_package = getattr(config, "_qwen35_verified_package", None)
         if (
             not force
-            and verified_package is None
             and not PerceptronIsaacPolicy._config_declares_mk1(config)
             and os.environ.get("QWEN35_VOCAB_PATH")
         ):
             return
-        hf_model_path = getattr(verified_package, "hf_model_path", None) or getattr(
-            config, "hf_model_path", None
-        )
+        hf_model_path = config.hf_model_path
         if hf_model_path:
             vocab = Path(str(hf_model_path)) / "vocab.json"
             if vocab.is_file():

@@ -28,10 +28,9 @@ import torch.nn.functional as F
 
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5PreTrainedModel, Qwen3_5RMSNorm
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5PreTrainedModel
 
 # --- Genesis TensorStream layout / mrope / context-mask utilities ---
-from .checkpoint_integrity import load_json_object
 from .rtc import (
     DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION,
     DIT_ACTION_EXPERT_CONFIG_V1_FIELDS,
@@ -42,19 +41,7 @@ from .rtc import (
     project_rtc_modulation,
     resolve_rtc_action_prefix,
 )
-from .qwen35_checkpoint import (
-    QWEN35_CONVERSION_PROVENANCE_FILE,
-    QWEN35_IMPORT_PROVENANCE_FILE,
-    QWEN35_PACKAGED_SOURCE_FILENAMES,
-    QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
-    QWEN35_WEIGHT_CONVENTION_FILE,
-    _snapshot_verified_qwen35_imported_package,
-    _snapshot_verified_qwen35_trained_package,
-    _VerifiedQwen35Package,
-    _verified_qwen35_model_path,
-    safetensors_checkpoint_layout,
-    verify_qwen35_weight_convention,
-)
+from .qwen35_checkpoint import safetensors_checkpoint_layout
 from .tensor_stream import TensorStream, TextType, VisionType, group_streams
 from .tensor_stream_utils import (
     build_action_context_mask,
@@ -149,26 +136,6 @@ def build_vector_encoder(vector_max_states: int, hidden: int) -> nn.Module:
         nn.SiLU(),
         nn.Linear(hidden, hidden, bias=False),
     )
-
-
-@torch.no_grad()
-def apply_qwen35_offset_norm_correction(language_model: nn.Module) -> int:
-    """Convert genesis (standard) RMSNorm weights to the native Qwen3.5 unit-offset convention.
-
-    Native ``Qwen3_5RMSNorm`` computes ``x_normed * (1 + weight)`` (weight init = 0), whereas genesis
-    trains a standard ``Qwen2RMSNorm`` (``x_normed * weight``, weight ~ 1). ``convert_genesis_qwen35_to_hf``
-    writes the genesis weights verbatim, so native would apply ``(1 + w)`` instead of ``w`` — a per-channel
-    direction change that compounds across layers into a garbage final state. Subtracting
-    1.0 makes native compute ``(1 + (w - 1)) = w``. Only ``Qwen3_5RMSNorm`` modules are touched — the gated
-    ``Qwen3_5RMSNormGated`` (a different class, standard convention) and the vision LayerNorms are untouched.
-    Idempotency is the caller's responsibility (apply exactly once, right after loading raw genesis weights).
-    """
-    corrected = 0
-    for module in language_model.modules():
-        if isinstance(module, Qwen3_5RMSNorm):
-            module.weight.sub_(1.0)
-            corrected += 1
-    return corrected
 
 
 # === Action expert (vendored MolmoAct2 DiT + pluggable head) ===
@@ -911,6 +878,7 @@ class ActionExpert(nn.Module):
             raise ValueError(
                 f"Action sequence length {seq_len} exceeds configured max_action_horizon={self.config.max_action_horizon}"
             )
+        block_modulations: Sequence[tuple[torch.Tensor, ...] | None]
         if rtc_conditioning is not None:
             if modulation is not None:
                 raise ValueError("precomputed modulation and RTC conditioning are mutually exclusive.")
@@ -921,7 +889,7 @@ class ActionExpert(nn.Module):
         elif modulation is None:
             rtc_suffix_conditioning = rtc_prefix_conditioning = rtc_prefix_mask = None
             conditioning = self._time_conditioning(timesteps)
-            block_modulations: Sequence[tuple[torch.Tensor, ...] | None] = [None] * len(self.blocks)
+            block_modulations = [None] * len(self.blocks)
             final_modulation = None
         else:
             rtc_suffix_conditioning = rtc_prefix_conditioning = rtc_prefix_mask = None
@@ -1084,7 +1052,7 @@ class MolmoActExpertHead(ActionExpertHead):
         self.hidden_dim = int(c["hidden_dim"])
         # Training-time args duck-typing genesis MolmoActFlowExpertArgs (read by the genesis flow
         # loss). setup_qwen35_vla_for_training overrides the train-only knobs; inference ignores it.
-        self.args = MolmoActExpertTrainArgs(
+        self.args: MolmoActExpertTrainArgs | DiTActionExpertArgs = MolmoActExpertTrainArgs(
             action_dim=self.action_dim,
             action_horizon=self.action_horizon,
             hidden_dim=self.hidden_dim,
@@ -1374,8 +1342,12 @@ class DiTActionExpertArgs:
             ("timestep_sampling_offset", self.timestep_sampling_offset),
             ("rtc_poisson_mean", self.rtc_poisson_mean),
         )
-        for field_name, value in numeric_fields:
-            if not isinstance(value, Real) or isinstance(value, bool) or not math.isfinite(float(value)):
+        for field_name, numeric_value in numeric_fields:
+            if (
+                not isinstance(numeric_value, Real)
+                or isinstance(numeric_value, bool)
+                or not math.isfinite(float(numeric_value))
+            ):
                 raise ValueError(f"{field_name} must be a finite number.")
         if self.rtc_probability is not None and (
             not isinstance(self.rtc_probability, Real)
@@ -1473,6 +1445,7 @@ class DiTActionExpertHead(MolmoActExpertHead):
     """
 
     expert_type = "dit"
+    args: DiTActionExpertArgs
 
     def __init__(self, action_expert_cfg: dict[str, Any], vlm_dim: int) -> None:
         args = _validate_action_expert_contract(action_expert_cfg)
@@ -1734,7 +1707,7 @@ class Qwen35VLAModel(Qwen3_5Model):
         embedded_ts = reconstruct_tensor_stream_from_compact_dict(tensor_stream, embedded)
         return embedded_ts.compact()  # [B, T, D]
 
-    def forward(self, tensor_stream: TensorStream, **kwargs: Any) -> BaseModelOutputWithPast:  # type: ignore[override]
+    def forward(self, tensor_stream: TensorStream, **kwargs: Any) -> BaseModelOutputWithPast:
         """Run the VLM over the rendered stream and return post-final-norm activations.
 
         Replicates genesis ``PerceptronTransformer.forward``: interleave -> MRoPE positions ->
@@ -1923,33 +1896,6 @@ def load_sharded_safetensors_into_model(
     return missing_keys, unexpected
 
 
-def _assert_offset_norm_matches_marker(hf_path: Path, *, apply_offset_norm: bool) -> None:
-    """Cross-check the offset-norm flag against checkpoint-owned convention markers.
-
-    ``rmsnorm_conversion.json`` is written only into directories whose RMSNorm weights have
-    already been converted to the native unit-offset convention. Canonical trained checkpoints
-    archive that import record and carry an explicit weight-convention marker. Subtracting one
-    again turns every language-model norm gain into ``w - 1 ~ 0``, which produces garbage
-    activations with no error, so refuse the load instead.
-    """
-    convention_marker = hf_path / QWEN35_WEIGHT_CONVENTION_FILE
-    if convention_marker.exists() or convention_marker.is_symlink():
-        verify_qwen35_weight_convention(hf_path)
-    markers = (
-        hf_path / QWEN35_CONVERSION_PROVENANCE_FILE,
-        hf_path / QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
-        convention_marker,
-    )
-    already_converted = any(marker.exists() or marker.is_symlink() for marker in markers)
-    if already_converted and apply_offset_norm:
-        marker_names = ", ".join(marker.name for marker in markers if marker.exists() or marker.is_symlink())
-        raise RuntimeError(
-            f"{hf_path} carries {marker_names}, so its RMSNorm weights are already in the native "
-            "unit-offset convention. Loading with apply_offset_norm=True would subtract one "
-            "twice and corrupt every language-model norm; pass apply_offset_norm=False."
-        )
-
-
 def resolve_action_expert_config(
     file_expert_cfg: dict[str, Any] | None,
     *,
@@ -1994,187 +1940,6 @@ def resolve_action_expert_config(
             )
         resolved = {**resolved, **action_expert_overrides}
     return resolved
-
-
-def load_qwen35_vla_from_hf(
-    hf_dir: str | Path,
-    *,
-    vector_max_states: int = 128,
-    action_expert: dict[str, Any] | None = None,
-    action_expert_overrides: dict[str, Any] | None = None,
-    dtype: torch.dtype = torch.float32,
-    device: str = "cpu",
-    strict: bool = True,
-    apply_offset_norm: bool = True,
-) -> tuple[Qwen35VLAForActionGeneration, Qwen35VLAConfig]:
-    """Load raw upstream HF weights or a stable, fully verified imported package snapshot."""
-    hf_path = Path(hf_dir)
-    package_root = hf_path.parent
-    load_options = {
-        "vector_max_states": vector_max_states,
-        "action_expert": action_expert,
-        "action_expert_overrides": action_expert_overrides,
-        "dtype": dtype,
-        "device": device,
-        "strict": strict,
-        "apply_offset_norm": apply_offset_norm,
-    }
-
-    from .trained_package import QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME
-
-    if (package_root / QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME).is_file():
-
-        def verify_trained_snapshot(snapshot_root: Path) -> tuple[str | Path, bool]:
-            from lerobot.configs import PreTrainedConfig
-
-            from .modeling_perceptron_isaac import PerceptronIsaacPolicy
-
-            saved_config = PreTrainedConfig.from_pretrained(snapshot_root)
-            PerceptronIsaacPolicy._resolve_checkpoint_local_paths(saved_config, snapshot_root)
-            PerceptronIsaacPolicy._verify_qwen35_trained_package_manifest(saved_config, snapshot_root)
-            return saved_config.hf_model_path, bool(saved_config.apply_offset_norm)
-
-        verified = _snapshot_verified_qwen35_trained_package(
-            package_root,
-            hf_model_dir=hf_path,
-            verify_snapshot=verify_trained_snapshot,
-        )
-        return _load_qwen35_vla_from_verified_package(verified, **load_options)
-
-    has_import_provenance = (package_root / QWEN35_IMPORT_PROVENANCE_FILE).is_file()
-    has_conversion_marker = (hf_path / QWEN35_CONVERSION_PROVENANCE_FILE).is_file()
-    parent_config_path = package_root / "config.json"
-    has_policy_config = False
-    if parent_config_path.is_file():
-        try:
-            has_policy_config = load_json_object(parent_config_path).get("type") == "perceptron_isaac"
-        except ValueError as exc:
-            raise RuntimeError(f"Cannot inspect parent policy config: {exc}") from exc
-    has_package_identity = (package_root / "isaac_deployment_adapter.json").is_file() or any(
-        (package_root / filename).is_file() for filename in QWEN35_PACKAGED_SOURCE_FILENAMES
-    )
-    if has_import_provenance or has_conversion_marker or has_package_identity or has_policy_config:
-        verified = _snapshot_verified_qwen35_imported_package(
-            package_root,
-            hf_model_dir=hf_path,
-        )
-        return _load_qwen35_vla_from_verified_package(verified, **load_options)
-    detached_markers = [
-        name
-        for name in (
-            QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
-            QWEN35_WEIGHT_CONVENTION_FILE,
-        )
-        if (hf_path / name).exists() or (hf_path / name).is_symlink()
-    ]
-    if detached_markers:
-        if QWEN35_WEIGHT_CONVENTION_FILE in detached_markers:
-            verify_qwen35_weight_convention(hf_path)
-        raise RuntimeError(
-            "Detached canonical Qwen3.5 hf_model cannot be loaded without its authenticated "
-            f"outer trained package; found markers={detached_markers}. Load the package root instead."
-        )
-    return _load_qwen35_vla_from_hf(hf_path, **load_options)
-
-
-def _load_qwen35_vla_from_verified_package(
-    verified: _VerifiedQwen35Package,
-    *,
-    vector_max_states: int,
-    action_expert: dict[str, Any] | None,
-    action_expert_overrides: dict[str, Any] | None,
-    dtype: torch.dtype,
-    device: str,
-    strict: bool,
-    apply_offset_norm: bool,
-) -> tuple[Qwen35VLAForActionGeneration, Qwen35VLAConfig]:
-    """Consume one exact-root verified snapshot and release it after model materialization."""
-    try:
-        hf_model_path = _verified_qwen35_model_path(verified)
-        if verified.apply_offset_norm != apply_offset_norm:
-            raise RuntimeError(
-                "Verified Qwen3.5 package apply_offset_norm disagrees with the loader request."
-            )
-        return _load_qwen35_vla_from_hf(
-            hf_model_path,
-            vector_max_states=vector_max_states,
-            action_expert=action_expert,
-            action_expert_overrides=action_expert_overrides,
-            dtype=dtype,
-            device=device,
-            strict=strict,
-            apply_offset_norm=apply_offset_norm,
-        )
-    finally:
-        verified.cleanup()
-
-
-def _load_qwen35_vla_from_hf(
-    hf_dir: str | Path,
-    *,
-    vector_max_states: int,
-    action_expert: dict[str, Any] | None,
-    action_expert_overrides: dict[str, Any] | None,
-    dtype: torch.dtype,
-    device: str,
-    strict: bool,
-    apply_offset_norm: bool,
-) -> tuple[Qwen35VLAForActionGeneration, Qwen35VLAConfig]:
-    """Instantiate ``Qwen35VLAForActionGeneration`` and load the converter's safetensors shards.
-
-    Historical converters write a *native* ``Qwen3_5Config`` (model_type ``qwen3_5``, no
-    action_expert block), for which ``DEFAULT_MOLMOACT_EXPERT_CFG`` supplies the expert
-    geometry. Genesis post-#3402 exports stamp an authoritative ``action_expert`` block
-    (type "dit" + schema_version) into config.json; that block is honored, never
-    silently replaced. ``action_expert_overrides`` carries serving knobs
-    (action_horizon / num_inference_steps) applied on top of whichever base wins.
-    Weights load with ``strict=False`` (the VLM/expert/proprio keys must all match; we
-    assert nothing is missing).
-    """
-    hf_path = Path(hf_dir).resolve()
-    # Load WITHOUT an action_expert kwarg so a checkpoint-stamped block survives as
-    # the authoritative contract (an HF from_pretrained kwarg would wholesale-replace
-    # it -- exactly the silent-discard failure this loader used to have).
-    config = Qwen35VLAConfig.from_pretrained(
-        hf_path,
-        vector_max_states=vector_max_states,
-        tie_word_embeddings=False,
-    )
-    config.action_expert = resolve_action_expert_config(
-        getattr(config, "action_expert", None),
-        action_expert=action_expert,
-        action_expert_overrides=action_expert_overrides,
-    )
-
-    # Construct parameters directly in their requested storage dtype. This
-    # avoids a second full fp32 model allocation during inference and matches
-    # the validated Accelerate loader's cast-before-RMSNorm-correction order.
-    original_default_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        model = Qwen35VLAForActionGeneration(config)
-    finally:
-        torch.set_default_dtype(original_default_dtype)
-    if model.lm_head.weight.data_ptr() == model.get_input_embeddings().weight.data_ptr():
-        raise RuntimeError("Qwen35VLA checkpoint load requires untied lm_head and input embeddings.")
-
-    load_sharded_safetensors_into_model(model, hf_path, strict=strict)
-
-    # convert_genesis_qwen35_to_hf writes standard (genesis) RMSNorm weights; native Qwen3.5 applies
-    # the unit-offset (1 + weight) convention, so correct the language-model norms once here. A
-    # finetuned-and-resaved checkpoint is ALREADY in native convention — load it with
-    # apply_offset_norm=False (re-applying the -1 would corrupt every language-model norm).
-    #
-    # The importer drops rmsnorm_conversion.json next to converted shards precisely so this is
-    # detectable: the correction is not idempotent, so honor the marker over the flag rather
-    # than silently subtracting one twice.
-    _assert_offset_norm_matches_marker(Path(hf_path), apply_offset_norm=apply_offset_norm)
-    if apply_offset_norm:
-        apply_qwen35_offset_norm_correction(model.model.language_model)
-
-    model = model.to(device=device, dtype=dtype)
-    model.eval()
-    return model, config
 
 
 def setup_qwen35_vla_for_training(

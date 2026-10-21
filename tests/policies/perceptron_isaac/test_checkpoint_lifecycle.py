@@ -2,25 +2,28 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
+
+pytest.importorskip("transformers")
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
+from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
-from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import load_qwen35_vla_from_hf
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     make_perceptron_isaac_pre_post_processors,
     make_perceptron_isaac_pre_post_processors_from_pretrained,
 )
-from lerobot.policies.perceptron_isaac.qwen35_checkpoint import QWEN35_WEIGHT_CONVENTION_FILE
-from lerobot.policies.perceptron_isaac.trained_package import stage_trained_processor_assets
+from lerobot.policies.perceptron_isaac.trained_package import (
+    finalize_canonical_trained_package,
+    stage_trained_processor_assets,
+)
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -46,8 +49,14 @@ def _config(**overrides) -> PerceptronIsaacConfig:
 
 
 def _source_package(root: Path) -> PerceptronIsaacConfig:
-    (root / "hf_model").mkdir(parents=True)
-    (root / "hf_model" / "config.json").write_text('{"model_type": "qwen3_5"}\n')
+    from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+        _write_portable_isaac05_checkpoint,
+    )
+
+    root.mkdir(parents=True)
+    _write_portable_isaac05_checkpoint(root / "hf_model")
+    source_identity = root / "hf_model" / "source_mk1_model_import.json"
+    source_identity.write_text('{"fixture": "native-source-identity"}\n')
     (root / "fast_processor").mkdir()
     (root / "fast_processor" / "processing_action_tokenizer.py").write_text("class ActionTokenizer: pass\n")
     (root / "native_render_metadata.json").write_text("{}\n")
@@ -58,7 +67,15 @@ def _source_package(root: Path) -> PerceptronIsaacConfig:
         native_stats_path="isaac_stats.json",
         fast_processor_path="fast_processor",
         fast_processor_tree_sha256="0" * 64,
+        apply_offset_norm=False,
+        trained_steps=100_000,
+        vector_max_states=4,
+        max_action_dim=4,
+        max_action_horizon=3,
+        mk1_source_model_import_sha256=file_sha256(source_identity),
     )
+    (root / "isaac_deployment_adapter.json").write_text("{}\n")
+    config.deployment_adapter_sha256 = file_sha256(root / "isaac_deployment_adapter.json")
     config.save_pretrained(root)
     (root / "policy_preprocessor.json").write_text(
         json.dumps(
@@ -81,8 +98,26 @@ def _source_package(root: Path) -> PerceptronIsaacConfig:
         )
         + "\n"
     )
+    finalize_canonical_trained_package(
+        config,
+        root,
+        family="mk1",
+        mk1_source_model_import_sha256=config.mk1_source_model_import_sha256,
+    )
     PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, root)
     return config
+
+
+def _load_native_fixture(config: PerceptronIsaacConfig) -> torch.nn.Module:
+    model, _, _ = load_mk1_vla_from_hf(
+        config.hf_model_path,
+        dtype=torch.float32,
+        device="cpu",
+        allow_test_only_reduced_geometry=True,
+        allowed_storage_dtypes=frozenset({"F32"}),
+        load_intent="training",
+    )
+    return model
 
 
 def _write_stats(path: Path, *, action_dim: int = 2, proprio_dim: int = 2) -> None:
@@ -116,10 +151,10 @@ def test_dense_save_is_self_contained_after_move_and_preserves_fp32_trainables(m
     source = tmp_path / "source"
     config = _source_package(source)
     policy = PerceptronIsaacPolicy(config)
-    policy._isaac_model = torch.nn.Linear(2, 1)
+    policy._isaac_model = _load_native_fixture(config)
     with torch.no_grad():
-        policy._isaac_model.weight.fill_(1.25)
-        policy._isaac_model.bias.fill_(-0.5)
+        policy._isaac_model.lm_head.weight.fill_(1.2500001192092896)
+        policy._isaac_model.model.vector_embedding[0].weight.fill_(-0.0)
 
     saved = tmp_path / "saved"
     policy.save_pretrained(saved)
@@ -128,21 +163,23 @@ def test_dense_save_is_self_contained_after_move_and_preserves_fp32_trainables(m
     policy.finalize_pretrained_package(saved)
     assert not list(saved.glob("model*.safetensors"))
     assert [path.name for path in saved.joinpath("hf_model").glob("model*.safetensors")] == [
-        "model.safetensors"
+        "model-00001-of-00001.safetensors"
     ]
+    assert (saved / "hf_model" / "model.safetensors.index.json").is_file()
     moved = tmp_path / "moved"
     saved.rename(moved)
     source.rename(tmp_path / "retired-source")
 
     serialized = json.loads((moved / "config.json").read_text())
     assert serialized["apply_offset_norm"] is False
-    assert config.apply_offset_norm is True
+    assert config.apply_offset_norm is False
     assert serialized["hf_model_path"] == "hf_model"
     assert serialized["native_render_metadata_path"] == "native_render_metadata.json"
     assert serialized["native_stats_path"] == "isaac_stats.json"
     assert serialized["fast_processor_path"] == "fast_processor"
     assert (moved / "fast_processor" / "processing_action_tokenizer.py").is_file()
-    assert (moved / "hf_model" / QWEN35_WEIGHT_CONVENTION_FILE).is_file()
+    assert (moved / "hf_model" / "source_mk1_model_import.json").is_file()
+    assert serialized["mk1_source_model_import_sha256"] == config.mk1_source_model_import_sha256
     processor_config = json.loads((moved / "policy_preprocessor.json").read_text())["steps"][0]["config"]
     assert processor_config == {
         "config_toml_path": None,
@@ -154,36 +191,30 @@ def test_dense_save_is_self_contained_after_move_and_preserves_fp32_trainables(m
         "suite_stats_path": None,
     }
 
-    standalone_hf_model = tmp_path / "standalone-canonical-hf-model"
-    shutil.copytree(moved / "hf_model", standalone_hf_model)
-    with pytest.raises(RuntimeError, match="Detached canonical Qwen3.5 hf_model"):
-        load_qwen35_vla_from_hf(standalone_hf_model)
-
     load_modes: list[bool] = []
 
     def fake_load_backbone(self, *, training=False):
         load_modes.append(training)
         assert self.config.apply_offset_norm is False
-        self._isaac_model = torch.nn.Linear(2, 1)
-        self._isaac_model.load_state_dict(load_file(Path(self.config.hf_model_path) / "model.safetensors"))
+        self._isaac_model = _load_native_fixture(self.config)
 
     monkeypatch.setattr(PerceptronIsaacPolicy, "_load_backbone", fake_load_backbone)
     reloaded = PerceptronIsaacPolicy.from_pretrained(moved, strict=True)
     reloaded._load_backbone(training=True)
 
     assert load_modes == [True]
-    assert reloaded._isaac_model.weight.dtype == torch.float32
-    torch.testing.assert_close(reloaded._isaac_model.weight, torch.full((1, 2), 1.25))
-    torch.testing.assert_close(reloaded._isaac_model.bias, torch.tensor([-0.5]))
+    assert reloaded._isaac_model.lm_head.weight.dtype == torch.float32
+    expected = torch.full_like(reloaded._isaac_model.lm_head.weight, 1.2500001192092896)
+    torch.testing.assert_close(reloaded._isaac_model.lm_head.weight, expected, rtol=0, atol=0)
+    assert torch.signbit(reloaded._isaac_model.model.vector_embedding[0].weight).all()
 
 
 def test_verified_runtime_sidecars_survive_source_mutation_without_weight_snapshot(tmp_path) -> None:
     source = tmp_path / "source"
     config = _source_package(source)
     (source / "hf_model" / "vocab.json").write_text('{"token": 0}\n')
-    save_file({"weight": torch.ones(1)}, source / "hf_model" / "model.safetensors")
     policy = PerceptronIsaacPolicy(config)
-    policy._isaac_model = torch.nn.Linear(2, 1)
+    policy._isaac_model = _load_native_fixture(config)
 
     policy._retain_verified_runtime_assets(source)
     retained_stats = Path(config.native_stats_path)
@@ -316,11 +347,9 @@ def test_peft_asset_staging_rejects_untrusted_serialized_sidecars(tmp_path, unsa
     assert not (package / "isaac_stats.json").exists()
 
 
-def test_qwen_local_base_save_verifies_a_fresh_snapshot_config(monkeypatch, tmp_path) -> None:
+def test_native_base_save_verifies_a_fresh_snapshot_config(monkeypatch, tmp_path) -> None:
     source = tmp_path / "source"
     config = _source_package(source)
-    config.qwen35_trained_package_manifest_sha256 = "0" * 64
-    config.save_pretrained(source)
     policy = PerceptronIsaacPolicy(config)
     policy._retain_verified_runtime_assets(source)
     live_model_path = Path(config.hf_model_path)
@@ -333,7 +362,9 @@ def test_qwen_local_base_save_verifies_a_fresh_snapshot_config(monkeypatch, tmp_
         assert model_path != live_model_path
         verified.append(Path(snapshot_root))
 
-    monkeypatch.setattr(policy, "_verify_qwen35_trained_package_manifest", verify_fresh)
+    monkeypatch.setattr(
+        PerceptronIsaacPolicy, "_verify_packaged_contract_digests", staticmethod(verify_fresh)
+    )
 
     with policy._verified_checkpoint_source(source) as stable_source:
         assert stable_source == verified[0]
@@ -342,50 +373,14 @@ def test_qwen_local_base_save_verifies_a_fresh_snapshot_config(monkeypatch, tmp_
     assert verified
 
 
-def test_qwen_backbone_redirects_lazy_sidecars_before_releasing_verified_model(monkeypatch, tmp_path) -> None:
-    import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as qwen35_vla
-
-    source = tmp_path / "source"
-    config = _source_package(source)
-    (source / "hf_model" / "vocab.json").write_text('{"token": 0}\n')
-    policy = PerceptronIsaacPolicy(config)
-
-    class VerifiedHandle:
-        root = source
-        cleaned = False
-
-        def cleanup(self):
-            self.cleaned = True
-
-    verified = VerifiedHandle()
-    config._qwen35_verified_package = verified
-
-    def load_verified(handle, **_kwargs):
-        assert handle is verified
-        (source / "isaac_stats.json").write_text('{"changed": true}\n')
-        (source / "native_render_metadata.json").write_text('{"changed": true}\n')
-        handle.cleanup()
-        return torch.nn.Linear(2, 1), SimpleNamespace()
-
-    monkeypatch.setattr(qwen35_vla, "_load_qwen35_vla_from_verified_package", load_verified)
-
-    policy._load_backbone()
-
-    assert verified.cleaned
-    assert Path(config.native_stats_path).read_text() == "{}\n"
-    assert Path(config.native_render_metadata_path).read_text() == "{}\n"
-    assert Path(config.native_stats_path).parent != source
-    assert not hasattr(config, "_qwen35_verified_package")
-
-
-def test_lazy_qwen_vocab_replaces_prior_env_with_open_verified_snapshot(monkeypatch, tmp_path) -> None:
+def test_native_vocab_replaces_prior_env_with_retained_snapshot(monkeypatch, tmp_path) -> None:
     source = tmp_path / "source"
     config = _source_package(source)
     (source / "hf_model" / "vocab.json").write_text('{"owner": "source"}\n')
     verified_model = tmp_path / "verified" / "hf_model"
     verified_model.mkdir(parents=True)
     (verified_model / "vocab.json").write_text('{"owner": "verified"}\n')
-    config._qwen35_verified_package = SimpleNamespace(hf_model_path=verified_model)
+    config.hf_model_path = str(verified_model)
     monkeypatch.setenv("QWEN35_VOCAB_PATH", str(source / "hf_model" / "vocab.json"))
 
     PerceptronIsaacPolicy._set_checkpoint_local_vocab_path(config)

@@ -31,17 +31,6 @@ def _write_portable_repo(path: Path) -> Path:
     return path
 
 
-@pytest.fixture(autouse=True)
-def _fail_legacy_loader(monkeypatch: pytest.MonkeyPatch) -> None:
-    import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as legacy_model
-
-    monkeypatch.setattr(
-        legacy_model,
-        "load_qwen35_vla_from_hf",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy loader called")),
-    )
-
-
 def _policy(model_path: Path, *, device: str = "cpu") -> PerceptronIsaacPolicy:
     config = PerceptronIsaacConfig(
         device=device,

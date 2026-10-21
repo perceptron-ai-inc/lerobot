@@ -21,10 +21,10 @@ from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import PERCEPT
 from lerobot.policies.perceptron_isaac.tensor_stream import TextType, VisionType
 from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _write_stats
 from tests.policies.perceptron_isaac.test_mharmony_training import _metadata
-from tests.policies.perceptron_isaac.test_qwen35_training_lifecycle import reduced_qwen35_policy
+from tests.policies.perceptron_isaac.test_qwen35_training_lifecycle import reduced_native_policy
 
 
-def test_cached_native_image_stream_trains_and_samples_reduced_real_qwen35(tmp_path, monkeypatch):
+def test_cached_native_image_stream_trains_and_samples_reduced_real_mk1(tmp_path, monkeypatch):
     pytest.importorskip("mharmony")
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     qwen = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / (
@@ -44,7 +44,7 @@ def test_cached_native_image_stream_trains_and_samples_reduced_real_qwen35(tmp_p
     # Retain the full base vocabulary and every declared FAST reserved slot, not only IDs observed here.
     base_vocab_size = json.loads((qwen / "config.json").read_text())["text_config"]["vocab_size"]
     vocab_size = base_vocab_size + sum(group["size"] for group in metadata.mharmony_reserved_token_groups)
-    policy = reduced_qwen35_policy(tmp_path / "seed", vocab_size=vocab_size)
+    policy = reduced_native_policy(tmp_path / "seed", vocab_size=vocab_size)
     stats_path = tmp_path / "seed/isaac_stats.json"
     _write_stats(stats_path)
     policy.config.native_stats_path = str(stats_path)
