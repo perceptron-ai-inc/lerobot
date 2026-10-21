@@ -11,20 +11,18 @@ from safetensors.torch import save_file
 
 pytest.importorskip("transformers")
 
-from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
+from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
 from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     make_perceptron_isaac_pre_post_processors,
-    make_perceptron_isaac_pre_post_processors_from_pretrained,
 )
 from lerobot.policies.perceptron_isaac.trained_package import (
     finalize_canonical_trained_package,
     stage_trained_processor_assets,
 )
-from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
@@ -418,125 +416,6 @@ def test_outer_sharded_weights_are_loaded_only_from_the_index(tmp_path) -> None:
     save_file({"_isaac_model.weight": torch.zeros(1, 2)}, tmp_path / "model-00003-of-00003.safetensors")
     with pytest.raises(RuntimeError, match="unreferenced"):
         PerceptronIsaacPolicy._maybe_load_finetuned_weights(policy, tmp_path, strict=True)
-
-
-def test_peft_materializes_frozen_backbone_in_bf16_and_promotes_only_trainables(
-    monkeypatch,
-) -> None:
-    class TinyPeftBackbone(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.frozen = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False)
-            self.lora_A = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16), requires_grad=False)
-
-    policy = PerceptronIsaacPolicy(_config())
-    load_modes: list[bool] = []
-
-    def fake_load_backbone(*, training=False):
-        load_modes.append(training)
-        policy._isaac_model = TinyPeftBackbone()
-
-    policy._load_backbone = fake_load_backbone
-    monkeypatch.setattr(
-        PreTrainedPolicy,
-        "wrap_with_peft",
-        lambda self, peft_config=None, peft_cli_overrides=None: self,
-    )
-
-    wrapped = policy.wrap_with_peft()
-
-    assert wrapped is policy
-    assert load_modes == [False]
-    assert policy._isaac_model.frozen.dtype == torch.bfloat16
-    assert not policy._isaac_model.frozen.requires_grad
-    assert policy._isaac_model.lora_A.dtype == torch.float32
-    assert policy._isaac_model.lora_A.requires_grad
-
-
-def test_remote_peft_finalization_preserves_hub_base_without_embedding(tmp_path) -> None:
-    config = _config(pretrained_path="org/base-policy", pretrained_revision="base-sha", use_peft=True)
-    config._embed_base_on_save = False
-    config._peft_base_reference = "org/base-policy"
-    config._peft_base_revision = "base-sha"
-    policy = PerceptronIsaacPolicy(config)
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    config.save_pretrained(adapter)
-    (adapter / "adapter_config.json").write_text(
-        json.dumps({"base_model_name_or_path": "/cache/base-snapshot", "revision": None})
-    )
-    save_file({"adapter": torch.ones(1)}, adapter / "adapter_model.safetensors")
-
-    policy.finalize_pretrained_package(adapter)
-
-    saved = json.loads((adapter / "adapter_config.json").read_text())
-    assert saved["base_model_name_or_path"] == "org/base-policy"
-    assert saved["revision"] == "base-sha"
-    assert not (adapter / "base_model").exists()
-
-
-def test_remote_peft_finalization_stages_real_processor_runtime_assets(tmp_path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    _write_stats(source / "isaac_stats.json")
-    (source / "fast_processor").mkdir()
-    (source / "fast_processor" / "processing_action_tokenizer.py").write_text("# retained\n")
-    config = _config(
-        pretrained_path="org/base-policy",
-        pretrained_revision="base-sha",
-        use_peft=True,
-        native_stats_path="isaac_stats.json",
-        fast_processor_path="fast_processor",
-        fast_processor_tree_sha256="0" * 64,
-    )
-    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, source)
-    preprocessor, postprocessor = make_perceptron_isaac_pre_post_processors(config)
-    preprocessor.save_pretrained(source)
-    postprocessor.save_pretrained(source)
-    policy = PerceptronIsaacPolicy(config)
-    policy.retain_pretrained_processor_assets(source)
-    source.rename(tmp_path / "retired-source")
-    preprocessor, postprocessor = make_perceptron_isaac_pre_post_processors_from_pretrained(
-        config,
-        str(config._pretrained_processor_root),
-    )
-
-    config._embed_base_on_save = False
-    config._peft_base_reference = "org/base-policy"
-    config._peft_base_revision = "base-sha"
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    config.save_pretrained(adapter)
-    preprocessor.save_pretrained(adapter)
-    postprocessor.save_pretrained(adapter)
-    (adapter / "adapter_config.json").write_text(
-        json.dumps({"base_model_name_or_path": "/cache/base-snapshot", "revision": None})
-    )
-    save_file({"adapter": torch.ones(1)}, adapter / "adapter_model.safetensors")
-
-    policy.finalize_pretrained_package(adapter)
-
-    saved_adapter = json.loads((adapter / "adapter_config.json").read_text())
-    assert saved_adapter == {"base_model_name_or_path": "org/base-policy", "revision": "base-sha"}
-    assert (adapter / "fast_processor" / "processing_action_tokenizer.py").read_text() == "# retained\n"
-    assert (adapter / "isaac_stats.json").is_file()
-    assert not (adapter / "base_model").exists()
-    serialized_preprocessor = json.loads((adapter / "policy_preprocessor.json").read_text())
-    assert "fast_processor" in json.dumps(serialized_preprocessor)
-    for filename in ("policy_preprocessor.json", "policy_postprocessor.json"):
-        serialized = json.loads((adapter / filename).read_text())
-        assert str(tmp_path) not in json.dumps(serialized)
-
-    moved = tmp_path / "moved-adapter"
-    adapter.rename(moved)
-    loaded_config = PreTrainedConfig.from_pretrained(moved)
-    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(loaded_config, moved)
-    loaded_preprocessor, loaded_postprocessor = make_perceptron_isaac_pre_post_processors_from_pretrained(
-        loaded_config,
-        str(moved),
-    )
-    assert loaded_preprocessor is not None
-    assert loaded_postprocessor is not None
 
 
 @pytest.mark.parametrize("retention", ["runtime", "processors"])

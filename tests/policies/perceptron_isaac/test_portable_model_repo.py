@@ -245,33 +245,24 @@ def test_policy_refuses_unsharded_dense_portable_training(
     assert "--parallelism.dp_shard" in message
     assert "--accelerator.mixed_precision=bf16" in message
     assert "accelerate FSDP config" not in message
-    assert "train_expert_only=true or use_peft=true" in message
+    assert "train_expert_only=true or use_peft=true" not in message
     assert not called
 
 
-def test_policy_admits_expert_only_portable_training(tmp_path: Path) -> None:
-    """A bounded trainable set trains: FP32 storage for the expert, BF16 frozen MoE experts."""
-    policy_path, config, _ = _native_portable_package(tmp_path)
-    config.train_expert_only = True
+@pytest.mark.parametrize("mode", ["train_expert_only", "use_peft"])
+def test_policy_rejects_mutated_deferred_training_modes(tmp_path: Path, mode: str) -> None:
+    _, config, _ = _native_portable_package(tmp_path)
+    if mode == "train_expert_only":
+        config.train_expert_only = True
+    else:
+        config.use_peft = True
     config.train_storage_fp32 = True
-    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
-
-    groups = policy.get_optim_params()
-
-    parameters = dict(policy._isaac_model.named_parameters())
-    trainable = {name for name, parameter in parameters.items() if parameter.requires_grad}
-    assert trainable
-    assert all(name.startswith("model.action_expert.") for name in trainable)
-    assert all(parameter.dtype is torch.float32 for group in groups for parameter in group["params"])
-    assert {id(parameter) for group in groups for parameter in group["params"]} == {
-        id(parameters[name]) for name in trainable
-    }
-    fused_expert_names = [name for name in parameters if ".mlp.experts." in name]
-    assert fused_expert_names
-    # The 32.2B fused MoE experts stay frozen in BF16, so training keeps the production
-    # grouped_mm dispatch instead of the FP32 eager expert loop.
-    assert all(parameters[name].dtype is torch.bfloat16 for name in fused_expert_names)
-    assert not any(parameters[name].requires_grad for name in fused_expert_names)
+    policy = PerceptronIsaacPolicy(config)
+    with pytest.raises(RuntimeError, match="supports only dense training"):
+        policy.get_optim_params()
+    with pytest.raises(RuntimeError, match="supports only dense training"):
+        policy({})
+    assert policy._isaac_model is None
 
 
 def test_policy_refuses_dense_training_at_optimizer_construction(tmp_path: Path) -> None:
@@ -322,10 +313,8 @@ def _install_distributed_state(
     monkeypatch.setattr(accelerate_state, "AcceleratorState", lambda *a, **k: state)
 
 
-def test_policy_admits_dense_training_under_fsdp_full_shard(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Dense full-parameter training is admitted when the live state is FSDP FULL_SHARD."""
+def test_policy_refuses_dense_training_under_fsdp1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """FSDP1 must fail before optimizer collection, not silently take an unqualified path."""
     from accelerate.utils.dataclasses import DistributedType
     from torch.distributed.fsdp import ShardingStrategy
 
@@ -347,14 +336,8 @@ def test_policy_admits_dense_training_under_fsdp_full_shard(
         ),
     )
 
-    groups = policy.get_optim_params()
-
-    trainable = {
-        name for name, parameter in policy._isaac_model.named_parameters() if parameter.requires_grad
-    }
-    assert trainable
-    assert any(".mlp.experts." in name for name in trainable)
-    assert {id(parameter) for group in groups for parameter in group["params"]}
+    with pytest.raises(RuntimeError, match="FSDP1 training is unsupported"):
+        policy.get_optim_params()
 
 
 def test_policy_refuses_dense_training_under_ddp_multi_gpu(
@@ -411,7 +394,7 @@ def _full_shard_state(sharding_strategy: object, mixed_precision: str) -> _StubA
     return _StubAcceleratorState(
         distributed_type=DistributedType.FSDP,
         fsdp_plugin=_StubFsdpPlugin(
-            fsdp_version=1,
+            fsdp_version=2,
             sharding_strategy=sharding_strategy,
             reshard_after_forward=True,
         ),
@@ -419,7 +402,7 @@ def _full_shard_state(sharding_strategy: object, mixed_precision: str) -> _StubA
     )
 
 
-def test_fp32_masters_are_not_materialized_before_fsdp_shards(
+def test_native_fp32_masters_keep_source_bits_before_fsdp2_shards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ordering defect: FP32 promotion must not run on the unsharded model.
@@ -454,9 +437,10 @@ def test_fp32_masters_are_not_materialized_before_fsdp_shards(
         if parameter.requires_grad
     ]
     assert trainable
-    upcast_before_sharding = [name for name, parameter in trainable if parameter.dtype is torch.float32]
-    assert upcast_before_sharding == []
-    assert all(parameter.dtype is torch.bfloat16 for _, parameter in trainable)
+    assert all(parameter.dtype is torch.float32 for _, parameter in trainable)
+    assert all(
+        torch.equal(parameter, torch.full_like(parameter, 0.12345679104328156)) for _, parameter in trainable
+    )
 
 
 def test_fp32_masters_refuse_full_shard_without_accelerate_mixed_precision(
@@ -488,12 +472,11 @@ def test_fp32_masters_refuse_full_shard_without_accelerate_mixed_precision(
 def test_fp32_masters_are_materialized_eagerly_without_sharding(tmp_path: Path) -> None:
     """Unsharded training keeps the existing eager promotion: there is no shard to defer to."""
     policy_path, config, _ = _native_portable_package(tmp_path)
-    config.train_expert_only = True
-    config.train_storage_fp32 = True
-    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
+    from tests.policies.perceptron_isaac.test_qwen35_training_lifecycle import reduced_native_policy
 
+    policy = reduced_native_policy(tmp_path / "in-memory")
     groups = policy.get_optim_params()
-
+    assert groups
     assert all(parameter.dtype is torch.float32 for group in groups for parameter in group["params"])
 
 
@@ -547,16 +530,15 @@ def test_fsdp2_dense_training_builds_the_backbone_in_host_memory(
     assert policy.config.device == "cuda", "the run device is unchanged for forward and checkpoints"
 
 
-def test_unsharded_training_builds_the_backbone_on_the_run_device(
+def test_unsharded_inference_builds_the_backbone_on_the_run_device(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     policy_path, config, _ = _native_portable_package(tmp_path)
-    config.train_expert_only = True
     config.train_storage_fp32 = True
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
     policy.config.device = "cuda"
     devices = _record_backbone_load_device(monkeypatch)
 
-    policy.get_optim_params()
+    policy._load_backbone(training=False)
 
     assert devices == ["cuda"]

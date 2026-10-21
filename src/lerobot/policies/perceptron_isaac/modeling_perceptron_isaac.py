@@ -1141,14 +1141,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             self._load_backbone(training=True)
         self._configure_training_parameters()
         assert self._isaac_model is not None
-        if self.config.use_peft:
-            # PEFT is applied in-place to this lazy inner model. Reassert the final
-            # contract here, immediately before optimizer groups are collected.
-            for name, parameter in self._isaac_model.named_parameters():
-                if "action_expert" in name:
-                    parameter.requires_grad_("modules_to_save.default" in name)
-                elif "lora_" in name:
-                    parameter.requires_grad_(True)
         self._promote_trainable_parameters_to_fp32(self._isaac_model)
         groups: dict[str, list[Tensor]] = {"vlm": [], "vision": [], "expert": []}
         for name, parameter in self._isaac_model.named_parameters():
@@ -1171,35 +1163,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         return result
 
     def wrap_with_peft(self, peft_config=None, peft_cli_overrides: dict | None = None):
-        """Materialize the lazy ISAAC backbone before PEFT discovers target modules."""
-        if self._isaac_model is None:
-            self._load_backbone(training=False)
-        peft_model = super().wrap_with_peft(peft_config=peft_config, peft_cli_overrides=peft_cli_overrides)
-        # ISAAC configures trainability while lazily loading its native backbone. Make the
-        # final PEFT contract explicit: adapters and exactly one PEFT-owned expert copy.
-        for name, parameter in peft_model.named_parameters():
-            if "action_expert" in name:
-                parameter.requires_grad_("modules_to_save.default" in name)
-            elif "lora_" in name:
-                parameter.requires_grad_(True)
-        self._promote_trainable_parameters_to_fp32(peft_model)
-        return peft_model
-
-    def _get_default_peft_targets(self) -> dict[str, Any]:
-        """LoRA the VLM/vision linears and fully train/save the action expert."""
-        vlm_linear_leaves = (
-            r"q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|"
-            r"in_proj_a|in_proj_b|in_proj_qkv|in_proj_z|out_proj|proj|"
-            r"linear_fc1|linear_fc2|qkv"
-        )
-        return {
-            "target_modules": (
-                rf"_isaac_model\.model\.(?:language_model|visual)\..*\.({vlm_linear_leaves})$"
-            ),
-            # The outer and inner modules are both named ``action_expert``. Target the
-            # fully-qualified inner module so PEFT does not recursively clone both.
-            "modules_to_save": ["_isaac_model.model.action_expert.action_expert"],
-        }
+        """Reject unqualified adapter training before touching the backbone."""
+        raise RuntimeError("Perceptron ISAAC PEFT training is unsupported; use dense FSDP2 training.")
 
     def _promote_trainable_parameters_to_fp32(self, module: torch.nn.Module) -> None:
         """Keep optimizer-owned parameters in FP32 without expanding the frozen backbone."""
@@ -1239,6 +1204,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         honoured. ``_verify_fp32_masters_once`` checks the realised master dtype at the first
         training step.
         """
+        if topology.fsdp_version != 2:
+            raise RuntimeError("Perceptron ISAAC FSDP1 training is unsupported; use FSDP2.")
         mixed_precision = read_accelerate_mixed_precision()
         if mixed_precision == "no":
             raise RuntimeError(
@@ -1288,30 +1255,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             units, shard_elements = report.units, report.shard_elements
             sampled = sorted(report.trainable_param_names)[:4]
         else:
-            from torch.distributed.fsdp import FullyShardedDataParallel
-
-            shard_elements = 0
-            units = 0
-            low_precision: list[str] = []
-            sampled = []
-            for unit in FullyShardedDataParallel.fsdp_modules(self):
-                if not unit._has_params:
-                    continue
-                shard = unit._flat_param
-                if not shard.requires_grad:
-                    continue
-                units += 1
-                shard_elements += int(shard.numel())
-                names = list(shard._fqns)
-                if shard.dtype is not torch.float32:
-                    low_precision.extend(f"{name}:{shard.dtype}" for name in names[:2])
-                elif len(sampled) < 4:
-                    sampled.append(f"{names[0]}:{shard.dtype}")
-            if low_precision:
-                raise RuntimeError(
-                    "ISAAC trainable parameters must use FP32 storage; the FSDP shard masters are "
-                    f"still low precision, first: {low_precision[:5]}"
-                )
+            raise RuntimeError("Perceptron ISAAC FSDP1 training is unsupported; use FSDP2.")
         self._fp32_masters_verified = True
         logging.info(
             "ISAAC FP32 masters verified after sharding (FSDP%d): %d units, %d trainable shard "
@@ -1509,25 +1453,15 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._training_parameters_configured = True
         from .modeling_qwen35_vla import setup_qwen35_vla_for_training
 
-        # PEFT already owns freezing (including custom modules_to_save and bias
-        # settings). Native setup must not expand that serialized trainable set.
-        peft_trainability = (
-            [(parameter, parameter.requires_grad) for parameter in self._isaac_model.parameters()]
-            if self.config.use_peft
-            else None
-        )
         setup_qwen35_vla_for_training(
             self._isaac_model,
-            train_expert_only=bool(self.config.train_expert_only),
+            train_expert_only=False,
             train_samples_per_chunk=int(self.config.train_samples_per_chunk),
             rtc_max_delay_steps=int(self.config.flow_rtc_max_delay_steps),
             rtc_delay_sampling=str(self.config.flow_rtc_delay_sampling),
             dual_timestep_ratio=float(self.config.flow_dual_timestep_ratio),
             mask_padded_action_rows=bool(self.config.flow_mask_padded_action_rows),
         )
-        if peft_trainability is not None:
-            for parameter, requires_grad in peft_trainability:
-                parameter.requires_grad_(requires_grad)
         if self.config.freeze_input_embeddings:
             input_embeddings = self._isaac_model.get_input_embeddings()
             if input_embeddings is None:
@@ -1543,30 +1477,21 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._promote_trainable_parameters_to_fp32(self._isaac_model)
 
     def _require_native_training_supported(self) -> None:
-        """Refuse the one Isaac-0.5 training shape this path cannot serve: unsharded dense.
+        """Require dense FSDP2 for checkpoint-backed training before allocation.
 
-        There is no FP32/BF16 dispatch conflict to refuse. ``GenesisNullSparseMoeBlock``
-        (``modeling_qwen36_moe.dispatch_backend``) already routes FP32-storage training to
-        its eager expert loop and keeps ``grouped_mm`` for inference, and BF16 ``grouped_mm``
-        is differentiable, so a trainable BF16 MoE stays on the production dispatch.
-
-        A bounded trainable set (``train_expert_only`` or PEFT) leaves the 32.2B fused MoE
-        expert weights frozen in BF16, so only the small trainable set is promoted to FP32
-        by ``_promote_trainable_parameters_to_fp32``. This check asserts that boundedness
-        alone -- it does not, and cannot from config, promise that a bounded set fits on any
-        particular device; an allocation that does not fit still fails at allocation time.
-
-        Dense full-parameter training is admitted in exactly one further case: a process whose
-        parameters are demonstrably FSDP full-shard sharded (``detect_full_shard_topology``),
-        read from the live distributed/accelerate state rather than declared by config. That
-        branch promises nothing about fit either -- sharded dense may still OOM, which is
-        allocation's job to report, not this guard's to predict.
+        PEFT, expert-only and FSDP1 training are deferred. Live full-shard evidence
+        admits native dense training; it is not a promise that allocation will fit.
         """
+        if self.config.train_expert_only or self.config.use_peft:
+            raise RuntimeError(
+                "Perceptron ISAAC supports only dense training; PEFT and expert-only training are unsupported."
+            )
+        topology = detect_full_shard_topology()
+        if topology is not None and topology.fsdp_version != 2:
+            raise RuntimeError("Perceptron ISAAC FSDP1 training is unsupported; use FSDP2.")
         if not (self.config.hf_model_path and self._config_declares_mk1(self.config)):
             return
-        if self.config.train_expert_only or self.config.use_peft:
-            return
-        if detect_full_shard_topology() is not None:
+        if topology is not None:
             return
         raise RuntimeError(
             "Isaac-0.5 dense full-parameter training is unsupported on this path. Its 35.7B "
@@ -1574,8 +1499,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             "storage, before optimizer state -- on a single device, against 79.65 GiB on an "
             "H100, and DDP replicates parameters rather than sharding them. Shard it instead "
             "with FSDP2 across every process: lerobot-train --parallelism.dp_shard=<world size> "
-            "--accelerator.mixed_precision=bf16. Alternatively, train a bounded set with "
-            "train_expert_only=true or use_peft=true."
+            "--accelerator.mixed_precision=bf16."
         )
 
     def _maybe_adopt_serving_stats(self, batch: dict[str, Any]) -> None:
@@ -2156,10 +2080,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         cls._set_checkpoint_local_vocab_path(config)
         policy = cls(config)
         cls._maybe_load_finetuned_weights(policy, checkpoint_root, strict=strict)
-        # PEFT discovers target modules immediately after this returns. Training adapters with
-        # FP32 expert storage therefore need the mixed-storage backbone materialized here.
-        if config.use_peft and policy._isaac_model is None:
-            policy._load_backbone(training=False)
         policy.eval()
         return policy
 

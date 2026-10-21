@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 
 pytest.importorskip("transformers")
 
@@ -17,6 +18,8 @@ from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
     Mk1Qwen36VLAForActionGeneration,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
+from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import PERCEPTRON_ISAAC_STREAM_KEY
+from tests.policies.perceptron_isaac._fixtures import flow_stream
 from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config as _mk1_config
 from tests.policies.perceptron_isaac.test_modeling_training import _config
 
@@ -57,32 +60,38 @@ def reduced_native_policy(
     return policy
 
 
-@pytest.mark.parametrize("train_expert_only", [False, True])
-def test_peft_optimizer_preserves_serializable_trainable_set(tmp_path: Path, train_expert_only: bool) -> None:
-    pytest.importorskip("peft")
-    from peft import get_peft_model_state_dict
-
+def test_dense_optimizer_preserves_serializable_trainable_set(tmp_path: Path) -> None:
     policy = reduced_native_policy(tmp_path)
-    policy.config.train_expert_only = train_expert_only
-    peft_policy = policy.wrap_with_peft(peft_cli_overrides={"r": 2})
-    frozen = {name: p.detach().clone() for name, p in peft_policy.named_parameters() if not p.requires_grad}
+    policy.config.freeze_input_embeddings = True
     cfg = TrainPipelineConfig(
         dataset=DatasetConfig(repo_id="synthetic/native-mk1"),
         policy=policy.config,
         optimizer=AdamWConfig(lr=0.002),
     )
-    optimizer, _ = make_optimizer_and_scheduler(cfg, peft_policy)
-    trainable = {name: p for name, p in peft_policy.named_parameters() if p.requires_grad}
-    assert all("lora_" in name or "modules_to_save.default" in name for name in trainable), sorted(trainable)
+    optimizer, _ = make_optimizer_and_scheduler(cfg, policy)
+    trainable = {name: p for name, p in policy.named_parameters() if p.requires_grad}
+    frozen = {name: p.detach().clone() for name, p in policy.named_parameters() if not p.requires_grad}
+    before = {name: p.detach().clone() for name, p in trainable.items()}
     assert {id(p) for group in optimizer.param_groups for p in group["params"]} == {
         id(p) for p in trainable.values()
     }
-    sum(p.square().sum() for p in trainable.values()).backward()
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss, _ = policy({PERCEPTRON_ISAAC_STREAM_KEY: flow_stream()})
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(p.grad is not None and torch.count_nonzero(p.grad) for p in trainable.values())
     optimizer.step()
-    for name, parameter in peft_policy.named_parameters():
+    assert any(not torch.equal(parameter, before[name]) for name, parameter in trainable.items())
+    for name, parameter in policy.named_parameters():
         if name in frozen:
             torch.testing.assert_close(parameter, frozen[name], rtol=0, atol=0)
-    adapter = get_peft_model_state_dict(peft_policy)
+    save_file(policy.state_dict(), tmp_path / "trained.safetensors")
+    saved = load_file(tmp_path / "trained.safetensors")
     for name, parameter in trainable.items():
-        key = name.replace(".modules_to_save.default", "").replace(".default", "")
-        torch.testing.assert_close(adapter[key], parameter)
+        torch.testing.assert_close(saved[name], parameter, rtol=0, atol=0)
+
+
+def test_peft_wrap_refuses_before_loading_backbone(tmp_path: Path) -> None:
+    policy = reduced_native_policy(tmp_path)
+    with pytest.raises(RuntimeError, match="PEFT training is unsupported"):
+        policy.wrap_with_peft()

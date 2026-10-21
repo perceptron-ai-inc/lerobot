@@ -9,6 +9,12 @@ from lerobot.policies.perceptron_isaac.mharmony_contract import SUPPORTED_MHARMO
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 
+@pytest.mark.parametrize("mode", ["use_peft", "train_expert_only"])
+def test_config_rejects_deferred_training_modes(mode: str) -> None:
+    with pytest.raises(ValueError, match="supports only dense training"):
+        PerceptronIsaacConfig(**{mode: True})
+
+
 def test_image_preprocessing_defaults_to_legacy_stretch() -> None:
     assert PerceptronIsaacConfig().image_preprocessing == "stretch"
 

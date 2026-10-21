@@ -324,8 +324,12 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     optimizer_warmup_steps: int = 200
     max_train_steps: int = 30000
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__post_init__()
+        if self.use_peft or self.train_expert_only:
+            raise ValueError(
+                "Perceptron ISAAC supports only dense training; PEFT and expert-only training are unsupported."
+            )
         # make_policy assigns the dataset's action names to action_feature_names BEFORE it calls
         # set_dataset_feature_metadata. A strict hardware package owns its wire order, so keep
         # the package's names to restore and validate against.
@@ -419,9 +423,10 @@ class PerceptronIsaacConfig(PreTrainedConfig):
             )
         if (self.joint_signs is None) != (self.joint_offsets is None):
             raise ValueError("joint_signs and joint_offsets must both be set or both be None.")
-        if self.joint_signs is not None and len(self.joint_signs) != len(self.joint_offsets):
-            raise ValueError("joint_signs and joint_offsets must have the same length.")
         if self.joint_signs is not None:
+            assert self.joint_offsets is not None
+            if len(self.joint_signs) != len(self.joint_offsets):
+                raise ValueError("joint_signs and joint_offsets must have the same length.")
             if len(self.joint_signs) > min(self.action_dim, self.proprio_dim):
                 raise ValueError("Joint-frame transform exceeds action/state dimensions.")
             if any(float(sign) not in {-1.0, 1.0} for sign in self.joint_signs):
