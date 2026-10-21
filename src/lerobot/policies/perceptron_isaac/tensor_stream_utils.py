@@ -23,45 +23,10 @@ ACTION_CONTEXT_EXCLUDED_TYPE_VALUES = tuple(
 
 
 @dataclass(frozen=True)
-class FlowActionContext:
-    """Precomputed flow-matching action-context, built once in the data-loader worker.
-
-    The per-action context mask (``build_action_context_mask``) is a pure function of the packed
-    TensorStream's event structure -- it does not depend on the model forward -- but it's an O(chunks x
-    events) Python double-loop that otherwise runs inline in the loss (~65ms, GPU-idle) between the
-    backbone forward and backward. Computing it here (worker-side, overlapped with the prior step via
-    prefetch) moves it off the critical path. Consumed by ``prepare_flow_matching_expert_inputs`` when the
-    chunk set it finds matches the loss's ``collect_action_chunks`` (guarded; falls back to inline otherwise).
-
-    ``action_start_indices`` is carried so the consumer can verify chunk-set alignment before trusting the mask.
-
-    It also carries the compact FA3-varlen geometry (``valid_idx``/``cu_k``/``max_seqlen_k``) derived from the
-    mask here on CPU -- so the expert's ``build_cross_varlen`` (a ``nonzero`` + ``.item()`` host sync that stalls
-    the critical path ~57ms in the profiled trace) is skipped entirely. ``valid_idx`` is flattened against
-    ``context_len`` (the worker's packed width, = model l_model + shift); the consumer remaps it sync-free to the
-    model's l_model since the trailing packed columns hold no action-context keys.
-    """
-
-    context_mask: torch.Tensor  # [num_chunks, context_len] bool
-    batch_indices: tuple[int, ...]
-    action_start_indices: tuple[int, ...]
-    exclude_non_agent_roles: bool
-    # Compact FA3-varlen geometry (CPU-derived from context_mask; no GPU sync on the critical path).
-    valid_idx: torch.Tensor  # [total_valid_k] int64, flattened b-major into [num_chunks * context_len]
-    cu_k: torch.Tensor  # [num_chunks + 1] int32 (per-chunk valid-key prefix sums)
-    max_seqlen_k: int
-    context_len: int
-
-
-@dataclass(frozen=True)
 class TensorStreamMetadata:
     modality_mask: torch.Tensor
     role_mask: torch.Tensor
-    mrope_positions: torch.Tensor
     interleave_partial_masks: dict[ModalityType, torch.Tensor]
-    control_token_positions_and_ids: tuple[tuple[tuple[int, int], ...], ...]
-    n_pos_dims: int = 3
-    flow_action_context: FlowActionContext | None = None
 
     def partial_mask(self, mod_type: ModalityType) -> torch.Tensor:
         mask = self.interleave_partial_masks.get(mod_type)
@@ -73,26 +38,9 @@ class TensorStreamMetadata:
         return TensorStreamMetadata(
             modality_mask=tensor_map(self.modality_mask),
             role_mask=tensor_map(self.role_mask),
-            mrope_positions=tensor_map(self.mrope_positions),
             interleave_partial_masks={
                 mod_type: tensor_map(mask) for mod_type, mask in self.interleave_partial_masks.items()
             },
-            control_token_positions_and_ids=self.control_token_positions_and_ids,
-            n_pos_dims=self.n_pos_dims,
-            flow_action_context=(
-                None
-                if self.flow_action_context is None
-                else FlowActionContext(
-                    context_mask=tensor_map(self.flow_action_context.context_mask),
-                    batch_indices=self.flow_action_context.batch_indices,
-                    action_start_indices=self.flow_action_context.action_start_indices,
-                    exclude_non_agent_roles=self.flow_action_context.exclude_non_agent_roles,
-                    valid_idx=tensor_map(self.flow_action_context.valid_idx),
-                    cu_k=tensor_map(self.flow_action_context.cu_k),
-                    max_seqlen_k=self.flow_action_context.max_seqlen_k,
-                    context_len=self.flow_action_context.context_len,
-                )
-            ),
         )
 
     def to(
@@ -163,30 +111,6 @@ def _compute_interleave_partial_mask_uncached(ts: TensorStream, mod_type: Modali
     return _spans_to_partial_mask(spans, total, device)
 
 
-def _extract_control_token_positions_and_ids(ts: TensorStream) -> tuple[tuple[tuple[int, int], ...], ...]:
-    control_token_positions_and_ids: list[tuple[tuple[int, int], ...]] = []
-    for stream in ts.streams:
-        stream_control_tokens: list[tuple[int, int]] = []
-        seq_offset = 0
-        for event in stream:
-            token_count = event.num_tokens()
-            if token_count == 0:
-                continue
-            if event.type == TextType.control and token_count == 1 and event.data.numel() == 1:
-                stream_control_tokens.append((seq_offset, int(event.data.item())))
-            seq_offset += token_count
-        control_token_positions_and_ids.append(tuple(stream_control_tokens))
-    return tuple(control_token_positions_and_ids)
-
-
-def control_token_positions_and_ids(
-    ts: TensorStream, metadata: TensorStreamMetadata | None = None
-) -> tuple[tuple[tuple[int, int], ...], ...]:
-    if metadata is not None:
-        return metadata.control_token_positions_and_ids
-    return _extract_control_token_positions_and_ids(ts)
-
-
 def interleave_partial_mask(
     ts: TensorStream,
     mod_type: ModalityType,
@@ -197,13 +121,12 @@ def interleave_partial_mask(
     return _compute_interleave_partial_mask_uncached(ts, mod_type)
 
 
-def compute_tensor_stream_metadata(ts: TensorStream, *, n_pos_dims: int = 3) -> TensorStreamMetadata:
+def compute_tensor_stream_metadata(ts: TensorStream) -> TensorStreamMetadata:
     batch_size, seq_len = ts.shape
     device = ts.device or torch.device("cpu")
     modality = torch.full((batch_size, seq_len), -1, dtype=torch.long, device=device)
     roles = torch.full((batch_size, seq_len), -1, dtype=torch.long, device=device)
     partial_mask_spans: dict[ModalityType, list[tuple[int, int, int]]] = {}
-    control_token_positions_and_ids: list[list[tuple[int, int]]] = [[] for _ in range(batch_size)]
 
     for batch_idx, stream in enumerate(ts.streams):
         seq_offset = 0
@@ -215,9 +138,6 @@ def compute_tensor_stream_metadata(ts: TensorStream, *, n_pos_dims: int = 3) -> 
             token_count = event.num_tokens()
             if token_count == 0:
                 continue
-
-            if event.type == TextType.control and token_count == 1 and event.data.numel() == 1:
-                control_token_positions_and_ids[batch_idx].append((seq_offset, int(event.data.item())))
 
             modality[batch_idx, seq_offset : seq_offset + token_count] = event.type.value
             roles[batch_idx, seq_offset : seq_offset + token_count] = ROLE_TO_IDX.get(event.role, -1)
@@ -235,15 +155,7 @@ def compute_tensor_stream_metadata(ts: TensorStream, *, n_pos_dims: int = 3) -> 
     return TensorStreamMetadata(
         modality_mask=modality,
         role_mask=roles,
-        mrope_positions=compute_mrope_pos_tensor_common(ts, n_pos_dims=n_pos_dims),
         interleave_partial_masks=partial_masks,
-        control_token_positions_and_ids=tuple(
-            tuple(control_tokens) for control_tokens in control_token_positions_and_ids
-        ),
-        n_pos_dims=n_pos_dims,
-        # Precompute the flow-action context mask off the critical path. exclude_non_agent_roles defaults
-        # to True (the loss default); the consumer falls back to inline build if the chunk set diverges.
-        flow_action_context=compute_flow_action_context(ts, exclude_non_agent_roles=True),
     )
 
 
@@ -262,7 +174,6 @@ def resolve_tensor_stream_metadata(
 def compute_mrope_pos_tensor(
     ts: TensorStream,
     n_pos_dims: int = 3,
-    metadata: TensorStreamMetadata | None = None,
 ) -> torch.Tensor:
     """
     Create a (batch, T, n_pos_dims) position tensor in one sweep.
@@ -276,8 +187,6 @@ def compute_mrope_pos_tensor(
         torch.LongTensor  - shape (batch_size, seq_len, n_pos_dims)
     """
 
-    if metadata is not None and metadata.n_pos_dims == n_pos_dims:
-        return metadata.mrope_positions
     return compute_mrope_pos_tensor_common(ts, n_pos_dims=n_pos_dims)
 
 
@@ -407,86 +316,6 @@ def build_action_context_mask(
                 context_mask[row_idx, span_start:span_end] = True
 
     return context_mask, context_without_provenance
-
-
-def _flow_action_allowed_roles(exclude_non_agent_roles: bool) -> set[int]:
-    # Mirror loss._allowed_role_indices without importing loss (avoids a cycle).
-    if not exclude_non_agent_roles:
-        return set(ROLE_TO_IDX.values())
-    return {ROLE_TO_IDX.get("agent", -2), ROLE_TO_IDX.get(None, -1)}
-
-
-def _scan_flow_action_positions(
-    ts: TensorStream, *, exclude_non_agent_roles: bool
-) -> tuple[list[int], list[int], list[tuple[object, ...] | None]]:
-    """Structural scan of flow-action chunk positions (batch idx, token start, provenance key).
-
-    Matches collect_action_chunks's common-case inclusion filter (FLOW_ACTION type + allowed role +
-    a present action_target tag). Malformed/dim-overflow drops are NOT replicated -- this may over-count
-    vs the loss; the consumer verifies the chunk set matches before trusting the precomputed mask.
-    """
-    allowed = _flow_action_allowed_roles(exclude_non_agent_roles)
-    batch_indices: list[int] = []
-    action_start_indices: list[int] = []
-    provenance_keys: list[tuple[object, ...] | None] = []
-    for b, stream in enumerate(ts.streams):
-        seq_offset = 0
-        for event in stream.events:
-            event_start = seq_offset
-            seq_offset += event.num_tokens()
-            if event.type != FLOW_ACTION_TEXT_TYPE:
-                continue
-            if ROLE_TO_IDX.get(event.role, -1) not in allowed:
-                continue
-            tags = event.tags or {}
-            if tags.get("action_target") is None:
-                continue
-            batch_indices.append(b)
-            action_start_indices.append(event_start)
-            provenance_keys.append(action_event_provenance_key(event))
-    return batch_indices, action_start_indices, provenance_keys
-
-
-def compute_flow_action_context(
-    ts: TensorStream, *, exclude_non_agent_roles: bool = True
-) -> "FlowActionContext | None":
-    """Precompute the per-action context mask off the critical path (worker-side). None if no chunks.
-
-    This runs the O(chunks x events) ``build_action_context_mask`` double-loop -- the ~65ms serial-Python
-    cost that otherwise stalls the GPU inline in the flow-matching loss between forward and backward.
-    """
-    batch_indices, action_start_indices, provenance_keys = _scan_flow_action_positions(
-        ts, exclude_non_agent_roles=exclude_non_agent_roles
-    )
-    if not batch_indices:
-        return None
-    l_model = ts.shape[1]
-    context_mask, _ = build_action_context_mask(
-        ts,
-        action_batch_indices=batch_indices,
-        action_start_indices=action_start_indices,
-        action_provenance_keys=provenance_keys,
-        l_model=l_model,
-        device=torch.device("cpu"),
-    )
-    # Compact FA3-varlen geometry, CPU-derived (nonzero + max are free here; on the model critical path they
-    # are host syncs). valid_idx is b-major flattened into [num_chunks * l_model]; the consumer remaps to the
-    # model's (shift-trimmed) l_model.
-    lens = context_mask.sum(1)
-    cu_k = torch.zeros(context_mask.shape[0] + 1, dtype=torch.int32)
-    cu_k[1:] = torch.cumsum(lens, 0).to(torch.int32)
-    valid_idx = context_mask.reshape(-1).nonzero(as_tuple=True)[0].to(torch.int64)
-    max_seqlen_k = int(lens.max()) if lens.numel() else 0
-    return FlowActionContext(
-        context_mask=context_mask,
-        batch_indices=tuple(batch_indices),
-        action_start_indices=tuple(action_start_indices),
-        exclude_non_agent_roles=exclude_non_agent_roles,
-        valid_idx=valid_idx,
-        cu_k=cu_k,
-        max_seqlen_k=max_seqlen_k,
-        context_len=int(context_mask.shape[1]),
-    )
 
 
 ROLE_TO_IDX = {

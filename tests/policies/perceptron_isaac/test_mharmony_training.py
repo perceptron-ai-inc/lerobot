@@ -31,7 +31,21 @@ from lerobot.policies.perceptron_isaac.mharmony_native import (
     build_isaac_mharmony_content_plan,
     build_isaac_training_proprio_contract,
 )
-from lerobot.policies.perceptron_isaac.tensor_stream import TextType, VectorType, VisionType
+from lerobot.policies.perceptron_isaac.tensor_stream import (
+    Event,
+    Stream,
+    TensorStream,
+    TextType,
+    VectorType,
+    VisionType,
+)
+from lerobot.policies.perceptron_isaac.tensor_stream_utils import (
+    build_action_context_mask,
+    compute_mrope_pos_tensor,
+    compute_tensor_stream_metadata,
+    interleave_partial_mask,
+    set_data,
+)
 
 
 def _stats():
@@ -427,6 +441,66 @@ def test_public_rendered_stream_lowering_rejects_invalid_pixel_shuffle_grid():
 
     with pytest.raises(ValueError, match="not divisible"):
         rendered_stream_to_local_tensor_stream(rendered, device="cpu", dtype=torch.float32)
+
+
+def test_stream_metadata_preserves_partial_tokens_roles_context_and_mrope() -> None:
+    events = [
+        Event.from_text_tokens(
+            torch.tensor(tokens),
+            time=(0.0, 0.0),
+            type=kind,
+            role=role,
+            tags={"source_stream_name": source},
+        )
+        for tokens, kind, role, source in [
+            ([10, 11, 12], TextType.text, "user", "a"),
+            ([99], TextType.control, "user", "a"),
+            ([0], TextType.action_c, "assistant", "a"),
+            ([7], TextType.action, "assistant", "a"),
+            ([6], TextType.text, "user", "b"),
+            ([0], TextType.action_c, "assistant", "b"),
+        ]
+    ]
+    events[0].slice_tokens(1, 3)
+    stream = TensorStream([Stream(events, list(TextType))])
+    metadata = compute_tensor_stream_metadata(stream)
+
+    torch.testing.assert_close(metadata.modality_mask, torch.tensor([[8, 8, 12, 15, 14, 8, 15]]))
+    torch.testing.assert_close(metadata.role_mask, torch.tensor([[1, 1, 1, 0, 0, 1, 0]]))
+    torch.testing.assert_close(
+        interleave_partial_mask(stream, TextType.text, metadata),
+        torch.tensor([False, True, True, True]),
+    )
+    tokens, valid = set_data(stream, (TextType.text, TextType.control), roles=("user",), metadata=metadata)
+    torch.testing.assert_close(tokens, torch.tensor([[11, 12, 99, 0, 0, 6, 0]]))
+    torch.testing.assert_close(valid, torch.tensor([[True, True, True, False, False, True, False]]))
+    context, fallback_count = build_action_context_mask(
+        stream,
+        metadata,
+        action_batch_indices=[0, 0, 0],
+        action_start_indices=[3, 6, 6],
+        action_provenance_keys=[("a", None, None), ("b", None, None), None],
+    )
+    torch.testing.assert_close(
+        context,
+        torch.tensor(
+            [
+                [True, True, True, False, False, False, False],
+                [False, False, False, False, False, True, False],
+                [True, True, True, False, False, True, False],
+            ]
+        ),
+    )
+    assert fallback_count == 1
+    torch.testing.assert_close(
+        compute_mrope_pos_tensor(stream),
+        torch.tensor([[[1, 0, 0], [2, 0, 0], [3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6], [7, 7, 7]]]),
+    )
+    assert metadata.to("cpu") is metadata
+    moved = metadata.to("meta")
+    assert moved.modality_mask.device.type == "meta"
+    assert moved.role_mask.device.type == "meta"
+    assert moved.partial_mask(TextType.text).device.type == "meta"
 
 
 def test_public_mharmony_encoding_loader_caches_equivalent_group_configs(monkeypatch):
