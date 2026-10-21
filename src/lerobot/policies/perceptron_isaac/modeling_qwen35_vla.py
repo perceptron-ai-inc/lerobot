@@ -17,7 +17,6 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
 from numbers import Real
 from typing import Any, Literal, Optional
 from collections.abc import Sequence
@@ -41,7 +40,6 @@ from .rtc import (
     project_rtc_modulation,
     resolve_rtc_action_prefix,
 )
-from .qwen35_checkpoint import safetensors_checkpoint_layout
 from .tensor_stream import TensorStream, TextType, VisionType, group_streams
 from .tensor_stream_utils import (
     build_action_context_mask,
@@ -1573,28 +1571,6 @@ class Qwen35VLAConfig(Qwen3_5Config):
         self.action_expert = action_expert
 
 
-# The molmoact flavor (qwen3_5_2b_moevit_ps16_vla_fm_molmoact) expert geometry — matches the converted
-# checkpoint's model.action_expert.action_expert.* shapes. clean_at_0=False => clean-at-1 (feed 1-tau).
-DEFAULT_MOLMOACT_EXPERT_CFG: dict[str, Any] = {
-    "type": "molmoact",
-    "action_dim": 64,
-    "action_horizon": 30,
-    "num_layers": 36,
-    "hidden_dim": 768,
-    "num_heads": 8,
-    "mlp_ratio": 4.0,
-    "num_inference_steps": 10,
-    "timestep_embed_dim": 256,
-    "clean_at_0": False,
-    "ffn_multiple_of": 256,
-    "qk_norm": True,
-    "qk_norm_eps": 1e-6,
-    "rope": True,
-    "context_layer_norm": True,
-    "causal_attn": False,
-}
-
-
 # === Inner model: native Qwen3.5-VL + proprio encoder + action expert ===
 
 
@@ -1804,110 +1780,6 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
             final_embedding=self.lm_head,
             flow_matching_expert=self.model.action_expert,
         )
-
-
-# === Loader for the convert_genesis_qwen35_to_hf.py output ===
-
-
-def load_sharded_safetensors_into_model(
-    model: nn.Module,
-    checkpoint_dir: str | Path,
-    *,
-    strict: bool = True,
-) -> tuple[list[str], list[str]]:
-    """Load a safetensors checkpoint while retaining at most one shard.
-
-    When an index exists it is authoritative: every advertised key must be in
-    its advertised shard and no unindexed tensor may be present. This catches
-    partial or accidentally mixed checkpoint directories before inference.
-    """
-    from safetensors.torch import load_file
-
-    root = Path(checkpoint_dir)
-    shard_paths, advertised_by_shard = safetensors_checkpoint_layout(root)
-
-    expected_keys = set(model.state_dict())
-    loaded_keys: set[str] = set()
-    unexpected_keys: set[str] = set()
-    for shard_path in shard_paths:
-        if not shard_path.is_file():
-            raise FileNotFoundError(f"Safetensors index references missing shard {shard_path}.")
-        shard = load_file(str(shard_path))
-        shard_keys = set(shard)
-        if advertised_by_shard is not None:
-            advertised = advertised_by_shard[shard_path.name]
-            missing_from_shard = advertised - shard_keys
-            unindexed_in_shard = shard_keys - advertised
-            if missing_from_shard or unindexed_in_shard:
-                raise ValueError(
-                    f"Safetensors index mismatch for {shard_path.name}: "
-                    f"missing={sorted(missing_from_shard)} unindexed={sorted(unindexed_in_shard)}."
-                )
-        duplicates = loaded_keys.intersection(shard_keys)
-        if duplicates:
-            raise ValueError(
-                f"Duplicate tensor keys across safetensors shards; first: {sorted(duplicates)[:10]}."
-            )
-        _, shard_unexpected = model.load_state_dict(shard, strict=False)
-        unexpected_keys.update(shard_unexpected)
-        loaded_keys.update(shard_keys)
-        del shard
-
-    missing_keys = sorted(expected_keys - loaded_keys)
-    unexpected = sorted(unexpected_keys | (loaded_keys - expected_keys))
-    if strict and (missing_keys or unexpected):
-        raise RuntimeError(
-            "ISAAC checkpoint key coverage mismatch: "
-            f"missing={len(missing_keys)} (first={missing_keys[:10]}), "
-            f"unexpected={len(unexpected)} (first={unexpected[:10]})."
-        )
-    return missing_keys, unexpected
-
-
-def resolve_action_expert_config(
-    file_expert_cfg: dict[str, Any] | None,
-    *,
-    action_expert: dict[str, Any] | None = None,
-    action_expert_overrides: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Resolve the effective action-expert config for a checkpoint load.
-
-    Precedence: a checkpoint-stamped block (``file_expert_cfg``, genesis post-#3402
-    exports) is authoritative and may not be wholesale-replaced; an explicit
-    ``action_expert`` dict is accepted only for checkpoints without one; otherwise
-    ``DEFAULT_MOLMOACT_EXPERT_CFG`` applies. ``action_expert_overrides`` carries
-    serving knobs (action_horizon / num_inference_steps) merged on top -- except that
-    a horizon contradicting a checkpoint-stamped contract fails loudly, because that
-    means the policy config and checkpoint disagree on trained geometry.
-    """
-    if action_expert is not None:
-        if file_expert_cfg is not None:
-            raise ValueError(
-                "The checkpoint's config.json carries an authoritative action_expert "
-                "contract; refusing to override it wholesale. Pass "
-                "action_expert_overrides for serving knobs instead."
-            )
-        resolved = dict(action_expert)
-    elif file_expert_cfg is not None:
-        resolved = dict(file_expert_cfg)
-    else:
-        resolved = dict(DEFAULT_MOLMOACT_EXPERT_CFG)
-    if action_expert_overrides:
-        file_horizon = resolved.get("action_horizon")
-        wanted_horizon = action_expert_overrides.get("action_horizon")
-        if (
-            file_expert_cfg is not None
-            and wanted_horizon is not None
-            and file_horizon is not None
-            and int(wanted_horizon) != int(file_horizon)
-        ):
-            raise ValueError(
-                f"Policy config implies action_horizon={wanted_horizon}, but the "
-                f"checkpoint's action_expert contract declares {file_horizon}; the "
-                "policy config and checkpoint disagree on trained geometry."
-            )
-        resolved = {**resolved, **action_expert_overrides}
-    return resolved
 
 
 def setup_qwen35_vla_for_training(
