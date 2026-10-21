@@ -52,7 +52,6 @@ class _FlowBatch:
     targets: Tensor
     full_mask: Tensor
     horizon_mask: Tensor
-    real_elements: Tensor
     batch_indices: list[int]
     action_start_indices: list[int]
     provenance_keys: list[tuple[object, ...] | None]
@@ -189,12 +188,10 @@ def _collect_flow_batch(
         provenance_keys.append(action_event_provenance_key(event))
     targets = targets * full_mask
     horizon_mask = full_mask.any(dim=2)
-    real_elements = full_mask.sum(dim=(1, 2)).clamp_min(1.0)
     return _FlowBatch(
         targets=targets,
         full_mask=full_mask,
         horizon_mask=horizon_mask,
-        real_elements=real_elements,
         batch_indices=batch_indices,
         action_start_indices=action_start_indices,
         provenance_keys=provenance_keys,
