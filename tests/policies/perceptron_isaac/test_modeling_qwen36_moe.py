@@ -723,17 +723,16 @@ def test_compact_routes_match_genesis_two_stage_real_renormalization() -> None:
     torch.testing.assert_close(routes.offsets, expected_offsets)
 
 
+def _cuda_grouped_moe() -> GenesisNullSparseMoeBlock:
+    return GenesisNullSparseMoeBlock(
+        _text_config(num_real_experts=8, num_null_experts=8, top_k=4, moe_intermediate_size=8)
+    ).to(device="cuda", dtype=torch.bfloat16)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA grouped_mm parity requires a GPU")
 def test_grouped_mm_compact_dispatch_matches_eager_oracle() -> None:
     torch.manual_seed(23)
-    block = GenesisNullSparseMoeBlock(
-        _text_config(
-            num_real_experts=8,
-            num_null_experts=8,
-            top_k=4,
-            moe_intermediate_size=8,
-        )
-    ).to(device="cuda", dtype=torch.bfloat16)
+    block = _cuda_grouped_moe()
     with torch.no_grad():
         for parameter in block.parameters():
             parameter.normal_(std=0.05)
@@ -758,14 +757,7 @@ def test_grouped_mm_compact_dispatch_matches_eager_oracle() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA all-null dispatch requires a GPU")
 def test_grouped_backend_all_null_routes_never_reads_nan_experts() -> None:
-    block = GenesisNullSparseMoeBlock(
-        _text_config(
-            num_real_experts=8,
-            num_null_experts=8,
-            top_k=4,
-            moe_intermediate_size=8,
-        )
-    ).to(device="cuda", dtype=torch.bfloat16)
+    block = _cuda_grouped_moe()
     with torch.no_grad():
         block.gate.weight.zero_()
         block.gate.weight[8, 0] = 10
@@ -788,14 +780,7 @@ def test_grouped_backend_all_null_routes_never_reads_nan_experts() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA grouped_mm gradients require a GPU")
 def test_grouped_mm_compact_dispatch_backward_is_finite() -> None:
     torch.manual_seed(29)
-    block = GenesisNullSparseMoeBlock(
-        _text_config(
-            num_real_experts=8,
-            num_null_experts=8,
-            top_k=4,
-            moe_intermediate_size=8,
-        )
-    ).to(device="cuda", dtype=torch.bfloat16)
+    block = _cuda_grouped_moe()
     with torch.no_grad():
         for parameter in block.parameters():
             parameter.normal_(std=0.05)
