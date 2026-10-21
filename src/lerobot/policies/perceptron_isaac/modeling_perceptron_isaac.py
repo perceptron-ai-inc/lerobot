@@ -39,7 +39,6 @@ from .checkpoint_integrity import (
     snapshot_directory,
 )
 from .configuration_perceptron_isaac import (
-    NATIVE_RECIPE_EXPORT_FILENAME,
     PerceptronIsaacConfig,
     is_portable_isaac05_repository,
 )
@@ -371,6 +370,23 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if config.hf_model_path and not config.train_storage_fp32:
             self._load_backbone()
 
+    def _require_native_save_supported(self) -> None:
+        """Refuse deferred export layouts before collective gathering or filesystem writes."""
+        if self.config.use_peft:
+            raise RuntimeError("Perceptron ISAAC PEFT saving is unsupported.")
+        model_path = self.config.hf_model_path
+        source_root = self._local_checkpoint_source_root()
+        raw_layout = source_root is not None and self._portable_export_root(source_root) is not None
+        unbound_export = (
+            model_path
+            and is_portable_isaac05_repository(Path(model_path))
+            and not (self.config.mk1_model_import_sha256 or self.config.mk1_source_model_import_sha256)
+        )
+        if raw_layout or unbound_export:
+            raise RuntimeError(
+                "Raw/portable-export saving is unsupported; use a source-bound native MK1 package."
+            )
+
     def _save_pretrained(self, save_directory: Path, state_dict: dict[str, Tensor] | None = None) -> None:
         """Save one canonical trained weight inventory plus checkpoint-local runtime assets.
 
@@ -383,6 +399,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         from lerobot.distributed.checkpoint import full_model_state_dict
         from lerobot.distributed.utils import is_main_process
 
+        self._require_native_save_supported()
         if state_dict is None:
             state_dict = full_model_state_dict(self)  # collective when sharded; {} off-main
         if not is_main_process():
@@ -396,15 +413,13 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             raise RuntimeError("Perceptron ISAAC dense saves require a loaded checkpoint package.")
         with self._verified_checkpoint_source(source_root) as verified_source:
             self._copy_checkpoint_package(verified_source, save_directory)
-            checkpoint_local_paths = self._materialize_portable_export_assets(verified_source, save_directory)
         self.config._export_apply_offset_norm = False
         if self._config_declares_mk1(self.config):
             self.config._export_mk1_source_model_import_sha256 = (
                 self.config.mk1_model_import_sha256 or self.config.mk1_source_model_import_sha256
             )
             self.config._export_mk1_model_import_sha256 = None
-        with self._checkpoint_local_path_records(checkpoint_local_paths, save_directory):
-            self.config._save_pretrained(save_directory)
+        self.config._save_pretrained(save_directory)
         self._save_canonical_inner_weights(save_directory, state_dict)
         self._canonical_inner_save_root = str(save_directory.resolve())
         self.finalize_pretrained_package(save_directory)
@@ -744,7 +759,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         return saved_config
 
     def finalize_pretrained_package(self, save_directory: str | Path) -> None:
-        """Bind final package contents, or embed a local PEFT base, after all writers finish."""
+        """Bind final native package contents after all checkpoint writers finish."""
+        self._require_native_save_supported()
         root = Path(save_directory)
         if (root / DCP_MODEL_SHARD_DIRNAME).is_dir() and getattr(
             self, "_canonical_inner_save_root", None
@@ -771,9 +787,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 "_export_mk1_source_model_import_sha256",
                 self.config.mk1_source_model_import_sha256,
             )
-            if not model_import_digest:
-                self._finalize_portable_isaac05_package(root)
-                return
             finalize_canonical_trained_package(
                 self.config,
                 root,
@@ -782,30 +795,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             )
             return
         raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
-
-    def _finalize_portable_isaac05_package(self, root: Path) -> None:
-        """Close a package saved from a raw Isaac-0.5 export on the identity it carries.
-
-        A raw export ships no ``mk1_model_import.json``, so there is no source model-import
-        identity for a canonical MK1 manifest to bind, and claiming one would be a manifest
-        that names a record the package does not contain. ``_verify_packaged_contract_digests``
-        authenticates exactly this package shape -- the export's model assets embedded as a
-        portable ``hf_model/`` -- by ``deployment_adapter_sha256``, so finalize verifies that
-        same record here. Every other MK1 package with no model-import digest is still refused,
-        and no reader check is relaxed: the load path decides which record it requires.
-        """
-        if not is_portable_isaac05_repository(root / "hf_model"):
-            raise RuntimeError("Cannot finalize an MK1 package without source model-import identity.")
-        adapter_path = root / "isaac_deployment_adapter.json"
-        if not self._is_package_file(root, adapter_path):
-            raise RuntimeError(
-                f"A portable Isaac-0.5 trained package is missing its deployment adapter: {adapter_path}."
-            )
-        _verify_sha256(
-            self.config.deployment_adapter_sha256,
-            "portable Isaac-0.5 trained package deployment_adapter_sha256",
-            adapter_path,
-        )
 
     def hub_delete_patterns(self) -> str:
         """Mirror the exact authenticated ISAAC package inventory on every Hub push."""
@@ -926,105 +915,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     f"Raw Isaac-0.5 export snapshot lost its policy package: {source_root.name}."
                 )
             yield package_root
-
-    @classmethod
-    def _materialize_portable_export_assets(cls, verified_source: Path, destination: Path) -> dict[str, str]:
-        """Embed a raw export's non-weight assets in the checkpoint, returning the names to record.
-
-        A written checkpoint has no export root above it, so the ".." its source config uses
-        would have nothing to resolve against. The assets are laid down as ``hf_model/`` and
-        recorded relative-and-downward: the layout imported Qwen3.5 packages already use
-        (``hf_model_path="hf_model"``) and the one ``_save_canonical_inner_weights`` already
-        writes its trained tensors into. Both weight inventories stay behind, because the save
-        replaces them.
-
-        Returns an empty mapping for an already self-contained source, which needs nothing.
-        """
-        export_root = cls._portable_export_root(verified_source)
-        if export_root is None:
-            return {}
-        package_name = verified_source.name
-        model_root = destination / "hf_model"
-
-        def ignore(directory: str, names: list[str]) -> set[str]:
-            at_export_root = Path(directory).resolve() == export_root
-            return {
-                name
-                for name in names
-                if cls._is_checkpoint_weight_name(name) or (at_export_root and name == package_name)
-            }
-
-        shutil.copytree(export_root, model_root, dirs_exist_ok=True, ignore=ignore)
-        # The export declares its mHarmony reserved-token groups in a root-level
-        # ``policy_inference_recipe.json``, and ``checkpoint_asset_roots`` only ever looks at the
-        # package root (plus a portable parent, which a checkpoint does not have). Embedding the
-        # export under ``hf_model/`` therefore leaves the recipe where no load will look, and the
-        # config-derived default carries no ``name="coord"`` group, so the written checkpoint
-        # fails its own coordinate contract at load. Keep one copy at the package root, where the
-        # checkpoint resolves it exactly as the export it was saved from does.
-        recipe = export_root / NATIVE_RECIPE_EXPORT_FILENAME
-        if recipe.is_file():
-            shutil.copyfile(recipe, destination / NATIVE_RECIPE_EXPORT_FILENAME)
-
-        declared = load_json_object(verified_source / "config.json")
-        checkpoint_local: dict[str, str] = {"hf_model_path": "hf_model"}
-        raw = declared.get("fast_processor_path")
-        remainder = cls._export_relative_remainder(raw)
-        if remainder is not None:
-            # One spelling of the written-package convention, shared with the importer.
-            canonical, _is_directory = PROCESSOR_PACKAGE_PATHS["fast_processor_path"]
-            shutil.copytree(export_root / remainder, destination / canonical, dirs_exist_ok=True)
-            checkpoint_local["fast_processor_path"] = canonical
-        return checkpoint_local
-
-    @staticmethod
-    def _export_relative_remainder(declared: object) -> Path | None:
-        """Return the export-root-relative part of a ``"../x"`` declaration, else None.
-
-        Anything else -- absolute, package-local, or a deeper ``..`` -- is left declared as
-        it is, so the loader's escape guard refuses it loudly rather than this save quietly
-        rebasing a path nobody has reviewed.
-        """
-        if not isinstance(declared, str) or not declared.strip():
-            return None
-        relative = Path(declared)
-        if relative.is_absolute() or relative.parts[:1] != ("..",):
-            return None
-        remainder = relative.relative_to("..")
-        return None if ".." in remainder.parts else remainder
-
-    @contextmanager
-    def _checkpoint_local_path_records(self, relative_by_attr: dict[str, str], destination: Path):
-        """Record checkpoint-local relatives for one config save, leaving the live config alone.
-
-        ``PerceptronIsaacConfig._save_pretrained`` writes the relative half of every
-        ``_checkpoint_relative_paths`` record whose absolute still matches the live field, so
-        rebinding those records is how a save declares a different layout. The live
-        ``hf_model_path`` keeps pointing at the loaded package, so training continues from it
-        after the checkpoint is written.
-        """
-        original = dict(getattr(self.config, "_checkpoint_relative_paths", {}))
-        if not relative_by_attr:
-            yield
-            return
-        rebound = dict(original)
-        for attr, relative in relative_by_attr.items():
-            record = original.get(attr)
-            if not isinstance(record, dict) or not isinstance(record.get("absolute"), str):
-                raise RuntimeError(
-                    f"Checkpoint-local {attr} cannot be rebound: "
-                    "the loaded package left no resolved path record."
-                )
-            rebound[attr] = {
-                "absolute": record["absolute"],
-                "relative": relative,
-                "root": str(destination),
-            }
-        self.config._checkpoint_relative_paths = rebound
-        try:
-            yield
-        finally:
-            self.config._checkpoint_relative_paths = original
 
     @staticmethod
     def _package_file_digests(root: Path) -> dict[str, str]:
