@@ -322,7 +322,7 @@ class Mk1CheckpointContract:
         special_tokens = _parse_special_tokens(root, text_raw, text=text, test_geometry=test_geometry)
         coord = _parse_coord(_object_field(root, "genesis_coord_tokens"), text, test_geometry=test_geometry)
         vector, action = _parse_vla(
-            _object_field(root, "genesis_vla"), text=text, mtp=mtp, test_geometry=test_geometry
+            _object_field(root, "genesis_vla"), text=text, test_geometry=test_geometry
         )
 
         return cls(
@@ -1248,7 +1248,7 @@ def _parse_special_tokens(
 
 
 def _parse_vla(
-    raw: Mapping[str, Any], *, text: Mk1TextContract, mtp: Mk1MtpContract, test_geometry: bool
+    raw: Mapping[str, Any], *, text: Mk1TextContract, test_geometry: bool
 ) -> tuple[Mk1VectorEncoderContract, Mk1ActionExpertContract]:
     _require_exact_keys(raw, _VLA_KEYS, "genesis_vla")
     _require_values(
@@ -1261,14 +1261,6 @@ def _parse_vla(
         },
         "genesis_vla",
     )
-    if _object_field(raw, "mtp", "genesis_vla") != {
-        "present": mtp.present,
-        "physical_layers": mtp.physical_layers,
-        "rollout_steps": mtp.rollout_steps,
-        "action_runtime": "exclude",
-    }:
-        _fail("genesis_vla.mtp changed while parsing")  # pragma: no cover - defensive
-
     vector_raw = _object_field(raw, "vector_encoder", "genesis_vla")
     _require_exact_keys(vector_raw, _VECTOR_KEYS, "genesis_vla.vector_encoder")
     _require_values(
