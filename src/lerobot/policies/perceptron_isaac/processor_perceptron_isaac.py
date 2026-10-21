@@ -8,9 +8,10 @@ policy device, and normalized actions are unnormalized on the way back to CPU.
 import json
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import numpy as np
 import torch
@@ -424,14 +425,14 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 "Perceptron Isaac image_preprocessing must be 'stretch' or 'letterbox'; "
                 f"got {self.image_preprocessing!r}."
             )
-        self._stream_builder = None
-        self._stats = None
+        self._stream_builder: IsaacNativeMharmonyRenderer | None = None
+        self._stats: IsaacNormalizationStats | None = None
         self._fast_processor = None
-        self._suite_stats = None
-        self._suite_by_task_index = None
+        self._suite_stats: dict[str, IsaacNormalizationStats] | None = None
+        self._suite_by_task_index: dict[int, str] | None = None
         # Run-local, factory-injected: the training dataset's declared fps, used to
         # cross-check the checkpoint-owned clock in _frame_index_anchors. Never serialized.
-        self._dataset_declared_fps = None
+        self._dataset_declared_fps: float | None = None
         self._warned_dataset_fps_mismatch = False
 
     def reset(self) -> None:
@@ -500,15 +501,12 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         if action is not None:
             return int(action.shape[0]) if action.ndim > 1 else 1
         state = observation.get(OBS_STATE)
-        if torch.is_tensor(state) or isinstance(state, np.ndarray):
-            ndim = getattr(state, "ndim", 0)
-            if ndim >= 2:
-                return int(state.shape[0])
-            return 1
+        if isinstance(state, (Tensor, np.ndarray)):
+            return int(state.shape[0]) if state.ndim >= 2 else 1
         for key in self._resolve_image_keys(observation):
             value = observation[key]
-            if torch.is_tensor(value) or isinstance(value, np.ndarray):
-                return int(value.shape[0]) if getattr(value, "ndim", 0) >= 4 else 1
+            if isinstance(value, (Tensor, np.ndarray)):
+                return int(value.shape[0]) if value.ndim >= 4 else 1
         return 1
 
     def _extract_image_tensor(self, observation: dict[str, Any], batch_size: int) -> np.ndarray:
@@ -611,9 +609,9 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             return state[None, None, :]
         raise ValueError(f"Unsupported Isaac state shape {state.shape}.")
 
-    def _ensure_renderer(self) -> None:
+    def _ensure_renderer(self) -> IsaacNativeMharmonyRenderer:
         if self._stream_builder is not None:
-            return
+            return self._stream_builder
         if self.inference_backend != "native_mharmony":
             raise ValueError(
                 "Perceptron Isaac pack only supports inference_backend='native_mharmony', "
@@ -656,6 +654,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             )
         self._validate_target_fps(metadata.target_fps, artifact="render metadata")
         self._stream_builder = IsaacNativeMharmonyRenderer(metadata=metadata, stats=self._stats)
+        return self._stream_builder
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         if not self.enabled:
@@ -763,6 +762,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 for scope, block in load_isaac_suite_stats(self.suite_stats_path).items()
             }
             self._require_suite_geometry_matches_contract(suite_stats)
+            assert self.suite_by_task_index_path is not None  # Validated together in __post_init__.
             raw = json.loads(Path(self.suite_by_task_index_path).read_text())
             suite_by_task_index = {int(k): str(v) for k, v in raw.items()}
             missing = sorted(set(suite_by_task_index.values()) - set(suite_stats))
@@ -826,6 +826,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         """Per-sample normalization stats, or None when per-suite routing is off."""
         if not self._ensure_suite_stats():
             return None
+        assert self._suite_stats is not None and self._suite_by_task_index is not None
         task_indices = self._anchor_numeric_values(
             complementary.get("task_index"), batch_size, field_name="task_index"
         )
@@ -891,7 +892,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 )
         return [float(frame) / fps for frame in frames]
 
-    def _anchor_timestamps(self, complementary: dict[str, Any], batch_size: int) -> list[float | None]:
+    def _anchor_timestamps(self, complementary: dict[str, Any], batch_size: int) -> list[float] | list[None]:
         explicit_anchors = self._anchor_numeric_values(
             complementary.get(PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY),
             batch_size,
@@ -931,11 +932,12 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         tasks: list[str],
         actions: Tensor | None,
         complementary: dict[str, Any],
-        anchors: list[float | None],
+        anchors: Sequence[float | None],
     ):
-        self._ensure_renderer()
+        renderer = self._ensure_renderer()
         if actions is not None:
-            if any(anchor is None for anchor in anchors):
+            training_anchors = [anchor for anchor in anchors if anchor is not None]
+            if len(training_anchors) != len(anchors):
                 raise ValueError(
                     "ISAAC training requires an explicit episode-relative dataset timestamp; "
                     "the stateless processor never synthesizes model time."
@@ -962,7 +964,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             unchecked_length = 2**31 - 1
 
             def render_sample(index: int, *, skip_outlier_threshold: float, max_sequence_length: int):
-                return self._stream_builder.build_training(
+                return renderer.build_training(
                     stats=None if suite_stats is None else suite_stats[index],
                     observation_window=windows[index],
                     prompt=tasks[index],
@@ -981,7 +983,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                     min_num_patches=self.min_num_patches,
                     pixel_shuffle_scale=self.pixel_shuffle_scale,
                     temporal_patch_size=self.temporal_patch_size,
-                    anchor_timestamp_seconds=float(anchors[index]),
+                    anchor_timestamp_seconds=float(training_anchors[index]),
                 )
 
             # In a distributed run a data-dependent raise on one rank aborts it alone while
@@ -1030,14 +1032,12 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                     "stats file or wrong per-suite routing)."
                 )
             complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] = kept_indices
-            return self._stream_builder.collate(streams)
+            return renderer.collate(streams)
         if len(windows) != 1:
             raise NotImplementedError("Perceptron Isaac eval rendering currently supports batch_size=1.")
         dtype = _dtype_from_name(self.dtype)
-        fast_processor = (
-            self._ensure_fast_processor() if self._stream_builder.metadata.action_conditioning else None
-        )
-        stream = self._stream_builder.build(
+        fast_processor = self._ensure_fast_processor() if renderer.metadata.action_conditioning else None
+        stream = renderer.build(
             observation_window=windows[0],
             prompt=tasks[0],
             fast_processor=fast_processor,
@@ -1229,6 +1229,72 @@ class PerceptronIsaacMharmonyPackProcessorStep(PerceptronIsaacRenderProcessorSte
 
     _serialize_pack_fields: ClassVar[bool] = True
 
+    @classmethod
+    def from_config(
+        cls,
+        config: PerceptronIsaacConfig,
+        *,
+        native_stats_path: str | None,
+        device: str,
+        suite_stats_path: str | None = None,
+        suite_by_task_index_path: str | None = None,
+    ) -> "PerceptronIsaacMharmonyPackProcessorStep":
+        """Apply the shared render contract with caller-owned path, device and suite routing."""
+        return cls(
+            enabled=True,
+            inference_backend=str(config.inference_backend),
+            config_toml_path=config.config_toml_path,
+            stats_path=config.stats_path,
+            native_render_metadata_path=config.native_render_metadata_path,
+            native_stats_path=native_stats_path,
+            fast_processor_path=config.fast_processor_path,
+            fast_processor_tree_sha256=config.fast_processor_tree_sha256,
+            mharmony_version=config.mharmony_version,
+            action_dim=int(config.action_dim),
+            proprio_dim=int(config.proprio_dim),
+            vector_max_states=int(config.vector_max_states),
+            dataset_name=str(config.dataset_name),
+            robot_type=str(config.robot_type),
+            target_fps=config.target_fps,
+            action_conditioning=bool(config.action_conditioning),
+            action_conditioning_role=str(config.action_conditioning_role),
+            mistake_conditioning=bool(config.mistake_conditioning),
+            camera_order=list(config.camera_order),
+            image_size=config.image_size,
+            image_preprocessing=str(config.image_preprocessing),
+            image_keys=[f"observation.images.{cam}" for cam in config.camera_order],
+            allow_image_key_fallback=bool(config.allow_image_key_fallback),
+            normalize_language=bool(config.normalize_task_text),
+            n_obs_steps=int(config.n_obs_steps),
+            chunk_size=int(config.chunk_size),
+            objective=str(config.objective),
+            patch_size=int(config.render_patch_size),
+            max_num_patches=config.render_max_num_patches,
+            min_num_patches=config.render_min_num_patches,
+            pixel_shuffle_scale=int(config.render_pixel_shuffle_scale),
+            temporal_patch_size=int(config.render_temporal_patch_size),
+            device=device,
+            dtype="bfloat16",
+            normalization_profile_id=config.normalization_profile_id,
+            normalization_profile_scope=config.normalization_profile_scope,
+            normalization_validation_status=config.normalization_validation_status,
+            render_metadata=(
+                IsaacMharmonyRenderMetadata.from_json_file(config.native_render_metadata_path).to_json_dict()
+                if config.native_render_metadata_path and Path(config.native_render_metadata_path).is_file()
+                else None
+            ),
+            train_clip_normalized_actions=bool(config.train_clip_normalized_actions),
+            clip_normalized_max=float(config.clip_normalized_max),
+            fast_clip_normalized_max=float(config.fast_clip_normalized_max),
+            train_skip_outlier_threshold=float(config.train_skip_outlier_threshold),
+            train_max_sequence_length=int(config.train_max_sequence_length),
+            normalize_gripper=bool(config.normalize_gripper),
+            action_feature_names=list(config.action_feature_names or []) or None,
+            state_feature_names=list(config.state_feature_names or []) or None,
+            suite_stats_path=suite_stats_path,
+            suite_by_task_index_path=suite_by_task_index_path,
+        )
+
 
 @ProcessorStepRegistry.register(name="perceptron_isaac_action_unnormalize")
 @dataclass
@@ -1342,7 +1408,7 @@ class _PerceptronIsaacJointFrameTransformStep(ProcessorStep):
     joint_signs: list[float] | None = None
     joint_offsets: list[float] | None = None
 
-    _container_key: ClassVar[TransitionKey | None] = None
+    _container_key: ClassVar[Literal["observation"] | None] = None
     _value_key: ClassVar[str] = TransitionKey.ACTION
     _inverse: ClassVar[bool] = False
 
@@ -1360,7 +1426,7 @@ class _PerceptronIsaacJointFrameTransformStep(ProcessorStep):
 
         out = transition.copy()
         if self._container_key is not None:
-            container = container.copy()
+            container = dict(container)
             out[self._container_key] = container
         else:
             container = out
@@ -1395,7 +1461,7 @@ class PerceptronIsaacStateFrameTransformStep(_PerceptronIsaacJointFrameTransform
     No-op when both fields are None. See PerceptronIsaacConfig.joint_signs/joint_offsets.
     """
 
-    _container_key: ClassVar[TransitionKey | None] = TransitionKey.OBSERVATION
+    _container_key: ClassVar[Literal["observation"] | None] = TransitionKey.OBSERVATION
     _value_key: ClassVar[str] = OBS_STATE
 
 
@@ -1448,64 +1514,12 @@ def make_perceptron_isaac_pre_post_processors(
     cams = config.camera_order
     if len(cams) >= 2 and cams[1] != "image2":
         rename_map["observation.images.image2"] = f"observation.images.{cams[1]}"
-    render_step_class: type[PerceptronIsaacRenderProcessorStep] = PerceptronIsaacMharmonyPackProcessorStep
-    render_step_kwargs = {
-        "native_render_metadata_path": config.native_render_metadata_path,
-        "native_stats_path": config.resolve_native_stats_path(),
-        "fast_processor_path": config.fast_processor_path,
-        "fast_processor_tree_sha256": config.fast_processor_tree_sha256,
-        "mharmony_version": config.mharmony_version,
-        "action_dim": int(config.action_dim),
-        "proprio_dim": int(config.proprio_dim),
-        "vector_max_states": int(config.vector_max_states),
-        "dataset_name": str(config.dataset_name),
-        "robot_type": str(config.robot_type),
-        "target_fps": config.target_fps,
-        "action_conditioning": bool(config.action_conditioning),
-        "action_conditioning_role": str(config.action_conditioning_role),
-        "mistake_conditioning": bool(config.mistake_conditioning),
-        "normalization_profile_id": config.normalization_profile_id,
-        "normalization_profile_scope": config.normalization_profile_scope,
-        "normalization_validation_status": config.normalization_validation_status,
-        "render_metadata": (
-            IsaacMharmonyRenderMetadata.from_json_file(config.native_render_metadata_path).to_json_dict()
-            if config.native_render_metadata_path and Path(config.native_render_metadata_path).is_file()
-            else None
-        ),
-        "train_clip_normalized_actions": bool(config.train_clip_normalized_actions),
-        "clip_normalized_max": float(config.clip_normalized_max),
-        "fast_clip_normalized_max": float(config.fast_clip_normalized_max),
-        "train_skip_outlier_threshold": float(config.train_skip_outlier_threshold),
-        "train_max_sequence_length": int(config.train_max_sequence_length),
-        "normalize_gripper": bool(config.normalize_gripper),
-        "action_feature_names": list(config.action_feature_names or []) or None,
-        "state_feature_names": list(config.state_feature_names or []) or None,
-    }
-    render_enabled = True
-    render_step = render_step_class(
-        enabled=render_enabled,
-        inference_backend=str(config.inference_backend),
-        config_toml_path=config.config_toml_path,
-        stats_path=config.stats_path,
-        camera_order=list(config.camera_order),
-        image_size=tuple(config.image_size),
-        image_preprocessing=str(config.image_preprocessing),
-        image_keys=[f"observation.images.{cam}" for cam in config.camera_order],
-        allow_image_key_fallback=bool(config.allow_image_key_fallback),
-        normalize_language=bool(config.normalize_task_text),
-        n_obs_steps=int(config.n_obs_steps),
-        chunk_size=int(config.chunk_size),
-        objective=str(config.objective),
-        patch_size=int(config.render_patch_size),
-        max_num_patches=config.render_max_num_patches,
-        min_num_patches=config.render_min_num_patches,
-        pixel_shuffle_scale=int(config.render_pixel_shuffle_scale),
-        temporal_patch_size=int(config.render_temporal_patch_size),
+    render_step = PerceptronIsaacMharmonyPackProcessorStep.from_config(
+        config,
+        native_stats_path=config.resolve_native_stats_path(),
         device=str(config.device),
-        dtype="bfloat16",
         suite_stats_path=config.suite_stats_path,
         suite_by_task_index_path=config.suite_by_task_index_path,
-        **render_step_kwargs,
     )
     declared_fps = getattr(dataset_meta, "fps", None)
     if declared_fps is not None:
@@ -1529,7 +1543,7 @@ def make_perceptron_isaac_pre_post_processors(
             joint_signs=config.joint_signs, joint_offsets=config.joint_offsets
         ),
         render_step,
-        DeviceProcessorStep(device=config.device),
+        DeviceProcessorStep(device=str(config.device)),
     ]
     output_steps: list[ProcessorStep] = []
     output_steps.append(
@@ -1742,13 +1756,15 @@ def _reconcile_training_action_frame_step(
             "ISAAC preprocessor must contain exactly one mharmony pack step before the "
             "training action-frame transform can be reconciled."
         )
-    preprocessor.steps.insert(
+    steps = list(preprocessor.steps)
+    steps.insert(
         pack_indices[0],
         PerceptronIsaacTrainingActionFrameTransformStep(
             joint_signs=config.joint_signs,
             joint_offsets=config.joint_offsets,
         ),
     )
+    preprocessor.steps = steps
     logging.info("Installed ISAAC v2 training action-frame transform before mharmony normalization.")
 
 
