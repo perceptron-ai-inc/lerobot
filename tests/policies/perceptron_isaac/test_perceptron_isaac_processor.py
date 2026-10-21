@@ -82,6 +82,23 @@ class FakeTensorStream:
         return self
 
 
+def _saved_processor_config(root: Path, *, normalize_task_text: bool = True) -> PerceptronIsaacConfig:
+    stats_path = root / "source_stats.json"
+    _write_native_stats(stats_path)
+    config = PerceptronIsaacConfig(
+        device="cpu",
+        n_obs_steps=1,
+        normalize_task_text=normalize_task_text,
+        native_stats_path=str(stats_path),
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+    preprocessor, postprocessor = make_pre_post_processors(config)
+    preprocessor.save_pretrained(root)
+    postprocessor.save_pretrained(root)
+    return config
+
+
 def test_perceptron_isaac_uses_v06_convention_based_factories(tmp_path):
     stats_path = tmp_path / "source_stats.json"
     _write_native_stats(stats_path)
@@ -122,25 +139,12 @@ def test_per_suite_normalization_survives_loading_from_a_package(tmp_path):
     into the package. A multi-suite run then trained entirely in one suite's frame and scored well
     on that suite alone -- indistinguishable from a policy that simply failed to learn the others.
     """
-    stats_path = tmp_path / "source_stats.json"
-    _write_native_stats(stats_path)
-
     suite_stats = tmp_path / "suite_stats.json"
     suite_map = tmp_path / "suite_by_task_index.json"
     suite_stats.write_text(json.dumps({"suite_a": {}, "suite_b": {}}))
     suite_map.write_text(json.dumps({"0": "suite_a", "1": "suite_b"}))
 
-    base = make_policy_config(
-        "perceptron_isaac",
-        device="cpu",
-        n_obs_steps=1,
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    preprocessor, postprocessor = make_pre_post_processors(base)
-    preprocessor.save_pretrained(tmp_path)
-    postprocessor.save_pretrained(tmp_path)
+    base = _saved_processor_config(tmp_path)
 
     # The saved package carries no suite fields -- that is the condition being guarded.
     saved = json.loads((tmp_path / "policy_preprocessor.json").read_text())
@@ -179,25 +183,13 @@ def test_from_pretrained_factory_rejects_half_configured_suite_normalization(tmp
 
 
 def test_dataset_declared_fps_reaches_pack_step_on_both_factory_paths(tmp_path):
-    stats_path = tmp_path / "source_stats.json"
-    _write_native_stats(stats_path)
-    cfg = make_policy_config(
-        "perceptron_isaac",
-        device="cpu",
-        n_obs_steps=1,
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
+    cfg = _saved_processor_config(tmp_path)
     meta = SimpleNamespace(fps=30)
 
     fresh, _ = make_pre_post_processors(cfg, dataset_meta=meta)
     pack = next(s for s in fresh.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
     assert pack._dataset_declared_fps == 30.0
 
-    preprocessor, postprocessor = make_pre_post_processors(cfg)
-    preprocessor.save_pretrained(tmp_path)
-    postprocessor.save_pretrained(tmp_path)
     loaded, _ = make_pre_post_processors(cfg, pretrained_path=str(tmp_path), dataset_meta=meta)
     pack = next(s for s in loaded.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
     assert pack._dataset_declared_fps == 30.0
@@ -209,20 +201,7 @@ def test_dataset_declared_fps_reaches_pack_step_on_both_factory_paths(tmp_path):
 
 
 def test_task_normalization_config_reaches_loaded_pack_step(tmp_path):
-    stats_path = tmp_path / "source_stats.json"
-    _write_native_stats(stats_path)
-    cfg = make_policy_config(
-        "perceptron_isaac",
-        device="cpu",
-        n_obs_steps=1,
-        normalize_task_text=False,
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    preprocessor, postprocessor = make_pre_post_processors(cfg)
-    preprocessor.save_pretrained(tmp_path)
-    postprocessor.save_pretrained(tmp_path)
+    cfg = _saved_processor_config(tmp_path, normalize_task_text=False)
 
     cfg.normalize_task_text = True
     loaded, _ = make_pre_post_processors(cfg, pretrained_path=str(tmp_path))
