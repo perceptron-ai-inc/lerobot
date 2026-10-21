@@ -1,15 +1,8 @@
 # ruff: noqa
-"""Local HF model definition for the Isaac Qwen3.5-VL flow-matching VLA.
+"""Shared VLA stream shell, vector encoder and flow-matching action expert.
 
-This wraps the native transformers ``Qwen3_5Model`` by composition and adds the
-Isaac proprio encoder plus MolmoAct2 flow-matching action expert. The model
-loads converted HF checkpoints with keys for ``lm_head``, ``model.language_model``,
-``model.visual``, ``model.vector_embedding``, and ``model.action_expert``.
-
-``sample_action(tensor_stream)`` runs the VLM once over a local TensorStream,
-conditions the action expert on pre-action context, and integrates the flow
-expert into a normalized ``[B, H, action_dim]`` chunk. TensorStream, MRoPE, and
-mask utilities are vendored locally for the LeRobot native eval path.
+Native MK1 borrows the stream embedding, mRoPE, training and sampling methods.
+Checkpoint validation and loading live in the native MK1 loader, not this module.
 """
 
 from __future__ import annotations

@@ -82,12 +82,7 @@ def _ensure_vla_feature_contract(
 @PreTrainedConfig.register_subclass("perceptron_isaac")
 @dataclass
 class PerceptronIsaacConfig(PreTrainedConfig):
-    """Config for the Perceptron Isaac flow-matching VLA policy.
-
-    The policy shell remains expert-agnostic. Checkpoint identity selects either
-    the existing Qwen3.5 VLA or the MK1 Qwen3.6 null-MoE backbone; both attach
-    the vector encoder and MolmoAct action expert behind the same policy API.
-    """
+    """Native MK1/Isaac-0.5 policy geometry, rendering, inference and dense-training configuration."""
 
     # --- observation / action geometry ---
     # Released ISAAC checkpoints use either one observation (post3279) or a
@@ -207,12 +202,12 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     training_action_frame_contract_version: int = 2
 
     # --- model / checkpoint paths (filled by the user / launcher) ---
-    hf_model_path: str | None = None  # checkpoint-local Qwen3.5 or MK1 composite HF directory
+    hf_model_path: str | None = None  # native MK1 composite model directory
     # Zero-step packages exercise checkpoint/model plumbing but are never deployable.
     artifact_kind: str = "trained_policy"
     trained_steps: int = 1
-    # Apply the converted Qwen3.5 checkpoint RMSNorm correction at load. MK1 is already
-    # zero-centered and its importer writes false into the packaged policy config.
+    # Serialized legacy flag. Native MK1 packages must declare false: their norms
+    # already use the zero-centered convention; generic Qwen loading is unsupported.
     apply_offset_norm: bool = True
     # Deprecated compatibility fields accepted by older configs. They are not
     # used by the native eval/serving path.
@@ -278,7 +273,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # --- LeRobot-native finetuning ---
     objective: str = "mixed"
     loss_plan: str = "text_ntp_fast_flow_action"
-    train_expert_only: bool = False  # True freezes the VLM + vision, trains only model.action_expert.*
+    train_expert_only: bool = False  # unsupported; rejected rather than silently training densely
     flow_matching_detach_vlm_activations: bool = False  # True = knowledge-insulation (no VLM grad from flow)
     exclude_non_agent_roles: bool = True
     train_samples_per_chunk: int = 8
@@ -295,10 +290,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # same BF16 compute from --accelerator.mixed_precision=bf16. ISAAC keeps numerically
     # sensitive loss reductions in FP32 internally, independently of this compute dtype.
     dtype: torch.dtype | None = torch.bfloat16
-    # Store every *trainable* parameter and its Adam moments in FP32 while computing under BF16
-    # autocast. In expert-only/LoRA training the frozen VLM stays BF16; in dense training every
-    # parameter is trainable and therefore remains FP32. Optimizing the expert directly in BF16
-    # rounds many AdamW updates at the recipe's learning rates.
+    # Keep trainable parameters and Adam moments in FP32 under BF16 autocast.
+    # Direct BF16 parameter updates can round away at the recipe's learning rates.
     train_storage_fp32: bool = True
 
     # Native Isaac processors own normalization, so bypass LeRobot's stock normalizer.

@@ -1,8 +1,9 @@
 # Perceptron ISAAC native runtime (draft)
 
 In-tree `perceptron_isaac` policy and processors for preconverted native MK1
-packages. Runtime loading and training do not need `checkpoint_import.py`;
-the offline producer is not included in this package.
+and Isaac-0.5 packages. The offline checkpoint producer is not included.
+Generic Qwen checkpoint packages, PEFT, expert-only training and FSDP1 training
+are unsupported and fail explicitly. Developer parity artifact tooling is not included.
 
 ## Scoped installation
 
@@ -71,9 +72,14 @@ modules. That proof was on HF base `8c920c4` plus runtime `9c315c1` and CUT
 `ac7c0ec74a19811cc939e99b1fe51bc77437e7e37350936e9d3f30c52f497dd1`,
 not this updated HF base `ae2b57f`.
 
-This draft does not claim current-base multi-GPU qualification, save/reload/move,
-evaluation, convergence or model quality. Keep saving/evaluation/Hub publishing
-disabled until separately qualified. The existing checkpoint vocabulary loader
+Raw/portable-export saving is deferred and fails before gathering weights or writing
+package assets. Source-bound native MK1 saves remain implemented. Focused CPU tests
+cover reduced native save/finalize/moved reload, exact FP32 values and signed zero;
+that is not production-scale checkpoint qualification.
+
+This draft does not claim current-base multi-GPU qualification, production-scale
+save/reload/move, evaluation, convergence or model quality. Keep saving, evaluation
+and Hub publishing disabled for the published raw export. The existing checkpoint vocabulary loader
 sets process-global `QWEN35_VOCAB_PATH`; do not interleave different package
 owners in one process. Instance-bound vocabulary requires a separately reviewed
 public mharmony API change; strict vocabulary authentication is not relaxed here.

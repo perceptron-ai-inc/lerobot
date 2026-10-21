@@ -405,16 +405,7 @@ def _full_shard_state(sharding_strategy: object, mixed_precision: str) -> _StubA
 def test_native_fp32_masters_keep_source_bits_before_fsdp2_shards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The ordering defect: FP32 promotion must not run on the unsharded model.
-
-    Every ``_promote_trainable_parameters_to_fp32`` call site runs before
-    ``accelerator.prepare``, so upcasting there holds the whole model in FP32 on every rank
-    -- 133.1 GiB of host RAM per rank for Isaac-0.5's 35,723,506,864 parameters, against
-    66.5 GiB for the BF16 model it replaces. FSDP FULL_SHARD makes the same masters cost
-    133.1/world_size GiB per rank, so under a live FULL_SHARD topology the parameters must
-    still be BF16 when the optimizer groups are collected; accelerate upcasts each sharded
-    flat parameter afterwards.
-    """
+    """Native F32 parameters preserve source values before FSDP2 shards their storage."""
     from torch.distributed.fsdp import ShardingStrategy
 
     policy_path, config, _ = _native_portable_package(tmp_path)
@@ -446,12 +437,7 @@ def test_native_fp32_masters_keep_source_bits_before_fsdp2_shards(
 def test_fp32_masters_refuse_full_shard_without_accelerate_mixed_precision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Deferring to FSDP is only sound while accelerate still performs the per-shard upcast.
-
-    ``Accelerator.prepare_model`` upcasts each sharded flat parameter to FP32 only when its
-    own mixed precision is on. With it off, deferring would leave BF16 masters while the
-    config claims FP32 storage, so the policy refuses instead of honouring that silently.
-    """
+    """Refuse master-promotion deferral when accelerate mixed precision is disabled."""
     from torch.distributed.fsdp import ShardingStrategy
 
     policy_path, config, _ = _native_portable_package(tmp_path)

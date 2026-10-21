@@ -657,17 +657,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     @classmethod
     @contextmanager
     def _snapshot_save_source(cls, source_root: Path, *, prefix: str):
-        """Snapshot a save source without detaching a raw export package from its root.
+        """Own a source snapshot without detaching raw packages from their export parent.
 
-        A package inside a raw Isaac-0.5 export points at the model with ``hf_model_path=".."``,
-        which only resolves because the package's PARENT is the export. Copying the package
-        alone leaves that parent behind, so ``_resolve_checkpoint_local_paths`` sees a path
-        leaving its root and refuses it. That refusal is correct, which is why the guard is
-        untouched and the snapshot is what changes: snapshotting the export and yielding the
-        package inside it keeps the ".." resolvable without widening what the guard accepts.
-
-        Both weight inventories are left out of the snapshot. The save replaces them, and at
-        this model size copying them would cost more than the whole checkpoint.
+        The raw-layout branch retains the documented parent-relative paths and
+        excludes stale outer weights. Native self-contained sources keep their layout.
         """
         export_root = cls._portable_export_root(source_root)
         if export_root is None:
@@ -781,21 +774,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             raise RuntimeError(f"ISAAC trainable parameters must use FP32 storage; first: {non_fp32[:5]}")
 
     def _defer_fp32_masters_to_the_shard(self, topology: FullShardTopology) -> None:
-        """Leave FP32 master promotion to accelerate's FSDP preparation.
+        """Require FSDP2 mixed precision before deferring promotion to accelerate.
 
-        Accelerate creates the masters itself, gated on its own mixed-precision setting.
-        FSDP2 (``fsdp2_prepare_model``): every trainable parameter that is not already FP32 is
-        upcast on the still-unsharded model, then ``fully_shard`` keeps one shard per rank. A
-        dense F32-storage load (``_loads_native_f32_masters``) is FP32 already, so nothing is
-        copied. Any other load pays the whole FP32 trainable set per rank as a transient in the
-        memory the policy was materialised in -- 133.1 GiB for Isaac-0.5's 35,723,506,864
-        parameters. At rest the masters cost 133.1 / ``world_size`` GiB per rank. FSDP1:
-        ``prepare_model`` upcasts each sharded ``_flat_param`` instead.
-
-        With mixed precision off neither upcast runs and the masters would stay BF16 while
-        this config claims FP32 storage, so that combination is refused rather than silently
-        honoured. ``_verify_fp32_masters_once`` checks the realised master dtype at the first
-        training step.
+        F32 mmap loads need no upcast. Other loads can require a full FP32 host copy
+        per rank before sharding; the first training forward verifies stored masters.
         """
         if topology.fsdp_version != 2:
             raise RuntimeError("Perceptron ISAAC FSDP1 training is unsupported; use FSDP2.")
@@ -810,17 +792,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             )
 
     def _verify_fp32_masters_once(self) -> None:
-        """Assert once, after sharding, that the FSDP masters really are FP32.
+        """Verify every trainable FSDP2 master, including root-owned parameters.
 
-        ``_defer_fp32_masters_to_the_shard`` hands promotion to accelerate, so the FP32 claim
-        can only be checked once the parameters are sharded. It reads the masters the optimizer
-        owns, never ``named_parameters()``: inside a forward those are the BF16 all-gathered
-        compute views. The flag is set only after a passing check, so a failure fails again.
-
-        FSDP2 (upstream LeRobot's sharded path): every trainable parameter must be found in some
-        unit's stored shard, the root unit included, and every one must be FP32; zero coverage
-        or an unowned trainable fails. FSDP1 (accelerate-config launches): each handle's flat
-        parameter, whose ``_fqns`` name the parameters it carries.
+        Stored optimizer shards must be FP32; BF16 all-gathered compute views are
+        not evidence. Mark success only after nonempty, complete coverage passes.
         """
         if self._fp32_masters_verified or not self.config.train_storage_fp32:
             return
@@ -861,16 +836,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         )
 
     def _backbone_materialization_device(self, *, training: bool) -> str:
-        """Device the backbone is built on: host RAM for FSDP2 training, else the run device.
+        """Build FSDP2 training weights on CPU; sharding moves each unit to its GPU.
 
-        Under live FSDP2, ``fully_shard`` moves each unit onto its rank's GPU as it shards it, so
-        the whole unsharded model -- 133.1 GiB of FP32 trainables for Isaac-0.5, more than one
-        80 GB device holds -- is built in host RAM. For a dense F32-storage package those
-        trainables are views of the shard files (``_loads_native_f32_masters``); otherwise
-        accelerate's ``fsdp2_prepare_model`` upcasts each trainable to an FP32 host copy per
-        rank, which the launch must budget. The run device still selects the kernels and the
-        CUDA ABI gate (``load_mk1_vla_from_hf(runtime_device=...)``). FSDP1 upcasts each flat
-        shard after wrapping, so it keeps the run device.
+        The run device still selects kernels and the CUDA ABI gate. Budget host
+        memory for mmap pages or an FP32 upcast copy before sharding.
         """
         if training:
             topology = detect_full_shard_topology()
@@ -879,17 +848,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         return self._resolve_device()
 
     def _loads_native_f32_masters(self, *, training: bool, storage_dtypes: frozenset[str]) -> bool:
-        """Whether the backbone loads its F32 source tensors unconverted, as the FP32 masters.
+        """Admit lossless F32 placement only for dense FP32-storage FSDP2 training.
 
-        Only dense FP32 training under live FSDP2 of an F32-storage package (Isaac-0.5 exports)
-        does, through the loader's lossless training intent. safetensors maps each shard file
-        privately and an F32 -> F32 placement copies nothing, so every parameter stays a view of
-        the file: the node-local ranks share one physical copy of the file pages (kernel page
-        cache, charged to whichever cgroup first faults each page) instead of each holding an
-        anonymous FP32 copy, an in-place write stays private to its process, and accelerate's
-        FSDP2 upcast finds nothing to convert. Every other load keeps BF16: inference,
-        BF16-storage packages, bounded trainable sets (``train_expert_only``, PEFT) and FSDP1,
-        which builds on the run device.
+        Private mmap views preserve source bits, share file pages across local
+        ranks and keep writes process-private. Inference and BF16 sources retain
+        their BF16 load path; unsupported training modes are rejected separately.
         """
         if not (training and self.config.train_storage_fp32) or storage_dtypes != frozenset({"F32"}):
             return False
@@ -1136,15 +1099,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._require_render_asset_prerequisites()
 
     def _require_render_asset_prerequisites(self) -> None:
-        """Reject a renderer whose configured assets are missing, on the first call.
-
-        The settle branch returns a canned idle action without touching the renderer,
-        so a policy configured with an unresolvable render asset would otherwise serve
-        ``num_settle_steps`` plausible-looking actions before the first genuine forward
-        discovered the problem. Every serving entry point runs this method first, so
-        the failure now lands on call #0 while settle behaviour for a correctly
-        configured policy is unchanged.
-        """
+        """Reject missing renderer assets before serving even a canned settle action."""
         fast_processor_path = self.config.fast_processor_path
         if fast_processor_path is None or Path(fast_processor_path).is_dir():
             return
@@ -2197,11 +2152,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         allow_missing_relative: bool = False,
         record_source_root: bool = True,
     ) -> None:
-        """Resolve and validate checkpoint-local sidecars.
+        """Resolve sidecars within their package and retain verified ownership records.
 
-        Public loader hooks may run twice for PEFT: once against the adapter and
-        again against its base. In that path, already-resolved absolute values are
-        intentionally left untouched. Direct package validation stays strict.
+        An already-resolved path is accepted only with its matching record.
+        Raw exports admit only the two documented parent-relative asset paths.
         """
         root = Path(pretrained_name_or_path)
         if not root.is_dir():
