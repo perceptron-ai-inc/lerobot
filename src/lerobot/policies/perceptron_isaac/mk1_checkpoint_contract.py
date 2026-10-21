@@ -13,7 +13,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Never
 
@@ -1342,17 +1342,7 @@ def _parse_vla(
     if not test_geometry and action != Mk1ActionExpertContract(64, 64, 36, 768, 8, 4.0, 256, 256):
         _fail("production MK1 action expert geometry does not match the 36-layer MolmoAct contract")
     if native:
-        action = Mk1ActionExpertContract(
-            action.action_dim,
-            action.action_horizon,
-            action.num_layers,
-            action.hidden_dim,
-            action.num_heads,
-            action.mlp_ratio,
-            action.timestep_embed_dim,
-            action.ffn_multiple_of,
-            metadata,
-        )
+        action = replace(action, native_metadata=metadata)
     return vector, action
 
 
