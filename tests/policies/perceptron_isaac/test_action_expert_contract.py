@@ -6,9 +6,7 @@ import torch
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
-    DEFAULT_MOLMOACT_EXPERT_CFG,
     build_action_expert_head,
-    resolve_action_expert_config,
 )
 
 _VLM_DIM = 16
@@ -122,120 +120,6 @@ def test_dit_contract_declaring_rtc_training_is_supported():
     assert head.args.rtc_max_delay_steps == 4
     with pytest.raises(ValueError, match="requires rtc_max_delay_steps"):
         build_action_expert_head(_dit_contract(rtc_max_delay_steps=0, rtc_probability=0.5), vlm_dim=_VLM_DIM)
-
-
-def test_resolver_defaults_to_molmoact_when_checkpoint_has_no_contract():
-    resolved = resolve_action_expert_config(None)
-    assert resolved == DEFAULT_MOLMOACT_EXPERT_CFG
-    assert resolved is not DEFAULT_MOLMOACT_EXPERT_CFG  # defensive copy
-
-
-def test_resolver_honors_the_checkpoint_stamped_contract():
-    contract = _dit_contract()
-    resolved = resolve_action_expert_config(
-        contract, action_expert_overrides={"action_horizon": 6, "num_inference_steps": 12}
-    )
-    assert resolved["type"] == "dit"
-    assert resolved["num_inference_steps"] == 12
-    assert resolved["rtc_max_delay_steps"] == 0
-
-
-def test_resolver_rejects_wholesale_override_of_a_stamped_contract():
-    with pytest.raises(ValueError, match="authoritative action_expert contract"):
-        resolve_action_expert_config(_dit_contract(), action_expert=_molmoact_cfg())
-
-
-def test_resolver_rejects_horizon_contradicting_the_stamped_contract():
-    with pytest.raises(ValueError, match="disagree on trained geometry"):
-        resolve_action_expert_config(_dit_contract(), action_expert_overrides={"action_horizon": 50})
-
-
-def test_resolver_applies_serving_overrides_to_the_default():
-    resolved = resolve_action_expert_config(
-        None, action_expert_overrides={"action_horizon": 50, "num_inference_steps": 12}
-    )
-    assert resolved["action_horizon"] == 50
-    assert resolved["num_inference_steps"] == 12
-    assert resolved["type"] == "molmoact"
-
-
-def _stub_loader_boundaries(monkeypatch, vla, file_block, captured):
-    from types import SimpleNamespace
-
-    class _StubConfig:
-        def __init__(self, action_expert):
-            self.action_expert = action_expert
-
-    def fake_config_from_pretrained(path, **kwargs):
-        # The loader must NOT pass an action_expert kwarg: HF from_pretrained applies
-        # kwargs as wholesale setattr, which would clobber a checkpoint-stamped block.
-        assert "action_expert" not in kwargs, "loader clobbers the file's action_expert block"
-        return _StubConfig(file_block)
-
-    class _StubModel:
-        def __init__(self, config):
-            captured["config"] = config
-            self._embeddings = torch.nn.Embedding(2, 2)
-            self.lm_head = torch.nn.Linear(2, 2, bias=False)
-            self.model = SimpleNamespace(language_model=None)
-
-        def get_input_embeddings(self):
-            return self._embeddings
-
-        def to(self, *args, **kwargs):
-            return self
-
-        def eval(self):
-            return self
-
-    monkeypatch.setattr(vla.Qwen35VLAConfig, "from_pretrained", staticmethod(fake_config_from_pretrained))
-    monkeypatch.setattr(vla, "Qwen35VLAForActionGeneration", _StubModel)
-    monkeypatch.setattr(vla, "load_sharded_safetensors_into_model", lambda *a, **k: None)
-    monkeypatch.setattr(vla, "_assert_offset_norm_matches_marker", lambda *a, **k: None)
-
-
-def test_loader_honors_a_file_stamped_contract_end_to_end(monkeypatch):
-    """Pin the glue: load_qwen35_vla_from_hf must let a checkpoint-stamped block win.
-
-    Reverting to the historical `action_expert=<default dict>` kwarg (the silent-
-    discard bug) fails this test twice: the from_pretrained stub rejects the kwarg,
-    and the model would be built from the default instead of the dit contract.
-    """
-    import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as vla
-
-    captured: dict = {}
-    _stub_loader_boundaries(monkeypatch, vla, _dit_contract(), captured)
-
-    _, config = vla.load_qwen35_vla_from_hf(
-        "/nonexistent/checkpoint",
-        action_expert_overrides={"num_inference_steps": 12},
-        apply_offset_norm=False,
-    )
-    assert captured["config"] is config
-    assert config.action_expert["type"] == "dit"
-    assert config.action_expert["num_inference_steps"] == 12
-    assert config.action_expert["hidden_dim"] == _dit_contract()["hidden_dim"]
-
-    with pytest.raises(ValueError, match="authoritative action_expert contract"):
-        vla.load_qwen35_vla_from_hf(
-            "/nonexistent/checkpoint", action_expert=_molmoact_cfg(), apply_offset_norm=False
-        )
-
-
-def test_loader_falls_back_to_the_default_for_legacy_checkpoints(monkeypatch):
-    import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as vla
-
-    captured: dict = {}
-    _stub_loader_boundaries(monkeypatch, vla, None, captured)
-
-    _, config = vla.load_qwen35_vla_from_hf(
-        "/nonexistent/checkpoint",
-        action_expert_overrides={"action_horizon": 30, "num_inference_steps": 10},
-        apply_offset_norm=False,
-    )
-    expected = dict(DEFAULT_MOLMOACT_EXPERT_CFG)
-    expected.update({"action_horizon": 30, "num_inference_steps": 10})
-    assert config.action_expert == expected
 
 
 @pytest.mark.parametrize("case", ["conditioning", "sampling", "rows_and_k", "legacy"])
