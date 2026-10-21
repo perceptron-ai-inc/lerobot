@@ -129,12 +129,7 @@ def test_fp32_masters_pass_inside_the_mixed_precision_forward_with_root_and_chil
         assert outcome["error"] is None
         assert outcome["units"] == 2
         assert {"head.weight", "head.bias", "block.lin.weight", "block.lin.bias"} == set(outcome["covered"])
-
-
-def test_the_check_passes_while_the_root_attributes_are_bf16_compute_views(tmp_path):
-    """The pass must come from the FP32 masters: the attributes it would otherwise read are BF16."""
-    for outcome in _run("fp32_masters", tmp_path):
-        assert outcome["error"] is None
+        # Inspect the real masters while root attributes expose BF16 compute views.
         assert outcome["attribute_dtypes"]["head.weight"] == "torch.bfloat16"
         assert outcome["attribute_dtypes"]["head.bias"] == "torch.bfloat16"
 

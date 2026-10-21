@@ -233,6 +233,8 @@ def test_fsdp2_dense_training_holds_the_exact_f32_source_bits(tmp_path, monkeypa
     assert not wrong_dtype, f"trainables not held as F32: {len(wrong_dtype)}, first {wrong_dtype[:3]}"
     unequal = sorted(name for name, param in params.items() if not _same_f32_bits(param, sources[name]))
     assert not unequal, f"trainables differ from their F32 source bits: {len(unequal)}, first {unequal[:3]}"
+    upcast = [name for name, p in policy.named_parameters() if p.requires_grad and p.dtype != torch.float32]
+    assert upcast == [], f"accelerate would copy {len(upcast)} parameters to FP32, first {upcast[:3]}"
 
 
 def test_the_bit_comparison_tells_signed_zeros_apart() -> None:
@@ -357,18 +359,6 @@ def test_the_f32_streaming_primitive_adds_no_anonymous_copy_in_a_fresh_process(t
 
     assert copying["anon_delta"] >= 0.4 * copying["f32_bytes"], f"positive control did not copy: {copying}"
     assert native["anon_delta"] < 0.1 * native["f32_bytes"], f"F32 stream copied: {native}"
-
-
-# --------------------------------------------------------------------------- R4 accelerate upcast
-
-
-def test_accelerate_fsdp2_upcast_has_nothing_to_copy_after_the_load(tmp_path, monkeypatch) -> None:
-    """R4: accelerate 1.15 ``fsdp2_prepare_model`` upcasts ``requires_grad and dtype != float32``."""
-    policy, _, _ = _fsdp2_dense_policy(tmp_path, monkeypatch)
-
-    upcast = [name for name, p in policy.named_parameters() if p.requires_grad and p.dtype != torch.float32]
-
-    assert upcast == [], f"accelerate would copy {len(upcast)} parameters to FP32, first {upcast[:3]}"
 
 
 # --------------------------------------------------------------------------- R5 run-device kernels and ABI
