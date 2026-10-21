@@ -4,6 +4,7 @@ import copy
 import json
 import shutil
 from pathlib import Path
+from typing import NotRequired, TypedDict
 
 import pytest
 import torch
@@ -247,6 +248,36 @@ def _parse_test_config(config: dict | None = None) -> Mk1CheckpointContract:
     )
 
 
+class _AddedToken(TypedDict):
+    content: str
+    id: int
+    special: NotRequired[bool]
+
+
+class _TokenizerPayload(TypedDict):
+    model: dict[str, dict[str, int]]
+    added_tokens: list[_AddedToken]
+
+
+def _tokenizer_payload(
+    *,
+    endoftext_id: int = 1,
+    vision_start_id: int = 2,
+    vision_end_id: int = 3,
+    image_id: int = 4,
+    video_id: int = 5,
+) -> _TokenizerPayload:
+    return {
+        "model": {"vocab": {"!": 0, "<|endoftext|>": endoftext_id}},
+        "added_tokens": [
+            {"content": "<|vision_start|>", "id": vision_start_id, "special": True},
+            {"content": "<|vision_end|>", "id": vision_end_id, "special": True},
+            {"content": "<|image_pad|>", "id": image_id, "special": True},
+            {"content": "<|video_pad|>", "id": video_id, "special": True},
+        ],
+    }
+
+
 def _write_checkpoint(
     root: Path,
     *,
@@ -262,17 +293,7 @@ def _write_checkpoint(
     checkpoint_config = _config(test_geometry=True) if config is None else copy.deepcopy(config)
     (root / "config.json").write_text(json.dumps(checkpoint_config), encoding="utf-8")
     (root / "tokenizer.json").write_text(
-        json.dumps(
-            {
-                "model": {"vocab": {"!": 0, "<|endoftext|>": 1}},
-                "added_tokens": [
-                    {"content": "<|vision_start|>", "id": 2, "special": True},
-                    {"content": "<|vision_end|>", "id": 3, "special": True},
-                    {"content": "<|image_pad|>", "id": 4, "special": True},
-                    {"content": "<|video_pad|>", "id": 5, "special": True},
-                ],
-            }
-        ),
+        json.dumps(_tokenizer_payload()),
         encoding="utf-8",
     )
     contract = _parse_test_config(checkpoint_config)
@@ -450,16 +471,8 @@ def test_coord_disabled_contract_accepts_fast_only_and_rejects_coord_group() -> 
 
 def test_tokenizer_special_ids_and_coordinate_reservation_are_checkpoint_owned(tmp_path: Path) -> None:
     contract = _parse_test_config()
-    added_tokens: list[dict[str, str | int | bool]] = [
-        {"content": "<|vision_start|>", "id": 2, "special": True},
-        {"content": "<|vision_end|>", "id": 3, "special": True},
-        {"content": "<|image_pad|>", "id": 4, "special": True},
-        {"content": "<|video_pad|>", "id": 5, "special": True},
-    ]
-    tokenizer = {
-        "model": {"vocab": {"!": 0, "<|endoftext|>": 1}},
-        "added_tokens": added_tokens,
-    }
+    tokenizer = _tokenizer_payload()
+    added_tokens = tokenizer["added_tokens"]
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
     validate_mk1_tokenizer(tmp_path, contract)
 
@@ -483,16 +496,8 @@ def test_tokenizer_special_ids_and_coordinate_reservation_are_checkpoint_owned(t
 
 def test_coord_disabled_tokenizer_has_no_reserved_coordinate_collision_check(tmp_path: Path) -> None:
     contract = _parse_test_config(_config(test_geometry=True, mtp_present=False, coord_enabled=False))
-    tokenizer = {
-        "model": {"vocab": {"!": 0, "<|endoftext|>": 1}},
-        "added_tokens": [
-            {"content": "<|vision_start|>", "id": 2, "special": True},
-            {"content": "<|vision_end|>", "id": 3, "special": True},
-            {"content": "<|image_pad|>", "id": 4, "special": True},
-            {"content": "<|video_pad|>", "id": 5, "special": True},
-            {"content": "<|ordinary_token|>", "id": 24, "special": False},
-        ],
-    }
+    tokenizer = _tokenizer_payload()
+    tokenizer["added_tokens"].append({"content": "<|ordinary_token|>", "id": 24, "special": False})
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
 
     validate_mk1_tokenizer(tmp_path, contract)
@@ -506,16 +511,10 @@ def test_production_tokenizer_rejects_explicit_ids_in_reserved_fast_range(
     contract = Mk1CheckpointContract.parse_allowlisted(
         _config(test_geometry=False, mtp_present=False, coord_enabled=coord_enabled)
     )
-    tokenizer = {
-        "model": {"vocab": {"!": 0, "<|endoftext|>": 248044}},
-        "added_tokens": [
-            {"content": "<|vision_start|>", "id": 248053, "special": True},
-            {"content": "<|vision_end|>", "id": 248054, "special": True},
-            {"content": "<|image_pad|>", "id": 248056, "special": True},
-            {"content": "<|video_pad|>", "id": 248057, "special": True},
-            {"content": "<|unexpected_fast|>", "id": 249321, "special": False},
-        ],
-    }
+    tokenizer = _tokenizer_payload(
+        endoftext_id=248044, vision_start_id=248053, vision_end_id=248054, image_id=248056, video_id=248057
+    )
+    tokenizer["added_tokens"].append({"content": "<|unexpected_fast|>", "id": 249321, "special": False})
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
 
     with pytest.raises(Mk1CheckpointContractError, match="reserved FAST range"):
