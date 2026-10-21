@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Never
 
+from .checkpoint_integrity import load_json_object
+
 MK1_MODEL_TYPE = "qwen3_5_moe"
 MK1_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
 MK1_ARCHITECTURE = "GenesisQwen3_5MoeForConditionalGeneration"
@@ -1463,21 +1465,10 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if size > _MAX_JSON_FILE_BYTES:
         _fail(f"JSON object {path} exceeds the {_MAX_JSON_FILE_BYTES}-byte safety limit")
 
-    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                _fail(f"duplicate JSON key {key!r} in {path}")
-            result[key] = value
-        return result
-
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates)
-    except Mk1CheckpointContractError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        _fail(f"could not read JSON object {path}: {exc}")
-    return dict(_object(value, str(path)))
+        return load_json_object(path)
+    except ValueError as exc:
+        raise Mk1CheckpointContractError(f"could not read JSON object {path}: {exc}") from exc
 
 
 def _local_file(root: Path, name: str) -> Path:

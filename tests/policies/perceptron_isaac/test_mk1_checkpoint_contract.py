@@ -14,6 +14,7 @@ from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
     Mk1CheckpointContract,
     Mk1CheckpointContractError,
     read_and_validate_safetensors_index,
+    read_mk1_config,
     validate_mk1_checkpoint,
     validate_mk1_tokenizer,
 )
@@ -818,8 +819,33 @@ def test_duplicate_json_keys_are_rejected(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(Mk1CheckpointContractError, match="duplicate JSON key"):
+    with pytest.raises(Mk1CheckpointContractError, match="duplicate.*key"):
         read_and_validate_safetensors_index(model_dir)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b'{"a": 1, "a": 2}', b'{"nested": {"a": 1, "a": 2}}', b"[]", b"{", b"\xff"],
+    ids=["duplicate", "nested-duplicate", "non-object", "malformed-json", "invalid-utf8"],
+)
+def test_config_json_rejects_malformed_objects(tmp_path: Path, payload: bytes) -> None:
+    (tmp_path / "config.json").write_bytes(payload)
+
+    with pytest.raises(Mk1CheckpointContractError, match="config.json"):
+        read_mk1_config(tmp_path)
+
+
+def test_config_json_size_limit_precedes_decoding(tmp_path: Path) -> None:
+    with (tmp_path / "config.json").open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+
+    with pytest.raises(Mk1CheckpointContractError, match="67108864-byte safety limit"):
+        read_mk1_config(tmp_path)
+
+
+def test_config_json_requires_existing_file(tmp_path: Path) -> None:
+    with pytest.raises(Mk1CheckpointContractError, match="required file is missing"):
+        read_mk1_config(tmp_path)
 
 
 def _write_portable_isaac05_checkpoint(
