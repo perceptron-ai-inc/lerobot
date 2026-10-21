@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -99,7 +102,7 @@ def test_joint_plan_places_flow_marker_immediately_before_fast_span():
     assert fast["tags"]["objective_form"] == "FAST"
 
 
-def _footer_rewrite_for(terminal: bool | None) -> bool:
+def _footer_rewrite_for(terminal: bool | None, monkeypatch: pytest.MonkeyPatch) -> bool:
     """Capture the footer decision ``build_training`` hands to the renderer."""
     from lerobot.policies.perceptron_isaac.mharmony_native import IsaacNativeMharmonyRenderer
 
@@ -112,8 +115,8 @@ def _footer_rewrite_for(terminal: bool | None) -> bool:
         captured.update(kwargs)
         return SimpleNamespace(shape=(1, 8))
 
-    renderer._render_plan_to_tensor_stream = fake_render
-    kwargs = {} if terminal is None else {"terminal": terminal}
+    monkeypatch.setattr(renderer, "_render_plan_to_tensor_stream", fake_render)
+    kwargs: dict[str, Any] = {} if terminal is None else {"terminal": terminal}
     renderer.build_training(
         observation_window=[
             {"images": {"image": np.zeros((2, 2, 3), dtype=np.uint8)}, "proprio": np.zeros(2)}
@@ -174,7 +177,7 @@ def test_fast_and_flow_targets_are_clipped_independently():
     assert np.abs(fast_input).max() < 3.0
 
 
-def test_non_terminal_training_chunks_supervise_the_return_footer():
+def test_non_terminal_training_chunks_supervise_the_return_footer(monkeypatch: pytest.MonkeyPatch) -> None:
     """Genesis sets message_stop_token="return" for every chunk short of the terminal step.
 
     ``_action_completion_metadata`` (core/datasets/augment/trajectory.py) attaches the token
@@ -182,12 +185,12 @@ def test_non_terminal_training_chunks_supervise_the_return_footer():
     rendered ``<|end|>`` footer for ``<|return|>``. Genesis's LeRobot-native training builder
     emits a window that never reaches the terminal step, so this is the default.
     """
-    assert _footer_rewrite_for(None) is True
-    assert _footer_rewrite_for(False) is True
+    assert _footer_rewrite_for(None, monkeypatch) is True
+    assert _footer_rewrite_for(False, monkeypatch) is True
 
 
-def test_terminal_training_chunks_keep_the_end_footer():
-    assert _footer_rewrite_for(True) is False
+def test_terminal_training_chunks_keep_the_end_footer(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _footer_rewrite_for(True, monkeypatch) is False
 
 
 def test_joint_plan_exactly_matches_genesis_final_prompt_metadata():
@@ -532,34 +535,40 @@ def test_stream_metadata_preserves_partial_tokens_roles_context_and_mrope() -> N
     assert moved.partial_mask(TextType.text).device.type == "meta"
 
 
-def test_public_mharmony_encoding_loader_caches_equivalent_group_configs(monkeypatch):
-    calls = []
-    sentinel = object()
+@pytest.fixture
+def encoding_load_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[list[tuple[str, list[dict[str, Any]] | None]]]:
+    calls: list[tuple[str, list[dict[str, Any]] | None]] = []
 
     class _FakeMharmony:
         @staticmethod
-        def load_harmony_encoding(name, *, reserved_token_groups):
+        def load_harmony_encoding(name: str, *, reserved_token_groups: list[dict[str, Any]] | None) -> object:
             calls.append((name, reserved_token_groups))
-            return sentinel
+            return object()
 
     mharmony_adapter._load_mharmony_encoding_cached.cache_clear()
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     monkeypatch.setattr(mharmony_adapter, "load_mharmony", lambda: _FakeMharmony)
     try:
-        first = load_mharmony_encoding(
-            "QWEN35_HARMONY",
-            reserved_token_groups=[{"size": 2048, "tokenizer": "physical-intelligence/fast"}],
-        )
-        second = load_mharmony_encoding(
-            "QWEN35_HARMONY",
-            reserved_token_groups=[{"tokenizer": "physical-intelligence/fast", "size": 2048}],
-        )
+        yield calls
     finally:
         mharmony_adapter._load_mharmony_encoding_cached.cache_clear()
 
-    assert first is sentinel
-    assert second is sentinel
-    assert calls == [
+
+def test_public_mharmony_encoding_loader_caches_equivalent_group_configs(
+    encoding_load_calls: list[tuple[str, list[dict[str, Any]] | None]],
+) -> None:
+    first = load_mharmony_encoding(
+        "QWEN35_HARMONY",
+        reserved_token_groups=[{"size": 2048, "tokenizer": "physical-intelligence/fast"}],
+    )
+    second = load_mharmony_encoding(
+        "QWEN35_HARMONY",
+        reserved_token_groups=[{"tokenizer": "physical-intelligence/fast", "size": 2048}],
+    )
+    assert first is second
+    assert encoding_load_calls == [
         (
             "QWEN35_HARMONY",
             [{"size": 2048, "tokenizer": "physical-intelligence/fast"}],
@@ -567,31 +576,20 @@ def test_public_mharmony_encoding_loader_caches_equivalent_group_configs(monkeyp
     ]
 
 
-def test_qwen35_encoding_cache_is_scoped_to_resolved_checkpoint_vocab(tmp_path, monkeypatch):
-    calls = []
-
-    class _FakeMharmony:
-        @staticmethod
-        def load_harmony_encoding(name, *, reserved_token_groups):
-            calls.append((name, reserved_token_groups))
-            return object()
-
+def test_qwen35_encoding_cache_is_scoped_to_resolved_checkpoint_vocab(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    encoding_load_calls: list[tuple[str, list[dict[str, Any]] | None]],
+) -> None:
     first_vocab = tmp_path / "first" / "vocab.json"
     second_vocab = tmp_path / "second" / "vocab.json"
-    mharmony_adapter._load_mharmony_encoding_cached.cache_clear()
-    monkeypatch.setattr(mharmony_adapter, "load_mharmony", lambda: _FakeMharmony)
-    try:
-        monkeypatch.setenv("QWEN35_VOCAB_PATH", str(first_vocab.parent / ".." / "first/vocab.json"))
-        first = load_mharmony_encoding("QWEN35_HARMONY")
-        assert load_mharmony_encoding("QWEN35_HARMONY") is first
-
-        monkeypatch.setenv("QWEN35_VOCAB_PATH", str(second_vocab))
-        second = load_mharmony_encoding("QWEN35_HARMONY")
-    finally:
-        mharmony_adapter._load_mharmony_encoding_cached.cache_clear()
-
+    monkeypatch.setenv("QWEN35_VOCAB_PATH", str(first_vocab.parent / ".." / "first/vocab.json"))
+    first = load_mharmony_encoding("QWEN35_HARMONY")
+    assert load_mharmony_encoding("QWEN35_HARMONY") is first
+    monkeypatch.setenv("QWEN35_VOCAB_PATH", str(second_vocab))
+    second = load_mharmony_encoding("QWEN35_HARMONY")
     assert second is not first
-    assert calls == [("QWEN35_HARMONY", None), ("QWEN35_HARMONY", None)]
+    assert encoding_load_calls == [("QWEN35_HARMONY", None), ("QWEN35_HARMONY", None)]
 
 
 def test_public_mharmony_version_must_match_the_pinned_distribution(monkeypatch):
