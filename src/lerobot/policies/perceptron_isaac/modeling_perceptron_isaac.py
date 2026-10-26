@@ -1488,7 +1488,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         strict: bool = False,
         **kwargs,
     ) -> T:
-        """Load a local or Hub-hosted LeRobot checkpoint and its checkpoint-local assets."""
+        """Load native checkpoint-local weights and assets; outer-root weights are unsupported."""
         if config is None:
             from lerobot.configs import PreTrainedConfig
 
@@ -1511,11 +1511,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             local_files_only=local_files_only,
             revision=revision,
         )
+        if any(cls._is_checkpoint_weight_name(path.name) for path in checkpoint_root.iterdir()):
+            raise RuntimeError(
+                "Outer-root model weights are unsupported; use native checkpoint-local hf_model weights."
+            )
         cls._resolve_checkpoint_local_paths(config, checkpoint_root)
         cls._verify_packaged_contract_digests(config, checkpoint_root)
         cls._set_checkpoint_local_vocab_path(config)
         policy = cls(config)
-        cls._maybe_load_finetuned_weights(policy, checkpoint_root, strict=strict)
         policy.eval()
         return policy
 
@@ -2179,72 +2182,3 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             vocab = Path(str(hf_model_path)) / "vocab.json"
             if vocab.is_file():
                 os.environ["QWEN35_VOCAB_PATH"] = str(vocab)
-
-    @staticmethod
-    def _maybe_load_finetuned_weights(
-        policy: PerceptronIsaacPolicy,
-        pretrained_name_or_path: str | Path,
-        *,
-        strict: bool = False,
-    ) -> None:
-        """Load LeRobot-saved finetuned policy weights when present."""
-        import logging
-
-        from safetensors.torch import load_file
-
-        from .qwen35_checkpoint import safetensors_checkpoint_layout
-
-        p = Path(pretrained_name_or_path)
-        if not p.is_dir():
-            return
-        if not any(
-            (
-                (p / "model.safetensors").is_file(),
-                (p / "model.safetensors.index.json").is_file(),
-                any(p.glob("model-*.safetensors")),
-            )
-        ):
-            # Imported packages carry no LeRobot-saved weights. Materializing the backbone
-            # here would pin eval dtype (bf16); leave it unloaded so a later training load
-            # honors train_storage_fp32.
-            return
-        if not (p / "model.safetensors.index.json").is_file() and any(p.glob("model-*.safetensors")):
-            raise RuntimeError("Outer sharded weights require model.safetensors.index.json.")
-        try:
-            shards, indexed_keys = safetensors_checkpoint_layout(p)
-        except (FileNotFoundError, ValueError) as exc:
-            raise RuntimeError(
-                f"Outer weight inventory contains unreferenced or missing files: {exc}"
-            ) from exc
-        state: dict[str, Tensor] = {}
-        for shard in shards:
-            shard_state = load_file(str(shard))
-            if indexed_keys is not None:
-                expected_keys = indexed_keys[shard.name]
-                actual_keys = set(shard_state)
-                if actual_keys != expected_keys:
-                    raise RuntimeError(
-                        f"Outer weight shard {shard.name} disagrees with its index: "
-                        f"missing={sorted(expected_keys - actual_keys)}, "
-                        f"unindexed={sorted(actual_keys - expected_keys)}."
-                    )
-            duplicate_keys = set(state).intersection(shard_state)
-            if duplicate_keys:
-                raise RuntimeError(
-                    f"Outer weight shards contain duplicate tensors: {sorted(duplicate_keys)}."
-                )
-            state.update(shard_state)
-        if policy._isaac_model is None:
-            policy._load_backbone(training=not policy._config_declares_mk1(policy.config))
-        overlap = set(policy.state_dict()).intersection(state)
-        if not overlap:
-            raise RuntimeError(
-                "perceptron_isaac.from_pretrained found finetuned weights but no keys matched the policy."
-            )
-        missing, unexpected = policy.load_state_dict(state, strict=strict)
-        logging.getLogger(__name__).info(
-            "perceptron_isaac.from_pretrained: loaded finetuned weights (%d tensors; missing=%d unexpected=%d)",
-            len(state),
-            len(missing),
-            len(unexpected),
-        )

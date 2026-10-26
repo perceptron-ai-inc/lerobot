@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
 import logging
 import shutil
@@ -2496,44 +2495,20 @@ def test_checkpoint_local_model_directory_rejects_symlink_escape(tmp_path):
         PerceptronIsaacPolicy._resolve_checkpoint_local_paths(cfg, tmp_path)
 
 
-def test_from_pretrained_resolves_hub_snapshot_and_loads_weights(tmp_path, monkeypatch):
-    from safetensors.torch import save_file
+def test_from_pretrained_resolves_hub_snapshot_and_loads_native_inner_weights(tmp_path, monkeypatch):
+    from tests.policies.perceptron_isaac.test_portable_model_repo import _native_portable_package
 
-    snapshot = tmp_path / "snapshot"
-    snapshot.mkdir()
-    (snapshot / "hf_model").mkdir()
-    (snapshot / "stats.json").write_text("{}")
-    adapter = snapshot / "isaac_deployment_adapter.json"
-    adapter.write_text("{}")
-    save_file({"_isaac_model.weight": torch.full((1, 1), 7.0)}, snapshot / "model.safetensors")
-
+    snapshot, config, source_value = _native_portable_package(tmp_path)
     snapshot_calls = []
 
     def _snapshot_download(**kwargs):
         snapshot_calls.append(kwargs)
         return str(snapshot)
 
-    def _load_backbone(policy, *, training=False):
-        # A dense finetune resume must materialize FP32 trainable storage before
-        # applying the saved outer state; BF16-first loading loses master-weight bits.
-        assert training is True
-        policy._isaac_model = torch.nn.Linear(1, 1, bias=False)
-
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
-    monkeypatch.setattr(PerceptronIsaacPolicy, "_load_backbone", _load_backbone)
-    monkeypatch.setattr(PerceptronIsaacPolicy, "_verify_packaged_contract_digests", lambda *_args: None)
-
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        hf_model_path="hf_model",
-        native_stats_path="stats.json",
-        deployment_adapter_sha256=hashlib.sha256(adapter.read_bytes()).hexdigest(),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
     policy = PerceptronIsaacPolicy.from_pretrained(
         "perceptron/example",
-        config=cfg,
+        config=config,
         revision="test-revision",
         local_files_only=True,
     )
@@ -2548,9 +2523,12 @@ def test_from_pretrained_resolves_hub_snapshot_and_loads_weights(tmp_path, monke
             "local_files_only": True,
         }
     ]
-    assert cfg.hf_model_path == str(snapshot / "hf_model")
-    assert cfg.native_stats_path == str(snapshot / "stats.json")
-    torch.testing.assert_close(policy._isaac_model.weight, torch.full((1, 1), 7.0))
+    assert config.hf_model_path == str(snapshot.parent)
+    assert policy._isaac_model is not None
+    assert all(
+        torch.equal(parameter, source_value.bfloat16().expand_as(parameter))
+        for parameter in policy._isaac_model.parameters()
+    )
 
 
 def test_deprecated_bridge_config_fields_are_ignored_and_stats_promoted():

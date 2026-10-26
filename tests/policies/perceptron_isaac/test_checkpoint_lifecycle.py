@@ -168,6 +168,7 @@ def test_dense_save_is_self_contained_after_move_and_preserves_fp32_trainables(m
     with torch.no_grad():
         policy._isaac_model.lm_head.weight.fill_(1.2500001192092896)
         policy._isaac_model.model.vector_embedding[0].weight.fill_(-0.0)
+    expected_state = {name: tensor.clone() for name, tensor in policy._isaac_model.state_dict().items()}
 
     saved = tmp_path / "saved"
     policy.save_pretrained(saved)
@@ -221,6 +222,15 @@ def test_dense_save_is_self_contained_after_move_and_preserves_fp32_trainables(m
     expected = torch.full_like(reloaded._isaac_model.lm_head.weight, 1.2500001192092896)
     torch.testing.assert_close(reloaded._isaac_model.lm_head.weight, expected, rtol=0, atol=0)
     assert torch.signbit(reloaded._isaac_model.model.vector_embedding[0].weight).all()
+    actual_state = reloaded._isaac_model.state_dict()
+    assert actual_state.keys() == expected_state.keys()
+    for name, expected_tensor in expected_state.items():
+        actual_tensor = actual_state[name]
+        assert actual_tensor.dtype == expected_tensor.dtype
+        assert actual_tensor.shape == expected_tensor.shape
+        assert torch.equal(
+            actual_tensor.contiguous().view(torch.uint8), expected_tensor.contiguous().view(torch.uint8)
+        )
 
 
 def test_verified_runtime_sidecars_survive_source_mutation_without_weight_snapshot(tmp_path) -> None:
@@ -345,33 +355,35 @@ def test_native_vocab_replaces_prior_env_with_retained_snapshot(monkeypatch, tmp
     assert vocab_path.read_text() == '{"owner": "verified"}\n'
 
 
-def test_outer_sharded_weights_are_loaded_only_from_the_index(tmp_path) -> None:
-    policy = PerceptronIsaacPolicy(_config())
-    policy._isaac_model = torch.nn.Linear(2, 1)
+@pytest.mark.parametrize("layout", ["single", "sharded", "unindexed_shard", "index_only"])
+@pytest.mark.parametrize("has_inner_model", [False, True])
+def test_public_load_rejects_unsupported_outer_weights(tmp_path, layout, has_inner_model) -> None:
+    from tests.policies.perceptron_isaac.test_portable_model_repo import _native_portable_package
+
+    root, config, _ = _native_portable_package(tmp_path)
+    if not has_inner_model:
+        config.hf_model_path = None
+    config.save_pretrained(root)
     first = "model-00001-of-00002.safetensors"
     second = "model-00002-of-00002.safetensors"
-    save_file({"_isaac_model.weight": torch.full((1, 2), 3.0)}, tmp_path / first)
-    save_file({"_isaac_model.bias": torch.tensor([4.0])}, tmp_path / second)
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": 12},
-                "weight_map": {
-                    "_isaac_model.weight": first,
-                    "_isaac_model.bias": second,
-                },
-            }
+    if layout == "single":
+        save_file({"_isaac_model.weight": torch.full((1, 2), 3.0)}, root / "model.safetensors")
+    elif layout != "index_only":
+        save_file({"_isaac_model.weight": torch.full((1, 2), 3.0)}, root / first)
+        if layout == "sharded":
+            save_file({"_isaac_model.bias": torch.tensor([4.0])}, root / second)
+    if layout in {"sharded", "index_only"}:
+        (root / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {"total_size": 12},
+                    "weight_map": {"_isaac_model.weight": first, "_isaac_model.bias": second},
+                }
+            )
         )
-    )
 
-    PerceptronIsaacPolicy._maybe_load_finetuned_weights(policy, tmp_path, strict=True)
-
-    torch.testing.assert_close(policy._isaac_model.weight, torch.full((1, 2), 3.0))
-    torch.testing.assert_close(policy._isaac_model.bias, torch.tensor([4.0]))
-
-    save_file({"_isaac_model.weight": torch.zeros(1, 2)}, tmp_path / "model-00003-of-00003.safetensors")
-    with pytest.raises(RuntimeError, match="unreferenced"):
-        PerceptronIsaacPolicy._maybe_load_finetuned_weights(policy, tmp_path, strict=True)
+    with pytest.raises(RuntimeError, match="Outer.*unsupported.*hf_model"):
+        PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
 
 
 def test_original_package_processors_bind_retained_instance(tmp_path) -> None:
