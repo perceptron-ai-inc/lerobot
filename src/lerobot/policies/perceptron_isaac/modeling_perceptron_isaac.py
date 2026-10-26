@@ -376,9 +376,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         Collective when the policy is FSDP2-sharded, exactly like the base implementation: every
         rank must call it, the full state dict is gathered onto the main rank, and only the main
-        rank writes. The package is finalized before returning so a standalone save is complete;
-        a checkpoint writer that adds sidecars afterwards finalizes it again through
-        ``finalize_pretrained_package``.
+        rank writes. This method writes artifacts only; ``save_pretrained`` finalizes standalone
+        packages, while checkpoint writers defer finalization until their sidecars are saved.
         """
         from lerobot.distributed.checkpoint import full_model_state_dict
         from lerobot.distributed.utils import is_main_process
@@ -405,7 +404,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self.config._save_pretrained(save_directory)
         self._save_canonical_inner_weights(save_directory, state_dict)
         self._canonical_inner_save_root = str(save_directory.resolve())
-        self.finalize_pretrained_package(save_directory)
 
     def _local_checkpoint_source_root(self) -> Path | None:
         source_value = getattr(self.config, "_checkpoint_source_root", None)

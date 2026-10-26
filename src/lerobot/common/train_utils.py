@@ -265,7 +265,7 @@ def save_checkpoint(
     elif fmt.wants_safetensors or not sharded:
         # Collective when sharded (full gather); writes happen on the main process only in all
         # multi-rank layouts (the gate lives inside _save_pretrained, next to its collective gather).
-        policy_to_save.save_pretrained(pretrained_dir)
+        policy_to_save.save_pretrained(pretrained_dir, finalize_package=False)
     if fmt.wants_dcp and sharded:
         save_sharded_model(accelerator, policy_to_save, pretrained_dir)
 
