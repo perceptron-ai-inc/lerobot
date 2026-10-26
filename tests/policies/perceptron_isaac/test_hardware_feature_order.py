@@ -93,6 +93,13 @@ def hardware_dataset(config: PerceptronIsaacConfig) -> SimpleNamespace:
     return SimpleNamespace(features=features, stats={}, fps=30.0)
 
 
+@pytest.fixture
+def isaac_policy_dependencies() -> None:
+    """Gate constructor-backed cases, not validation that precedes construction."""
+    pytest.importorskip("transformers", reason="install lerobot[perceptron_isaac]")
+    pytest.importorskip("mharmony", reason="install lerobot[perceptron_isaac]")
+
+
 @pytest.mark.parametrize("robot_type", ["so100_so101", "bi_yam"])
 @pytest.mark.parametrize("feature", ["action", "observation.state"])
 @pytest.mark.parametrize("caller", ["policy", "fresh_processors", "restored_processors"])
@@ -115,6 +122,7 @@ def test_strict_hardware_rejects_permuted_dataset_joints(robot_type, feature, ca
 
 
 @pytest.mark.parametrize("semantic_aliases", [False, True])
+@pytest.mark.usefixtures("isaac_policy_dependencies")
 def test_strict_so100_accepts_ordered_hardware_names_and_approved_aliases(semantic_aliases) -> None:
     config = hardware_config("so100_so101")
     dataset = hardware_dataset(config)

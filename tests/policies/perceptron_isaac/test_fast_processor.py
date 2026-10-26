@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 import pytest
+
+if TYPE_CHECKING:
+    from lerobot.policies.perceptron_isaac.fast_processor import NativeFastActionProcessor
 
 from lerobot.policies.perceptron_isaac.fast_processor import (
     DEFAULT_FAST_PROCESSOR_TREE_SHA256,
@@ -90,10 +96,11 @@ def test_reviewed_fast_tree_identity_is_immutable():
 
 
 @pytest.fixture
-def tiny_fast_artifact(tmp_path, monkeypatch):
+def tiny_fast_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
     """Generate BPE DATA directly; never fit or execute artifact Python."""
     import json
 
+    pytest.importorskip("tokenizers", reason="install lerobot[perceptron_isaac]")
     from tokenizers import Tokenizer, decoders, models
 
     from lerobot.policies.perceptron_isaac import fast_processor as fast
@@ -144,11 +151,11 @@ def tiny_fast_artifact(tmp_path, monkeypatch):
     return root, digest
 
 
-def test_fast_processor_never_executes_checkpoint_python(tiny_fast_artifact):
-    from lerobot.policies.perceptron_isaac.fast_processor import load_fast_action_processor
-
-    root, digest = tiny_fast_artifact
-    processor = load_fast_action_processor(root, expected_tree_sha256=digest)
+def test_fast_processor_never_executes_checkpoint_python(
+    tiny_fast_artifact: tuple[Path, str], loaded_native_fast: NativeFastActionProcessor
+) -> None:
+    root, _ = tiny_fast_artifact
+    processor = loaded_native_fast
     assert type(processor).__module__ == "lerobot.policies.perceptron_isaac.fast_processor"
     assert processor.bpe_tokenizer.clean_up_tokenization_spaces is True
     assert processor.bpe_tokenizer.model_max_length == 512
@@ -156,11 +163,19 @@ def test_fast_processor_never_executes_checkpoint_python(tiny_fast_artifact):
 
 
 @pytest.fixture
-def native_fast(tiny_fast_artifact):
+def loaded_native_fast(tiny_fast_artifact: tuple[Path, str]) -> NativeFastActionProcessor:
+    pytest.importorskip("transformers", reason="install lerobot[perceptron_isaac]")
     from lerobot.policies.perceptron_isaac.fast_processor import load_fast_action_processor
 
     root, digest = tiny_fast_artifact
     return load_fast_action_processor(root, expected_tree_sha256=digest)
+
+
+@pytest.fixture
+def native_fast(loaded_native_fast: NativeFastActionProcessor) -> NativeFastActionProcessor:
+    # Only encode/decode needs SciPy; artifact integrity and loading do not.
+    pytest.importorskip("scipy.fft", reason="install lerobot[perceptron_isaac]")
+    return loaded_native_fast
 
 
 def test_fast_processor_analytic_dct_bpe_and_inverse(native_fast):

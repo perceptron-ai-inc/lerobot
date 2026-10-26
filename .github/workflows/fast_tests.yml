@@ -133,6 +133,28 @@ jobs:
       - name: "Tier 5 — Install: Isaac"
         run: uv sync --locked --extra test --extra dataset --extra training --extra perceptron_isaac
 
+      - name: "Tier 5 — Verify: Isaac dependencies"
+        run: |
+          uv run --no-sync python - <<'PY'
+          from importlib.metadata import version
+
+          import mharmony
+          import scipy.fft
+          import tokenizers
+          import transformers
+          from packaging.version import Version
+          from transformers import PreTrainedTokenizerFast
+
+          from lerobot.policies.perceptron_isaac.mharmony_adapter import SUPPORTED_MHARMONY_VERSION
+
+          assert version("mharmony") == SUPPORTED_MHARMONY_VERSION, version("mharmony")
+          assert transformers.__version__ == "5.5.4", transformers.__version__
+          assert Version("1.14.0") <= Version(version("scipy")) < Version("2.0.0")
+          for module in (transformers, tokenizers, scipy, mharmony):
+              print(f"{module.__name__}=={version(module.__name__)}")
+          print(f"FAST tokenizer API ready: {PreTrainedTokenizerFast.__name__}")
+          PY
+
       - name: "Tier 5 — Test: Isaac CPU contracts"
         env:
           CUDA_VISIBLE_DEVICES: ""
