@@ -10,7 +10,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -206,9 +206,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # Zero-step packages exercise checkpoint/model plumbing but are never deployable.
     artifact_kind: str = "trained_policy"
     trained_steps: int = 1
-    # Serialized legacy flag. Native MK1 packages must declare false: their norms
-    # already use the zero-centered convention; generic Qwen loading is unsupported.
-    apply_offset_norm: bool = True
+    # Read existing native configs that serialized false; native norms need no conversion.
+    apply_offset_norm: Literal[False] = False
     # Deprecated compatibility fields accepted by older configs. They are not
     # used by the native eval/serving path.
     config_toml_path: str | None = None
@@ -316,6 +315,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.apply_offset_norm is not False:
+            raise ValueError("Native MK1 checkpoints forbid apply_offset_norm=True.")
         if self.use_peft or self.train_expert_only:
             raise ValueError(
                 "Perceptron ISAAC supports only dense training; PEFT and expert-only training are unsupported."
@@ -594,7 +595,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         """
         overrides: dict[str, object] = {}
         for name in (
-            "apply_offset_norm",
             "mk1_model_import_sha256",
             "mk1_source_model_import_sha256",
         ):
@@ -707,7 +707,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                 "gripper_binary_to_signed": False,
                 "num_settle_steps": 0,
                 "normalize_task_text": False,
-                "apply_offset_norm": False,
                 "target_fps": 30.0,
             }
             self._require_platform_values("BimanualYAM", expected)
@@ -738,7 +737,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                 "clip_action_pose": False,
                 "gripper_binary_to_signed": False,
                 "num_settle_steps": 0,
-                "apply_offset_norm": False,
                 "target_fps": 30.0,
                 "joint_signs": [1.0, -1.0, 1.0, 1.0, 1.0, 1.0],
                 "joint_offsets": [0.0, 90.0, 90.0, 0.0, 0.0, 0.0],
@@ -766,7 +764,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                 # env's free in-reset `num_steps_wait` is the right settling lever, not idle
                 # frames charged to the episode budget.
                 "normalize_task_text": True,
-                "apply_offset_norm": False,
                 "joint_signs": None,
                 "joint_offsets": None,
                 "target_fps": 20.0,

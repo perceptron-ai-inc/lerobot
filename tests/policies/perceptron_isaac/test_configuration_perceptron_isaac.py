@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 import pytest
+from draccus.utils import DecodingError
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.configs.policies import PreTrainedConfig
@@ -22,6 +23,35 @@ def test_image_preprocessing_defaults_to_legacy_stretch() -> None:
 
 def test_mharmony_version_defaults_to_supported_public_release() -> None:
     assert PerceptronIsaacConfig().mharmony_version == SUPPORTED_MHARMONY_VERSION
+
+
+def test_native_config_reads_saved_false_offset_norm(tmp_path) -> None:
+    PerceptronIsaacConfig(device="cpu").save_pretrained(tmp_path)
+    config_path = tmp_path / "config.json"
+    payload = json.loads(config_path.read_text())
+    payload["apply_offset_norm"] = False
+    config_path.write_text(json.dumps(payload))
+
+    loaded = PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
+    loaded.save_pretrained(tmp_path)
+
+    assert json.loads(config_path.read_text()).get("apply_offset_norm", False) is False
+
+
+def test_native_config_rejects_true_offset_norm_at_construction() -> None:
+    with pytest.raises(ValueError, match="apply_offset_norm"):
+        PerceptronIsaacConfig(device="cpu", apply_offset_norm=True)
+
+
+def test_native_config_rejects_saved_true_offset_norm(tmp_path) -> None:
+    PerceptronIsaacConfig(device="cpu").save_pretrained(tmp_path)
+    config_path = tmp_path / "config.json"
+    payload = json.loads(config_path.read_text())
+    payload["apply_offset_norm"] = True
+    config_path.write_text(json.dumps(payload))
+
+    with pytest.raises((ValueError, DecodingError), match="apply_offset_norm"):
+        PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
 
 
 def test_legacy_mharmony_marker_is_explicitly_upgraded() -> None:

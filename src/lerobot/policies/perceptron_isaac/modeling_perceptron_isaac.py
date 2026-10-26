@@ -397,7 +397,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             raise RuntimeError("Perceptron ISAAC dense saves require a loaded checkpoint package.")
         with self._verified_checkpoint_source(source_root) as verified_source:
             self._copy_checkpoint_package(verified_source, save_directory)
-        self.config._export_apply_offset_norm = False
         if self._config_declares_mk1(self.config):
             self.config._export_mk1_source_model_import_sha256 = (
                 self.config.mk1_model_import_sha256 or self.config.mk1_source_model_import_sha256
@@ -944,8 +943,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 "ISAAC policy chunk_size exceeds the checkpoint maximum: "
                 f"policy={self.config.chunk_size}, checkpoint={contract.action_expert.action_horizon}."
             )
-        if bool(getattr(self.config, "apply_offset_norm", False)):
-            raise RuntimeError("MK1 checkpoints forbid the legacy apply_offset_norm conversion.")
         try:
             render_metadata = load_native_render_metadata(self.config)
             contract.validate_coord_reserved_token_groups(render_metadata.mharmony_reserved_token_groups)

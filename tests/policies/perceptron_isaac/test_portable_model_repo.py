@@ -87,6 +87,24 @@ def _forbid_checkpoint_code(*args: object, **kwargs: object) -> None:
     raise AssertionError("FORBIDDEN_AUTOCLASS_BOUNDARY: checkpoint code must not execute")
 
 
+def test_native_policy_loads_with_default_offset_norm(tmp_path: Path) -> None:
+    policy_path, config, source_value = _native_portable_package(tmp_path)
+    config.save_pretrained(policy_path)
+    config_path = policy_path / "config.json"
+    payload = json.loads(config_path.read_text())
+    # Exercise the schema default, not the fixture's explicit legacy false value.
+    payload.pop("apply_offset_norm", None)
+    config_path.write_text(json.dumps(payload))
+
+    policy = PerceptronIsaacPolicy.from_pretrained(policy_path, local_files_only=True)
+
+    assert policy._isaac_model is not None
+    assert all(
+        torch.equal(parameter, source_value.bfloat16().expand_as(parameter))
+        for parameter in policy._isaac_model.parameters()
+    )
+
+
 def test_policy_loads_portable_repo_through_native_mk1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
