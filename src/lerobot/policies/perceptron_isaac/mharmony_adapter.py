@@ -353,7 +353,9 @@ def _pixel_shuffle_scale(rendered: Mapping[str, Any]) -> int:
     image_config = config.get("image") or {}
     if not isinstance(image_config, Mapping):
         raise ValueError("mharmony RenderedStream image config must be a mapping.")
-    raw_scale = image_config.get("pixel_shuffle_scale") or 1
+    raw_scale = image_config.get("pixel_shuffle_scale")
+    if raw_scale is None:
+        raw_scale = 1
     if isinstance(raw_scale, bool):
         raise ValueError("mharmony pixel_shuffle_scale must be a positive integer.")
     scale = int(raw_scale)
