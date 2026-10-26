@@ -526,7 +526,7 @@ def test_factory_restoration_keeps_checkpoint_stats_over_destination_metadata(
     loaded_pre, loaded_post = make_pre_post_processors(
         config,
         pretrained_path=str(source),
-        dataset_meta=SimpleNamespace(fps=20, stats=destination_stats),
+        dataset_meta=SimpleNamespace(fps=20, stats=destination_stats, features={}),
     )
     pack = next(s for s in loaded_pre.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
     assert pack.native_stats_path == config.native_stats_path

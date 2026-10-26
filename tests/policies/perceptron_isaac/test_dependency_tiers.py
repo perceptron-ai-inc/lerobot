@@ -39,10 +39,10 @@ import pytest
             ("transformers", "peft"),
             (),
             20,
-            2,
+            4,
             id="hardware-no-transformers",
         ),
-        pytest.param("test_hardware_feature_order.py", ("mharmony",), (), 20, 2, id="hardware-no-mharmony"),
+        pytest.param("test_hardware_feature_order.py", ("mharmony",), (), 20, 4, id="hardware-no-mharmony"),
     ],
 )
 def test_missing_extra_preserves_dependency_free_cases(

@@ -11,7 +11,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
 import torch
@@ -73,6 +73,9 @@ from .processor_utils import (
     to_numpy as _to_numpy,
 )
 
+if TYPE_CHECKING:
+    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+
 PERCEPTRON_ISAAC_STREAM_KEY = "perceptron_isaac_stream"
 PERCEPTRON_ISAAC_RENDER_META_KEY = "perceptron_isaac_render_meta"
 PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY = "perceptron_isaac_anchor_timestamp_seconds"
@@ -104,27 +107,16 @@ _PACK_CONFIG_METADATA = {"pack_config": True}
 _LIST_CONFIG_FIELD_NAMES = frozenset({"camera_order", "image_size", "image_keys"})
 
 
-def _adopt_dataset_state_feature_names(config: PerceptronIsaacConfig, dataset_meta: Any | None) -> None:
-    """Validate strict joint order or capture non-strict state names for gripper masks."""
-    if dataset_meta is None:
+def _adopt_dataset_state_feature_names(
+    config: PerceptronIsaacConfig, dataset_meta: "LeRobotDatasetMetadata | None"
+) -> None:
+    """Capture non-strict state names for masks; make_policy validates strict joint order."""
+    if dataset_meta is None or config.strict_hardware_feature_contract:
         return
-    features = getattr(dataset_meta, "features", None)
-    if not isinstance(features, dict):
-        if config.strict_hardware_feature_contract:
-            config.set_dataset_feature_metadata({})
-        return
-    config.set_dataset_feature_metadata(features)
-    if config.strict_hardware_feature_contract:
-        return
-    state_feature = features.get(OBS_STATE)
+    state_feature = dataset_meta.features.get(OBS_STATE)
     if state_feature is None:
         return
-    raw_names = (
-        state_feature.get("names")
-        if isinstance(state_feature, dict)
-        else getattr(state_feature, "names", None)
-    )
-    names = flatten_feature_names(raw_names, empty_as_none=True)
+    names = flatten_feature_names(state_feature.get("names"), empty_as_none=True)
     if names is None:
         return
     if len(names) != int(config.proprio_dim):
@@ -1498,7 +1490,7 @@ class PerceptronIsaacActionFrameTransformStep(_PerceptronIsaacJointFrameTransfor
 def make_perceptron_isaac_pre_post_processors(
     config: PerceptronIsaacConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-    dataset_meta: Any | None = None,
+    dataset_meta: "LeRobotDatasetMetadata | None" = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -1521,7 +1513,7 @@ def make_perceptron_isaac_pre_post_processors(
         suite_stats_path=config.suite_stats_path,
         suite_by_task_index_path=config.suite_by_task_index_path,
     )
-    declared_fps = getattr(dataset_meta, "fps", None)
+    declared_fps = dataset_meta.fps if dataset_meta is not None else None
     if declared_fps is not None:
         # Hand the anchor derivation the training dataset's declared clock so a genuine
         # rate mismatch with the checkpoint's target_fps fails loudly instead of silently
@@ -1582,9 +1574,7 @@ def make_perceptron_isaac_pre_post_processors(
         _install_dataset_stats(
             preprocessor,
             postprocessor,
-            _dataset_stats_to_isaac_stats(
-                dataset_stats, config, dataset_fps=getattr(dataset_meta, "fps", None)
-            ),
+            _dataset_stats_to_isaac_stats(dataset_stats, config, dataset_fps=declared_fps),
         )
     _record_config_stats_export(config, preprocessor)
     return preprocessor, postprocessor
@@ -1825,7 +1815,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     *,
     revision: str | None = None,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-    dataset_meta: Any | None = None,
+    dataset_meta: "LeRobotDatasetMetadata | None" = None,
     preprocessor_overrides: dict[str, Any] | None = None,
     postprocessor_overrides: dict[str, Any] | None = None,
     preprocessor_config_filename: str = f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
@@ -1929,7 +1919,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
             )
             step.render_metadata = metadata.to_json_dict()
             step._stream_builder = None
-    declared_fps = getattr(dataset_meta, "fps", None)
+    declared_fps = dataset_meta.fps if dataset_meta is not None else None
     for step in preprocessor.steps:
         if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep):
             step.device = str(config.device)
@@ -1967,9 +1957,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
         _install_dataset_stats(
             preprocessor,
             postprocessor,
-            _dataset_stats_to_isaac_stats(
-                dataset_stats, config, dataset_fps=getattr(dataset_meta, "fps", None)
-            ),
+            _dataset_stats_to_isaac_stats(dataset_stats, config, dataset_fps=declared_fps),
         )
     elif dataset_meta is None:
         # Serving/eval load: the package must not be split-brained between its

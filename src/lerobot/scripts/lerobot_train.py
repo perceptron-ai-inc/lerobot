@@ -673,12 +673,11 @@ def train(cfg: TrainPipelineConfig) -> None:
         # Language fine-tuning must use the active recipe, not the saved processor recipe.
         processor_pretrained_path = None
 
-    processor_kwargs = ProcessorConfigKwargs()
+    # Metadata supplies feature names and the declared frame clock, including on resume.
+    processor_kwargs = ProcessorConfigKwargs(dataset_meta=dataset.meta)
     processor_dataset_stats = rename_stats(dataset.meta.stats, cfg.rename_map)
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = processor_dataset_stats
-    if cfg.is_reward_model_training:
-        processor_kwargs["dataset_meta"] = dataset.meta
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         preprocessor_overrides = {
             "device_processor": {"device": device.type},

@@ -184,7 +184,7 @@ def test_from_pretrained_factory_rejects_half_configured_suite_normalization(tmp
 
 def test_dataset_declared_fps_reaches_pack_step_on_both_factory_paths(tmp_path):
     cfg = _saved_processor_config(tmp_path)
-    meta = SimpleNamespace(fps=30)
+    meta = SimpleNamespace(fps=30, features={})
 
     fresh, _ = make_pre_post_processors(cfg, dataset_meta=meta)
     pack = next(s for s in fresh.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
@@ -198,6 +198,117 @@ def test_dataset_declared_fps_reaches_pack_step_on_both_factory_paths(tmp_path):
     inference, _ = make_pre_post_processors(cfg, pretrained_path=str(tmp_path))
     pack = next(s for s in inference.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
     assert pack._dataset_declared_fps is None
+
+
+@pytest.mark.parametrize("route", ["fresh", "finetune", "resume"])
+@pytest.mark.parametrize("scenario", ["gripper_names", "wrong_fps", "libero_clock"])
+def test_trainer_forwards_metadata_to_actual_processor_factories(
+    tmp_path, monkeypatch, caplog, route, scenario
+):
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig
+    from lerobot.scripts import lerobot_train
+
+    config = PerceptronIsaacConfig(
+        device="cpu",
+        n_obs_steps=1,
+        chunk_size=30,
+        n_action_steps=30,
+        action_dim=7,
+        proprio_dim=7,
+        dataset_name="libero" if scenario == "libero_clock" else "custom_robot",
+        normalize_gripper=scenario != "gripper_names",
+        action_feature_names=list(_ARM_NAMES),
+        input_features={
+            "observation.images.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+        },
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+    checkpoint = tmp_path / "checkpoint"
+    pretrained = checkpoint / "pretrained_model"
+    if route != "fresh":
+        config.state_feature_names = list(_ARM_NAMES)
+        pre, post = make_pre_post_processors(config, dataset_stats=_dummy_dataset_stats())
+        pre.save_pretrained(pretrained)
+        post.save_pretrained(pretrained)
+        config.pretrained_path = pretrained
+        config.state_feature_names = None
+    dataset_stats = _dummy_dataset_stats()
+    # A resume must retain serialized quantiles, not replace them with these new values.
+    dataset_stats[ACTION]["q01"] = torch.full((7,), -9.0)
+    metadata = SimpleNamespace(
+        fps=10.0 if scenario == "libero_clock" else 30.0 if scenario == "wrong_fps" else 20.0,
+        stats=dataset_stats,
+        features={OBS_STATE: {"names": {"motors": list(_ARM_NAMES)}}},
+    )
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="local/metadata-test"),
+        policy=config,
+        resume=route == "resume",
+        seed=None,
+    )
+    cfg.checkpoint_path = checkpoint if cfg.resume else None
+    monkeypatch.setattr(cfg, "validate", lambda: None)
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"), num_processes=1, process_index=0, wait_for_everyone=lambda: None
+    )
+    monkeypatch.setattr(lerobot_train, "make_accelerator", lambda cfg: accelerator)
+    monkeypatch.setattr(lerobot_train, "init_logging", lambda **kwargs: None)
+    monkeypatch.setattr(lerobot_train, "is_main_process", lambda: False)
+    monkeypatch.setattr(
+        lerobot_train, "make_train_eval_datasets", lambda cfg: (SimpleNamespace(meta=metadata), None)
+    )
+    monkeypatch.setattr(lerobot_train, "make_policy", lambda **kwargs: PerceptronIsaacPolicy(config))
+    # Restore global backend settings when the actual trainer prefix exits.
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", torch.backends.cudnn.deterministic)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", torch.backends.cudnn.benchmark)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", torch.backends.cuda.matmul.allow_tf32)
+    pipelines = []
+
+    def capture_processors(*args, **kwargs):
+        assert kwargs.get("dataset_meta") is metadata, "trainer dropped dataset metadata"
+        assert ("dataset_stats" in kwargs) is (route != "resume")
+        result = make_pre_post_processors(*args, **kwargs)
+        pipelines.append(result)
+        return result
+
+    class ProcessorsReadyError(Exception):
+        pass
+
+    def stop_before_training(*args):
+        raise ProcessorsReadyError
+
+    monkeypatch.setattr(lerobot_train, "make_pre_post_processors", capture_processors)
+    monkeypatch.setattr(lerobot_train, "_make_image_augmentation", stop_before_training)
+    with pytest.raises(ProcessorsReadyError):
+        lerobot_train.train(cfg)
+
+    pre, post = pipelines[0]
+    pack = next(step for step in pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
+    assert pack._dataset_declared_fps == metadata.fps
+    assert config.state_feature_names == _ARM_NAMES
+    assert pack._stats is not None
+    expected_stats = _dummy_dataset_stats() if route == "resume" else dataset_stats
+    np.testing.assert_array_equal(pack._stats.action.q01, expected_stats[ACTION]["q01"])
+    if scenario == "gripper_names":
+        assert _serialized_masks(("pre", pre), ("post", post)) == {
+            "pre:action.mask": [6],
+            "pre:proprio.mask": [6],
+            "post:action.mask": [6],
+            "post:proprio.mask": [6],
+        }
+    else:
+        _install_fake_native_renderer(pack, monkeypatch)
+        complementary = {"frame_index": torch.tensor([4])}
+        if scenario == "wrong_fps":
+            with pytest.raises(ValueError, match="scaled episode clock"):
+                pack._frame_index_anchors(complementary, batch_size=1)
+        else:
+            with caplog.at_level(logging.WARNING):
+                assert pack._frame_index_anchors(complementary, batch_size=1) == pytest.approx([4 / 20])
+                assert pack._frame_index_anchors(complementary, batch_size=1) == pytest.approx([4 / 20])
+            assert sum("misdeclare" in record.getMessage() for record in caplog.records) == 1
 
 
 def test_task_normalization_config_reaches_loaded_pack_step(tmp_path):

@@ -113,11 +113,11 @@ def test_strict_hardware_rejects_permuted_dataset_joints(robot_type, feature, ca
     names = dataset.features[feature]["names"]
     names[0], names[1] = names[1], names[0]
     with pytest.raises(ValueError, match="ISAAC dataset feature order"):
-        if caller == "policy":
-            make_policy(config, ds_meta=dataset)
-        elif caller == "fresh_processors":
+        # The trainer builds/validates the policy before either processor route.
+        make_policy(config, ds_meta=dataset)
+        if caller == "fresh_processors":
             make_perceptron_isaac_pre_post_processors(config, dataset_meta=dataset)
-        else:
+        elif caller == "restored_processors":
             make_perceptron_isaac_pre_post_processors_from_pretrained(config, tmp_path, dataset_meta=dataset)
 
 
@@ -144,19 +144,41 @@ def test_strict_so100_accepts_ordered_hardware_names_and_approved_aliases(semant
 
 
 @pytest.mark.parametrize("caller", ["fresh_processors", "restored_processors"])
-def test_strict_hardware_processors_reject_missing_feature_metadata(caller, tmp_path) -> None:
+def test_strict_hardware_training_rejects_missing_feature_metadata(caller, tmp_path) -> None:
     config = hardware_config("so100_so101")
     dataset = hardware_dataset(config)
     if caller == "restored_processors":
         pre, post = make_perceptron_isaac_pre_post_processors(config, dataset_meta=dataset)
         pre.save_pretrained(tmp_path)
         post.save_pretrained(tmp_path)
-    dataset.features = None
+    dataset.features["observation.state"].pop("names")
     with pytest.raises(ValueError, match="ISAAC dataset feature order"):
+        make_policy(config, ds_meta=dataset)
         if caller == "fresh_processors":
             make_perceptron_isaac_pre_post_processors(config, dataset_meta=dataset)
         else:
             make_perceptron_isaac_pre_post_processors_from_pretrained(config, tmp_path, dataset_meta=dataset)
+
+
+@pytest.mark.parametrize("restored", [False, True])
+@pytest.mark.usefixtures("isaac_policy_dependencies")
+def test_processors_do_not_repeat_policy_feature_order_validation(tmp_path, monkeypatch, restored) -> None:
+    config = hardware_config("so100_so101")
+    dataset = hardware_dataset(config)
+    make_policy(config, ds_meta=dataset)
+    if restored:
+        pre, post = make_perceptron_isaac_pre_post_processors(config, dataset_meta=dataset)
+        pre.save_pretrained(tmp_path)
+        post.save_pretrained(tmp_path)
+
+    def unexpected_validation(features):
+        raise AssertionError("processor repeated make_policy feature order validation")
+
+    monkeypatch.setattr(config, "set_dataset_feature_metadata", unexpected_validation)
+    if restored:
+        make_perceptron_isaac_pre_post_processors_from_pretrained(config, tmp_path, dataset_meta=dataset)
+    else:
+        make_perceptron_isaac_pre_post_processors(config, dataset_meta=dataset)
 
 
 @pytest.mark.parametrize("feature", ["action", "observation.state"])

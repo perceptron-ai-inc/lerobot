@@ -305,7 +305,7 @@ def test_pretrained_load_fails_loud_when_config_path_stats_diverge(tmp_path):
     # resumed train_config still records the launch-time (base) stats path -- the
     # guard must not kill a healthy finetune resume.
     make_perceptron_isaac_pre_post_processors_from_pretrained(
-        cfg, str(package), dataset_meta=SimpleNamespace(fps=20.0)
+        cfg, str(package), dataset_meta=SimpleNamespace(fps=20.0, features={})
     )
 
 
@@ -374,7 +374,7 @@ def test_config_save_exports_checkpoint_local_stats_with_relative_path(tmp_path)
         },
     }
     preprocessor, _postprocessor = make_perceptron_isaac_pre_post_processors(
-        cfg, dataset_stats=dataset_stats, dataset_meta=SimpleNamespace(fps=20.0)
+        cfg, dataset_stats=dataset_stats, dataset_meta=SimpleNamespace(fps=20.0, features={})
     )
 
     # Installed dataset stats sync the step-level JSON labels (issue 6: saved step
