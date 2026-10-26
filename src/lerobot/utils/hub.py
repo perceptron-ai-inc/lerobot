@@ -110,6 +110,16 @@ class HubMixin:
             return self.push_to_hub(repo_id=repo_id, card_kwargs=card_kwargs, **push_to_hub_kwargs)
         return None
 
+    def finalize_pretrained_package(self, save_directory: Path) -> None:
+        """Finalize model-owned metadata after every checkpoint writer has finished.
+
+        The checkpoint writer calls this on the main process after weights, configs and
+        processors are saved. Objects without additional package metadata inherit a no-op.
+
+        Args:
+            save_directory (Path): The completed pretrained-model directory.
+        """
+
     def _save_pretrained(self, save_directory: Path) -> None:
         """
         Overwrite this method in subclass to define how to save your object.

@@ -153,18 +153,6 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         self.config._save_pretrained(save_directory)
         save_torch_state_dict(state_dict, str(save_directory), max_shard_size=_SINGLE_FILE_SHARD_SIZE)
 
-    def finalize_pretrained_package(self, save_directory: Path) -> None:
-        """Bind policy-owned package metadata once every checkpoint writer has finished.
-
-        `save_checkpoint` calls this on the main process after the policy weights, policy and
-        train configs, and processors are all in `save_directory`. A policy whose package
-        authenticates its full file inventory, or must rewrite processor asset paths to be
-        package-relative, does that here. The default does nothing.
-
-        Args:
-            save_directory (Path): The completed `pretrained_model` directory.
-        """
-
     @classmethod
     def from_pretrained(
         cls: builtins.type[T],
