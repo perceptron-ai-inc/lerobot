@@ -70,11 +70,14 @@ from .processor_perceptron_isaac import (
 from .trained_package import (
     CANONICAL_INNER_MODEL_STORAGE,
     MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+    MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2,
     MK1_MODEL_IMPORT_FILENAME,
     MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
     MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
     MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+    VerifiedTrainedTensorStorage,
     finalize_canonical_trained_package,
+    parse_trained_tensor_storage_dtypes,
     rewrite_trained_processor_paths,
     verify_trained_package_manifest,
 )
@@ -304,14 +307,19 @@ def read_accelerate_mixed_precision() -> str:
         return "no"
 
 
-def _package_storage_dtypes(model_dir: Path) -> frozenset[str]:
-    """Storage dtypes an MK1 model directory is allowed to hold.
-
-    One rule for both ends: the loader validates a package it is about to read, and
-    ``_save_canonical_inner_weights`` validates the package it has just written. Isaac-0.5
-    export assets store F32 source tensors, every other MK1 package stores BF16.
-    """
+def _package_storage_dtypes(
+    model_dir: Path, *, verified_tensor_storage: VerifiedTrainedTensorStorage | None = None
+) -> frozenset[str]:
+    """Use authenticated v3 storage, otherwise retain original/v2 source-family rules."""
+    if verified_tensor_storage is not None:
+        return verified_tensor_storage.for_model(model_dir)
     return frozenset({"F32" if is_portable_isaac05_repository(model_dir) else "BF16"})
+
+
+@dataclass(frozen=True)
+class _CanonicalInnerState:
+    tensors: dict[str, Tensor]
+    storage_dtypes: frozenset[str]
 
 
 class PerceptronIsaacPolicy(PreTrainedPolicy):
@@ -324,12 +332,19 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     # always fully_shards; its parameters are sharded at rest and gathered for the step.
     _fsdp_wrap_modules = ["GenesisQwen36DecoderLayer", "ActionExpertBlock"]
 
-    def __init__(self, config: PerceptronIsaacConfig, **kwargs):
+    def __init__(
+        self,
+        config: PerceptronIsaacConfig,
+        *,
+        verified_tensor_storage: VerifiedTrainedTensorStorage | None = None,
+        **kwargs: Any,
+    ) -> None:
         require_package("transformers", extra="perceptron_isaac")
         require_package("mharmony", extra="perceptron_isaac")
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self._verified_tensor_storage = verified_tensor_storage
 
         self._isaac_model: Mk1Qwen36VLAForActionGeneration | None = None
         self._stats: IsaacNormalizationStats | None = None
@@ -395,6 +410,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if source_root is None:
             raise RuntimeError("Perceptron ISAAC dense saves require a loaded checkpoint package.")
         with self._verified_checkpoint_source(source_root) as verified_source:
+            inner_state = self._preflight_canonical_inner_state(state_dict, verified_source / "hf_model")
             self._copy_checkpoint_package(verified_source, save_directory)
         if self._config_declares_mk1(self.config):
             self.config._export_mk1_source_model_import_sha256 = (
@@ -402,7 +418,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             )
             self.config._export_mk1_model_import_sha256 = None
         self.config._save_pretrained(save_directory)
-        self._save_canonical_inner_weights(save_directory, state_dict)
+        self._save_canonical_inner_weights(save_directory, inner_state)
         self._canonical_inner_save_root = str(save_directory.resolve())
 
     def _local_checkpoint_source_root(self) -> Path | None:
@@ -517,12 +533,16 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         assert runtime_assets is not None
         yield runtime_assets.root
 
-    def _save_canonical_inner_weights(
-        self,
-        save_directory: Path,
-        state_dict: dict[str, Tensor] | None,
-    ) -> None:
-        policy_state = self.state_dict() if state_dict is None else state_dict
+    @staticmethod
+    def _preflight_canonical_inner_state(
+        policy_state: dict[str, Tensor], model_root: Path
+    ) -> _CanonicalInnerState:
+        """Validate the gathered runtime inventory before touching any destination assets."""
+        from .mk1_checkpoint_contract import (
+            Mk1CheckpointContract,
+            TensorMetadata,
+        )
+
         prefixes = ("_isaac_model.", "module._isaac_model.")
         prefix = next(
             (item for item in prefixes if policy_state and all(key.startswith(item) for key in policy_state)),
@@ -535,6 +555,23 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 f"unexpected={unexpected[:10]}."
             )
         inner_state = {key.removeprefix(prefix): tensor for key, tensor in policy_state.items()}
+        contract = Mk1CheckpointContract.parse_allowlisted(
+            load_json_object(model_root / "config.json"), allow_test_only_reduced_geometry=True
+        )
+        # Only these actual dtypes may be saved; do not cast gathered trainable masters.
+        dtype_names = {torch.bfloat16: "BF16", torch.float32: "F32"}
+        metadata = {
+            key: TensorMetadata(
+                shape=tuple(tensor.shape), dtype=dtype_names.get(tensor.dtype, str(tensor.dtype))
+            )
+            for key, tensor in inner_state.items()
+        }
+        contract.validate_tensor_metadata(
+            metadata, allowed_storage_dtypes=frozenset({"BF16", "F32"}), runtime_only=True
+        )
+        return _CanonicalInnerState(inner_state, frozenset(value.dtype for value in metadata.values()))
+
+    def _save_canonical_inner_weights(self, save_directory: Path, inner_state: _CanonicalInnerState) -> None:
         model_root = save_directory / "hf_model"
         if not model_root.is_dir() or model_root.is_symlink():
             raise RuntimeError("Perceptron ISAAC dense save is missing a regular checkpoint-local hf_model.")
@@ -545,7 +582,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 *directory.glob("model-*.safetensors"),
             ):
                 weight_path.unlink(missing_ok=True)
-        save_torch_state_dict(inner_state, model_root, max_shard_size="5GB")
+        save_torch_state_dict(inner_state.tensors, model_root, max_shard_size="5GB")
         if self._config_declares_mk1(self.config):
             from .mk1_checkpoint_contract import (
                 MK1_TEST_GEOMETRY_MARKER,
@@ -563,10 +600,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                         inner_config.get(MK1_TEST_GEOMETRY_MARKER, False)
                         or inner_config.get("isaac05_test_only_reduced_geometry", False)
                     ),
-                    # The same rule the load path applies. FSDP's full-state-dict gather
-                    # upcasts, so a package saved from an F32 export is itself F32; validating
-                    # it as BF16 rejected an inventory this method had just written.
-                    allowed_storage_dtypes=_package_storage_dtypes(model_root),
+                    allowed_storage_dtypes=inner_state.storage_dtypes,
                 )
             except (ValueError, Mk1CheckpointContractError) as exc:
                 raise RuntimeError(f"Saved MK1 runtime checkpoint is invalid: {exc}") from exc
@@ -822,13 +856,15 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         return self._resolve_device()
 
     def _loads_native_f32_masters(self, *, training: bool, storage_dtypes: frozenset[str]) -> bool:
-        """Admit lossless F32 placement only for dense FP32-storage FSDP2 training.
+        """Admit F32 placement only for dense FP32-storage FSDP2 training.
 
         Private mmap views preserve source bits, share file pages across local
         ranks and keep writes process-private. Inference and BF16 sources retain
         their BF16 load path; unsupported training modes are rejected separately.
+        Mixed trained storage promotes even frozen BF16 tensors to F32, doubling
+        their host storage. Promotion preserves BF16 values, not lost precision.
         """
-        if not (training and self.config.train_storage_fp32) or storage_dtypes != frozenset({"F32"}):
+        if not (training and self.config.train_storage_fp32) or "F32" not in storage_dtypes:
             return False
         if self.config.train_expert_only or self.config.use_peft:
             return False
@@ -898,19 +934,31 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         model_dir = Path(self.config.hf_model_path)
         allow_test_geometry = self.config.artifact_kind == "neutral_debug"
-        # Isaac-0.5 exports store F32 source tensors, not an F32 inference runtime.
-        # Keep legacy MK1 storage strict and route both formats through native validation.
-        storage_dtypes = _package_storage_dtypes(model_dir)
+        verified_storage = self._verified_tensor_storage
+        if verified_storage is None and (
+            self.config.mk1_trained_package_manifest_sha256 is not None
+            or (model_dir.parent / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME).exists()
+        ):
+            verified_storage = self._verify_packaged_contract_digests(self.config, model_dir.parent)
+            self._verified_tensor_storage = verified_storage
+        # Source profiles remain strict. Only authenticated outer v3 metadata overrides them.
+        storage_dtypes = (
+            _package_storage_dtypes(model_dir, verified_tensor_storage=verified_storage)
+            if verified_storage is not None
+            else _package_storage_dtypes(model_dir)
+        )
         native_f32 = self._loads_native_f32_masters(training=training, storage_dtypes=storage_dtypes)
         model_dtype = torch.float32 if native_f32 else torch.bfloat16
         try:
-            contract, _ = validate_mk1_checkpoint(
+            contract, inventory = validate_mk1_checkpoint(
                 model_dir,
                 allow_test_only_reduced_geometry=allow_test_geometry,
                 allowed_storage_dtypes=storage_dtypes,
             )
         except Mk1CheckpointContractError as exc:
             raise RuntimeError(f"ISAAC requires a valid MK1 composite checkpoint: {exc}") from exc
+        if verified_storage is not None:
+            verified_storage.require_header_dtypes(inventory)
         if (
             self.config.artifact_kind != contract.artifact.artifact_kind
             or self.config.trained_steps != contract.artifact.trained_steps
@@ -961,6 +1009,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             route_reduction=DETERMINISTIC_ROUTE_REDUCTION,
             allowed_storage_dtypes=storage_dtypes,
             load_intent="training" if native_f32 else "inference",
+            verified_tensor_storage=verified_storage,
         )
         if loaded_contract != contract:
             raise RuntimeError("MK1 checkpoint contract changed between preflight and model loading.")
@@ -1521,9 +1570,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 "Outer-root model weights are unsupported; use native checkpoint-local hf_model weights."
             )
         cls._resolve_checkpoint_local_paths(config, checkpoint_root)
-        cls._verify_packaged_contract_digests(config, checkpoint_root)
+        verified_storage = cls._verify_packaged_contract_digests(config, checkpoint_root)
         cls._set_checkpoint_local_vocab_path(config)
-        policy = cls(config)
+        policy = cls(config, verified_tensor_storage=verified_storage)
         # Raw exports keep their documented parent-relative inference assets.
         if cls._portable_export_root(checkpoint_root) is None:
             policy._retain_verified_runtime_assets(checkpoint_root)
@@ -1534,12 +1583,12 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     def _verify_packaged_contract_digests(
         config: PerceptronIsaacConfig,
         checkpoint_root: Path | None,
-    ) -> None:
+    ) -> VerifiedTrainedTensorStorage | None:
         """Verify native checkpoint integrity before model allocation."""
         if not PerceptronIsaacPolicy._config_declares_mk1(config):
             raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
         if checkpoint_root is None:
-            return
+            return None
         root = Path(checkpoint_root).resolve()
         declares_trained_package = (
             config.mk1_trained_package_manifest_sha256 is not None
@@ -1568,16 +1617,18 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     f"expected {expected}, found {actual}."
                 ),
             )
-            return
+            return None
         is_mk1_package = PerceptronIsaacPolicy._config_declares_mk1(config)
         if is_mk1_package:
             if config.artifact_kind == "neutral_debug" and not declares_trained_package:
                 PerceptronIsaacPolicy._verify_neutral_debug_manifest(config, root)
-                return
+                return None
 
             verified_model_import_digest = PerceptronIsaacPolicy._verify_trained_package_manifest(
                 config, root
             )
+            if isinstance(verified_model_import_digest, VerifiedTrainedTensorStorage):
+                return verified_model_import_digest
             if verified_model_import_digest is not None:
                 PerceptronIsaacPolicy._verify_mk1_model_import(
                     config,
@@ -1585,7 +1636,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     verified_record_digest=verified_model_import_digest,
                     root_weights_bound=True,
                 )
-            return
+            return None
+        return None
 
     @staticmethod
     def _require_canonical_hf_model_path(
@@ -1613,8 +1665,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         return expected
 
     @staticmethod
-    def _verify_trained_package_manifest(config: PerceptronIsaacConfig, root: Path) -> str | None:
-        """Verify every trained package asset outside the delegated HF model tree."""
+    def _verify_trained_package_manifest(
+        config: PerceptronIsaacConfig, root: Path
+    ) -> str | VerifiedTrainedTensorStorage | None:
+        """Authenticate trained assets, returning v3 storage only after full verification."""
         context = "MK1 trained package"
         manifest_path = root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME
         try:
@@ -1622,16 +1676,31 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         except ValueError as exc:
             raise RuntimeError(f"Cannot read {context} manifest: {exc}") from exc
         manifest_schema = raw_manifest.get("schema")
-        if manifest_schema == MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA:
+        if manifest_schema in (
+            MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+            MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2,
+        ):
             model_import_digest = _verify_sha256(
                 config.mk1_source_model_import_sha256,
                 f"{context} mk1_source_model_import_sha256",
             )
-            verify_trained_package_manifest(
+            metadata: dict[str, Any] = {"model_storage": CANONICAL_INNER_MODEL_STORAGE}
+            source_inventory = None
+            if manifest_schema == MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA:
+                from .mk1_checkpoint_contract import read_and_validate_safetensors_index
+
+                metadata["metadata"] = raw_manifest.get("metadata")
+                model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(
+                    config, root, context="MK1"
+                )
+                # Bind the header identities before authenticating payload bytes, then
+                # check them again afterward. A replacement cannot inherit an old hash.
+                source_inventory = read_and_validate_safetensors_index(model_root)
+            manifest = verify_trained_package_manifest(
                 root,
                 label="MK1 canonical trained package",
                 manifest_filename=MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
-                manifest_schema=MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+                manifest_schema=manifest_schema,
                 digest_field=MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
                 manifest_digest=config.mk1_trained_package_manifest_sha256,
                 identity={
@@ -1639,7 +1708,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     "trained_steps": config.trained_steps,
                     "mk1_source_model_import_sha256": model_import_digest,
                 },
-                metadata={"model_storage": CANONICAL_INNER_MODEL_STORAGE},
+                metadata=metadata,
                 is_package_file=PerceptronIsaacPolicy._is_package_file,
                 delegated_directory=None,
             )
@@ -1653,7 +1722,38 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 f"{context} deployment_adapter_sha256",
                 adapter_path,
             )
-            PerceptronIsaacPolicy._require_canonical_hf_model_path(config, root, context="MK1")
+            model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(config, root, context="MK1")
+            if manifest_schema == MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA:
+                from types import MappingProxyType
+
+                assert source_inventory is not None
+                _verify_sha256(
+                    model_import_digest,
+                    f"{context} source model-import identity",
+                    model_root / "source_mk1_model_import.json",
+                )
+                shard_paths = frozenset(source_inventory.shards)
+                metadata_digests = {
+                    root / relative: digest
+                    for relative, digest in manifest["files_sha256"].items()
+                    if (root / relative).is_relative_to(model_root) and root / relative not in shard_paths
+                }
+                nanoseconds_per_second = 1_000_000_000
+                coarse_shard_digests = {
+                    shard: manifest["files_sha256"][shard.relative_to(root).as_posix()]
+                    for shard, identity in source_inventory.shard_identities.items()
+                    if identity.mtime_ns % nanoseconds_per_second == 0
+                    and identity.ctime_ns % nanoseconds_per_second == 0
+                }
+                verified_storage = VerifiedTrainedTensorStorage(
+                    model_root=model_root.resolve(strict=True),
+                    dtypes=parse_trained_tensor_storage_dtypes(manifest["metadata"]),
+                    source_inventory=source_inventory,
+                    metadata_digests=MappingProxyType(metadata_digests),
+                    coarse_shard_digests=MappingProxyType(coarse_shard_digests),
+                )
+                verified_storage.require_header_dtypes(source_inventory)
+                return verified_storage
             return None
 
         if not config.deployment_adapter_sha256:

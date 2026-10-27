@@ -38,8 +38,9 @@ from .modeling_qwen36_moe import (
     GenesisQwen36Model,
     Mk1Qwen36MoeConfig,
 )
+from .trained_package import VerifiedTrainedTensorStorage
 
-TORCH_SDPA_ATTENTION_BACKEND = "torch_sdpa_v1"
+TORCH_SDPA_ATTENTION_BACKEND: Literal["torch_sdpa_v1"] = "torch_sdpa_v1"
 QUALIFIED_TRANSFORMERS_VERSION = "5.5.4"
 QUALIFIED_TORCH_CUDA_ABI = "2.10.0+cu128"
 _QUALIFIED_CUDA_VERSION = "12.8"
@@ -306,19 +307,33 @@ def load_mk1_vla_from_hf(
     route_reduction: Literal["stable_token_segment_sum_v1"] = DETERMINISTIC_ROUTE_REDUCTION,
     allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
     load_intent: Literal["inference", "training"] = "inference",
+    verified_tensor_storage: VerifiedTrainedTensorStorage | None = None,
 ) -> tuple[Mk1Qwen36VLAForActionGeneration, Mk1Qwen36VLAConfig, Mk1CheckpointContract]:
     """Validate, construct once on meta, and stream an MK1 VLA using the qualified SDPA backend.
 
     ``device`` is where the weights are materialized. ``runtime_device`` (default: ``device``) is
     where the model will run: it selects the GDN kernels and gates the production CUDA ABI, so a
     host-memory build for a CUDA run keeps the CUDA kernels and the CUDA qualification gate.
+    Authenticated mixed trained storage may resume in F32: F32 values need no cast,
+    while BF16 values promote exactly (without recovering precision already lost).
+    This also promotes frozen BF16 tensors and doubles their host storage.
     """
     if load_intent not in ("inference", "training"):
         raise ValueError("load_intent must be inference or training")
-    if load_intent == "training" and (dtype != torch.float32 or allowed_storage_dtypes != frozenset({"F32"})):
-        raise ValueError("training load requires lossless F32 storage and runtime")
-    _require_qualified_transformers_abi()
     root = Path(model_dir)
+    if verified_tensor_storage is not None and (
+        verified_tensor_storage.for_model(root) != allowed_storage_dtypes
+    ):
+        raise ValueError("Verified trained storage disagrees with allowed_storage_dtypes")
+    if load_intent == "training":
+        authenticated_mixed = verified_tensor_storage is not None and allowed_storage_dtypes == frozenset(
+            {"BF16", "F32"}
+        )
+        if dtype != torch.float32 or not (
+            allowed_storage_dtypes == frozenset({"F32"}) or authenticated_mixed
+        ):
+            raise ValueError("training load requires lossless F32 storage and runtime")
+    _require_qualified_transformers_abi()
     raw, contract = read_mk1_config_data(
         root,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
@@ -329,7 +344,12 @@ def load_mk1_vla_from_hf(
     _require_qualified_torch_cuda_abi(contract, run_device)
     inventory = read_and_validate_safetensors_index(root)
     contract.validate_tensor_inventory(inventory, allowed_storage_dtypes=allowed_storage_dtypes)
+    if verified_tensor_storage is not None:
+        verified_tensor_storage.require_header_dtypes(inventory)
     validate_mk1_tokenizer(root, contract)
+    if verified_tensor_storage is not None:
+        # Bind every loader-read metadata file through its final read, before allocation.
+        verified_tensor_storage.verify_for_materialization()
     config = _build_config(raw, contract)
     _configure_attention_backend(config, attention_backend)
     _configure_route_reduction(config, route_reduction)

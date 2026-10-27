@@ -435,7 +435,8 @@ def _tiny_policy(
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
     policy = PerceptronIsaacPolicy(config)
-    policy._isaac_model = model
+    # Processor tests intentionally inject a narrow fake backend, not a complete VLA.
+    policy._isaac_model = model  # type: ignore[assignment]
     return policy
 
 
@@ -1936,6 +1937,7 @@ def test_native_policy_mk1_loader_is_checkpoint_driven(tmp_path, monkeypatch):
             "route_reduction": "stable_token_segment_sum_v1",
             "allowed_storage_dtypes": frozenset({"BF16"}),
             "load_intent": "inference",
+            "verified_tensor_storage": None,
         }
     ]
 

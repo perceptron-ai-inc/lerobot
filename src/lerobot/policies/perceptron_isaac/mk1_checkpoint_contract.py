@@ -201,6 +201,14 @@ class Mk1ArtifactContract:
 
 
 @dataclass(frozen=True)
+class TensorMetadata:
+    """Shape and storage dtype, independent of any filesystem inventory."""
+
+    shape: tuple[int, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
 class TensorHeader:
     key: str
     shard: str
@@ -420,8 +428,24 @@ class Mk1CheckpointContract:
         allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
     ) -> None:
         """Require exact key, shape, and explicitly allowed dtype coverage before allocation."""
+        self.validate_tensor_metadata(inventory.tensors, allowed_storage_dtypes=allowed_storage_dtypes)
+
+    def validate_tensor_metadata(
+        self,
+        tensors: Mapping[str, TensorMetadata | TensorHeader],
+        *,
+        allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
+        runtime_only: bool = False,
+    ) -> None:
+        """Validate headers or gathered tensors; only runtime saves may omit source-only MTP."""
         expected = self.expected_tensor_shapes()
-        actual_keys = set(inventory.tensors)
+        if runtime_only:
+            expected = {
+                key: shape
+                for key, shape in expected.items()
+                if not key.startswith(self.excluded_runtime_prefixes)
+            }
+        actual_keys = set(tensors)
         missing = sorted(set(expected) - actual_keys)
         unexpected = sorted(actual_keys - set(expected))
         if missing or unexpected:
@@ -431,20 +455,18 @@ class Mk1CheckpointContract:
                 f"unexpected={len(unexpected)} (first={unexpected[:8]})"
             )
         bad_shapes = [
-            (key, inventory.tensors[key].shape, shape)
-            for key, shape in expected.items()
-            if inventory.tensors[key].shape != shape
+            (key, tensors[key].shape, shape) for key, shape in expected.items() if tensors[key].shape != shape
         ]
         if bad_shapes:
             key, actual, wanted = bad_shapes[0]
             _fail(f"tensor {key!r} has shape {actual}, expected {wanted}")
         bad_dtypes = sorted(
-            key for key, header in inventory.tensors.items() if header.dtype not in allowed_storage_dtypes
+            key for key, header in tensors.items() if header.dtype not in allowed_storage_dtypes
         )
         if bad_dtypes:
             first = bad_dtypes[0]
             expected_dtype = "/".join(sorted(allowed_storage_dtypes))
-            _fail(f"tensor {first!r} has dtype {inventory.tensors[first].dtype}, expected {expected_dtype}")
+            _fail(f"tensor {first!r} has dtype {tensors[first].dtype}, expected {expected_dtype}")
 
     def validate_coord_reserved_token_groups(self, groups: Any) -> None:
         """Cross-check the checkpoint coordinate range against mHarmony metadata.

@@ -40,7 +40,8 @@ def test_native_config_reads_saved_false_offset_norm(tmp_path) -> None:
 
 def test_native_config_rejects_true_offset_norm_at_construction() -> None:
     with pytest.raises(ValueError, match="apply_offset_norm"):
-        PerceptronIsaacConfig(device="cpu", apply_offset_norm=True)
+        # Deliberately violate the static contract to exercise its runtime boundary.
+        PerceptronIsaacConfig(device="cpu", apply_offset_norm=True)  # type: ignore[arg-type]
 
 
 def test_native_config_rejects_saved_true_offset_norm(tmp_path) -> None:

@@ -106,6 +106,7 @@ def _source_package(root: Path) -> PerceptronIsaacConfig:
 
 
 def _load_native_fixture(config: PerceptronIsaacConfig) -> torch.nn.Module:
+    assert config.hf_model_path is not None
     model, _, _ = load_mk1_vla_from_hf(
         config.hf_model_path,
         dtype=torch.float32,
@@ -480,6 +481,8 @@ def test_native_base_save_verifies_fresh_source_config_and_retains_sidecars(
 
 @pytest.mark.parametrize("asset", ["isaac_stats.json", "hf_model/model-00001-of-00002.safetensors"])
 def test_native_save_rejects_changed_source_before_retaining_sidecars(tmp_path: Path, asset: str) -> None:
+    from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContractError
+
     source = tmp_path / "source"
     config = _source_package(source)
     policy = PerceptronIsaacPolicy(config)
@@ -487,7 +490,11 @@ def test_native_save_rejects_changed_source_before_retaining_sidecars(tmp_path: 
     changed.write_bytes(changed.read_bytes() + b"tampered")
 
     with (
-        pytest.raises(RuntimeError, match="digest mismatch"),
+        # A malformed shard can fail inventory validation before full digest verification.
+        pytest.raises(
+            (RuntimeError, Mk1CheckpointContractError),
+            match="digest mismatch|could not inspect safetensors shard",
+        ),
         policy._verified_checkpoint_source(source),
     ):
         pytest.fail("Changed source must not become a verified checkpoint source.")

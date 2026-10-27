@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ from .checkpoint_integrity import (
     load_json_object,
     require_sha256,
 )
+from .mk1_checkpoint_contract import SafetensorsInventory, read_and_validate_safetensors_index
 
 if TYPE_CHECKING:
     from .configuration_perceptron_isaac import PerceptronIsaacConfig
@@ -24,7 +26,10 @@ MK1_TRAINED_PACKAGE_MANIFEST_FILENAME = "mk1_trained_package_manifest.json"
 MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_trained_package_manifest_v1"
 MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD = "mk1_trained_package_manifest_sha256"
 MK1_MODEL_IMPORT_FILENAME = "mk1_model_import.json"
-MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_canonical_trained_package_manifest_v2"
+MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2 = (
+    "perceptron_isaac_mk1_canonical_trained_package_manifest_v2"
+)
+MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_canonical_trained_package_manifest_v3"
 CANONICAL_INNER_MODEL_STORAGE = "canonical_inner"
 
 PackageFilePredicate = Callable[[Path, Path], bool]
@@ -36,6 +41,89 @@ PROCESSOR_PACKAGE_PATHS = {
     "suite_stats_path": ("isaac_suite_stats.json", False),
     "suite_by_task_index_path": ("isaac_suite_by_task_index.json", False),
 }
+
+
+def parse_trained_tensor_storage_dtypes(metadata: object) -> frozenset[str]:
+    """Read the exact v3 storage declaration, never infer a missing declaration."""
+    if not isinstance(metadata, dict) or set(metadata) != {"tensor_storage_dtypes"}:
+        raise RuntimeError(
+            "MK1 trained storage declaration metadata must contain only tensor_storage_dtypes."
+        )
+    values = metadata["tensor_storage_dtypes"]
+    if (
+        not isinstance(values, list)
+        or not values
+        or any(not isinstance(value, str) or value not in {"BF16", "F32"} for value in values)
+        or values != sorted(set(values))
+    ):
+        raise RuntimeError("MK1 tensor_storage_dtypes must be a sorted distinct nonempty BF16/F32 list.")
+    return frozenset(values)
+
+
+@dataclass(frozen=True)
+class VerifiedTrainedTensorStorage:
+    """Storage and source generation authenticated by the complete outer checkpoint.
+
+    Inner descriptors retain producer lineage; a trained hf_model is not a standalone ABI.
+    Precise shard identities avoid a second payload-hash pass; second-resolution
+    sources are rehashed before lazy materialization.
+    """
+
+    model_root: Path
+    dtypes: frozenset[str]
+    source_inventory: SafetensorsInventory
+    metadata_digests: Mapping[Path, str]
+    coarse_shard_digests: Mapping[Path, str]
+
+    def _verify_shards_unchanged(self) -> None:
+        for shard in self.source_inventory.shards:
+            self.source_inventory.verify_shard_identity(shard)
+
+    def for_model(self, model_root: Path) -> frozenset[str]:
+        if model_root.resolve(strict=True) != self.model_root:
+            raise RuntimeError("Verified MK1 tensor storage belongs to a different model directory.")
+        self.verify_source_unchanged()
+        return self.dtypes
+
+    def verify_source_unchanged(self) -> None:
+        """Check the authenticated generation without rereading weight payloads."""
+        self._verify_shards_unchanged()
+        # These small files are read again by the loader; sidecar snapshots do not
+        # authorize a changed config, tokenizer, or index at the weight-backed root.
+        for path, expected in self.metadata_digests.items():
+            try:
+                actual = file_sha256(path)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Authenticated MK1 model metadata changed: {path.name}") from exc
+            if not hmac.compare_digest(actual, expected):
+                raise RuntimeError(f"Authenticated MK1 model metadata changed: {path.name}")
+
+    def verify_for_materialization(self) -> None:
+        """Rehash second-resolution shards; their timestamps can hide same-second writes.
+
+        Precise identities keep the no-extra-payload-read path. Coarse sources incur
+        one extra authenticated weight read, without copying or casting tensors.
+        """
+        self.verify_source_unchanged()
+        for shard, expected in self.coarse_shard_digests.items():
+            try:
+                actual = file_sha256(shard)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Authenticated MK1 shard changed: {shard.name}") from exc
+            if not hmac.compare_digest(actual, expected):
+                raise RuntimeError(f"Authenticated MK1 shard digest mismatch: {shard.name}")
+        if self.coarse_shard_digests:
+            # Metadata must remain bound through the potentially long payload read.
+            self.verify_source_unchanged()
+
+    def require_header_dtypes(self, inventory: SafetensorsInventory) -> None:
+        self._verify_shards_unchanged()
+        actual = frozenset(header.dtype for header in inventory.tensors.values())
+        if actual != self.dtypes:
+            raise RuntimeError(
+                "MK1 trained storage declaration disagrees with tensor header dtype set: "
+                f"declared={sorted(self.dtypes)}, headers={sorted(actual)}."
+            )
 
 
 def _processor_configs(root: Path) -> list[Path]:
@@ -333,6 +421,9 @@ def finalize_canonical_trained_package(
     if not mk1_source_model_import_sha256:
         raise RuntimeError("Cannot finalize an MK1 package without source model-import identity.")
     root = Path(package_root).resolve(strict=True)
+    inventory = read_and_validate_safetensors_index(root / "hf_model")
+    storage_metadata = {"tensor_storage_dtypes": sorted({h.dtype for h in inventory.tensors.values()})}
+    parse_trained_tensor_storage_dtypes(storage_metadata)
     config.mk1_trained_package_manifest_sha256 = None
     config._save_pretrained(root)
     digest = write_trained_package_manifest(
@@ -346,7 +437,7 @@ def finalize_canonical_trained_package(
             "trained_steps": config.trained_steps,
             "mk1_source_model_import_sha256": mk1_source_model_import_sha256,
         },
-        metadata={"model_storage": CANONICAL_INNER_MODEL_STORAGE},
+        metadata={"model_storage": CANONICAL_INNER_MODEL_STORAGE, "metadata": storage_metadata},
         delegated_directory=None,
     )
     config.mk1_trained_package_manifest_sha256 = digest

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -492,9 +493,10 @@ def _record_backbone_load_device(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     real_loader = mk1.load_mk1_vla_from_hf
     devices: list[str] = []
 
-    def recording_loader(*args: object, device: str, **kwargs: object):
+    def recording_loader(model_dir: str | Path, *, device: str, **kwargs: Any):
+        # Forward opaque loader options unchanged; only placement is under test.
         devices.append(str(device))
-        return real_loader(*args, device="cpu", **kwargs)
+        return real_loader(model_dir, device="cpu", **kwargs)
 
     monkeypatch.setattr(mk1, "load_mk1_vla_from_hf", recording_loader)
     return devices
