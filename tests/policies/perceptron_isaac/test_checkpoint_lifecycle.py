@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -233,10 +234,115 @@ def test_dense_save_is_self_contained_after_move_and_preserves_fp32_trainables(m
         )
 
 
-def test_verified_runtime_sidecars_survive_source_mutation_without_weight_snapshot(tmp_path) -> None:
+@pytest.mark.parametrize("train_storage_fp32", [True, False], ids=["lazy", "eager"])
+def test_from_pretrained_retains_sidecars_without_rebinding_weight_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, train_storage_fp32: bool
+) -> None:
+    source = tmp_path / "source"
+    config = _source_package(source)
+    config.train_storage_fp32 = train_storage_fp32
+    (source / "hf_model" / "vocab.json").write_text('{"token": 0}\n')
+    (source / "policy_inference_recipe.json").write_text('{"fixture": "recipe"}\n')
+    provenance = (source / "hf_model" / "source_mk1_model_import.json").read_text()
+    finalize_canonical_trained_package(
+        config, source, mk1_source_model_import_sha256=config.mk1_source_model_import_sha256
+    )
+    monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
+    load_modes: list[bool] = []
+
+    # Only the reduced-geometry loader is substituted; package loading and ownership are real.
+    def load_fixture(self: PerceptronIsaacPolicy, *, training: bool = False) -> None:
+        load_modes.append(training)
+        self._isaac_model = _load_native_fixture(self.config)
+
+    monkeypatch.setattr(PerceptronIsaacPolicy, "_load_backbone", load_fixture)
+    policy = PerceptronIsaacPolicy.from_pretrained(source, local_files_only=True, strict=True)
+    assert load_modes == ([] if train_storage_fp32 else [False])
+    assert policy.config.hf_model_path is not None
+    assert Path(policy.config.hf_model_path) == source / "hf_model"
+    assert list(Path(policy.config.hf_model_path).glob("model*.safetensors"))
+    assert policy._verified_runtime_assets is not None
+    assert not list(policy._verified_runtime_assets.root.rglob("*.safetensors"))
+    assert not list(policy._verified_runtime_assets.root.rglob("model.safetensors.index.json"))
+    assert policy.config.native_stats_path is not None
+    assert not Path(policy.config.native_stats_path).is_relative_to(source)
+    retained_vocab = Path(os.environ["QWEN35_VOCAB_PATH"])
+    assert not retained_vocab.is_relative_to(source)
+
+    if train_storage_fp32:
+        policy._load_backbone(training=True)
+    assert policy._isaac_model is not None
+    expected = policy._isaac_model.lm_head.weight.detach().clone()
+    (source / "isaac_stats.json").write_text('{"changed": true}\n')
+    (source / "hf_model" / "vocab.json").write_text('{"changed": true}\n')
+    (source / "native_render_metadata.json").write_text('{"changed": true}\n')
+    (source / "policy_inference_recipe.json").write_text('{"changed": true}\n')
+    (source / "hf_model" / "source_mk1_model_import.json").write_text('{"changed": true}\n')
+    (source / "fast_processor" / "processing_action_tokenizer.py").write_text("# changed\n")
+    source.rename(tmp_path / "retired-source")
+    assert Path(policy.config.native_stats_path).read_text() == "{}\n"
+    assert retained_vocab.read_text() == '{"token": 0}\n'
+
+    saved = tmp_path / "saved"
+    policy.save_pretrained(saved)
+    PerceptronIsaacPolicy._verify_saved_package(saved)
+    assert (saved / "isaac_stats.json").read_text() == "{}\n"
+    assert (saved / "hf_model" / "vocab.json").read_text() == '{"token": 0}\n'
+    assert (saved / "fast_processor" / "processing_action_tokenizer.py").read_text() == (
+        "class ActionTokenizer: pass\n"
+    )
+    assert (saved / "native_render_metadata.json").read_text() == "{}\n"
+    assert (saved / "policy_inference_recipe.json").read_text() == '{"fixture": "recipe"}\n'
+    assert (saved / "hf_model" / "source_mk1_model_import.json").read_text() == provenance
+    reloaded = PerceptronIsaacPolicy.from_pretrained(saved, local_files_only=True, strict=True)
+    if reloaded._isaac_model is None:
+        reloaded._load_backbone(training=True)
+    assert reloaded._isaac_model is not None
+    torch.testing.assert_close(reloaded._isaac_model.lm_head.weight, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("load_from_package", [False, True], ids=["constructor", "from_pretrained"])
+def test_native_save_never_copies_source_weight_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, load_from_package: bool
+) -> None:
+    from lerobot.policies.perceptron_isaac import checkpoint_integrity
+
+    source = tmp_path / "source"
+    config = _source_package(source)
+    copied_weights: list[Path] = []
+    copyfile = checkpoint_integrity.shutil.copyfile
+
+    def record_copy(
+        src: str | os.PathLike[str],
+        dst: str | os.PathLike[str],
+        *,
+        follow_symlinks: bool = True,
+    ) -> str | os.PathLike[str]:
+        if Path(src).suffix == ".safetensors" or Path(src).name == "model.safetensors.index.json":
+            copied_weights.append(Path(src))
+        return copyfile(src, dst, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(checkpoint_integrity.shutil, "copyfile", record_copy)
+    policy = (
+        PerceptronIsaacPolicy.from_pretrained(source, local_files_only=True, strict=True)
+        if load_from_package
+        else PerceptronIsaacPolicy(config)
+    )
+    policy._isaac_model = _load_native_fixture(policy.config)
+    policy.save_pretrained(tmp_path / "saved")
+
+    assert copied_weights == [], f"Source weights were unnecessarily snapshotted: {copied_weights}"
+    assert list((source / "hf_model").glob("model*.safetensors"))
+    assert (source / "mk1_trained_package_manifest.json").is_file()
+
+
+def test_verified_runtime_sidecars_survive_source_mutation_without_weight_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     source = tmp_path / "source"
     config = _source_package(source)
     (source / "hf_model" / "vocab.json").write_text('{"token": 0}\n')
+    monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     policy = PerceptronIsaacPolicy(config)
     policy._isaac_model = _load_native_fixture(config)
 
@@ -244,7 +350,7 @@ def test_verified_runtime_sidecars_survive_source_mutation_without_weight_snapsh
     assert config.native_stats_path is not None
     assert config.hf_model_path is not None
     retained_stats = Path(config.native_stats_path)
-    retained_vocab = Path(config.hf_model_path) / "vocab.json"
+    retained_vocab = Path(os.environ["QWEN35_VOCAB_PATH"])
     (source / "isaac_stats.json").write_text('{"changed": true}\n')
     (source / "hf_model" / "vocab.json").write_text('{"changed": true}\n')
 
@@ -252,7 +358,10 @@ def test_verified_runtime_sidecars_survive_source_mutation_without_weight_snapsh
     assert retained_stats.parent != source
     assert retained_stats.read_text() == "{}\n"
     assert retained_vocab.read_text() == '{"token": 0}\n'
-    assert not list(Path(config.hf_model_path).glob("model*.safetensors"))
+    assert Path(config.hf_model_path) == source / "hf_model"
+    assert list(Path(config.hf_model_path).glob("model*.safetensors"))
+    assert policy._verified_runtime_assets is not None
+    assert not list(policy._verified_runtime_assets.root.rglob("model*.safetensors"))
 
     saved = tmp_path / "saved"
     policy.save_pretrained(saved)
@@ -297,44 +406,94 @@ def test_verified_runtime_assets_preserve_adapter_owned_sidecars(monkeypatch, tm
     assert config.native_stats_path is not None
     assert config.native_render_metadata_path is not None
     assert config.fast_processor_path is not None
-    assert Path(config.hf_model_path, "vocab.json").read_text() == '{"owner": "base"}\n'
+    assert Path(config.hf_model_path) == base / "hf_model"
+    assert list(Path(config.hf_model_path).glob("model*.safetensors"))
+    retained_vocab = Path(os.environ["QWEN35_VOCAB_PATH"])
+    assert retained_vocab.read_text() == '{"owner": "base"}\n'
+    assert not retained_vocab.is_relative_to(base)
     assert Path(config.native_stats_path).read_text() == '{"owner": "adapter"}\n'
     assert Path(config.native_render_metadata_path).read_text() == '{"owner": "adapter"}\n'
     assert Path(config.fast_processor_path, "processing_action_tokenizer.py").read_text() == (
         "# adapter processor\n"
     )
     assert Path(config.native_stats_path).parent not in {base, adapter}
-    assert Path(config.hf_model_path).parent != Path(config.native_stats_path).parent
+    assert policy._verified_runtime_assets is not None
+    assert Path(config.native_stats_path).parent != policy._verified_runtime_assets.root
+    assert retained_vocab.is_relative_to(policy._verified_runtime_assets.root)
+    assert len(policy._verified_external_runtime_assets) == 1
+    assert Path(config.native_stats_path).is_relative_to(policy._verified_external_runtime_assets[0].root)
+    assert not list(policy._verified_runtime_assets.root.rglob("model*.safetensors"))
 
 
-def test_native_base_save_verifies_a_fresh_snapshot_config(monkeypatch, tmp_path) -> None:
+def test_native_base_save_verifies_fresh_source_config_and_retains_sidecars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     source = tmp_path / "source"
     config = _source_package(source)
     policy = PerceptronIsaacPolicy(config)
-    policy._retain_verified_runtime_assets(source)
-    assert config.hf_model_path is not None
-    live_model_path = Path(config.hf_model_path)
+    policy._isaac_model = _load_native_fixture(config)
     verified: list[Path] = []
+    verify_contract = PerceptronIsaacPolicy._verify_packaged_contract_digests
 
-    def verify_fresh(snapshot_config, snapshot_root):
-        assert snapshot_config is not config
-        model_path = Path(snapshot_config.hf_model_path)
-        assert model_path.is_relative_to(snapshot_root)
-        assert model_path != live_model_path
-        verified.append(Path(snapshot_root))
+    def verify_fresh(source_config: PerceptronIsaacConfig, source_root: Path | None) -> None:
+        assert source_config is not config
+        assert source_root is not None
+        assert source_root == source
+        assert source_config.hf_model_path is not None
+        assert Path(source_config.hf_model_path) == source / "hf_model"
+        assert config.native_stats_path == str(source / "isaac_stats.json")
+        verify_contract(source_config, source_root)
+        verified.append(source_root)
 
     monkeypatch.setattr(
         PerceptronIsaacPolicy, "_verify_packaged_contract_digests", staticmethod(verify_fresh)
     )
 
-    with policy._verified_checkpoint_source(source) as stable_source:
-        assert stable_source == verified[0]
-        assert stable_source != source
-        assert (stable_source / "hf_model" / "config.json").is_file()
+    policy.save_pretrained(tmp_path / "first-save")
+    assert verified == [source]
+    assert policy._verified_runtime_assets is not None
+    retained_root = policy._verified_runtime_assets.root
+    assert retained_root != source
+    assert (retained_root / "hf_model" / "config.json").is_file()
+    assert not list(retained_root.rglob("*.safetensors"))
+    assert not list(retained_root.rglob("model.safetensors.index.json"))
+    assert config.native_stats_path is not None
+    assert config.native_stats_path == str(retained_root / "isaac_stats.json")
+    assert Path(config.native_stats_path).read_text() == "{}\n"
+    assert config.hf_model_path == str(source / "hf_model")
+    assert list((source / "hf_model").glob("model*.safetensors"))
 
-    assert not stable_source.exists()
-    assert (source / "hf_model" / "config.json").is_file()
-    assert verified
+    retired_source = tmp_path / "retired-source"
+    source.rename(retired_source)
+    policy.save_pretrained(tmp_path / "second-save")
+    assert verified == [source]
+    assert policy._verified_runtime_assets.root == retained_root
+    assert (retained_root / "isaac_stats.json").read_text() == "{}\n"
+    assert (tmp_path / "second-save" / "isaac_stats.json").read_text() == "{}\n"
+
+    del policy
+    gc.collect()
+    assert not retained_root.exists()
+    assert list((retired_source / "hf_model").glob("model*.safetensors"))
+    assert (retired_source / "mk1_trained_package_manifest.json").is_file()
+
+
+@pytest.mark.parametrize("asset", ["isaac_stats.json", "hf_model/model-00001-of-00002.safetensors"])
+def test_native_save_rejects_changed_source_before_retaining_sidecars(tmp_path: Path, asset: str) -> None:
+    source = tmp_path / "source"
+    config = _source_package(source)
+    policy = PerceptronIsaacPolicy(config)
+    changed = source / asset
+    changed.write_bytes(changed.read_bytes() + b"tampered")
+
+    with (
+        pytest.raises(RuntimeError, match="digest mismatch"),
+        policy._verified_checkpoint_source(source),
+    ):
+        pytest.fail("Changed source must not become a verified checkpoint source.")
+
+    assert policy._verified_runtime_assets is None
+    assert config.native_stats_path == str(source / "isaac_stats.json")
 
 
 def test_native_vocab_replaces_prior_env_with_retained_snapshot(monkeypatch, tmp_path) -> None:

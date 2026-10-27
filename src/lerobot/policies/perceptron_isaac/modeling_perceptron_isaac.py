@@ -14,7 +14,7 @@ import json
 import logging
 import shutil
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -424,7 +424,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         )
 
     def _retain_verified_runtime_assets(self, verified_root: Path) -> None:
-        """Keep verified sidecars stable without retaining a second copy of model weights."""
+        """Retain verified sidecars privately while leaving lazy weights at their source root."""
         root = Path(verified_root)
         root_entries = {
             path.name
@@ -449,6 +449,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             source_root_value = getattr(self.config, "_checkpoint_source_root", None)
             source_root = Path(str(source_root_value)).resolve() if source_root_value else root.resolve()
             records_by_owner: dict[Path, list[tuple[str, dict[str, str]]]] = {}
+            rebound_paths: dict[str, dict[str, str]] = {}
             for attr, record in relative_paths.items():
                 if (
                     not isinstance(record, dict)
@@ -456,11 +457,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     or not isinstance(record.get("relative"), str)
                 ):
                     continue
+                if attr == "hf_model_path":
+                    # Weight ownership stays with the original package, not the sidecar snapshot.
+                    rebound_paths[attr] = record
+                    continue
                 owner_value = record.get("root")
                 owner = Path(owner_value).resolve() if isinstance(owner_value, str) else source_root
                 records_by_owner.setdefault(owner, []).append((attr, record))
 
-            rebound_paths: dict[str, dict[str, str]] = {}
             for owner, records in records_by_owner.items():
                 if owner == source_root:
                     owner_snapshot = snapshot
@@ -486,7 +490,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     }
             self.config._checkpoint_relative_paths = rebound_paths
             self.config._pretrained_processor_root = str(snapshot.root)
-            self._set_checkpoint_local_vocab_path(self.config, force=True)
+            self._set_checkpoint_local_vocab_path(
+                self.config, model_root=snapshot.root / "hf_model", force=True
+            )
         except BaseException:
             snapshot.cleanup()
             for external in external_snapshots:
@@ -502,15 +508,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             external.cleanup()
 
     @contextmanager
-    def _verified_checkpoint_source(self, source_root: Path):
-        """Yield one stable, verified package root and release its private snapshot."""
+    def _verified_checkpoint_source(self, source_root: Path) -> Iterator[Path]:
+        """Verify original source bytes once and retain only sidecars for the policy lifetime."""
+        if self._verified_runtime_assets is None:
+            self._verify_saved_package(source_root)
+            self._retain_verified_runtime_assets(source_root)
         runtime_assets = self._verified_runtime_assets
-        if runtime_assets is not None and source_root == runtime_assets.root:
-            yield runtime_assets.root
-            return
-        with snapshot_directory(source_root, prefix="lerobot-mk1-save-") as snapshot:
-            self._verify_saved_package(snapshot.root)
-            yield snapshot.root
+        assert runtime_assets is not None
+        yield runtime_assets.root
 
     def _save_canonical_inner_weights(
         self,
@@ -1519,6 +1524,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         cls._verify_packaged_contract_digests(config, checkpoint_root)
         cls._set_checkpoint_local_vocab_path(config)
         policy = cls(config)
+        # Raw exports keep their documented parent-relative inference assets.
+        if cls._portable_export_root(checkpoint_root) is None:
+            policy._retain_verified_runtime_assets(checkpoint_root)
         policy.eval()
         return policy
 
@@ -1533,8 +1541,16 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if checkpoint_root is None:
             return
         root = Path(checkpoint_root).resolve()
+        declares_trained_package = (
+            config.mk1_trained_package_manifest_sha256 is not None
+            or (root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME).exists()
+        )
         model_path = getattr(config, "hf_model_path", None)
-        if model_path is not None and is_portable_isaac05_repository(Path(model_path)):
+        if (
+            model_path is not None
+            and is_portable_isaac05_repository(Path(model_path))
+            and not declares_trained_package
+        ):
             expected_adapter = getattr(config, "deployment_adapter_sha256", None)
             if not expected_adapter:
                 raise RuntimeError("Portable Isaac-0.5 package requires deployment_adapter_sha256.")
@@ -1555,7 +1571,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             return
         is_mk1_package = PerceptronIsaacPolicy._config_declares_mk1(config)
         if is_mk1_package:
-            if config.artifact_kind == "neutral_debug":
+            if config.artifact_kind == "neutral_debug" and not declares_trained_package:
                 PerceptronIsaacPolicy._verify_neutral_debug_manifest(config, root)
                 return
 
@@ -2166,9 +2182,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     def _set_checkpoint_local_vocab_path(
         config: PerceptronIsaacConfig,
         *,
+        model_root: Path | None = None,
         force: bool = False,
     ) -> None:
-        """Publish the package vocab only after its integrity record has passed."""
+        """Publish verified vocab from its retained owner or the original model root."""
         import os
 
         if (
@@ -2177,8 +2194,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             and os.environ.get("QWEN35_VOCAB_PATH")
         ):
             return
-        hf_model_path = config.hf_model_path
+        hf_model_path = model_root if model_root is not None else config.hf_model_path
         if hf_model_path:
-            vocab = Path(str(hf_model_path)) / "vocab.json"
+            vocab = Path(hf_model_path) / "vocab.json"
             if vocab.is_file():
                 os.environ["QWEN35_VOCAB_PATH"] = str(vocab)
