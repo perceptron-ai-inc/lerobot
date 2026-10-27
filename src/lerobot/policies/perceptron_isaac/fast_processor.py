@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from lerobot.utils.import_utils import require_package
+
 if TYPE_CHECKING:
     import numpy as np
     from transformers import PreTrainedTokenizerFast
@@ -140,6 +142,7 @@ class NativeFastActionProcessor:
     inverse DCT. No fitting, checkpoint Python, or ProcessorMixin dispatch.
     Malformed decoded rows retain the original zero-coefficient fallback.
     Decode geometry overrides persist, matching the pinned processor cache.
+    SciPy is required only when encoding or decoding.
     """
 
     def __init__(
@@ -174,6 +177,8 @@ class NativeFastActionProcessor:
 
     def __call__(self, action_chunk: np.ndarray) -> list[list[int]]:
         import numpy as np
+
+        require_package("scipy", extra="perceptron_isaac")
         from scipy.fft import dct
 
         actions = np.asarray(action_chunk)
@@ -204,6 +209,8 @@ class NativeFastActionProcessor:
         action_dim: int | None = None,
     ) -> np.ndarray:
         import numpy as np
+
+        require_package("scipy", extra="perceptron_isaac")
         from scipy.fft import idct
 
         self._validate_geometry(time_horizon, action_dim)
@@ -236,6 +243,7 @@ def load_fast_action_processor(path: str | Path, *, expected_tree_sha256: str) -
     Checkpoint files supply data only. The historical Python file remains part
     of the immutable tree identity, but is never compiled, imported or executed.
     Tokenizer JSON is loaded by the native tokenizer constructor below.
+    Optional tokenizer dependencies are checked only after artifact authentication.
     """
     if not expected_tree_sha256 or len(expected_tree_sha256) != 64:
         raise ValueError("FAST processor loading requires a checkpoint-owned tree SHA-256.")
@@ -266,6 +274,7 @@ def load_fast_action_processor(path: str | Path, *, expected_tree_sha256: str) -
         raise ValueError("FAST processor metadata does not name the pinned UniversalActionProcessor.")
     tokenizer_config = json.loads((root / "tokenizer_config.json").read_text())
 
+    require_package("transformers", extra="perceptron_isaac")
     from transformers import PreTrainedTokenizerFast
 
     tokenizer = PreTrainedTokenizerFast(

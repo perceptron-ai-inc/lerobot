@@ -7,13 +7,12 @@ import pytest
 
 from lerobot.utils.import_utils import _transformers_available
 
-_MISSING_EXTRA = """
+_MISSING_IMPORTS = """
 import importlib.abc
 import importlib.util
 import sys
 
 blocked = set(sys.argv[1].split(","))
-missing = sys.argv[2]
 original_find_spec = importlib.util.find_spec
 
 def find_spec(name, *args, **kwargs):
@@ -29,6 +28,12 @@ class MissingOptionalDependency(importlib.abc.MetaPathFinder):
             raise ModuleNotFoundError(fullname)
 
 sys.meta_path.insert(0, MissingOptionalDependency())
+"""
+
+_MISSING_EXTRA = (
+    _MISSING_IMPORTS
+    + """
+missing = sys.argv[2]
 
 from lerobot.policies import PerceptronIsaacConfig, make_policy_config
 assert isinstance(make_policy_config("perceptron_isaac"), PerceptronIsaacConfig)
@@ -43,6 +48,7 @@ except ImportError as exc:
 else:
     raise AssertionError(f"construction must explain the missing {missing} extra")
 """
+)
 
 
 @pytest.mark.parametrize(

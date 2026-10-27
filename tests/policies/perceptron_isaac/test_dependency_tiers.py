@@ -18,7 +18,7 @@ import pytest
             ("tokenizers", "transformers", "peft"),
             (),
             7,
-            21,
+            25,
             id="fast-base-tier",
         ),
         # Tamper/digest rejection needs artifact data, but never reaches Transformers.
@@ -26,13 +26,13 @@ import pytest
             "test_fast_processor.py",
             ("transformers", "peft"),
             ("tokenizers",),
-            8,
-            20,
+            10,
+            22,
             id="fast-no-transformers",
         ),
         # Loading and security checks do not call the SciPy-backed codec.
         pytest.param(
-            "test_fast_processor.py", ("scipy",), ("tokenizers", "transformers"), 9, 19, id="fast-no-scipy"
+            "test_fast_processor.py", ("scipy",), ("tokenizers", "transformers"), 13, 19, id="fast-no-scipy"
         ),
         pytest.param(
             "test_hardware_feature_order.py",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,6 +16,54 @@ from lerobot.policies.perceptron_isaac.fast_processor import (
     fast_processor_tree_identity,
     materialize_fast_processor_artifact,
     materialize_pinned_fast_processor_snapshot,
+)
+from tests.policies.perceptron_isaac.test_optional_imports import _MISSING_IMPORTS
+
+_MISSING_FAST_EXTRA = (
+    _MISSING_IMPORTS
+    + """
+from pathlib import Path
+import pytest
+
+from lerobot.policies import PerceptronIsaacConfig, make_policy_config
+from lerobot.policies.perceptron_isaac import fast_processor as fast
+
+assert isinstance(make_policy_config("perceptron_isaac"), PerceptronIsaacConfig)
+assert not blocked.intersection(sys.modules), "FAST module import must keep extras lazy"
+
+root = Path(sys.argv[2])
+digest = sys.argv[3]
+operation = sys.argv[4]
+# Reuse the tiny artifact's explicit identity boundary in this fresh process.
+fast.DEFAULT_FAST_PROCESSOR_TREE_SHA256 = digest
+assert fast.fast_processor_tree_identity(root)[0] == digest
+
+if operation == "integrity":
+    with pytest.raises(ValueError, match="reviewed pinned revision"):
+        fast.load_fast_action_processor(root, expected_tree_sha256="f" * 64)
+    (root / "processing_action_tokenizer.py").write_text("changed inert data")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        fast.load_fast_action_processor(root, expected_tree_sha256=digest)
+else:
+    if operation != "load":
+        # Loading valid artifacts must not require SciPy, even for decode-only use.
+        processor = fast.load_fast_action_processor(root, expected_tree_sha256=digest)
+        assert "scipy" not in sys.modules
+        import numpy as np
+
+    with pytest.raises(ImportError) as error:
+        if operation == "load":
+            fast.load_fast_action_processor(root, expected_tree_sha256=digest)
+        elif operation == "encode":
+            processor(np.zeros((1, 2)))
+        elif operation == "decode":
+            processor.decode([[128]], time_horizon=1, action_dim=2)
+        else:
+            raise AssertionError(f"unknown FAST operation: {operation}")
+    message = str(error.value)
+    assert "lerobot[perceptron_isaac]" in message, message
+    assert sys.argv[1].split(",")[0] in message, message
+"""
 )
 
 
@@ -149,6 +199,31 @@ def tiny_fast_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
     monkeypatch.setitem(fast.__dict__, "compile", reject_checkpoint_code)
     monkeypatch.setitem(fast.__dict__, "exec", reject_checkpoint_code)
     return root, digest
+
+
+@pytest.mark.parametrize(
+    ("blocked", "operation"),
+    [
+        pytest.param(("transformers", "peft"), "load", id="transformers-load"),
+        pytest.param(("scipy",), "encode", id="scipy-encode"),
+        pytest.param(("scipy",), "decode", id="scipy-decode"),
+        pytest.param(("transformers", "peft", "scipy", "mharmony"), "integrity", id="integrity-first"),
+    ],
+)
+def test_fast_processor_optional_dependency_boundary(
+    tiny_fast_artifact: tuple[Path, str], blocked: tuple[str, ...], operation: str
+) -> None:
+    """Exercise real FAST leaves without changing imports in the pytest process."""
+    if operation in ("encode", "decode"):
+        pytest.importorskip("transformers", reason="install lerobot[perceptron_isaac]")
+    root, digest = tiny_fast_artifact
+    result = subprocess.run(
+        [sys.executable, "-c", _MISSING_FAST_EXTRA, ",".join(blocked), str(root), digest, operation],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_fast_processor_never_executes_checkpoint_python(
