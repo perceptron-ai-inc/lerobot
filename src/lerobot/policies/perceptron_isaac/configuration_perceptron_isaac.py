@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
+from huggingface_hub.constants import CONFIG_NAME
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
@@ -577,6 +578,56 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                 return str(candidate)
         return None
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return portable asset paths and export identity without mutating runtime paths.
+
+        Both config.json and the nested training policy use this representation.
+        Export metadata is deliberately outside dataclass fields so draccus never
+        persists runtime ownership records or processor objects.
+        """
+        config = super().to_dict()
+        metadata = vars(self)
+        for name in (
+            "mk1_model_import_sha256",
+            "mk1_source_model_import_sha256",
+        ):
+            export_name = f"_export_{name}"
+            if export_name in metadata:
+                config[name] = metadata[export_name]
+        for name, record in metadata.get("_checkpoint_relative_paths", {}).items():
+            if (
+                isinstance(record, dict)
+                and str(config.get(name, "")) == record.get("absolute")
+                and isinstance(record.get("relative"), str)
+            ):
+                config[name] = record["relative"]
+
+        stats = metadata.get("_export_native_stats")
+        if stats is not None:
+            config["native_stats_path"] = NATIVE_STATS_EXPORT_FILENAME
+            config["stats_path"] = None
+            # Labels follow the exported stats, not the base package's quantiles.
+            config["normalization_profile_id"] = stats.profile_id
+            config["normalization_profile_scope"] = stats.profile_scope
+            config["normalization_validation_status"] = stats.validation_status
+        suite_tables = self._suite_table_export_sources()
+        if all(source.is_file() for source, _ in suite_tables.values()):
+            config.update({name: filename for name, (_, filename) in suite_tables.items()})
+        return config
+
+    def _suite_table_export_sources(self) -> dict[str, tuple[Path, str]]:
+        """Describe the paired routing-table export without copying or changing paths."""
+        declared = {
+            "suite_stats_path": (self.suite_stats_path, SUITE_STATS_EXPORT_FILENAME),
+            "suite_by_task_index_path": (
+                self.suite_by_task_index_path,
+                SUITE_BY_TASK_INDEX_EXPORT_FILENAME,
+            ),
+        }
+        if not all(str(source or "").strip() for source, _ in declared.values()):
+            return {}
+        return {name: (Path(str(source)), filename) for name, (source, filename) in declared.items()}
+
     def _save_pretrained(self, save_directory: Path) -> None:
         """Write config.json, exporting checkpoint-local sidecars when known.
 
@@ -593,49 +644,16 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         absolute ``native_stats_path`` and serving-side path-loads normalize proprio
         with the wrong quantiles.
         """
-        overrides: dict[str, object] = {}
-        for name in (
-            "mk1_model_import_sha256",
-            "mk1_source_model_import_sha256",
-        ):
-            override = getattr(self, f"_export_{name}", None)
-            if override is not None or hasattr(self, f"_export_{name}"):
-                overrides[name] = override
-        for name, record in getattr(self, "_checkpoint_relative_paths", {}).items():
-            if (
-                isinstance(record, dict)
-                and str(getattr(self, name, "")) == record.get("absolute")
-                and isinstance(record.get("relative"), str)
-            ):
-                overrides[name] = record["relative"]
-
-        stats = getattr(self, "_export_native_stats", None)
+        stats = vars(self).get("_export_native_stats")
         if stats is not None:
             from .isaac_stats import save_isaac_stats
 
             save_isaac_stats(stats, Path(save_directory) / NATIVE_STATS_EXPORT_FILENAME)
-            overrides["native_stats_path"] = NATIVE_STATS_EXPORT_FILENAME
-            overrides["stats_path"] = None
-            # Labels follow the exported stats so the saved config stops advertising the
-            # base lineage while carrying finetune-dataset values.
-            overrides["normalization_profile_id"] = stats.profile_id
-            overrides["normalization_profile_scope"] = stats.profile_scope
-            overrides["normalization_validation_status"] = stats.validation_status
 
-        overrides.update(self._export_suite_tables(Path(save_directory)))
-
-        if not overrides:
-            super()._save_pretrained(save_directory)
-            return
-
-        original = {name: getattr(self, name) for name in overrides}
-        for name, value in overrides.items():
-            setattr(self, name, value)
-        try:
-            super()._save_pretrained(save_directory)
-        finally:
-            for name, value in original.items():
-                setattr(self, name, value)
+        config = self.to_dict()
+        config.update(self._export_suite_tables(Path(save_directory)))
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            json.dump(config, f, indent=4)
 
     def _export_suite_tables(self, save_directory: Path) -> dict[str, str | None]:
         """Copy the per-suite routing tables into the checkpoint, returning relative overrides.
@@ -654,17 +672,12 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         import logging
         import shutil
 
-        pairs = (
-            ("suite_stats_path", SUITE_STATS_EXPORT_FILENAME),
-            ("suite_by_task_index_path", SUITE_BY_TASK_INDEX_EXPORT_FILENAME),
-        )
         # Both or neither: the processor rejects a lone path, so a half-copied pair would
         # turn a recoverable stale path into an outright invalid config.
-        declared = {name: getattr(self, name, None) for name, _ in pairs}
-        if not all(str(value or "").strip() for value in declared.values()):
+        sources = self._suite_table_export_sources()
+        if not sources:
             return {}
-        sources = {name: Path(str(value)) for name, value in declared.items()}
-        missing = [str(path) for path in sources.values() if not path.is_file()]
+        missing = [str(path) for path, _ in sources.values() if not path.is_file()]
         if missing:
             logging.getLogger(__name__).warning(
                 "Perceptron Isaac per-suite table(s) %s are not readable at save time; the saved "
@@ -675,9 +688,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
             return {}
 
         exported: dict[str, str | None] = {}
-        for name, filename in pairs:
+        for name, (source, filename) in sources.items():
             destination = save_directory / filename
-            source = sources[name]
             if source.resolve() != destination.resolve():
                 shutil.copyfile(source, destination)
             exported[name] = filename

@@ -191,8 +191,8 @@ class TrainPipelineConfig(HubMixin):
     def trainable_config(self) -> PreTrainedConfig | RewardModelConfig:
         """Return whichever config (policy or reward_model) is active."""
         if self.is_reward_model_training:
-            return self.reward_model  # type: ignore[return-value]
-        return self.policy  # type: ignore[return-value]
+            return self.reward_model
+        return self.policy
 
     def _resolve_pretrained_from_cli(self) -> None:
         """Resolve the pretrained source passed on the CLI into a loaded config.
@@ -218,6 +218,15 @@ class TrainPipelineConfig(HubMixin):
             self.policy.pretrained_path = Path(policy_path)
         elif self.resume:
             self._resolve_resume_checkpoint()
+            if self.policy is not None and self.checkpoint_path is not None:
+                # The run config precedes finalization. Reload the component's final
+                # identities instead of treating a stale nested manifest as a new pin.
+                parent_path = self.policy.pretrained_path
+                overrides = parser.get_yaml_overrides("policy") + (parser.get_cli_overrides("policy") or [])
+                self.policy = PreTrainedConfig.from_pretrained(
+                    self.checkpoint_path / PRETRAINED_MODEL_DIR, cli_overrides=overrides
+                )
+                self.policy.pretrained_path = parent_path
 
     def _resolve_resume_checkpoint(self) -> None:
         """Resolve the checkpoint named by `--config_path` into `checkpoint_path`.
@@ -402,11 +411,14 @@ class TrainPipelineConfig(HubMixin):
         return ["policy", "reward_model"]
 
     def to_dict(self) -> dict[str, Any]:
-        return draccus.encode(self)
+        config = draccus.encode(self)
+        if self.policy is not None:
+            config["policy"] = self.policy.to_dict()
+        return config
 
     def _save_pretrained(self, save_directory: Path) -> None:
         with open(save_directory / TRAIN_CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+            draccus.dump(self.to_dict(), f, indent=4)
 
     @classmethod
     def from_pretrained(

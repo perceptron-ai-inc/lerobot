@@ -190,11 +190,15 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
                 return ft
         return None
 
-    def _save_pretrained(self, save_directory: Path) -> None:
+    def to_dict(self) -> dict[str, Any]:
+        """Return the serialized policy config without changing the live configuration."""
         # Encode against the base class so draccus includes the choice "type" key,
         # which `from_pretrained` needs to resolve the concrete subclass.
+        return draccus.encode(self, PreTrainedConfig)
+
+    def _save_pretrained(self, save_directory: Path) -> None:
         with open(save_directory / CONFIG_NAME, "w") as f:
-            json.dump(draccus.encode(self, PreTrainedConfig), f, indent=4)
+            json.dump(self.to_dict(), f, indent=4)
 
     @classmethod
     def from_pretrained(
