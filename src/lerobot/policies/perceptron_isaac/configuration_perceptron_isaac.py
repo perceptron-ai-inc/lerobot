@@ -106,7 +106,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     num_inference_steps: int = 10
     # Flow-sample averaging: sample the flow ODE `num_flow_samples` times (fresh noise each) and
     # mean the normalized chunks before unnormalize. 1 = single sample (no averaging).
-    num_flow_samples: int = 4
+    num_flow_samples: int = 1
     flow_seed_base: int | None = None
     # Flow-target clip. This is the checkpoint-owned value: the inference recipe carries it on
     # the ``flow_action`` wire, and the importer copies it from there.

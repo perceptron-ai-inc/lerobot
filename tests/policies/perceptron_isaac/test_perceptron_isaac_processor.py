@@ -1842,6 +1842,7 @@ def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
         chunk_size=50,
         n_action_steps=30,
         num_inference_steps=12,
+        num_flow_samples=4,
         apply_offset_norm=False,
         mk1_model_import_sha256="0" * 64,
         # fp32 storage defers the load, so pin bf16 storage to exercise the eager path.
