@@ -8,6 +8,7 @@ without depending on RNG consumption order.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -449,11 +450,10 @@ def _global_objective_mean(
         raise ValueError("ISAAC global objective denominator must be one finite scalar.")
     if not bool(global_denominator > 0):
         raise ValueError("ISAAC global objective denominator must be positive.")
-    return (
-        numerator * (world_size * metric_scale / global_denominator),
-        global_numerator * metric_scale / global_denominator,
-        global_denominator,
-    )
+    backward = numerator * (world_size * metric_scale / global_denominator)
+    value = global_numerator * metric_scale / global_denominator
+    # The public scalar is global; DDP still averages only rank-local derivatives.
+    return backward + (value - backward.detach()), value, global_denominator
 
 
 def perceptron_isaac_training_loss(
@@ -466,6 +466,8 @@ def perceptron_isaac_training_loss(
     train_samples_per_chunk: int = 1,
     flow_mask_padded_action_rows: bool = True,
     softmax_auxiliary_loss_scale: float = 0.0,
+    moe_load_balancing_loss_coeff: float = 0.02,
+    moe_z_loss_coeff: float = 0.001,
     flow_timesteps: Tensor | None = None,
     flow_noise: Tensor | None = None,
     flow_loss_mask: Tensor | None = None,
@@ -478,8 +480,13 @@ def perceptron_isaac_training_loss(
         raise ValueError(f"Unsupported ISAAC loss plan {loss_plan!r}.")
     if reduction not in {"mean", "none"}:
         raise ValueError("ISAAC loss reduction must be 'mean' or 'none'.")
-    if softmax_auxiliary_loss_scale < 0:
-        raise ValueError("softmax_auxiliary_loss_scale must be nonnegative.")
+    for name, coefficient in (
+        ("softmax_auxiliary_loss_scale", softmax_auxiliary_loss_scale),
+        ("moe_load_balancing_loss_coeff", moe_load_balancing_loss_coeff),
+        ("moe_z_loss_coeff", moe_z_loss_coeff),
+    ):
+        if not math.isfinite(coefficient) or coefficient < 0:
+            raise ValueError(f"{name} must be finite and nonnegative.")
     if accumulation_scale < 1:
         raise ValueError("ISAAC loss accumulation_scale must be >= 1.")
     expected_denominators = {"flow", "text"} if loss_plan == "text_ntp_fast_flow_action" else {"flow"}
@@ -543,6 +550,21 @@ def perceptron_isaac_training_loss(
                 "text_token_count": output.final_activations.new_zeros((), dtype=torch.float32),
             }
         )
+    auxiliary = total_backward.new_zeros(())
+    for key, coefficient in (
+        ("load_balancing_loss", moe_load_balancing_loss_coeff),
+        ("router_z_loss", moe_z_loss_coeff),
+    ):
+        # Do not attach disabled branches: even zero times an overflowing loss can poison backward.
+        if coefficient == 0:
+            continue
+        layers = output.additional_info.get(key, ())
+        if layers:
+            layer_mean = torch.stack(layers).mean()
+            metrics[key] = layer_mean.detach()
+            auxiliary = auxiliary + coefficient * layer_mean
+    total_backward = total_backward + auxiliary
+    per_sample = per_sample + auxiliary
     loss = total_backward if reduction == "mean" else per_sample
-    metrics["loss"] = metrics["flow_loss"] + metrics["text_loss"]
+    metrics["loss"] = metrics["flow_loss"] + metrics["text_loss"] + auxiliary.detach()
     return IsaacLossOutput(loss=loss, per_sample_loss=per_sample, metrics=metrics)

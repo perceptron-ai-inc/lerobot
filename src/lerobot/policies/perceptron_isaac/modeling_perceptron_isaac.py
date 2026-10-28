@@ -1421,6 +1421,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             train_samples_per_chunk=int(self.config.train_samples_per_chunk),
             flow_mask_padded_action_rows=bool(self.config.flow_mask_padded_action_rows),
             softmax_auxiliary_loss_scale=float(self.config.softmax_auxiliary_loss_scale),
+            moe_load_balancing_loss_coeff=self.config.moe_load_balancing_loss_coeff,
+            moe_z_loss_coeff=self.config.moe_z_loss_coeff,
             flow_timesteps=flow_fixture_tensors[ISAAC_FLOW_TIMESTEPS_KEY],
             flow_noise=flow_fixture_tensors[ISAAC_FLOW_NOISE_KEY],
             flow_loss_mask=flow_fixture_tensors[ISAAC_FLOW_LOSS_MASK_KEY],

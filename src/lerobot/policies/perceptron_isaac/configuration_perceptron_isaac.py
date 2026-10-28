@@ -285,6 +285,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     flow_dual_timestep_ratio: float = 0.0
     flow_mask_padded_action_rows: bool = True  # MolmoAct expert masks padded terminal action rows
     softmax_auxiliary_loss_scale: float = 0.0001
+    moe_load_balancing_loss_coeff: float = 0.02
+    moe_z_loss_coeff: float = 0.001
     freeze_input_embeddings: bool = True
     # Compute dtype: the policy opens the matching autocast context. Sharded training gets the
     # same BF16 compute from --accelerator.mixed_precision=bf16. ISAAC keeps numerically
@@ -491,8 +493,13 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                 "Native ISAAC training does not yet implement dual-timestep sampling; "
                 "flow_dual_timestep_ratio must be 0."
             )
-        if self.softmax_auxiliary_loss_scale < 0.0:
-            raise ValueError("softmax_auxiliary_loss_scale must be nonnegative.")
+        for name, coefficient in (
+            ("softmax_auxiliary_loss_scale", self.softmax_auxiliary_loss_scale),
+            ("moe_load_balancing_loss_coeff", self.moe_load_balancing_loss_coeff),
+            ("moe_z_loss_coeff", self.moe_z_loss_coeff),
+        ):
+            if not math.isfinite(coefficient) or coefficient < 0:
+                raise ValueError(f"{name} must be finite and nonnegative.")
         if self.dtype != torch.bfloat16:
             raise ValueError(
                 "Perceptron Isaac training and inference require dtype=torch.bfloat16 compute; "

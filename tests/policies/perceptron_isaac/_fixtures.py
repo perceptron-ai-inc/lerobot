@@ -81,6 +81,7 @@ class TinyIsaacModel(nn.Module):
             final_activations=activations,
             final_embedding=self.lm_head,
             flow_matching_expert=self.action_expert,
+            additional_info={},
         )
 
 

@@ -1544,13 +1544,17 @@ class Qwen35VLAModel(Qwen3_5Model):
         # padding so this is all-ones (identical to the prior behavior). Truncate `mod` to L_model to
         # match the [:, :-1] NTP shift.
         attention_mask = (mod != TextType.padding.value).to(torch.long)[:, :-1]
+        router_output_kwargs = {}
+        if kwargs.get("output_router_auxiliaries", False):
+            router_output_kwargs["output_router_auxiliaries"] = True
         out = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             use_cache=False,
+            **router_output_kwargs,
         )
-        return BaseModelOutputWithPast(last_hidden_state=out.last_hidden_state)
+        return out
 
 
 # === Top-level model: inner VLA model + lm_head + sample_action ===

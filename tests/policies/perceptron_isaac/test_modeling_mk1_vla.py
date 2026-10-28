@@ -103,29 +103,31 @@ def _qualify_cuda_runtime(
     capability: tuple[int, int] | None = None,
     device_name: str | None = None,
 ) -> None:
-    monkeypatch.setattr(modeling_mk1_vla.torch, "__version__", QUALIFIED_TORCH_CUDA_ABI)
-    monkeypatch.setattr(modeling_mk1_vla.torch.version, "cuda", "12.8")
+    monkeypatch.setattr(torch, "__version__", QUALIFIED_TORCH_CUDA_ABI)
+    monkeypatch.setattr(torch.version, "cuda", "12.8")
     if capability is not None:
         monkeypatch.setattr(
-            modeling_mk1_vla.torch.cuda,
+            torch.cuda,
             "get_device_capability",
             lambda device: capability,
         )
     if device_name is not None:
         monkeypatch.setattr(
-            modeling_mk1_vla.torch.cuda,
+            torch.cuda,
             "get_device_name",
             lambda device: device_name,
         )
 
 
-def test_mk1_reuses_pr3154_vla_shell_descriptors_verbatim() -> None:
+def test_mk1_reuses_pr3154_embedding_and_inference_shell_descriptors_verbatim() -> None:
     for name in ("_embed_text", "_embed_vector", "_embed_vision", "embed_stream", "forward"):
         assert (
             modeling_mk1_vla.Mk1Qwen36VLAModel.__dict__[name]
             is modeling_qwen35_vla.Qwen35VLAModel.__dict__[name]
         )
-    for name in ("get_input_embeddings", "action_expert", "sample_action", "train_forward"):
+    # Native train_forward now owns the approved router-auxiliary capture; its
+    # real scalar, gradient and count contract is tested in the MoE suites.
+    for name in ("get_input_embeddings", "action_expert", "sample_action"):
         assert (
             modeling_mk1_vla.Mk1Qwen36VLAForActionGeneration.__dict__[name]
             is modeling_qwen35_vla.Qwen35VLAForActionGeneration.__dict__[name]

@@ -93,6 +93,11 @@ row per environment without adding frames to model history or time.
 Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
 `action-noise`.
 
+`moe_auxiliary_losses.py` materializes global logical dispatch counts and router
+probabilities for each layer. Balance (0.02) and router z-loss (0.001) average
+across layers, independently of the LM softmax penalty (0.0001). Every forwarded
+position participates, including padding remaining after NTP truncation.
+
 RTC execution, prefix pinning and dual-time conditioning are retired. Legacy
 RTC-off settings remain readable. Released RTC-capable source metadata and
 weights remain authenticated and unchanged; source recipe values do not enable

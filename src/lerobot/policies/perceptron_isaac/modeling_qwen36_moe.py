@@ -38,11 +38,14 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeTextModel,
     Qwen3_5MoeVisionModel,
 )
+from transformers.utils.output_capturing import OutputRecorder
+
+from .moe_auxiliary_losses import GenesisNullRouterAuxiliary
 
 _NULL_EXPERT_SEMANTICS = "skip_compute_renormalize_real_routes"
 _SIGMOID_GATED_SHARED_EXPERT = "sigmoid_gated_additive"
 _ROUTER_CONTRACT_VERSION = 1
-DETERMINISTIC_ROUTE_REDUCTION = "stable_token_segment_sum_v1"
+DETERMINISTIC_ROUTE_REDUCTION: Literal["stable_token_segment_sum_v1"] = "stable_token_segment_sum_v1"
 GENESIS_ROTARY_PRECISION = "checkpoint_bf16_inv_freq_fp32_phase_v1"
 
 
@@ -379,6 +382,9 @@ class GenesisNullSparseMoeBlock(nn.Module):
         super().__init__()
         self.contract = GenesisNullMoeContract.from_text_config(config)
         self.gate = GenesisNullTopKRouter(config)
+        self.auxiliary = GenesisNullRouterAuxiliary(
+            self.contract.num_real_experts, self.contract.num_null_experts
+        )
         self.experts = Qwen3_5MoeExperts(config)
         self.shared_expert = Qwen3_5MoeMLP(
             config,
@@ -602,6 +608,7 @@ class GenesisNullSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flattened = hidden_states.reshape(-1, hidden_dim)
         routing = self.gate.route(flattened)
+        self.auxiliary(routing.physical_logits, routing.logical_probabilities, routing.selected_experts)
         shared_output = self._shared_expert_output(flattened)
         routed_output, combined_output = self._dispatch_real_experts(flattened, routing, shared_output)
         output = combined_output.reshape(batch_size, sequence_length, hidden_dim)
@@ -1098,6 +1105,10 @@ class GenesisQwen36TextModel(Qwen3_5MoeTextModel):
     """Qwen3.6 hybrid text stack constructed directly with null-aware layers."""
 
     _no_split_modules = ["GenesisQwen36DecoderLayer"]
+    _can_record_outputs = {
+        **Qwen3_5MoeTextModel._can_record_outputs,
+        "router_auxiliaries": OutputRecorder(GenesisNullRouterAuxiliary),
+    }
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         Qwen3_5MoePreTrainedModel.__init__(self, config)

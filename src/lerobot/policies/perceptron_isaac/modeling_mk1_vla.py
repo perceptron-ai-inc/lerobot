@@ -28,6 +28,7 @@ from .mk1_checkpoint_contract import (
     validate_mk1_tokenizer,
 )
 from .modeling_qwen35_vla import (
+    ModelOutput,
     Qwen35VLAForActionGeneration,
     Qwen35VLAModel,
     build_action_expert_head,
@@ -38,6 +39,7 @@ from .modeling_qwen36_moe import (
     GenesisQwen36Model,
     Mk1Qwen36MoeConfig,
 )
+from .moe_auxiliary_losses import materialize_router_auxiliaries
 from .trained_package import VerifiedTrainedTensorStorage
 
 TORCH_SDPA_ATTENTION_BACKEND: Literal["torch_sdpa_v1"] = "torch_sdpa_v1"
@@ -120,7 +122,19 @@ class Mk1Qwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
     get_input_embeddings = Qwen35VLAForActionGeneration.get_input_embeddings
     action_expert = Qwen35VLAForActionGeneration.action_expert
     sample_action = Qwen35VLAForActionGeneration.sample_action
-    train_forward = Qwen35VLAForActionGeneration.train_forward
+
+    def train_forward(self, tensor_stream: Any) -> ModelOutput:
+        """Capture every forwarded router position without retaining mutable per-layer loss state."""
+        out = self.model(tensor_stream, output_router_auxiliaries=True)
+        layers = out.get("router_auxiliaries", ())
+        if len(layers) != len(self.model.language_model.layers):
+            raise RuntimeError("Native training must return one router auxiliary per backbone layer.")
+        return ModelOutput(
+            final_activations=out.last_hidden_state,
+            final_embedding=self.lm_head,
+            flow_matching_expert=self.model.action_expert,
+            additional_info=materialize_router_auxiliaries(layers),
+        )
 
 
 def _build_config(
