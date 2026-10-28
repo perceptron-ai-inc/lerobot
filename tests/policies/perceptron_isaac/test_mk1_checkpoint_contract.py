@@ -4,7 +4,7 @@ import copy
 import json
 import shutil
 from pathlib import Path
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import pytest
 import torch
@@ -844,11 +844,13 @@ def test_config_json_requires_existing_file(tmp_path: Path) -> None:
 
 def _write_portable_isaac05_checkpoint(
     root: Path,
+    *,
+    config: dict[str, Any] | None = None,
 ) -> tuple[Mk1CheckpointContract, dict, torch.Tensor]:
-    """Write the shared tiny F32 source fixture; no checkpoint code is needed."""
+    """Write a tiny F32 source; optional geometry must pass the real native parser."""
     from safetensors.torch import load_file
 
-    native = _config(test_geometry=True, mtp_present=False)
+    native = _config(test_geometry=True, mtp_present=False) if config is None else config
     raw = copy.deepcopy(native)
     raw["model_type"] = "isaac_0_5"
     raw["architectures"] = ["Isaac05ForConditionalGeneration"]

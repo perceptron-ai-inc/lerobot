@@ -98,6 +98,11 @@ probabilities for each layer. Balance (0.02) and router z-loss (0.001) average
 across layers, independently of the LM softmax penalty (0.0001). Every forwarded
 position participates, including padding remaining after NTP truncation.
 
+Training load intent and one-time training setup recompute nonpersistent text
+RoPE frequencies in F32 from the original formula, including BF16-source training.
+They do not replace parameters or widen a rounded BF16 table. Inference retains
+the released BF16 frequency table and phase behavior.
+
 RTC execution, prefix pinning and dual-time conditioning are retired. Legacy
 RTC-off settings remain readable. Released RTC-capable source metadata and
 weights remain authenticated and unchanged; source recipe values do not enable

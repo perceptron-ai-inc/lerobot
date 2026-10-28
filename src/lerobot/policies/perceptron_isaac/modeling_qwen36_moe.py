@@ -890,30 +890,31 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
 
 
 class GenesisQwen36TextRotaryEmbedding(nn.Module):
-    """Genesis mRoPE with model-dtype inverse-frequency quantization.
+    """Genesis mRoPE with intent-specific derived inverse frequencies.
 
-    Genesis registers ``inv_freq`` on the backbone before casting the complete
-    model to its inference dtype. Its phase calculation then promotes that
-    already-quantized table back to FP32. Keeping this derived buffer
-    nonpersistent preserves the HF checkpoint tensor ABI, while the loader
-    places it using the same dtype as the checkpoint parameters.
+    Serving promotes the released BF16 frequency table to F32 for phase math.
+    The training loader instead recomputes the original F32 formula before
+    distributed preparation and optimizer construction. Neither path adds
+    persistent checkpoint tensors or changes parameter ownership.
     """
 
     precision_contract = GENESIS_ROTARY_PRECISION
+    inv_freq: torch.Tensor
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         super().__init__()
         rope_parameters = config.rope_parameters
         if rope_parameters.get("rope_type") != "default":
             raise ValueError("MK1 Genesis rotary precision only supports default RoPE")
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        head_dim = config.head_dim or config.hidden_size // config.num_attention_heads
         rotary_dim = int(head_dim * rope_parameters.get("partial_rotary_factor", 1.0))
         if rotary_dim <= 0 or rotary_dim % 2 != 0:
             raise ValueError(f"MK1 rotary dimension must be positive and even, got {rotary_dim}")
-        theta = float(rope_parameters["rope_theta"])
-        inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
-        # The trained Genesis checkpoint owns this BF16 quantization regardless
-        # of an optional FP32 debug runtime requested by the caller.
+        self.theta = float(rope_parameters["rope_theta"])
+        self.rotary_dim = rotary_dim
+        inv_freq = self._training_inv_freq(None)
+        # Serving, including an F32 debug runtime, retains the released BF16 table.
+        # Explicit training load intent recomputes it after buffer placement.
         self.register_buffer("inv_freq", inv_freq.to(torch.bfloat16), persistent=False)
         self.mrope_section = list(rope_parameters.get("mrope_section", [11, 11, 10]))
         if sum(self.mrope_section) != rotary_dim // 2:
@@ -921,6 +922,16 @@ class GenesisQwen36TextRotaryEmbedding(nn.Module):
                 "MK1 mrope_section must sum to half the rotary dimension: "
                 f"sum={sum(self.mrope_section)}, rotary_dim={rotary_dim}"
             )
+
+    def _training_inv_freq(self, device: torch.device | None) -> torch.Tensor:
+        return 1.0 / (
+            self.theta
+            ** (torch.arange(0, self.rotary_dim, 2, device=device, dtype=torch.float32) / self.rotary_dim)
+        )
+
+    def prepare_for_training(self) -> None:
+        """Recompute derived F32 frequencies; widening the serving BF16 table loses source precision."""
+        self.inv_freq = self._training_inv_freq(self.inv_freq.device)
 
     @torch.no_grad()
     def forward(

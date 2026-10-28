@@ -391,6 +391,8 @@ def load_mk1_vla_from_hf(
         dtype=dtype,
     )
     _place_config_buffers(model, device)
+    if load_intent == "training":
+        model.model.language_model.rotary_emb.prepare_for_training()
     meta_parameters = [
         name for name, parameter in model.named_parameters() if parameter.device.type == "meta"
     ]
