@@ -94,9 +94,9 @@ Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
 `action-noise`. Flow first averages valid weighted elements within each draw,
 then draws within each chunk, then chunks equally. Text remains token-normalized.
 The loss accepts independent update-wide text-token and flow-chunk denominators
-for DDP/Accelerate accumulation. The stock trainer does not yet prefetch those
-counts across an accumulation window; unequal retained microbatch sizes require
-explicit denominators. Automatic trainer wiring remains an architecture gate.
+for DDP/Accelerate accumulation. The stock trainer automatically computes these
+totals across ranks and preprocessed microbatches in each accumulation window,
+including when filtering leaves unequal local sample counts.
 
 `moe_auxiliary_losses.py` materializes global logical dispatch counts and router
 probabilities for each layer. Balance (0.02) and router z-loss (0.001) average
