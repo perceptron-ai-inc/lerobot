@@ -70,7 +70,6 @@ def _native_portable_package(tmp_path: Path) -> tuple[Path, PerceptronIsaacConfi
     config = _policy(model_path).config
     config.hf_model_path = ".."
     config.artifact_kind = "neutral_debug"
-    config.trained_steps = 0
     config.vector_max_states = 4
     config.max_action_dim = 4
     config.max_action_horizon = 3
@@ -133,7 +132,7 @@ def test_policy_loads_portable_repo_through_native_mk1(
     assert model.action_expert.args.rtc_probability == 0.5
     assert model.config.action_expert["type"] == "dit"
     assert policy.config.action_expert_type == "molmoact"
-    assert (policy.config.artifact_kind, policy.config.trained_steps) == ("neutral_debug", 0)
+    assert policy.config.artifact_kind == "neutral_debug"
     assert all(parameter.dtype == torch.bfloat16 for parameter in model.parameters())
     assert all(parameter.device.type == "cpu" for parameter in model.parameters())
     assert all(buffer.device.type != "meta" for buffer in model.buffers())

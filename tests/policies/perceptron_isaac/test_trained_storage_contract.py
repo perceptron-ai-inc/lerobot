@@ -463,7 +463,6 @@ def test_original_source_still_rejects_wrong_family_storage_dtype(
     config = _config(
         hf_model_path=str(model_root),
         train_storage_fp32=False,
-        trained_steps=100_000,
         vector_max_states=4,
         max_action_dim=4,
         max_action_horizon=3,

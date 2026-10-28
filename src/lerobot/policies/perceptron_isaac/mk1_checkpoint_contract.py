@@ -90,7 +90,7 @@ _ROPE_KEYS = {
     "rope_theta",
     "rope_type",
 }
-_ARTIFACT_IDENTITY_KEYS = {"schema_version", "artifact_kind", "trained_steps"}
+_ARTIFACT_IDENTITY_KEYS = {"schema_version", "artifact_kind"}
 
 
 class Mk1CheckpointContractError(ValueError):
@@ -197,7 +197,6 @@ class Mk1MtpContract:
 class Mk1ArtifactContract:
     schema_version: int
     artifact_kind: str
-    trained_steps: int
 
 
 @dataclass(frozen=True)
@@ -965,10 +964,10 @@ def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> Mk1MoeContract
 
 
 def _parse_artifact(raw: Mapping[str, Any]) -> Mk1ArtifactContract:
-    """Parse the exporter-owned training-state identity.
+    """Parse the exporter-owned artifact identity, not trainer progress.
 
     Neutral Step-0 exports may carry additional hash/provenance fields. Those
-    fields are inert metadata; the three versioned identity fields below are
+    fields are inert metadata; the two versioned identity fields below are
     the complete behavior and deployment authority contract.
     """
     missing = _ARTIFACT_IDENTITY_KEYS - set(raw)
@@ -980,14 +979,9 @@ def _parse_artifact(raw: Mapping[str, Any]) -> Mk1ArtifactContract:
     artifact_kind = raw.get("artifact_kind")
     if artifact_kind not in {"trained_policy", "neutral_debug"}:
         _fail("genesis_artifact.artifact_kind must be 'trained_policy' or 'neutral_debug'")
-    trained_steps = _integer(raw, "trained_steps", "genesis_artifact")
-    if artifact_kind == "trained_policy" and trained_steps <= 0:
-        _fail("genesis_artifact trained_policy requires positive trained_steps")
-    if artifact_kind == "neutral_debug" and trained_steps != 0:
-        _fail("genesis_artifact neutral_debug requires trained_steps=0")
-    if artifact_kind == "trained_policy" and set(raw) != _ARTIFACT_IDENTITY_KEYS:
+    if artifact_kind == "trained_policy" and set(raw) - {"trained_steps"} != _ARTIFACT_IDENTITY_KEYS:
         _fail("trained genesis_artifact fields do not match schema version 1")
-    return Mk1ArtifactContract(schema_version, artifact_kind, trained_steps)
+    return Mk1ArtifactContract(schema_version, artifact_kind)
 
 
 def _validate_standard_runtime_fields(raw: Mapping[str, Any], *, path: str) -> None:

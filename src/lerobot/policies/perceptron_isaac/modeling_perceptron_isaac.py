@@ -959,14 +959,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             raise RuntimeError(f"ISAAC requires a valid MK1 composite checkpoint: {exc}") from exc
         if verified_storage is not None:
             verified_storage.require_header_dtypes(inventory)
-        if (
-            self.config.artifact_kind != contract.artifact.artifact_kind
-            or self.config.trained_steps != contract.artifact.trained_steps
-        ):
+        if self.config.artifact_kind != contract.artifact.artifact_kind:
             raise RuntimeError(
                 "ISAAC policy/checkpoint artifact identity mismatch: "
-                f"policy=({self.config.artifact_kind!r}, {self.config.trained_steps}), "
-                f"checkpoint=({contract.artifact.artifact_kind!r}, {contract.artifact.trained_steps})."
+                f"policy={self.config.artifact_kind!r}, checkpoint={contract.artifact.artifact_kind!r}."
             )
         if self.config.vector_max_states != contract.vector_encoder.max_states:
             raise RuntimeError(
@@ -1705,7 +1701,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 manifest_digest=config.mk1_trained_package_manifest_sha256,
                 identity={
                     "artifact_kind": config.artifact_kind,
-                    "trained_steps": config.trained_steps,
                     "mk1_source_model_import_sha256": model_import_digest,
                 },
                 metadata=metadata,
@@ -1795,7 +1790,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             manifest_digest=getattr(config, MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD, None),
             identity={
                 "artifact_kind": "trained_policy",
-                "trained_steps": config.trained_steps,
                 "mk1_model_import_sha256": expected_model_import_digest,
             },
             is_package_file=PerceptronIsaacPolicy._is_package_file,
@@ -2014,12 +2008,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         expected_artifact = {
             "schema_version": 1,
             "artifact_kind": "trained_policy",
-            "trained_steps": config.trained_steps,
         }
         if (
-            artifact != expected_artifact
-            or not isinstance(config.trained_steps, int)
-            or config.trained_steps <= 0
+            not isinstance(artifact, dict)
+            or {key: value for key, value in artifact.items() if key != "trained_steps"} != expected_artifact
+            or config.artifact_kind != "trained_policy"
         ):
             raise RuntimeError("MK1 model import artifact identity disagrees with the package config.")
         raw_config = _load_json_object(model_root / "config.json", "MK1 config.json")
@@ -2056,20 +2049,17 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         expected_keys = {
             "schema_version",
             "artifact_kind",
-            "trained_steps",
             "source_config_sha256",
             "source_index_sha256",
             "model_materialization",
             "files_sha256",
         }
-        if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        if not isinstance(manifest, dict) or set(manifest) - {"trained_steps"} != expected_keys:
             raise RuntimeError("Neutral-debug manifest fields do not match schema version 1.")
         if (
             manifest["schema_version"] != 1
             or manifest["artifact_kind"] != "neutral_debug"
-            or manifest["trained_steps"] != 0
             or config.artifact_kind != "neutral_debug"
-            or config.trained_steps != 0
         ):
             raise RuntimeError("Neutral-debug manifest identity disagrees with the package config.")
 

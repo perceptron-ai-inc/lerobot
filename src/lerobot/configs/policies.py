@@ -196,6 +196,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # which `from_pretrained` needs to resolve the concrete subclass.
         return draccus.encode(self, PreTrainedConfig)
 
+    @classmethod
+    def migrate_config(cls, config: dict[str, Any]) -> dict[str, Any]:
+        """Project historical JSON into runtime fields without modifying source bytes."""
+        return config
+
     def _save_pretrained(self, save_directory: Path) -> None:
         with open(save_directory / CONFIG_NAME, "w") as f:
             json.dump(self.to_dict(), f, indent=4)
@@ -260,7 +265,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
             ) from e
 
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
-            json.dump(config, f)
+            json.dump(config_cls.migrate_config(config), f)
             config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])

@@ -66,7 +66,6 @@ def _source_package(root: Path) -> PerceptronIsaacConfig:
         fast_processor_path="fast_processor",
         fast_processor_tree_sha256="0" * 64,
         apply_offset_norm=False,
-        trained_steps=100_000,
         vector_max_states=4,
         max_action_dim=4,
         max_action_horizon=3,

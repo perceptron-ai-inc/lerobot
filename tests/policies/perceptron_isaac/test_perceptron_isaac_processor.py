@@ -1881,7 +1881,7 @@ def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
 
 def _patch_mk1_checkpoint_load(monkeypatch, loader):
     contract = SimpleNamespace(
-        artifact=SimpleNamespace(artifact_kind="trained_policy", trained_steps=1),
+        artifact=SimpleNamespace(artifact_kind="trained_policy"),
         vector_encoder=SimpleNamespace(max_states=128),
         action_expert=SimpleNamespace(action_dim=64, action_horizon=64),
         validate_coord_reserved_token_groups=lambda groups: None,
@@ -1949,7 +1949,6 @@ def test_neutral_debug_package_loads_but_cannot_emit_actions(tmp_path):
         device="cpu",
         native_stats_path=str(stats_path),
         artifact_kind="neutral_debug",
-        trained_steps=0,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
@@ -1961,35 +1960,13 @@ def test_neutral_debug_package_loads_but_cannot_emit_actions(tmp_path):
         policy.select_action({})
 
 
-@pytest.mark.parametrize("trained_steps", [None, 1, -1, True, 1.5])
-def test_neutral_debug_config_requires_exact_zero_training_steps(trained_steps):
-    with pytest.raises(ValueError, match="trained_steps"):
-        PerceptronIsaacConfig(
-            artifact_kind="neutral_debug",
-            trained_steps=trained_steps,
-            input_features=_features(),
-            output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-        )
+@pytest.mark.parametrize("artifact_kind", ["trained_policy", "neutral_debug"])
+def test_artifact_kind_requires_no_model_count(artifact_kind):
+    config = PerceptronIsaacConfig(artifact_kind=artifact_kind, device="cpu")
+    assert "trained_steps" not in config.to_dict()
 
 
-@pytest.mark.parametrize("trained_steps", [None, 0, -1, True, 1.5])
-def test_trained_policy_config_requires_positive_training_steps(trained_steps):
-    with pytest.raises(ValueError, match="trained_steps"):
-        PerceptronIsaacConfig(
-            artifact_kind="trained_policy",
-            trained_steps=trained_steps,
-            input_features=_features(),
-            output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-        )
-
-
-@pytest.mark.parametrize(
-    ("artifact_kind", "trained_steps"),
-    [("trained_policy", 2), ("neutral_debug", 0)],
-)
-def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(
-    tmp_path, monkeypatch, artifact_kind, trained_steps
-):
+def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     load_calls = []
@@ -2001,8 +1978,7 @@ def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(
                 device="cpu",
                 hf_model_path=str(tmp_path / "hf"),
                 native_stats_path=str(stats_path),
-                artifact_kind=artifact_kind,
-                trained_steps=trained_steps,
+                artifact_kind="neutral_debug",
                 mk1_model_import_sha256="0" * 64,
                 train_storage_fp32=False,
                 input_features=_features(),

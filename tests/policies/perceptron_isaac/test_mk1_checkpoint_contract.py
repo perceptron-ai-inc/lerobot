@@ -352,7 +352,6 @@ def test_production_contract_parses_exact_documented_geometry() -> None:
     assert contract.mtp.present is True
     assert contract.coord_tokens.enabled is True
     assert contract.artifact.artifact_kind == "trained_policy"
-    assert contract.artifact.trained_steps == 100_000
     assert contract.excluded_runtime_prefixes == ("mtp.",)
     shapes = contract.expected_tensor_shapes()
     assert shapes["model.language_model.layers.0.mlp.gate.weight"] == (257, 2048)
@@ -367,7 +366,7 @@ def test_production_contract_accepts_actual_non_mtp_coord_disabled_variant() -> 
     contract = Mk1CheckpointContract.parse_allowlisted(config)
     shapes = contract.expected_tensor_shapes()
 
-    assert contract.artifact.trained_steps == 10_000
+    assert contract.artifact.artifact_kind == "trained_policy"
     assert contract.text.vocab_size == 256279
     assert contract.mtp.present is False
     assert contract.coord_tokens.enabled is False
@@ -553,9 +552,6 @@ def test_reduced_geometry_permission_accepts_unmarked_production_geometry() -> N
         ({"artifact_kind": "trained_policy", "trained_steps": 1}, "missing required"),
         ({"schema_version": 2, "artifact_kind": "trained_policy", "trained_steps": 1}, "schema_version"),
         ({"schema_version": 1, "artifact_kind": "other", "trained_steps": 1}, "artifact_kind"),
-        ({"schema_version": 1, "artifact_kind": "trained_policy", "trained_steps": 0}, "positive"),
-        ({"schema_version": 1, "artifact_kind": "neutral_debug", "trained_steps": 1}, "trained_steps=0"),
-        ({"schema_version": 1, "artifact_kind": "trained_policy", "trained_steps": True}, "integer"),
         (
             {
                 "schema_version": 1,
@@ -587,7 +583,6 @@ def test_neutral_artifact_accepts_inert_exporter_provenance() -> None:
     contract = _parse_test_config(config)
 
     assert contract.artifact.artifact_kind == "neutral_debug"
-    assert contract.artifact.trained_steps == 0
 
 
 @pytest.mark.parametrize(

@@ -206,7 +206,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     hf_model_path: str | None = None  # native MK1 composite model directory
     # Zero-step packages exercise checkpoint/model plumbing but are never deployable.
     artifact_kind: str = "trained_policy"
-    trained_steps: int = 1
     # Read existing native configs that serialized false; native norms need no conversion.
     apply_offset_norm: Literal[False] = False
     # Deprecated compatibility fields accepted by older configs. They are not
@@ -314,6 +313,11 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     optimizer_warmup_steps: int = 200
     max_train_steps: int = 30000
 
+    @classmethod
+    def migrate_config(cls, config: dict[str, Any]) -> dict[str, Any]:
+        """Retire the model count only in memory; authenticated files stay byte-exact."""
+        return {key: value for key, value in config.items() if key != "trained_steps"}
+
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.apply_offset_norm is not False:
@@ -364,12 +368,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                 "Perceptron Isaac artifact_kind must be 'trained_policy' or 'neutral_debug', "
                 f"got {self.artifact_kind!r}."
             )
-        if not isinstance(self.trained_steps, int) or isinstance(self.trained_steps, bool):
-            raise ValueError("Perceptron Isaac trained_steps must be an integer.")
-        if self.artifact_kind == "neutral_debug" and self.trained_steps != 0:
-            raise ValueError("A neutral_debug Perceptron Isaac package must declare trained_steps=0.")
-        if self.artifact_kind == "trained_policy" and self.trained_steps <= 0:
-            raise ValueError("A trained_policy Perceptron Isaac package must declare positive trained_steps.")
         # Both names resolve to the same vendored expert head: 'dit' is genesis's
         # post-#3402 name for it (see build_action_expert_head's alias).
         if self.action_expert_type not in {"molmoact", "dit"}:

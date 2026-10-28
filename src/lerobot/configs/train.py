@@ -476,6 +476,13 @@ class TrainPipelineConfig(HubMixin):
             with open(config_file) as f:
                 config = json.load(f)
             migrated_config = _migrate_legacy_rabc_fields(config)
+            config = migrated_config if migrated_config is not None else config
+            policy = config.get("policy")
+            if isinstance(policy, dict) and "type" in policy:
+                policy_cls = PreTrainedConfig.get_choice_class(policy["type"])
+                migrated_policy = policy_cls.migrate_config(policy)
+                if migrated_policy != policy:
+                    migrated_config = dict(config, policy=migrated_policy)
             if migrated_config is not None:
                 with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
                     json.dump(migrated_config, f)

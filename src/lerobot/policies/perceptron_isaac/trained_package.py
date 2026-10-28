@@ -339,6 +339,10 @@ def verify_trained_package_manifest(
 
     metadata = metadata or {}
     expected_keys = {"schema", *identity, *metadata, "config_sha256", "files_sha256"}
+    # Historical ISAAC manifests retain the retired count in both authenticated JSONs.
+    # It is not runtime identity, and is never removed before hashing either document.
+    if "trained_steps" in manifest:
+        expected_keys.add("trained_steps")
     if set(manifest) != expected_keys or manifest.get("schema") != manifest_schema:
         raise RuntimeError(f"{label} manifest fields do not match its schema.")
     if any(manifest.get(key) != value or raw_config.get(key) != value for key, value in identity.items()):
@@ -434,7 +438,6 @@ def finalize_canonical_trained_package(
         digest_field=MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
         identity={
             "artifact_kind": config.artifact_kind,
-            "trained_steps": config.trained_steps,
             "mk1_source_model_import_sha256": mk1_source_model_import_sha256,
         },
         metadata={"model_storage": CANONICAL_INNER_MODEL_STORAGE, "metadata": storage_metadata},
