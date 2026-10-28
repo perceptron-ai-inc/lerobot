@@ -553,6 +553,7 @@ def test_public_load_rejects_unsupported_outer_weights(tmp_path, layout, has_inn
 
 def test_original_package_processors_bind_retained_instance(tmp_path) -> None:
     from lerobot.policies.factory import make_pre_post_processors
+    from lerobot.policies.perceptron_isaac.mharmony_native import IsaacMharmonyRenderMetadata
     from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
         PerceptronIsaacMharmonyPackProcessorStep,
     )
@@ -573,7 +574,9 @@ def test_original_package_processors_bind_retained_instance(tmp_path) -> None:
     pre.save_pretrained(source)
     post.save_pretrained(source)
     rewrite_trained_processor_paths(source)
-    (source / "native_render_metadata.json").write_text("{}\n")
+    (source / "native_render_metadata.json").write_text(
+        json.dumps(IsaacMharmonyRenderMetadata.from_config(config).to_json_dict())
+    )
     payload = json.loads((source / "policy_preprocessor.json").read_text())
     for step in payload["steps"]:
         if "fast_processor_path" in step["config"]:

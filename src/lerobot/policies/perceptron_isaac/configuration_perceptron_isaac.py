@@ -564,6 +564,11 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         ``pretrained_path`` is the policy package, which for a raw Isaac-0.5 export is
         ``<root>/lerobot_policy`` while the documented sidecars sit at ``<root>``.
         """
+        # The policy loader retains already-verified sidecars here. Never rediscover
+        # recipe/stats bytes from the mutable original package after that handoff.
+        retained_root = vars(self).get("_pretrained_processor_root")
+        if retained_root is not None:
+            return (Path(retained_root),)
         if self.pretrained_path is None:
             return ()
         package_root = Path(self.pretrained_path)

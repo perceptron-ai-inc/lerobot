@@ -63,6 +63,7 @@ from .mharmony_native import (
     IsaacMharmonyRenderMetadata,
     IsaacNativeMharmonyRenderer,
     hydrate_isaac_training_proprio_contract,
+    load_native_render_metadata,
 )
 from .processor_utils import (
     RETAINED_SAMPLE_INDICES_KEY,
@@ -645,6 +646,12 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 mharmony_version=self.mharmony_version,
             )
         self._validate_target_fps(metadata.target_fps, artifact="render metadata")
+        # Inlined/sidecar metadata is authoritative on restored pipelines as well.
+        self.patch_size = metadata.patch_size
+        self.pixel_shuffle_scale = metadata.pixel_shuffle_scale
+        self.temporal_patch_size = metadata.temporal_patch_size
+        self.max_num_patches = metadata.max_num_patches
+        self.min_num_patches = metadata.min_num_patches
         self._stream_builder = IsaacNativeMharmonyRenderer(metadata=metadata, stats=self._stats)
         return self._stream_builder
 
@@ -1232,6 +1239,9 @@ class PerceptronIsaacMharmonyPackProcessorStep(PerceptronIsaacRenderProcessorSte
         suite_by_task_index_path: str | None = None,
     ) -> "PerceptronIsaacMharmonyPackProcessorStep":
         """Apply the shared render contract with caller-owned path, device and suite routing."""
+        metadata = None
+        if config.native_render_metadata_path or config.resolve_native_recipe_path() is not None:
+            metadata = load_native_render_metadata(config, stats_fps=config.target_fps)
         return cls(
             enabled=True,
             inference_backend=str(config.inference_backend),
@@ -1260,21 +1270,21 @@ class PerceptronIsaacMharmonyPackProcessorStep(PerceptronIsaacRenderProcessorSte
             n_obs_steps=int(config.n_obs_steps),
             chunk_size=int(config.chunk_size),
             objective=str(config.objective),
-            patch_size=int(config.render_patch_size),
-            max_num_patches=config.render_max_num_patches,
-            min_num_patches=config.render_min_num_patches,
-            pixel_shuffle_scale=int(config.render_pixel_shuffle_scale),
-            temporal_patch_size=int(config.render_temporal_patch_size),
+            patch_size=int(config.render_patch_size) if metadata is None else metadata.patch_size,
+            max_num_patches=config.render_max_num_patches if metadata is None else metadata.max_num_patches,
+            min_num_patches=config.render_min_num_patches if metadata is None else metadata.min_num_patches,
+            pixel_shuffle_scale=(
+                int(config.render_pixel_shuffle_scale) if metadata is None else metadata.pixel_shuffle_scale
+            ),
+            temporal_patch_size=(
+                int(config.render_temporal_patch_size) if metadata is None else metadata.temporal_patch_size
+            ),
             device=device,
             dtype="bfloat16",
             normalization_profile_id=config.normalization_profile_id,
             normalization_profile_scope=config.normalization_profile_scope,
             normalization_validation_status=config.normalization_validation_status,
-            render_metadata=(
-                IsaacMharmonyRenderMetadata.from_json_file(config.native_render_metadata_path).to_json_dict()
-                if config.native_render_metadata_path and Path(config.native_render_metadata_path).is_file()
-                else None
-            ),
+            render_metadata=None if metadata is None else metadata.to_json_dict(),
             train_clip_normalized_actions=bool(config.train_clip_normalized_actions),
             clip_normalized_max=float(config.clip_normalized_max),
             fast_clip_normalized_max=float(config.fast_clip_normalized_max),
@@ -1923,6 +1933,15 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     for step in preprocessor.steps:
         if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep):
             step.device = str(config.device)
+            if step.render_metadata is not None:
+                IsaacMharmonyRenderMetadata(**step.render_metadata).validate_image_preprocess_for_config(
+                    config
+                )
+            elif config.native_render_metadata_path or config.resolve_native_recipe_path() is not None:
+                step.render_metadata = load_native_render_metadata(
+                    config, stats_fps=config.target_fps
+                ).to_json_dict()
+                step._stream_builder = None
             if declared_fps is not None:
                 # Hand the anchor derivation the training dataset's declared clock so a
                 # genuine rate mismatch with the checkpoint's target_fps fails loudly

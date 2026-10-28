@@ -17,6 +17,7 @@ from typing import Any, TypedDict
 
 import numpy as np
 
+from .checkpoint_integrity import load_json_object
 from .configuration_perceptron_isaac import PerceptronIsaacConfig
 from .fast_processor import encode_fast_action_tokens
 from .isaac_stats import (
@@ -108,9 +109,29 @@ class IsaacMharmonyRenderMetadata:
     temporal_patch_size: int = 2
     max_num_patches: int | None = 576
     min_num_patches: int | None = None
+    image_resize_size: list[int] | None = None
     training_proprio_contract: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.image_resize_size is not None and (
+            not isinstance(self.image_resize_size, list)
+            or len(self.image_resize_size) != 2
+            or any(
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                for size in self.image_resize_size
+            )
+        ):
+            raise ValueError("ISAAC image_resize_size must contain positive integer height and width.")
+        if self.image_resize_size is not None:
+            height, width = self.image_resize_size
+            factor = self.patch_size * self.pixel_shuffle_scale
+            if factor <= 0 or height % factor or width % factor:
+                raise ValueError("ISAAC fixed image resize must align with the merged patch grid.")
+            patches = height * width // (self.patch_size * self.patch_size)
+            if (self.max_num_patches is not None and patches > self.max_num_patches) or (
+                self.min_num_patches is not None and patches < self.min_num_patches
+            ):
+                raise ValueError("ISAAC fixed image resize conflicts with recipe patch bounds.")
         object.__setattr__(
             self,
             "mharmony_version",
@@ -129,7 +150,13 @@ class IsaacMharmonyRenderMetadata:
             action_dim=int(config.action_dim),
             proprio_dim=int(config.proprio_dim),
             vector_max_states=int(config.vector_max_states),
-            target_fps=float(stats_fps) if stats_fps is not None else DEFAULT_INFERENCE_FPS,
+            target_fps=(
+                float(stats_fps)
+                if stats_fps is not None
+                else float(config.target_fps)
+                if config.target_fps is not None
+                else DEFAULT_INFERENCE_FPS
+            ),
             dataset_name=str(config.dataset_name),
             robot_type=str(config.robot_type),
             include_scene_description=bool(config.include_scene_description),
@@ -157,7 +184,22 @@ class IsaacMharmonyRenderMetadata:
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def validate_image_preprocess_for_config(self, config: PerceptronIsaacConfig) -> None:
+        """Reject explicit runtime overrides of the checkpoint's image preprocessing recipe."""
+        for name, actual, expected in (
+            ("patch_size", config.render_patch_size, self.patch_size),
+            ("pixel_shuffle_scale", config.render_pixel_shuffle_scale, self.pixel_shuffle_scale),
+            ("temporal_patch_size", config.render_temporal_patch_size, self.temporal_patch_size),
+            ("max_num_patches", config.render_max_num_patches, self.max_num_patches),
+            ("min_num_patches", config.render_min_num_patches, self.min_num_patches),
+        ):
+            if actual is not None and actual != expected:
+                raise ValueError(
+                    f"ISAAC runtime image preprocessing {name}={actual} conflicts with recipe {expected}."
+                )
+
     def validate_for_config(self, config: PerceptronIsaacConfig) -> None:
+        self.validate_image_preprocess_for_config(config)
         if self.schema != "perceptron_isaac_mharmony_render_v1":
             raise ValueError(f"Unsupported Isaac mharmony metadata schema {self.schema!r}.")
         if tuple(self.camera_order) != tuple(config.camera_order):
@@ -462,8 +504,11 @@ def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
     ``Mk1CheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
     an artifact independent of this recipe.
     """
+    return _recipe_reserved_token_groups(load_json_object(path))
+
+
+def _recipe_reserved_token_groups(raw: dict[str, Any]) -> list[dict[str, Any]]:
     location = "policy_inference_recipe.json"
-    raw = json.loads(Path(path).read_text())
     if not isinstance(raw, dict):
         raise ValueError(f"{location} must be a JSON object, got {type(raw).__name__}.")
     recipes = raw.get("recipes")
@@ -514,6 +559,72 @@ def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
     return [group.to_json_dict() for group in groups]
 
 
+def _apply_recipe_image_preprocess(
+    metadata: IsaacMharmonyRenderMetadata, raw: dict[str, Any]
+) -> IsaacMharmonyRenderMetadata:
+    """Consume the supported image recipe at the existing checkpoint admission boundary."""
+    recipes = raw["recipes"]  # Reserved-group parsing has already validated this structure.
+    image = recipes[0].get("image_preprocess")
+    if any(recipe.get("image_preprocess") != image for recipe in recipes):
+        raise ValueError("ISAAC image preprocessing recipes are ambiguous; all recipes must agree.")
+    if image is None:
+        return metadata  # All reserved-pool-only recipes retain the working defaults.
+    # Validate every declaration: JSON numbers such as 16 and 16.0 compare equal
+    # in Python, but only integer fields satisfy the supported recipe schema.
+    parsed = [
+        _parse_recipe_image_preprocess(
+            metadata,
+            recipe["image_preprocess"],
+            location=f"policy_inference_recipe.json.recipes[{index}].image_preprocess",
+        )
+        for index, recipe in enumerate(recipes)
+    ]
+    return parsed[0]
+
+
+def _parse_recipe_image_preprocess(
+    metadata: IsaacMharmonyRenderMetadata, image: object, *, location: str
+) -> IsaacMharmonyRenderMetadata:
+    """Validate one image recipe before deriving its render metadata."""
+    required = {
+        "patch_size",
+        "pixel_shuffle_scale_factor",
+        "temporal_patch_size",
+        "max_num_patches",
+        "min_num_patches",
+    }
+    if (
+        not isinstance(image, dict)
+        or not required <= set(image)
+        or set(image) - required - {"image_resize_size"}
+    ):
+        raise ValueError(f"{location} has unsupported or missing image preprocessing fields.")
+    patch = _recipe_int(image, "patch_size", location, minimum=1)
+    scale = _recipe_int(image, "pixel_shuffle_scale_factor", location, minimum=1)
+    temporal = _recipe_int(image, "temporal_patch_size", location, minimum=1)
+    maximum = (
+        None
+        if image["max_num_patches"] is None
+        else _recipe_int(image, "max_num_patches", location, minimum=1)
+    )
+    minimum = (
+        None
+        if image["min_num_patches"] is None
+        else _recipe_int(image, "min_num_patches", location, minimum=1)
+    )
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError(f"{location} min_num_patches exceeds max_num_patches.")
+    return replace(
+        metadata,
+        patch_size=patch,
+        pixel_shuffle_scale=scale,
+        temporal_patch_size=temporal,
+        max_num_patches=maximum,
+        min_num_patches=minimum,
+        image_resize_size=image.get("image_resize_size"),
+    )
+
+
 def load_native_render_metadata(
     config: PerceptronIsaacConfig, *, stats_fps: float | None = None
 ) -> IsaacMharmonyRenderMetadata:
@@ -523,10 +634,12 @@ def load_native_render_metadata(
         metadata = IsaacMharmonyRenderMetadata.from_config(config, stats_fps=stats_fps)
         recipe_path = config.resolve_native_recipe_path()
         if recipe_path is not None:
+            recipe = load_json_object(recipe_path)
             metadata = replace(
                 metadata,
-                mharmony_reserved_token_groups=read_recipe_reserved_token_groups(recipe_path),
+                mharmony_reserved_token_groups=_recipe_reserved_token_groups(recipe),
             )
+            metadata = _apply_recipe_image_preprocess(metadata, recipe)
     if stats_fps is not None and metadata.target_fps is None:
         metadata = replace(metadata, target_fps=float(stats_fps))
     metadata.validate_for_config(config)
@@ -704,11 +817,11 @@ class IsaacNativeMharmonyRenderer:
         fast_processor: Any | None = None,
         device: Any = "cuda",
         dtype: Any = None,
-        patch_size: int = 16,
-        max_num_patches: int | None = 576,
+        patch_size: int | None = None,
+        max_num_patches: int | None = None,
         min_num_patches: int | None = None,
-        pixel_shuffle_scale: int = 2,
-        temporal_patch_size: int = 1,
+        pixel_shuffle_scale: int | None = None,
+        temporal_patch_size: int | None = None,
         anchor_timestamp_seconds: float | None = None,
         scene_events: Any = None,
     ):
@@ -757,11 +870,11 @@ class IsaacNativeMharmonyRenderer:
         max_sequence_length: int = 4096,
         device: Any = "cpu",
         dtype: Any = None,
-        patch_size: int = 16,
-        max_num_patches: int | None = 576,
+        patch_size: int | None = None,
+        max_num_patches: int | None = None,
         min_num_patches: int | None = None,
-        pixel_shuffle_scale: int = 2,
-        temporal_patch_size: int = 1,
+        pixel_shuffle_scale: int | None = None,
+        temporal_patch_size: int | None = None,
         anchor_timestamp_seconds: float | None = None,
         terminal: bool = False,
         stats: IsaacNormalizationStats | None = None,
@@ -882,11 +995,11 @@ class IsaacNativeMharmonyRenderer:
         *,
         device: Any,
         dtype: Any,
-        patch_size: int,
+        patch_size: int | None,
         max_num_patches: int | None,
         min_num_patches: int | None,
-        pixel_shuffle_scale: int,
-        temporal_patch_size: int,
+        pixel_shuffle_scale: int | None,
+        temporal_patch_size: int | None,
         rewrite_final_assistant_footer: bool = True,
     ):
         mharmony = load_mharmony()
@@ -973,7 +1086,15 @@ class IsaacNativeMharmonyRenderer:
         pixel_shuffle_scale: int,
         temporal_patch_size: int,
     ):
-        key = (patch_size, max_num_patches, min_num_patches, pixel_shuffle_scale, temporal_patch_size)
+        resize = self.metadata.image_resize_size
+        key = (
+            patch_size,
+            max_num_patches,
+            min_num_patches,
+            pixel_shuffle_scale,
+            temporal_patch_size,
+            None if resize is None else tuple(resize),
+        )
         if self._image_processor is None or self._image_processor_key != key:
             self._image_processor = create_qwen35_image_processor(
                 patch_size=patch_size,
@@ -1394,7 +1515,7 @@ def _plan_item_to_mh_content(
         media_ref = mharmony.MediaRef(
             id=str(item["media_id"]),
             mime="image/png",
-            bytes_b64=_image_to_png_b64(item["image"]),
+            bytes_b64=_image_to_png_b64(item["image"], image_resize_size=metadata.image_resize_size),
             metadata=item.get("metadata"),
         )
         return mharmony.ImageContent(media_ref=media_ref, metadata=item.get("metadata"))
@@ -1410,9 +1531,29 @@ def _plan_item_to_mh_content(
     raise ValueError(f"Unsupported Isaac mharmony content kind {kind!r}.")
 
 
-def _image_to_png_b64(image: Any) -> str:
+def _image_to_png_b64(image: Any, *, image_resize_size: list[int] | None = None) -> str:
     from PIL import Image as PILImage
 
+    # The pinned public SDK accepts patch bounds, not a fixed-resize argument.
+    # Resize before media admission so bounds-only recipes keep their aspect ratio.
+    if image_resize_size is not None:
+        if isinstance(image, bytes | bytearray):
+            with PILImage.open(io.BytesIO(bytes(image))) as pil:
+                rgb = pil.convert("RGB")
+        else:
+            rgb = PILImage.fromarray(
+                coerce_rgb_uint8(
+                    image,
+                    contiguous=True,
+                    shape_error="Unsupported Isaac image shape for native mharmony: {shape}.",
+                ),
+                mode="RGB",
+            )
+        height, width = image_resize_size
+        rgb = rgb.resize((width, height), resample=PILImage.Resampling.BICUBIC)
+        buf = io.BytesIO()
+        rgb.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
     if isinstance(image, bytes | bytearray):
         with PILImage.open(io.BytesIO(bytes(image))) as pil:
             rgb = pil.convert("RGB")
