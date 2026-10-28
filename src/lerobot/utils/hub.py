@@ -76,6 +76,7 @@ class HubMixin:
         *,
         repo_id: str | None = None,
         push_to_hub: bool = False,
+        finalize_package: bool = True,
         card_kwargs: dict[str, Any] | None = None,
         **push_to_hub_kwargs,
     ) -> str | None:
@@ -87,6 +88,10 @@ class HubMixin:
                 Path to directory in which the object will be saved.
             push_to_hub (`bool`, *optional*, defaults to `False`):
                 Whether or not to push your object to the Huggingface Hub after saving it.
+            finalize_package (`bool`, *optional*, defaults to `True`):
+                Finalize package metadata after saving. Set to `False` when a checkpoint writer
+                must add sidecars before calling `finalize_pretrained_package`. Cannot be `False`
+                when `push_to_hub=True`.
             repo_id (`str`, *optional*):
                 ID of your repository on the Hub. Used only if `push_to_hub=True`. Will default to the folder name if
                 not provided.
@@ -97,11 +102,21 @@ class HubMixin:
         Returns:
             `str` or `None`: url of the commit on the Hub if `push_to_hub=True`, `None` otherwise.
         """
+        if push_to_hub and not finalize_package:
+            raise ValueError("Cannot push to the Hub with finalize_package=False.")
+
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
 
         # save object (weights, files, etc.)
         self._save_pretrained(save_directory)
+
+        if finalize_package:
+            # Keep collective saves on every rank, but package metadata writes main-process-only.
+            from lerobot.distributed.utils import is_main_process
+
+            if is_main_process():
+                self.finalize_pretrained_package(save_directory)
 
         # push to the Hub if required
         if push_to_hub:
@@ -109,6 +124,17 @@ class HubMixin:
                 repo_id = save_directory.name  # Defaults to `save_directory` name
             return self.push_to_hub(repo_id=repo_id, card_kwargs=card_kwargs, **push_to_hub_kwargs)
         return None
+
+    def finalize_pretrained_package(self, save_directory: Path) -> None:
+        """Finalize model-owned metadata after every checkpoint writer has finished.
+
+        Standalone saves call this on the main process after serialization. Checkpoint writers
+        defer it until weights, configs and processors are saved. Objects without additional
+        package metadata inherit a no-op.
+
+        Args:
+            save_directory (Path): The completed pretrained-model directory.
+        """
 
     def _save_pretrained(self, save_directory: Path) -> None:
         """

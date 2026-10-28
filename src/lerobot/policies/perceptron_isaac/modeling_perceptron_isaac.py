@@ -1,0 +1,2268 @@
+"""Perceptron Isaac VLA policy for LeRobot native eval/serving.
+
+LeRobot processors own observation normalization, mharmony packing, stats
+normalization, and action unnormalization. The policy loads the HF VLA, owns
+live rollout window state for online serving, invokes ``sample_action`` on
+native mharmony streams, and returns normalized action chunks.
+"""
+
+from __future__ import annotations
+
+import builtins
+import hmac
+import json
+import logging
+import shutil
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+
+import numpy as np
+import torch
+from huggingface_hub import save_torch_state_dict
+from torch import Tensor
+
+from lerobot.lerobot_types import TransitionKey
+from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.import_utils import require_package
+
+from ..pretrained import PreTrainedPolicy
+from ..training_loss_normalization import TrainingLossNormalization, TrainingLossNormalizer
+from .checkpoint_integrity import (
+    DirectorySnapshot,
+    file_sha256,
+    is_hf_snapshot_blob_link,
+    load_json_object,
+    require_sha256,
+    snapshot_directory,
+)
+from .configuration_perceptron_isaac import (
+    PerceptronIsaacConfig,
+    is_portable_isaac05_repository,
+)
+from .isaac_stats import (
+    IsaacNormalizationStats,
+    normalize_isaac_actions,
+    require_closed_loop_safe_isaac_stats,
+)
+from .loss_perceptron_isaac import (
+    ISAAC_FLOW_LOSS_MASK_KEY,
+    ISAAC_FLOW_NOISE_KEY,
+    ISAAC_FLOW_TIMESTEPS_KEY,
+    perceptron_isaac_training_loss,
+)
+from .mharmony_native import (
+    IsaacMharmonyRenderMetadata,
+    load_native_isaac_stats,
+    load_native_render_metadata,
+)
+from .processor_perceptron_isaac import (
+    PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY,
+    PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY,
+    PERCEPTRON_ISAAC_RENDER_META_KEY,
+    PERCEPTRON_ISAAC_SERVING_STATS_KEY,
+    PERCEPTRON_ISAAC_STREAM_KEY,
+    PerceptronIsaacMharmonyPackProcessorStep,
+)
+from .rtc import reject_rtc_prefix
+from .trained_package import (
+    CANONICAL_INNER_MODEL_STORAGE,
+    MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+    MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2,
+    MK1_MODEL_IMPORT_FILENAME,
+    MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
+    MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
+    MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+    VerifiedTrainedTensorStorage,
+    finalize_canonical_trained_package,
+    parse_trained_tensor_storage_dtypes,
+    rewrite_trained_processor_paths,
+    verify_trained_package_manifest,
+)
+from .training_perceptron_isaac import IsaacTrainingLossNormalizer
+
+if TYPE_CHECKING:
+    from .modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
+
+T = TypeVar("T", bound="PerceptronIsaacPolicy")
+logger = logging.getLogger(__name__)
+_MK1_BASE_VOCAB_SIZE = 248_044
+
+
+def _load_json_object(path: Path, label: str) -> dict[str, Any]:
+    """Keep the package context and original JSON failure without parsing error text."""
+    try:
+        return load_json_object(path)
+    except ValueError as exc:
+        raise RuntimeError(f"Cannot read {label}: {exc}") from exc
+
+
+def _verify_sha256(
+    expected: Any,
+    context: str,
+    actual: str | Path | None = None,
+    mismatch_error: str | Callable[[str, str], str] | None = None,
+) -> str:
+    try:
+        expected = require_sha256(expected, context=context)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if isinstance(actual, Path):
+        actual = file_sha256(actual)
+    assert actual is None or isinstance(actual, str)
+    if actual is not None and not hmac.compare_digest(actual, expected):
+        if callable(mismatch_error):
+            mismatch_error = mismatch_error(expected, actual)
+        raise RuntimeError(mismatch_error or f"{context} mismatch: expected {expected}, found {actual}.")
+    return expected
+
+
+# Directory upstream LeRobot's DCP checkpoint formats write sharded model weights into
+# (accelerate's FSDP_MODEL_NAME with the `_0` model index).
+DCP_MODEL_SHARD_DIRNAME = "pytorch_model_fsdp_0"
+
+
+def _resolve_local_or_hub_snapshot(reference: str | Path, **snapshot_kwargs: Any) -> Path:
+    """Return ``reference`` when it is a local directory, else download its Hub snapshot."""
+    local_path = Path(reference)
+    if local_path.is_dir():
+        return local_path
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(repo_id=str(reference), **snapshot_kwargs))
+
+
+@dataclass(frozen=True)
+class FullShardTopology:
+    """Runtime-observed evidence that this process's parameters are FSDP full-shard sharded."""
+
+    world_size: int
+    fsdp_version: int
+    sharding_strategy: str
+
+
+class FullyShardedPluginSurface(Protocol):
+    """The part of accelerate's ``FullyShardedDataParallelPlugin`` this module reads."""
+
+    fsdp_version: int
+    sharding_strategy: object
+    reshard_after_forward: object
+
+
+def _read_full_shard_strategy(plugin: FullyShardedPluginSurface, world_size: int) -> FullShardTopology | None:
+    """Read accelerate's plugin sharding surface; ``None`` when it is not full-shard.
+
+    The pinned accelerate (1.14) dataclass carries BOTH the FSDP1 ``sharding_strategy`` and
+    the FSDP2 ``reshard_after_forward`` fields, so both are handled and ``fsdp_version``
+    selects between them. A plugin object that does not expose those fields -- a future or
+    replaced accelerate -- raises ``AttributeError`` and is refused rather than guessed at.
+    """
+    from torch.distributed.fsdp import ShardingStrategy
+
+    try:
+        fsdp_version = int(plugin.fsdp_version)
+        if fsdp_version == 1:
+            strategy = plugin.sharding_strategy
+        elif fsdp_version == 2:
+            strategy = plugin.reshard_after_forward
+        else:
+            return None
+    except AttributeError:
+        # Deliberate: `plugin` is an EXTERNAL accelerate object whose surface is version
+        # dependent. A missing field is ambiguity, and ambiguity must fail closed.
+        return None
+
+    if fsdp_version == 1:
+        if isinstance(strategy, ShardingStrategy):
+            name = strategy.name
+        elif isinstance(strategy, str):
+            name = strategy
+        else:
+            return None
+        if name != ShardingStrategy.FULL_SHARD.name:
+            return None
+        return FullShardTopology(world_size=world_size, fsdp_version=1, sharding_strategy=name)
+
+    if strategy is not True:
+        return None
+    return FullShardTopology(
+        world_size=world_size, fsdp_version=2, sharding_strategy="reshard_after_forward=True"
+    )
+
+
+def detect_full_shard_topology() -> FullShardTopology | None:
+    """Return the live FSDP full-shard topology, or ``None`` when it cannot be established.
+
+    Fails closed by construction. Only POSITIVE evidence -- an initialised process group of
+    world size >= 2, an initialised accelerate state whose ``distributed_type`` is FSDP, and
+    a plugin that reads back as FULL_SHARD -- returns a topology. Accelerate missing, its
+    state uninitialised, a DDP/MULTI_GPU state (DDP replicates parameters rather than
+    sharding them, so the capacity argument is untouched), or an unreadable plugin all
+    return ``None``.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    world_size = int(torch.distributed.get_world_size())
+    if world_size < 2:
+        return None
+    try:
+        from accelerate.state import AcceleratorState, is_initialized
+        from accelerate.utils.dataclasses import DistributedType
+    except ImportError:
+        return None
+    if not is_initialized():
+        return None
+    state = AcceleratorState()
+    try:
+        # Deliberate: accelerate's AcceleratorState binds its attributes through a shared
+        # state dict, so a field can be absent on an incompletely initialised state.
+        distributed_type = state.distributed_type
+        plugin = state.fsdp_plugin
+    except AttributeError:
+        return None
+    if distributed_type is not DistributedType.FSDP or plugin is None:
+        return None
+    return _read_full_shard_strategy(plugin, world_size)
+
+
+@dataclass(frozen=True)
+class Fsdp2MasterReport:
+    """FP32-master evidence for a module's trainable parameters, read from FSDP2's stored shards."""
+
+    units: int  # FSDP2 units (root included) that own at least one parameter
+    trainable_param_names: frozenset[str]  # trainables whose master shard was found
+    uncovered_trainable_names: tuple[str, ...]  # trainables no FSDP2 unit owns
+    low_precision: tuple[str, ...]  # "name:dtype" of trainable masters that are not FP32
+    shard_elements: int  # trainable master elements held on this rank
+
+
+def inspect_fsdp2_trainable_masters(module: torch.nn.Module) -> Fsdp2MasterReport:
+    """Read ``module``'s trainable FP32 masters from the shards FSDP2 stores, root unit included.
+
+    Valid inside a forward. FSDP2's pre-forward swaps every unsharded unit's module attributes
+    to its all-gathered compute parameter -- BF16 under a BF16 ``MixedPrecisionPolicy`` -- so
+    ``named_parameters()`` there shows compute views, not masters. The masters are each
+    ``FSDPParam.sharded_param``: the local DTensor shard the optimizer owns, reached through
+    every unit's parameter group. Those are torch-private fields of the qualified torch
+    2.10.0+cu128 build; if they move, the ``AttributeError`` propagates rather than producing
+    an empty report that could pass.
+    """
+    from torch.distributed.fsdp import FSDPModule, fully_shard
+
+    module_names = {id(submodule): name for name, submodule in module.named_modules(remove_duplicate=False)}
+    covered: set[str] = set()
+    low_precision: list[str] = []
+    units = 0
+    shard_elements = 0
+    for submodule in module.modules():
+        if not isinstance(submodule, FSDPModule):
+            continue
+        param_group = fully_shard.state(submodule)._fsdp_param_group
+        if param_group is None:
+            continue
+        units += 1
+        for fsdp_param in param_group.fsdp_params:
+            master = fsdp_param.sharded_param
+            if not master.requires_grad:
+                continue
+            info = fsdp_param._module_info
+            owners = [(info.module, info.param_name)]
+            owners.extend(zip(info.shared_modules, info.shared_param_names, strict=True))
+            names = [
+                f"{module_names[id(owner)]}.{param_name}" if module_names[id(owner)] else param_name
+                for owner, param_name in owners
+            ]
+            covered.update(names)
+            shard_elements += int(master.to_local().numel())
+            if master.dtype is not torch.float32:
+                low_precision.append(f"{names[0]}:{master.dtype}")
+    trainable = [name for name, parameter in module.named_parameters() if parameter.requires_grad]
+    return Fsdp2MasterReport(
+        units=units,
+        trainable_param_names=frozenset(covered),
+        uncovered_trainable_names=tuple(name for name in trainable if name not in covered),
+        low_precision=tuple(low_precision),
+        shard_elements=shard_elements,
+    )
+
+
+def read_accelerate_mixed_precision() -> str:
+    """Return accelerate's live mixed-precision setting, or ``"no"`` when it cannot be read.
+
+    Fails closed, like ``detect_full_shard_topology``: the only caller uses this to decide
+    whether accelerate will upcast the sharded FSDP masters to FP32, and an unreadable state
+    must be treated as "it will not".
+    """
+    try:
+        from accelerate.state import AcceleratorState
+    except ImportError:
+        return "no"
+    state = AcceleratorState()
+    try:
+        # Deliberate: accelerate's AcceleratorState binds its attributes through a shared
+        # state dict, so a field can be absent on an incompletely initialised state.
+        return str(state.mixed_precision)
+    except AttributeError:
+        return "no"
+
+
+def _package_storage_dtypes(
+    model_dir: Path, *, verified_tensor_storage: VerifiedTrainedTensorStorage | None = None
+) -> frozenset[str]:
+    """Use authenticated v3 storage, otherwise retain original/v2 source-family rules."""
+    if verified_tensor_storage is not None:
+        return verified_tensor_storage.for_model(model_dir)
+    return frozenset({"F32" if is_portable_isaac05_repository(model_dir) else "BF16"})
+
+
+@dataclass(frozen=True)
+class _CanonicalInnerState:
+    tensors: dict[str, Tensor]
+    storage_dtypes: frozenset[str]
+
+
+class PerceptronIsaacPolicy(PreTrainedPolicy):
+    """LeRobot training/eval wrapper for checkpoint-selected native ISAAC VLAs."""
+
+    name = "perceptron_isaac"
+    config_class = PerceptronIsaacConfig
+    # FSDP2 wrap units for sharded training: the units dense Isaac-0.5 was trained with. The
+    # rest (embeddings, lm_head, the vision tower) stays in the root unit, which accelerate
+    # always fully_shards; its parameters are sharded at rest and gathered for the step.
+    _fsdp_wrap_modules = ["GenesisQwen36DecoderLayer", "ActionExpertBlock"]
+
+    def __init__(
+        self,
+        config: PerceptronIsaacConfig,
+        *,
+        verified_tensor_storage: VerifiedTrainedTensorStorage | None = None,
+        **kwargs: Any,
+    ) -> None:
+        require_package("transformers", extra="perceptron_isaac")
+        require_package("mharmony", extra="perceptron_isaac")
+        super().__init__(config)
+        config.validate_features()
+        self.config = config
+        self._verified_tensor_storage = verified_tensor_storage
+
+        self._isaac_model: Mk1Qwen36VLAForActionGeneration | None = None
+        self._stats: IsaacNormalizationStats | None = None
+        self._native_render_metadata: IsaacMharmonyRenderMetadata | None = None
+        self._verified_runtime_assets: DirectorySnapshot | None = None
+        self._verified_external_runtime_assets: list[DirectorySnapshot] = []
+        # Checkpoint-serialized normalization stats adopted from the restored
+        # preprocessor pipeline (see _maybe_adopt_serving_stats). Set once per loaded
+        # checkpoint and deliberately NOT cleared by reset(): the checkpoint identity
+        # does not change between episodes, only per-episode rollout state does.
+        self._adopted_serving_stats: IsaacNormalizationStats | None = None
+        # Set once, outside reset(): parameter freezing must happen before the model is
+        # wrapped for distributed training and must not be re-applied per step.
+        self._training_parameters_configured = False
+        self._fp32_masters_verified = False
+
+        self.reset()
+
+        # Pre-load only when inference dtype (bf16) is also the training storage dtype.
+        # With fp32 storage the load is deferred so the backbone is never materialized twice;
+        # both ``predict_action_chunk`` and ``forward`` load lazily on first use.
+        if config.hf_model_path and not config.train_storage_fp32:
+            self._load_backbone()
+
+    def _require_native_save_supported(self) -> None:
+        """Refuse deferred export layouts before collective gathering or filesystem writes."""
+        if self.config.use_peft:
+            raise RuntimeError("Perceptron ISAAC PEFT saving is unsupported.")
+        if self.config.raw_export_saving_unsupported(self._local_checkpoint_source_root()):
+            raise RuntimeError(
+                "Raw/portable-export saving is unsupported; use a source-bound native MK1 package."
+            )
+
+    def _save_pretrained(self, save_directory: Path, state_dict: dict[str, Tensor] | None = None) -> None:
+        """Save one canonical trained weight inventory plus checkpoint-local runtime assets.
+
+        Collective when the policy is FSDP2-sharded, exactly like the base implementation: every
+        rank must call it, the full state dict is gathered onto the main rank, and only the main
+        rank writes. This method writes artifacts only; ``save_pretrained`` finalizes standalone
+        packages, while checkpoint writers defer finalization until their sidecars are saved.
+        """
+        from lerobot.distributed.checkpoint import full_model_state_dict
+        from lerobot.distributed.utils import is_main_process
+
+        self._require_native_save_supported()
+        if state_dict is None:
+            state_dict = full_model_state_dict(self)  # collective when sharded; {} off-main
+        if not is_main_process():
+            return
+        source_root = (
+            self._verified_runtime_assets.root
+            if self._verified_runtime_assets is not None
+            else self._local_checkpoint_source_root()
+        )
+        if source_root is None:
+            raise RuntimeError("Perceptron ISAAC dense saves require a loaded checkpoint package.")
+        with self._verified_checkpoint_source(source_root) as verified_source:
+            inner_state = self._preflight_canonical_inner_state(state_dict, verified_source / "hf_model")
+            self._copy_checkpoint_package(verified_source, save_directory)
+        if self._config_declares_mk1(self.config):
+            self.config._export_mk1_source_model_import_sha256 = (
+                self.config.mk1_model_import_sha256 or self.config.mk1_source_model_import_sha256
+            )
+            self.config._export_mk1_model_import_sha256 = None
+        self.config._save_pretrained(save_directory)
+        self._save_canonical_inner_weights(save_directory, inner_state)
+        self._canonical_inner_save_root = str(save_directory.resolve())
+
+    def _local_checkpoint_source_root(self) -> Path | None:
+        source_value = getattr(self.config, "_checkpoint_source_root", None)
+        source_root = Path(str(source_value)) if source_value else None
+        if source_root is None or not source_root.is_dir():
+            pretrained_path = getattr(self.config, "pretrained_path", None)
+            candidate = Path(str(pretrained_path)) if pretrained_path else None
+            if candidate is not None and candidate.is_dir():
+                source_root = candidate
+        return source_root.resolve() if source_root is not None else None
+
+    @staticmethod
+    def _is_checkpoint_weight_name(name: str) -> bool:
+        return (
+            name == "model.safetensors"
+            or name == "model.safetensors.index.json"
+            or (name.startswith("model-") and name.endswith(".safetensors"))
+        )
+
+    def _retain_verified_runtime_assets(self, verified_root: Path) -> None:
+        """Retain verified sidecars privately while leaving lazy weights at their source root."""
+        root = Path(verified_root)
+        root_entries = {
+            path.name
+            for path in root.iterdir()
+            if path.name != "base_model" and not self._is_checkpoint_weight_name(path.name)
+        }
+        model_root = root / "hf_model"
+        model_entries = (
+            {path.name for path in model_root.iterdir() if not self._is_checkpoint_weight_name(path.name)}
+            if model_root.is_dir()
+            else set()
+        )
+        snapshot = snapshot_directory(
+            root,
+            prefix="lerobot-isaac-runtime-",
+            root_entries=root_entries,
+            directory_entries={"hf_model": model_entries} if "hf_model" in root_entries else None,
+        )
+        external_snapshots = []
+        try:
+            relative_paths = dict(getattr(self.config, "_checkpoint_relative_paths", {}))
+            source_root_value = getattr(self.config, "_checkpoint_source_root", None)
+            source_root = Path(str(source_root_value)).resolve() if source_root_value else root.resolve()
+            records_by_owner: dict[Path, list[tuple[str, dict[str, str]]]] = {}
+            rebound_paths: dict[str, dict[str, str]] = {}
+            for attr, record in relative_paths.items():
+                if (
+                    not isinstance(record, dict)
+                    or not isinstance(record.get("absolute"), str)
+                    or not isinstance(record.get("relative"), str)
+                ):
+                    continue
+                if attr == "hf_model_path":
+                    # Weight ownership stays with the original package, not the sidecar snapshot.
+                    rebound_paths[attr] = record
+                    continue
+                owner_value = record.get("root")
+                owner = Path(owner_value).resolve() if isinstance(owner_value, str) else source_root
+                records_by_owner.setdefault(owner, []).append((attr, record))
+
+            for owner, records in records_by_owner.items():
+                if owner == source_root:
+                    owner_snapshot = snapshot
+                else:
+                    owner_snapshot = snapshot_directory(
+                        owner,
+                        prefix="lerobot-isaac-owned-runtime-",
+                        root_entries={Path(record["relative"]).parts[0] for _, record in records},
+                    )
+                    external_snapshots.append(owner_snapshot)
+                for attr, record in records:
+                    candidate = owner_snapshot.root / record["relative"]
+                    if not candidate.exists():
+                        raise RuntimeError(
+                            f"Retained checkpoint-local path {attr} disappeared from its owning package."
+                        )
+                    absolute = str(candidate)
+                    setattr(self.config, attr, absolute)
+                    rebound_paths[attr] = {
+                        "absolute": absolute,
+                        "relative": record["relative"],
+                        "root": str(owner_snapshot.root),
+                    }
+            self.config._checkpoint_relative_paths = rebound_paths
+            self.config._pretrained_processor_root = str(snapshot.root)
+            self._set_checkpoint_local_vocab_path(
+                self.config, model_root=snapshot.root / "hf_model", force=True
+            )
+        except BaseException:
+            snapshot.cleanup()
+            for external in external_snapshots:
+                external.cleanup()
+            raise
+        previous = self._verified_runtime_assets
+        previous_external = self._verified_external_runtime_assets
+        self._verified_runtime_assets = snapshot
+        self._verified_external_runtime_assets = external_snapshots
+        if previous is not None:
+            previous.cleanup()
+        for external in previous_external:
+            external.cleanup()
+
+    @contextmanager
+    def _verified_checkpoint_source(self, source_root: Path) -> Iterator[Path]:
+        """Verify original source bytes once and retain only sidecars for the policy lifetime."""
+        if self._verified_runtime_assets is None:
+            self._verify_saved_package(source_root)
+            self._retain_verified_runtime_assets(source_root)
+        runtime_assets = self._verified_runtime_assets
+        assert runtime_assets is not None
+        yield runtime_assets.root
+
+    @staticmethod
+    def _preflight_canonical_inner_state(
+        policy_state: dict[str, Tensor], model_root: Path
+    ) -> _CanonicalInnerState:
+        """Validate the gathered runtime inventory before touching any destination assets."""
+        from .mk1_checkpoint_contract import (
+            Mk1CheckpointContract,
+            TensorMetadata,
+        )
+
+        prefixes = ("_isaac_model.", "module._isaac_model.")
+        prefix = next(
+            (item for item in prefixes if policy_state and all(key.startswith(item) for key in policy_state)),
+            None,
+        )
+        if prefix is None:
+            unexpected = sorted(key for key in policy_state if not key.startswith(prefixes))
+            raise RuntimeError(
+                "Perceptron ISAAC dense state must contain only native backbone tensors; "
+                f"unexpected={unexpected[:10]}."
+            )
+        inner_state = {key.removeprefix(prefix): tensor for key, tensor in policy_state.items()}
+        contract = Mk1CheckpointContract.parse_allowlisted(
+            load_json_object(model_root / "config.json"), allow_test_only_reduced_geometry=True
+        )
+        # Only these actual dtypes may be saved; do not cast gathered trainable masters.
+        dtype_names = {torch.bfloat16: "BF16", torch.float32: "F32"}
+        metadata = {
+            key: TensorMetadata(
+                shape=tuple(tensor.shape), dtype=dtype_names.get(tensor.dtype, str(tensor.dtype))
+            )
+            for key, tensor in inner_state.items()
+        }
+        contract.validate_tensor_metadata(
+            metadata, allowed_storage_dtypes=frozenset({"BF16", "F32"}), runtime_only=True
+        )
+        return _CanonicalInnerState(inner_state, frozenset(value.dtype for value in metadata.values()))
+
+    def _save_canonical_inner_weights(self, save_directory: Path, inner_state: _CanonicalInnerState) -> None:
+        model_root = save_directory / "hf_model"
+        if not model_root.is_dir() or model_root.is_symlink():
+            raise RuntimeError("Perceptron ISAAC dense save is missing a regular checkpoint-local hf_model.")
+        for directory in (save_directory, model_root):
+            for weight_path in (
+                directory / "model.safetensors",
+                directory / "model.safetensors.index.json",
+                *directory.glob("model-*.safetensors"),
+            ):
+                weight_path.unlink(missing_ok=True)
+        save_torch_state_dict(inner_state.tensors, model_root, max_shard_size="5GB")
+        if self._config_declares_mk1(self.config):
+            from .mk1_checkpoint_contract import (
+                MK1_TEST_GEOMETRY_MARKER,
+                Mk1CheckpointContractError,
+                finalize_mk1_runtime_checkpoint_layout,
+                validate_mk1_checkpoint,
+            )
+
+            finalize_mk1_runtime_checkpoint_layout(model_root)
+            try:
+                inner_config = load_json_object(model_root / "config.json")
+                validate_mk1_checkpoint(
+                    model_root,
+                    allow_test_only_reduced_geometry=bool(
+                        inner_config.get(MK1_TEST_GEOMETRY_MARKER, False)
+                        or inner_config.get("isaac05_test_only_reduced_geometry", False)
+                    ),
+                    allowed_storage_dtypes=inner_state.storage_dtypes,
+                )
+            except (ValueError, Mk1CheckpointContractError) as exc:
+                raise RuntimeError(f"Saved MK1 runtime checkpoint is invalid: {exc}") from exc
+            lineage = (
+                (
+                    save_directory / "isaac_import_provenance.json",
+                    save_directory / "source_isaac_import_provenance.json",
+                ),
+                (model_root / "mk1_model_import.json", model_root / "source_mk1_model_import.json"),
+            )
+        else:
+            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
+        for source, destination in lineage:
+            if source.is_file():
+                destination.unlink(missing_ok=True)
+                source.replace(destination)
+
+    @classmethod
+    def _verify_saved_package(cls, root: str | Path) -> PerceptronIsaacConfig:
+        from lerobot.configs import PreTrainedConfig
+
+        saved_config = PreTrainedConfig.from_pretrained(root)
+        cls._resolve_checkpoint_local_paths(saved_config, root)
+        cls._verify_packaged_contract_digests(saved_config, Path(root))
+        return saved_config
+
+    def finalize_pretrained_package(self, save_directory: str | Path) -> None:
+        """Bind final native package contents after all checkpoint writers finish."""
+        self._require_native_save_supported()
+        root = Path(save_directory)
+        if (root / DCP_MODEL_SHARD_DIRNAME).is_dir() and getattr(
+            self, "_canonical_inner_save_root", None
+        ) != str(root.resolve()):
+            raise RuntimeError(
+                "This Perceptron Isaac checkpoint holds only DCP model shards: the DCP-only "
+                "checkpoint_format skips the policy's own save, so the package assets the reload "
+                "path requires (hf_model/, deployment adapter, FAST and recipe sidecars) were never "
+                "written. Train Perceptron Isaac with checkpoint_format=safetensors (the default) "
+                f"or safetensors_dcp. Directory: {root}."
+            )
+        rewrite_trained_processor_paths(root)
+        if getattr(self, "_canonical_inner_save_root", None) != str(root.resolve()):
+            return
+        if self._config_declares_mk1(self.config):
+            model_import_digest = getattr(
+                self.config,
+                "_export_mk1_source_model_import_sha256",
+                self.config.mk1_source_model_import_sha256,
+            )
+            finalize_canonical_trained_package(
+                self.config,
+                root,
+                mk1_source_model_import_sha256=model_import_digest,
+            )
+            return
+        raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
+
+    @staticmethod
+    def _copy_checkpoint_package(source_root: Path, destination: Path) -> None:
+        """Materialize runtime assets without copying either stale trained weight inventory."""
+        if source_root == destination.resolve():
+            return
+
+        def ignore(directory: str, names: list[str]) -> set[str]:
+            current = Path(directory).resolve()
+            at_package_root = current == source_root
+            at_model_root = current == source_root / "hf_model"
+            return {
+                name
+                for name in names
+                if (at_package_root and name == "config.json")
+                or (
+                    (at_package_root or at_model_root)
+                    and PerceptronIsaacPolicy._is_checkpoint_weight_name(name)
+                )
+            }
+
+        shutil.copytree(source_root, destination, dirs_exist_ok=True, ignore=ignore)
+
+    @staticmethod
+    def _portable_export_root(package_root: Path) -> Path | None:
+        """Return the raw Isaac-0.5 export that owns ``package_root``, when it is nested in one."""
+        parent = package_root.parent
+        return parent if is_portable_isaac05_repository(parent) else None
+
+    def reset(self) -> None:
+        """Clear the whole vector rollout's queues and shared episode clock."""
+        self._queues: dict[str, deque[Tensor]] = {ACTION: deque(maxlen=self.config.n_action_steps)}
+        self._online_image_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
+        self._online_state_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
+        self._rollout_batch_size: int | None = None
+        self._online_render_step: PerceptronIsaacMharmonyPackProcessorStep | None = None
+        self._frame_index: int = -1
+        # Settle frames are counted separately so they never advance the episode clock.
+        self._settle_index: int = 0
+        self._last_external_timestamp_seconds: float | None = None
+        self._flow_seed_index: int = -1
+
+    def get_optim_params(self) -> list[dict[str, Any]]:
+        """Return shell optimizer groups after enforcing the native training guard."""
+        self._require_native_training_supported()
+        if self._isaac_model is None:
+            self._load_backbone(training=True)
+        self._configure_training_parameters()
+        assert self._isaac_model is not None
+        self._promote_trainable_parameters_to_fp32(self._isaac_model)
+        groups: dict[str, list[Tensor]] = {"vlm": [], "vision": [], "expert": []}
+        for name, parameter in self._isaac_model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if "action_expert" in name:
+                groups["expert"].append(parameter)
+            elif name.startswith("model.visual."):
+                groups["vision"].append(parameter)
+            else:
+                groups["vlm"].append(parameter)
+        result: list[dict[str, Any]] = []
+        for name, lr in (
+            ("vlm", self.config.optimizer_lr),
+            ("vision", self.config.optimizer_vit_lr),
+            ("expert", self.config.optimizer_action_expert_lr),
+        ):
+            if groups[name]:
+                result.append({"params": groups[name], "lr": lr})
+        return result
+
+    def wrap_with_peft(self, peft_config=None, peft_cli_overrides: dict | None = None):
+        """Reject unqualified adapter training before touching the backbone."""
+        raise RuntimeError("Perceptron ISAAC PEFT training is unsupported; use dense FSDP2 training.")
+
+    def _promote_trainable_parameters_to_fp32(self, module: torch.nn.Module) -> None:
+        """Keep optimizer-owned parameters in FP32 without expanding the frozen backbone."""
+        if not self.config.train_storage_fp32:
+            return
+        topology = detect_full_shard_topology()
+        if topology is not None:
+            self._defer_fp32_masters_to_the_shard(topology)
+            return
+        for parameter in module.parameters():
+            if parameter.requires_grad and parameter.is_floating_point() and parameter.dtype != torch.float32:
+                # This runs before optimizer/FSDP/DDP construction, so replacing parameter storage is safe.
+                parameter.data = parameter.data.to(dtype=torch.float32)
+
+        non_fp32 = [
+            name
+            for name, parameter in module.named_parameters()
+            if parameter.requires_grad and parameter.is_floating_point() and parameter.dtype != torch.float32
+        ]
+        if non_fp32:
+            raise RuntimeError(f"ISAAC trainable parameters must use FP32 storage; first: {non_fp32[:5]}")
+
+    def _defer_fp32_masters_to_the_shard(self, topology: FullShardTopology) -> None:
+        """Require FSDP2 mixed precision before deferring promotion to accelerate.
+
+        F32 mmap loads need no upcast. Other loads can require a full FP32 host copy
+        per rank before sharding; the first training forward verifies stored masters.
+        """
+        if topology.fsdp_version != 2:
+            raise RuntimeError("Perceptron ISAAC FSDP1 training is unsupported; use FSDP2.")
+        mixed_precision = read_accelerate_mixed_precision()
+        if mixed_precision == "no":
+            raise RuntimeError(
+                "ISAAC train_storage_fp32=true needs accelerate mixed precision enabled under "
+                f"FSDP{topology.fsdp_version} {topology.sharding_strategy} "
+                f"(world_size={topology.world_size}): accelerate creates the FP32 masters while "
+                "preparing the sharded model, and skips that upcast when mixed_precision is 'no'. "
+                "Launch with --accelerator.mixed_precision=bf16."
+            )
+
+    def _verify_fp32_masters_once(self) -> None:
+        """Verify every trainable FSDP2 master, including root-owned parameters.
+
+        Stored optimizer shards must be FP32; BF16 all-gathered compute views are
+        not evidence. Mark success only after nonempty, complete coverage passes.
+        """
+        if self._fp32_masters_verified or not self.config.train_storage_fp32:
+            return
+        topology = detect_full_shard_topology()
+        if topology is None:
+            return
+        if topology.fsdp_version == 2:
+            report = inspect_fsdp2_trainable_masters(self)
+            if report.units == 0 or not report.trainable_param_names:
+                raise RuntimeError(
+                    "ISAAC train_storage_fp32 found no FSDP2 shard masters to verify under a live "
+                    f"FSDP2 topology (world_size={topology.world_size}, {report.units} units): the "
+                    "trainable parameters are not owned by any FSDP2 unit of this policy."
+                )
+            if report.uncovered_trainable_names:
+                raise RuntimeError(
+                    "ISAAC trainable parameters must all be FSDP2-sharded masters; not owned by any "
+                    f"FSDP2 unit, first: {list(report.uncovered_trainable_names[:5])}"
+                )
+            if report.low_precision:
+                raise RuntimeError(
+                    "ISAAC trainable parameters must use FP32 storage; the FSDP2 shard masters are "
+                    f"still low precision, first: {list(report.low_precision[:5])}"
+                )
+            units, shard_elements = report.units, report.shard_elements
+            sampled = sorted(report.trainable_param_names)[:4]
+        else:
+            raise RuntimeError("Perceptron ISAAC FSDP1 training is unsupported; use FSDP2.")
+        self._fp32_masters_verified = True
+        logging.info(
+            "ISAAC FP32 masters verified after sharding (FSDP%d): %d units, %d trainable shard "
+            "elements (%.2f GiB at FP32) on this rank, sample %s",
+            topology.fsdp_version,
+            units,
+            shard_elements,
+            shard_elements * 4 / 1024**3,
+            sampled,
+        )
+
+    def _backbone_materialization_device(self, *, training: bool) -> str:
+        """Build FSDP2 training weights on CPU; sharding moves each unit to its GPU.
+
+        The run device still selects kernels and the CUDA ABI gate. Budget host
+        memory for mmap pages or an FP32 upcast copy before sharding.
+        """
+        if training:
+            topology = detect_full_shard_topology()
+            if topology is not None and topology.fsdp_version == 2:
+                return "cpu"
+        return self._resolve_device()
+
+    def _loads_native_f32_masters(self, *, training: bool, storage_dtypes: frozenset[str]) -> bool:
+        """Admit F32 placement only for dense FP32-storage FSDP2 training.
+
+        Private mmap views preserve source bits, share file pages across local
+        ranks and keep writes process-private. Inference and BF16 sources retain
+        their BF16 load path; unsupported training modes are rejected separately.
+        Mixed trained storage promotes even frozen BF16 tensors to F32, doubling
+        their host storage. Promotion preserves BF16 values, not lost precision.
+        """
+        if not (training and self.config.train_storage_fp32) or "F32" not in storage_dtypes:
+            return False
+        if self.config.train_expert_only or self.config.use_peft:
+            return False
+        topology = detect_full_shard_topology()
+        return topology is not None and topology.fsdp_version == 2
+
+    def _resolve_device(self) -> str:
+        """Per-rank CUDA device under accelerate multi-GPU, else config.device."""
+        import os
+
+        d = str(self.config.device)
+        if d.startswith("cuda") and os.environ.get("LOCAL_RANK") is not None and torch.cuda.is_available():
+            return f"cuda:{torch.cuda.current_device()}"
+        return d
+
+    def _model_dtype(self) -> torch.dtype:
+        """Dtype of the loaded backbone, falling back to bf16 for parameterless stand-ins."""
+        if self._isaac_model is None:
+            return torch.bfloat16
+        try:
+            return next(p.dtype for p in self._isaac_model.parameters() if p.is_floating_point())
+        except (AttributeError, StopIteration):
+            return torch.bfloat16
+
+    @staticmethod
+    def _config_declares_mk1(config: PerceptronIsaacConfig) -> bool:
+        """Select MK1 from authenticated metadata or the inner checkpoint config."""
+        if (
+            config.artifact_kind == "neutral_debug"
+            or config.mk1_model_import_sha256 is not None
+            or config.mk1_source_model_import_sha256 is not None
+            or config.mk1_trained_package_manifest_sha256 is not None
+        ):
+            return True
+
+        model_path = getattr(config, "hf_model_path", None)
+        config_path = Path(str(model_path)) / "config.json" if model_path else None
+        if config_path is not None and config_path.is_file():
+            try:
+                raw = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return False
+            if not isinstance(raw, dict):
+                return False
+            if raw.get("model_type") == "isaac_0_5":
+                return True
+            genesis_vla = raw.get("genesis_vla")
+            return bool(
+                raw.get("model_type") == "qwen3_5_moe"
+                and isinstance(genesis_vla, dict)
+                and genesis_vla.get("backbone_family") == "mk1_qwen3_6_moe"
+            )
+
+        return False
+
+    def _load_backbone(self, *, training: bool = False) -> None:
+        if not self.config.hf_model_path:
+            raise RuntimeError("PerceptronIsaacConfig.hf_model_path is required to load the Isaac HF VLA.")
+        if not self._config_declares_mk1(self.config):
+            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
+
+        if training:
+            self._require_native_training_supported()
+        from .mk1_checkpoint_contract import Mk1CheckpointContractError, validate_mk1_checkpoint
+        from .modeling_mk1_vla import TORCH_SDPA_ATTENTION_BACKEND, load_mk1_vla_from_hf
+        from .modeling_qwen36_moe import DETERMINISTIC_ROUTE_REDUCTION
+
+        model_dir = Path(self.config.hf_model_path)
+        allow_test_geometry = self.config.artifact_kind == "neutral_debug"
+        verified_storage = self._verified_tensor_storage
+        if verified_storage is None and (
+            self.config.mk1_trained_package_manifest_sha256 is not None
+            or (model_dir.parent / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME).exists()
+        ):
+            verified_storage = self._verify_packaged_contract_digests(self.config, model_dir.parent)
+            self._verified_tensor_storage = verified_storage
+        # Source profiles remain strict. Only authenticated outer v3 metadata overrides them.
+        storage_dtypes = (
+            _package_storage_dtypes(model_dir, verified_tensor_storage=verified_storage)
+            if verified_storage is not None
+            else _package_storage_dtypes(model_dir)
+        )
+        native_f32 = self._loads_native_f32_masters(training=training, storage_dtypes=storage_dtypes)
+        model_dtype = torch.float32 if native_f32 else torch.bfloat16
+        try:
+            contract, inventory = validate_mk1_checkpoint(
+                model_dir,
+                allow_test_only_reduced_geometry=allow_test_geometry,
+                allowed_storage_dtypes=storage_dtypes,
+            )
+        except Mk1CheckpointContractError as exc:
+            raise RuntimeError(f"ISAAC requires a valid MK1 composite checkpoint: {exc}") from exc
+        if verified_storage is not None:
+            verified_storage.require_header_dtypes(inventory)
+        if self.config.artifact_kind != contract.artifact.artifact_kind:
+            raise RuntimeError(
+                "ISAAC policy/checkpoint artifact identity mismatch: "
+                f"policy={self.config.artifact_kind!r}, checkpoint={contract.artifact.artifact_kind!r}."
+            )
+        if self.config.vector_max_states != contract.vector_encoder.max_states:
+            raise RuntimeError(
+                "ISAAC policy/checkpoint vector width mismatch: "
+                f"policy={self.config.vector_max_states}, checkpoint={contract.vector_encoder.max_states}."
+            )
+        if self.config.max_action_dim != contract.action_expert.action_dim:
+            raise RuntimeError(
+                "ISAAC policy/checkpoint maximum action width mismatch: "
+                f"policy={self.config.max_action_dim}, checkpoint={contract.action_expert.action_dim}."
+            )
+        if self.config.max_action_horizon != contract.action_expert.action_horizon:
+            raise RuntimeError(
+                "ISAAC policy/checkpoint maximum action horizon mismatch: "
+                f"policy={self.config.max_action_horizon}, "
+                f"checkpoint={contract.action_expert.action_horizon}."
+            )
+        if self.config.action_dim > contract.action_expert.action_dim:
+            raise RuntimeError(
+                "ISAAC policy action_dim exceeds the checkpoint maximum: "
+                f"policy={self.config.action_dim}, checkpoint={contract.action_expert.action_dim}."
+            )
+        if self.config.chunk_size > contract.action_expert.action_horizon:
+            raise RuntimeError(
+                "ISAAC policy chunk_size exceeds the checkpoint maximum: "
+                f"policy={self.config.chunk_size}, checkpoint={contract.action_expert.action_horizon}."
+            )
+        try:
+            render_metadata = load_native_render_metadata(self.config)
+            contract.validate_coord_reserved_token_groups(render_metadata.mharmony_reserved_token_groups)
+        except (ValueError, Mk1CheckpointContractError) as exc:
+            raise RuntimeError(f"ISAAC MK1 coordinate/rendering contract mismatch: {exc}") from exc
+        model, _, loaded_contract = load_mk1_vla_from_hf(
+            model_dir,
+            dtype=model_dtype,
+            device=self._backbone_materialization_device(training=training),
+            runtime_device=self._resolve_device(),
+            allow_test_only_reduced_geometry=allow_test_geometry,
+            attention_backend=TORCH_SDPA_ATTENTION_BACKEND,
+            route_reduction=DETERMINISTIC_ROUTE_REDUCTION,
+            allowed_storage_dtypes=storage_dtypes,
+            load_intent="training" if native_f32 else "inference",
+            verified_tensor_storage=verified_storage,
+        )
+        if loaded_contract != contract:
+            raise RuntimeError("MK1 checkpoint contract changed between preflight and model loading.")
+        self._isaac_model = model
+        self._native_render_metadata = render_metadata
+        if training:
+            self._configure_training_parameters()
+
+    def _configure_training_parameters(self) -> None:
+        if self._isaac_model is None:
+            raise RuntimeError("ISAAC backbone must be loaded before training setup.")
+        # Freezing is a one-time setup step that must happen before the model is wrapped.
+        # ``forward`` also calls this on every training step, and once FSDP has flat-sharded
+        # the parameters they are no longer leaf tensors, so re-applying ``requires_grad_``
+        # raises "you can only change requires_grad flags of leaf variables".
+        if self._training_parameters_configured:
+            return
+        self._training_parameters_configured = True
+        from .modeling_qwen35_vla import setup_qwen35_vla_for_training
+
+        setup_qwen35_vla_for_training(
+            self._isaac_model,
+            train_expert_only=False,
+            train_samples_per_chunk=int(self.config.train_samples_per_chunk),
+            rtc_max_delay_steps=int(self.config.flow_rtc_max_delay_steps),
+            rtc_delay_sampling=str(self.config.flow_rtc_delay_sampling),
+            dual_timestep_ratio=float(self.config.flow_dual_timestep_ratio),
+            mask_padded_action_rows=bool(self.config.flow_mask_padded_action_rows),
+        )
+        if self.config.freeze_input_embeddings:
+            input_embeddings = self._isaac_model.get_input_embeddings()
+            if input_embeddings is None:
+                raise RuntimeError("freeze_input_embeddings=true but ISAAC exposes no input embeddings.")
+            lm_head_params = {id(param) for param in self._isaac_model.lm_head.parameters()}
+            if any(id(param) in lm_head_params for param in input_embeddings.parameters()):
+                raise RuntimeError("ISAAC input embeddings unexpectedly share parameters with lm_head.")
+            for parameter in input_embeddings.parameters():
+                # Defensive: a parameter already wrapped by FSDP/DDP is a non-leaf view and
+                # cannot take a requires_grad flag. The freeze applies before wrapping.
+                if parameter.is_leaf:
+                    parameter.requires_grad_(False)
+        self._promote_trainable_parameters_to_fp32(self._isaac_model)
+
+    def _require_native_training_supported(self) -> None:
+        """Require dense FSDP2 for checkpoint-backed training before allocation.
+
+        PEFT, expert-only and FSDP1 training are deferred. Live full-shard evidence
+        admits native dense training; it is not a promise that allocation will fit.
+        """
+        if self.config.train_expert_only or self.config.use_peft:
+            raise RuntimeError(
+                "Perceptron ISAAC supports only dense training; PEFT and expert-only training are unsupported."
+            )
+        topology = detect_full_shard_topology()
+        if topology is not None and topology.fsdp_version != 2:
+            raise RuntimeError("Perceptron ISAAC FSDP1 training is unsupported; use FSDP2.")
+        if not (self.config.hf_model_path and self._config_declares_mk1(self.config)):
+            return
+        if topology is not None:
+            return
+        raise RuntimeError(
+            "Isaac-0.5 dense full-parameter training is unsupported on this path. Its 35.7B "
+            "parameters need 126.5 GiB of BF16 weights+gradients -- 133.1 GiB with FP32 "
+            "storage, before optimizer state -- on a single device, against 79.65 GiB on an "
+            "H100, and DDP replicates parameters rather than sharding them. Shard it instead "
+            "with FSDP2 across every process: lerobot-train --parallelism.dp_shard=<world size> "
+            "--accelerator.mixed_precision=bf16."
+        )
+
+    def _maybe_adopt_serving_stats(self, batch: dict[str, Any]) -> None:
+        """Adopt checkpoint-serialized normalization stats handed over by the pack step.
+
+        At online single-step serving the saved preprocessor skips rendering (the
+        anchor is injected only after preprocessing) and attaches its restored stats
+        to the batch instead. Those serialized stats are the training-time ground
+        truth, so every policy-owned consumer -- the online render step and the
+        settle branch -- must use them in preference to independently path-loading
+        ``config.native_stats_path`` (which, for PEFT finetunes, historically pointed
+        at the *base* package and normalized proprio in the wrong frame).
+        """
+        stats = batch.get(PERCEPTRON_ISAAC_SERVING_STATS_KEY)
+        if stats is None or stats is self._adopted_serving_stats:
+            return
+        if not isinstance(stats, IsaacNormalizationStats):
+            raise TypeError(
+                f"{PERCEPTRON_ISAAC_SERVING_STATS_KEY!r} must carry IsaacNormalizationStats, "
+                f"got {type(stats).__name__}."
+            )
+        require_closed_loop_safe_isaac_stats(stats)
+        self._adopted_serving_stats = stats
+        self._stats = stats
+        # Render metadata may derive its clock from the stats; rebuild it lazily.
+        self._native_render_metadata = None
+        step = self._online_render_step
+        if step is not None and step._stats is not stats:
+            step._stats = stats
+            step._stream_builder = None
+
+    def _ensure_native_metadata(self) -> None:
+        if self._stats is None:
+            self._stats = self._adopted_serving_stats or load_native_isaac_stats(self.config)
+        if self._native_render_metadata is None:
+            assert self._stats is not None
+            self._native_render_metadata = load_native_render_metadata(
+                self.config,
+                stats_fps=self._stats.target_fps,
+            )
+        self._require_render_asset_prerequisites()
+
+    def _require_render_asset_prerequisites(self) -> None:
+        """Reject missing renderer assets before serving even a canned settle action."""
+        fast_processor_path = self.config.fast_processor_path
+        if fast_processor_path is None or Path(fast_processor_path).is_dir():
+            return
+        raise RuntimeError(
+            "Perceptron Isaac renderer cannot serve an action: configured "
+            f"fast_processor_path={fast_processor_path!r} is not a directory."
+        )
+
+    def _ensure_renderer(self) -> None:
+        """Compatibility hook for callers/tests: rendering is owned by processors."""
+        self._ensure_native_metadata()
+
+    def _require_deployable_action_artifact(self) -> None:
+        if self.config.artifact_kind != "trained_policy":
+            raise RuntimeError(
+                "Perceptron Isaac action serving rejects neutral_debug checkpoints. "
+                "This zero-step artifact validates construction and parity only and must never control a robot."
+            )
+
+    def _ensure_online_render_step(self) -> PerceptronIsaacMharmonyPackProcessorStep:
+        """Create the stateless pack/render processor used after policy-owned online windowing."""
+        device = self._resolve_device()
+        if self._online_render_step is None:
+            self._online_render_step = PerceptronIsaacMharmonyPackProcessorStep.from_config(
+                self.config,
+                native_stats_path=self.config.native_stats_path,
+                device=device,
+            )
+            if self._adopted_serving_stats is not None:
+                # The checkpoint's serialized stats outrank any config-path load,
+                # and must survive the per-Ready() reset that rebuilds this step.
+                self._online_render_step._stats = self._adopted_serving_stats
+        else:
+            self._online_render_step.device = device
+        return self._online_render_step
+
+    def _bind_rollout_batch_size(self, batch_size: int) -> None:
+        """Bind raw and prepacked inputs to one vector rollout until reset."""
+        if batch_size < 1:
+            raise ValueError("ISAAC online rollout requires a nonempty batch.")
+        if self._rollout_batch_size is not None and self._rollout_batch_size != batch_size:
+            raise ValueError("ISAAC online batch size changed within a rollout; call reset() first.")
+        self._rollout_batch_size = batch_size
+
+    def _update_online_rollout_state(self, batch: dict[str, Any]) -> None:
+        """Retain owned [B, ...] snapshots, including while queued actions drain."""
+        render_step = self._ensure_online_render_step()
+        batch_size = render_step._infer_batch_size(batch, None)
+        self._bind_rollout_batch_size(batch_size)
+        images = render_step._extract_image_tensor(batch, batch_size)
+        states = render_step._extract_state_tensor(batch, batch_size)
+        if images.shape[:2] != states.shape[:2]:
+            raise ValueError(f"Image/state window shape mismatch: {images.shape[:2]} vs {states.shape[:2]}.")
+        for idx in range(images.shape[1]):
+            # Vector environments may reuse their observation buffers on the next step.
+            self._online_image_queue.append(images[:, idx].copy())
+            self._online_state_queue.append(states[:, idx].copy())
+
+    def _online_anchor_timestamp_seconds(self) -> float:
+        self._ensure_native_metadata()
+        fps = (
+            getattr(self._native_render_metadata, "target_fps", None)
+            or getattr(self._stats, "target_fps", None)
+            or 20.0
+        )
+        fps = float(fps) if float(fps) > 0.0 else 20.0
+        if self._frame_index < 0:
+            raise RuntimeError("Perceptron Isaac model time requested before the first episode frame.")
+        # Floor the anchor at (k-1)/fps like Genesis does, so the k rendered observation
+        # timestamps stay distinct instead of collapsing to duplicates at episode start.
+        n_obs_steps = int(getattr(self._native_render_metadata, "n_obs_steps", 1) or 1)
+        min_anchor_steps = max(0, n_obs_steps - 1)
+        return float(max(self._frame_index, min_anchor_steps)) / fps
+
+    def _external_anchor_timestamp_seconds(self, batch: dict[str, Any]) -> float | None:
+        """Read and validate an explicitly supplied episode-relative model time.
+
+        The policy clock remains frame based for normal online rollout. Offline
+        replay may override it with an explicit timestamp, but processors never
+        synthesize or retain time and RNG state is not used as a clock.
+        """
+        raw = None
+        for key in (
+            PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY,
+            "anchor_timestamp_seconds",
+            "timestamp_seconds",
+            "timestamp",
+        ):
+            if batch.get(key) is not None:
+                raw = batch[key]
+                break
+        if raw is None:
+            return None
+        if torch.is_tensor(raw):
+            values = raw.detach().to(device="cpu", dtype=torch.float64).reshape(-1).tolist()
+        else:
+            values = np.asarray(raw, dtype=np.float64).reshape(-1).tolist()
+        if len(values) != 1:
+            raise ValueError(
+                f"Perceptron Isaac online timestamp override requires exactly one value; got {len(values)}."
+            )
+        timestamp = float(values[0])
+        if not np.isfinite(timestamp) or timestamp < 0.0:
+            raise ValueError(
+                f"Perceptron Isaac timestamp override must be finite and nonnegative; got {timestamp!r}."
+            )
+        previous = self._last_external_timestamp_seconds
+        if previous is not None and timestamp < previous:
+            raise ValueError(
+                "Perceptron Isaac timestamp override must be monotonic within an episode; "
+                f"got {timestamp} after {previous}."
+            )
+        self._last_external_timestamp_seconds = timestamp
+        return timestamp
+
+    @staticmethod
+    def _online_task_source(batch: dict[str, Any]) -> Any:
+        task = batch.get("task")
+        if task is None:
+            task = batch.get("observation.language")
+        if task is None:
+            task = batch.get("language_instruction")
+        return task
+
+    def _render_online_stream_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Render a stream from policy-owned online history and explicit policy-owned anchor timing."""
+        if not self._online_image_queue or not self._online_state_queue:
+            raise RuntimeError("Perceptron Isaac online render requested before any observation was queued.")
+        render_step = self._ensure_online_render_step()
+        image_keys = render_step._resolve_image_keys(batch)
+        image_values = list(self._online_image_queue)
+        state_values = list(self._online_state_queue)
+        target_steps = max(1, int(self.config.n_obs_steps))
+        if len(image_values) < target_steps:
+            pad_count = target_steps - len(image_values)
+            image_values = [image_values[0]] * pad_count + image_values
+            state_values = [state_values[0]] * pad_count + state_values
+        image_window = np.stack(image_values, axis=1)  # [B, T, N_cam, ...]
+        state_window = np.stack(state_values, axis=1)  # [B, T, D]
+        observation = {
+            image_key: image_window[:, :, camera_idx] for camera_idx, image_key in enumerate(image_keys)
+        }
+        observation[OBS_STATE] = state_window
+        task_source = self._online_task_source(batch)
+        if task_source is not None:
+            observation["task"] = task_source
+        external_anchor = self._external_anchor_timestamp_seconds(batch)
+        complementary = {
+            "task": task_source,
+            PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY: [
+                external_anchor if external_anchor is not None else self._online_anchor_timestamp_seconds()
+            ]
+            * int(state_window.shape[0]),
+        }
+        transition = {
+            TransitionKey.OBSERVATION: observation,
+            TransitionKey.ACTION: None,
+            TransitionKey.REWARD: 0.0,
+            TransitionKey.DONE: False,
+            TransitionKey.TRUNCATED: False,
+            TransitionKey.INFO: {},
+            TransitionKey.COMPLEMENTARY_DATA: complementary,
+        }
+        rendered = render_step(transition)
+        rendered_complementary = rendered[TransitionKey.COMPLEMENTARY_DATA]
+        out = dict(batch)
+        out[PERCEPTRON_ISAAC_STREAM_KEY] = rendered_complementary[PERCEPTRON_ISAAC_STREAM_KEY]
+        out[PERCEPTRON_ISAAC_RENDER_META_KEY] = rendered_complementary[PERCEPTRON_ISAAC_RENDER_META_KEY]
+        out["task"] = rendered_complementary.get("task", task_source)
+        return out
+
+    @torch.no_grad()
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Any],
+        action_prefix: Tensor | None = None,
+        prefix_length: int | None = None,
+        **kwargs,
+    ) -> Tensor:
+        """Run the flow expert on a native mharmony stream.
+
+        Returns normalized actions shaped ``[B, chunk_size, action_dim]``. The
+        postprocessor is responsible for action unnormalization and clipping.
+        """
+        self._require_deployable_action_artifact()
+        reject_rtc_prefix(action_prefix, prefix_length)
+        # Fail before loading or advancing clocks on retired RTC inference requests.
+        if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
+            raise NotImplementedError(
+                "perceptron_isaac does not support RTC inference. Use --inference.type=sync."
+            )
+        self.eval()
+        if self._isaac_model is None:
+            self._load_backbone()
+        model = self._isaac_model
+        assert model is not None
+        self._maybe_adopt_serving_stats(batch)
+        self._ensure_native_metadata()
+
+        stream = batch.get(PERCEPTRON_ISAAC_STREAM_KEY)
+        if stream is None:
+            self._update_online_rollout_state(batch)
+            self._frame_index += 1
+            batch = self._render_online_stream_batch(batch)
+            stream = batch[PERCEPTRON_ISAAC_STREAM_KEY]
+        self._bind_rollout_batch_size(int(stream.shape[0]))
+        # Follow the loaded model's dtype rather than assuming bf16: an fp32 backbone
+        # (train_storage_fp32) is evaluated in-process during training.
+        stream = stream.to(device=self._resolve_device(), dtype=self._model_dtype())
+
+        n_flow = max(1, int(getattr(self.config, "num_flow_samples", 1) or 1))
+
+        def _sample() -> Tensor:
+            return model.sample_action(
+                stream,
+                num_steps=self.config.num_inference_steps,
+                action_dim=self.config.action_dim,
+                num_action_steps=self.config.chunk_size,
+                num_flow_samples=n_flow,
+            )
+
+        def _run_samples() -> Tensor:
+            device = torch.device(self._resolve_device())
+            compute_dtype = self.config.dtype
+            autocast_context = (
+                torch.autocast(device_type=device.type, dtype=compute_dtype)
+                if device.type in {"cuda", "cpu"} and compute_dtype in {torch.bfloat16, torch.float16}
+                else nullcontext()
+            )
+            with autocast_context:
+                return _sample()
+
+        import os
+
+        seed_base = self.config.flow_seed_base
+        if seed_base is None:
+            seed_base_env = os.environ.get("ISAAC_FLOW_SEED_BASE")
+            seed_base = int(seed_base_env) if seed_base_env is not None else None
+        if seed_base is not None:
+            self._flow_seed_index = int(getattr(self, "_flow_seed_index", -1)) + 1
+            seed = int(seed_base) + self._flow_seed_index
+            dev = torch.device(self._resolve_device())
+            use_cuda = dev.type == "cuda" and torch.cuda.is_available()
+            if use_cuda:
+                device_index = dev.index if dev.index is not None else torch.cuda.current_device()
+                with torch.random.fork_rng(devices=[device_index]), torch.cuda.device(device_index):
+                    torch.cuda.manual_seed(seed)
+                    actions_norm = _run_samples()
+            else:
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(seed)
+                    actions_norm = _run_samples()
+        else:
+            actions_norm = _run_samples()
+
+        if not bool(torch.isfinite(actions_norm).all()):
+            raise RuntimeError("Perceptron Isaac model returned non-finite normalized actions.")
+        return actions_norm[:, :, : self.config.action_dim].float()
+
+    @torch.no_grad()
+    def select_action(self, batch: dict[str, Any], **kwargs) -> Tensor:
+        """Serve one normalized action per call; refill chunks through ``predict_action_chunk``."""
+        reject_rtc_prefix(kwargs.get("action_prefix"), kwargs.get("prefix_length"))
+        if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
+            raise NotImplementedError("perceptron_isaac does not support RTC inference; use sync inference.")
+        self._require_deployable_action_artifact()
+        self.eval()
+        if ACTION in batch:
+            batch = {k: v for k, v in batch.items() if k != ACTION}
+
+        # Adopt before the settle branch below: idle actions are normalized with
+        # policy-level stats, which must be the checkpoint's serialized stats rather
+        # than a config-path load.
+        self._maybe_adopt_serving_stats(batch)
+
+        has_stream = PERCEPTRON_ISAAC_STREAM_KEY in batch
+        settle = int(self.config.num_settle_steps or 0)
+        if has_stream:
+            batch_size = int(batch[PERCEPTRON_ISAAC_STREAM_KEY].shape[0])
+        elif self._settle_index < settle and not batch:
+            # The legacy empty-observation settle call is single-env unless a
+            # previous observation already established the vector rollout size.
+            batch_size = self._rollout_batch_size or 1
+        else:
+            batch_size = self._ensure_online_render_step()._infer_batch_size(batch, None)
+        # Reject changed ownership before clocks advance or queued actions drain.
+        self._bind_rollout_batch_size(batch_size)
+        # Genesis settles inside the environment reset and counts only executed post-settle
+        # steps in its model clock, so idle settle frames must not advance the episode clock.
+        if self._settle_index < settle:
+            self._settle_index += 1
+            # Idle settle frames must not enter the model observation window. The first
+            # post-settle observation starts the policy-owned history and is padded there.
+            self._ensure_native_metadata()
+            idle = np.zeros((batch_size, self.config.action_dim), dtype=np.float32)
+            idle[:, -1] = float(self.config.settle_gripper)
+            assert self._stats is not None
+            idle_norm = normalize_isaac_actions(idle, self._stats.action)
+            return torch.from_numpy(idle_norm).float()
+
+        if not has_stream:
+            self._update_online_rollout_state(batch)
+        self._frame_index += 1
+
+        if len(self._queues[ACTION]) == 0:
+            model_batch = batch if has_stream else self._render_online_stream_batch(batch)
+            actions = self.predict_action_chunk(model_batch)
+            actions = actions[:, : self.config.n_action_steps]
+            self._queues[ACTION].extend(actions.transpose(0, 1))
+        return self._queues[ACTION].popleft()
+
+    def get_training_loss_normalizer(self) -> TrainingLossNormalizer:
+        # Read geometry only; no model tensors, forward, or diffusion RNG during counting.
+        expert = None if self._isaac_model is None else self._isaac_model.action_expert
+        return IsaacTrainingLossNormalizer(
+            self.config,
+            self.config.action_dim if expert is None else int(expert.args.action_dim),
+            self.config.max_action_horizon if expert is None else int(expert.args.action_horizon),
+            self._aligned_flow_fixture_tensors,
+        )
+
+    def forward(
+        self,
+        batch: dict[str, Any],
+        reduction: str = "mean",
+        loss_denominators: dict[str, Tensor] | None = None,
+        loss_accumulation_scale: int = 1,
+        training_loss_normalization: TrainingLossNormalization | None = None,
+    ) -> tuple[Tensor, dict]:
+        self._require_native_training_supported()
+        stream = batch.get(PERCEPTRON_ISAAC_STREAM_KEY)
+        if stream is None:
+            raise ValueError(
+                f"ISAAC training requires the native preprocessor output {PERCEPTRON_ISAAC_STREAM_KEY!r}."
+            )
+        if self._isaac_model is None:
+            self._load_backbone(training=True)
+        self._configure_training_parameters()
+        assert self._isaac_model is not None
+        self._verify_fp32_masters_once()
+        stream = stream.to(device=self._resolve_device(), dtype=self._model_dtype())
+        model_output = self._isaac_model.train_forward(stream)
+        if training_loss_normalization is not None:
+            schema = self.get_training_loss_normalizer().schema
+            if training_loss_normalization.schema != schema or loss_denominators is not None:
+                raise ValueError("ISAAC stock training normalization schema conflicts with forward inputs.")
+            loss_denominators = {
+                name: torch.tensor(total, device=stream.device, dtype=torch.int64)
+                for name, total in zip(schema.names, training_loss_normalization.totals, strict=True)
+            }
+            loss_accumulation_scale = training_loss_normalization.backward_divisor
+        flow_fixture_tensors = self._aligned_flow_fixture_tensors(
+            batch, 0 if stream.collective_only else len(stream.streams)
+        )
+        loss_output = perceptron_isaac_training_loss(
+            model_output,
+            stream,
+            loss_plan=str(self.config.loss_plan),
+            exclude_non_agent_roles=bool(self.config.exclude_non_agent_roles),
+            flow_matching_detach_vlm_activations=bool(self.config.flow_matching_detach_vlm_activations),
+            train_samples_per_chunk=int(self.config.train_samples_per_chunk),
+            flow_mask_padded_action_rows=bool(self.config.flow_mask_padded_action_rows),
+            softmax_auxiliary_loss_scale=float(self.config.softmax_auxiliary_loss_scale),
+            moe_load_balancing_loss_coeff=self.config.moe_load_balancing_loss_coeff,
+            moe_z_loss_coeff=self.config.moe_z_loss_coeff,
+            flow_timesteps=flow_fixture_tensors[ISAAC_FLOW_TIMESTEPS_KEY],
+            flow_noise=flow_fixture_tensors[ISAAC_FLOW_NOISE_KEY],
+            flow_loss_mask=flow_fixture_tensors[ISAAC_FLOW_LOSS_MASK_KEY],
+            global_denominators=loss_denominators,
+            accumulation_scale=loss_accumulation_scale,
+            reduction=reduction,
+        )
+        metrics = {
+            name: value.detach().float().item() if torch.is_tensor(value) else float(value)
+            for name, value in loss_output.metrics.items()
+        }
+        return loss_output.loss, metrics
+
+    @staticmethod
+    def _aligned_flow_fixture_tensors(
+        batch: dict[str, Any], stream_batch_size: int
+    ) -> dict[str, Tensor | None]:
+        """Keep explicit oracle tensors aligned when the renderer skips action outliers."""
+        kept_raw = batch.get(PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY)
+        kept = None if kept_raw is None else torch.as_tensor(kept_raw, dtype=torch.long).reshape(-1)
+        if kept is not None:
+            if kept.numel() != stream_batch_size or bool((kept < 0).any()):
+                raise ValueError(
+                    "ISAAC kept-sample indices must be nonnegative and match the rendered stream batch."
+                )
+            if kept.unique().numel() != kept.numel() or not bool((kept[1:] > kept[:-1]).all()):
+                raise ValueError("ISAAC kept-sample indices must be unique and strictly increasing.")
+
+        aligned: dict[str, Tensor | None] = {}
+        for key in (ISAAC_FLOW_TIMESTEPS_KEY, ISAAC_FLOW_NOISE_KEY, ISAAC_FLOW_LOSS_MASK_KEY):
+            value = batch.get(key)
+            if value is None:
+                aligned[key] = None
+                continue
+            tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+            if kept is not None and tensor.ndim >= 2 and tensor.shape[1] != stream_batch_size:
+                if kept.numel() and int(kept.max()) >= tensor.shape[1]:
+                    raise ValueError(
+                        f"ISAAC fixture {key!r} cannot select kept indices {kept.tolist()} "  # nosec B608
+                        f"from batch axis of size {tensor.shape[1]}."
+                    )
+                tensor = tensor.index_select(1, kept.to(device=tensor.device))
+            aligned[key] = tensor
+        return aligned
+
+    @classmethod
+    def from_pretrained(
+        cls: builtins.type[T],
+        pretrained_name_or_path: str | Path,
+        *,
+        config: PerceptronIsaacConfig | None = None,
+        force_download: bool = False,
+        resume_download: bool | None = None,
+        proxies: dict | None = None,
+        token: str | bool | None = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
+        revision: str | None = None,
+        strict: bool = False,
+        **kwargs,
+    ) -> T:
+        """Load native checkpoint-local weights and assets; outer-root weights are unsupported."""
+        if config is None:
+            from lerobot.configs import PreTrainedConfig
+
+            config = PreTrainedConfig.from_pretrained(
+                pretrained_name_or_path,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+                **kwargs,
+            )
+        checkpoint_root = cls._resolve_checkpoint_root(
+            pretrained_name_or_path,
+            force_download=force_download,
+            token=token,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            revision=revision,
+        )
+        if any(cls._is_checkpoint_weight_name(path.name) for path in checkpoint_root.iterdir()):
+            raise RuntimeError(
+                "Outer-root model weights are unsupported; use native checkpoint-local hf_model weights."
+            )
+        cls._resolve_checkpoint_local_paths(config, checkpoint_root)
+        verified_storage = cls._verify_packaged_contract_digests(config, checkpoint_root)
+        # Lazy FP32 loading must refuse unsupported context semantics as early as eager loading.
+        if config.hf_model_path:
+            from .mk1_checkpoint_contract import validate_checkpoint_action_expert_semantics
+
+            validate_checkpoint_action_expert_semantics(
+                load_json_object(Path(config.hf_model_path) / "config.json")
+            )
+        cls._set_checkpoint_local_vocab_path(config)
+        policy = cls(config, verified_tensor_storage=verified_storage)
+        # Raw exports keep their documented parent-relative inference assets.
+        if cls._portable_export_root(checkpoint_root) is None:
+            policy._retain_verified_runtime_assets(checkpoint_root)
+        policy.eval()
+        return policy
+
+    @staticmethod
+    def _verify_packaged_contract_digests(
+        config: PerceptronIsaacConfig,
+        checkpoint_root: Path | None,
+    ) -> VerifiedTrainedTensorStorage | None:
+        """Verify native checkpoint integrity before model allocation."""
+        if not PerceptronIsaacPolicy._config_declares_mk1(config):
+            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
+        if checkpoint_root is None:
+            return None
+        root = Path(checkpoint_root).resolve()
+        declares_trained_package = (
+            config.mk1_trained_package_manifest_sha256 is not None
+            or (root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME).exists()
+        )
+        model_path = getattr(config, "hf_model_path", None)
+        if (
+            model_path is not None
+            and is_portable_isaac05_repository(Path(model_path))
+            and not declares_trained_package
+        ):
+            expected_adapter = getattr(config, "deployment_adapter_sha256", None)
+            if not expected_adapter:
+                raise RuntimeError("Portable Isaac-0.5 package requires deployment_adapter_sha256.")
+            adapter_path = root / "isaac_deployment_adapter.json"
+            if not PerceptronIsaacPolicy._is_package_file(root, adapter_path):
+                raise RuntimeError(
+                    f"Portable Isaac-0.5 package is missing its deployment adapter: {adapter_path}."
+                )
+            _verify_sha256(
+                expected_adapter,
+                "deployment_adapter_sha256",
+                adapter_path,
+                mismatch_error=lambda expected, actual: (
+                    "Portable Isaac-0.5 deployment adapter digest mismatch: "
+                    f"expected {expected}, found {actual}."
+                ),
+            )
+            return None
+        is_mk1_package = PerceptronIsaacPolicy._config_declares_mk1(config)
+        if is_mk1_package:
+            if config.artifact_kind == "neutral_debug" and not declares_trained_package:
+                PerceptronIsaacPolicy._verify_neutral_debug_manifest(config, root)
+                return None
+
+            verified_model_import_digest = PerceptronIsaacPolicy._verify_trained_package_manifest(
+                config, root
+            )
+            if isinstance(verified_model_import_digest, VerifiedTrainedTensorStorage):
+                return verified_model_import_digest
+            if verified_model_import_digest is not None:
+                PerceptronIsaacPolicy._verify_mk1_model_import(
+                    config,
+                    root,
+                    verified_record_digest=verified_model_import_digest,
+                    root_weights_bound=True,
+                )
+            return None
+        return None
+
+    @staticmethod
+    def _require_canonical_hf_model_path(
+        config: PerceptronIsaacConfig,
+        root: Path,
+        *,
+        context: str,
+    ) -> Path:
+        model_path = getattr(config, "hf_model_path", None)
+        if not model_path:
+            raise RuntimeError(f"{context} trained package requires hf_model_path.")
+        expected = root / "hf_model"
+        configured_path = Path(str(model_path))
+        if not configured_path.is_absolute():
+            configured_path = root / configured_path
+        try:
+            configured = configured_path.resolve(strict=True)
+            packaged = expected.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f"{context} trained package hf_model directory cannot be resolved.") from exc
+        if configured != packaged or not expected.is_dir() or expected.is_symlink():
+            raise RuntimeError(
+                f"{context} trained package hf_model_path must resolve to package-local hf_model."
+            )
+        return expected
+
+    @staticmethod
+    def _verify_trained_package_manifest(
+        config: PerceptronIsaacConfig, root: Path
+    ) -> str | VerifiedTrainedTensorStorage | None:
+        """Authenticate trained assets, returning v3 storage only after full verification."""
+        context = "MK1 trained package"
+        manifest_path = root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME
+        try:
+            raw_manifest = load_json_object(manifest_path)
+        except ValueError as exc:
+            raise RuntimeError(f"Cannot read {context} manifest: {exc}") from exc
+        manifest_schema = raw_manifest.get("schema")
+        if manifest_schema in (
+            MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+            MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2,
+        ):
+            model_import_digest = _verify_sha256(
+                config.mk1_source_model_import_sha256,
+                f"{context} mk1_source_model_import_sha256",
+            )
+            metadata: dict[str, Any] = {"model_storage": CANONICAL_INNER_MODEL_STORAGE}
+            source_inventory = None
+            if manifest_schema == MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA:
+                from .mk1_checkpoint_contract import read_and_validate_safetensors_index
+
+                metadata["metadata"] = raw_manifest.get("metadata")
+                model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(
+                    config, root, context="MK1"
+                )
+                # Bind the header identities before authenticating payload bytes, then
+                # check them again afterward. A replacement cannot inherit an old hash.
+                source_inventory = read_and_validate_safetensors_index(model_root)
+            manifest = verify_trained_package_manifest(
+                root,
+                label="MK1 canonical trained package",
+                manifest_filename=MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
+                manifest_schema=manifest_schema,
+                digest_field=MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
+                manifest_digest=config.mk1_trained_package_manifest_sha256,
+                identity={
+                    "artifact_kind": config.artifact_kind,
+                    "mk1_source_model_import_sha256": model_import_digest,
+                },
+                metadata=metadata,
+                is_package_file=PerceptronIsaacPolicy._is_package_file,
+                delegated_directory=None,
+            )
+            expected_adapter_digest = _verify_sha256(
+                config.deployment_adapter_sha256,
+                f"{context} deployment_adapter_sha256",
+            )
+            adapter_path = root / "isaac_deployment_adapter.json"
+            _verify_sha256(
+                expected_adapter_digest,
+                f"{context} deployment_adapter_sha256",
+                adapter_path,
+            )
+            model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(config, root, context="MK1")
+            if manifest_schema == MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA:
+                from types import MappingProxyType
+
+                assert source_inventory is not None
+                _verify_sha256(
+                    model_import_digest,
+                    f"{context} source model-import identity",
+                    model_root / "source_mk1_model_import.json",
+                )
+                shard_paths = frozenset(source_inventory.shards)
+                metadata_digests = {
+                    root / relative: digest
+                    for relative, digest in manifest["files_sha256"].items()
+                    if (root / relative).is_relative_to(model_root) and root / relative not in shard_paths
+                }
+                nanoseconds_per_second = 1_000_000_000
+                coarse_shard_digests = {
+                    shard: manifest["files_sha256"][shard.relative_to(root).as_posix()]
+                    for shard, identity in source_inventory.shard_identities.items()
+                    if identity.mtime_ns % nanoseconds_per_second == 0
+                    and identity.ctime_ns % nanoseconds_per_second == 0
+                }
+                verified_storage = VerifiedTrainedTensorStorage(
+                    model_root=model_root.resolve(strict=True),
+                    dtypes=parse_trained_tensor_storage_dtypes(manifest["metadata"]),
+                    source_inventory=source_inventory,
+                    metadata_digests=MappingProxyType(metadata_digests),
+                    coarse_shard_digests=MappingProxyType(coarse_shard_digests),
+                )
+                verified_storage.require_header_dtypes(source_inventory)
+                return verified_storage
+            return None
+
+        if not config.deployment_adapter_sha256:
+            raise RuntimeError("A trained MK1 Perceptron Isaac package requires deployment_adapter_sha256.")
+        expected_adapter_digest = _verify_sha256(
+            config.deployment_adapter_sha256, f"{context} deployment_adapter_sha256"
+        )
+        adapter_path = root / "isaac_deployment_adapter.json"
+        if not PerceptronIsaacPolicy._is_package_file(root, adapter_path):
+            raise RuntimeError(
+                "A trained MK1 Perceptron Isaac package is missing its local deployment adapter: "
+                f"{adapter_path}."
+            )
+        expected_model_import_digest = _verify_sha256(
+            getattr(config, "mk1_model_import_sha256", None),
+            f"{context} mk1_model_import_sha256",
+        )
+        expected_model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(
+            config, root, context="MK1"
+        )
+        model_import_path = expected_model_root / MK1_MODEL_IMPORT_FILENAME
+        if not PerceptronIsaacPolicy._is_package_file(root, model_import_path):
+            raise RuntimeError(f"A trained MK1 package is missing {MK1_MODEL_IMPORT_FILENAME}.")
+        verified_model_import_digest = file_sha256(model_import_path)
+        _verify_sha256(
+            expected_model_import_digest,
+            f"{context} model-import record digest",
+            verified_model_import_digest,
+        )
+        if config.artifact_kind != "trained_policy":
+            raise RuntimeError("MK1 trained package manifest identity disagrees with the policy config.")
+
+        manifest = verify_trained_package_manifest(
+            root,
+            label=context,
+            manifest_filename=MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
+            manifest_schema=MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+            digest_field=MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
+            manifest_digest=getattr(config, MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD, None),
+            identity={
+                "artifact_kind": "trained_policy",
+                "mk1_model_import_sha256": expected_model_import_digest,
+            },
+            is_package_file=PerceptronIsaacPolicy._is_package_file,
+            delegated_directory="hf_model",
+        )
+        raw_files = manifest["files_sha256"]
+        if not raw_files:
+            raise RuntimeError("MK1 trained package files_sha256 must be a non-empty object.")
+
+        def adapter_mismatch(expected: str, actual: str) -> str:
+            return (
+                f"Perceptron Isaac deployment adapter digest mismatch at {adapter_path}: "
+                f"expected {expected}, found {actual}. The package was modified after import."
+            )
+
+        _verify_sha256(
+            expected_adapter_digest,
+            f"{context} deployment_adapter_sha256",
+            adapter_path,
+            mismatch_error=adapter_mismatch,
+        )
+        _verify_sha256(
+            expected_adapter_digest,
+            f"{context} deployment_adapter_sha256",
+            raw_files[adapter_path.name],
+            mismatch_error=adapter_mismatch,
+        )
+        return verified_model_import_digest
+
+    @staticmethod
+    def _verify_mk1_model_import(
+        config: PerceptronIsaacConfig,
+        root: Path,
+        *,
+        verified_record_digest: str | None = None,
+        root_weights_bound: bool = False,
+    ) -> None:
+        """Verify the exhaustive MK1 model import record before allocating weights."""
+        from .mk1_checkpoint_contract import (
+            Mk1CheckpointContractError,
+            read_mk1_config,
+            validate_mk1_tokenizer,
+        )
+
+        context = "MK1 model import"
+        record_name = "mk1_model_import.json"
+        model_path = getattr(config, "hf_model_path", None)
+        if not model_path:
+            raise RuntimeError("A trained Perceptron Isaac package requires hf_model_path.")
+        root_weight_overrides = {
+            candidate.name
+            for candidate in root.iterdir()
+            if candidate.name == "model.safetensors"
+            or candidate.name == "model.safetensors.index.json"
+            or (candidate.name.startswith("model-") and candidate.name.endswith(".safetensors"))
+        }
+        if root_weight_overrides and not root_weights_bound:
+            raise RuntimeError(
+                "Trained MK1 packages forbid unbound root-level weight overrides; "
+                f"found {sorted(root_weight_overrides)}. Re-import them into the hashed hf_model inventory."
+            )
+        model_root = Path(str(model_path))
+        record_path = model_root / record_name
+        if not PerceptronIsaacPolicy._is_package_file(root, record_path):
+            raise RuntimeError(f"A trained MK1 package is missing {record_name}.")
+        expected_record_digest = getattr(config, "mk1_model_import_sha256", None)
+        if not expected_record_digest:
+            raise RuntimeError("A trained MK1 package requires mk1_model_import_sha256.")
+        if verified_record_digest is None:
+            verified_record_digest = file_sha256(record_path)
+        _verify_sha256(expected_record_digest, f"{context} record digest", verified_record_digest)
+
+        record = _load_json_object(record_path, record_name)
+        record_keys = {
+            "schema",
+            "algorithm",
+            "backbone_family",
+            "rmsnorm_weight_convention",
+            "artifact",
+            "source_files_sha256",
+            "files_sha256",
+            "qwen35_vocab",
+            "shards",
+        }
+        if set(record) != record_keys:
+            raise RuntimeError("MK1 model import record fields do not match schema version 2.")
+        if (
+            record["schema"] != "perceptron_isaac_mk1_model_import_v2"
+            or record["algorithm"] != "byte_for_byte_safetensors_copy"
+            or record["backbone_family"] != "mk1_qwen3_6_moe"
+            or record["rmsnorm_weight_convention"] != "zero_centered_1_plus_weight"
+        ):
+            raise RuntimeError("MK1 model import record identity is unsupported.")
+
+        def digest_map(value: Any, *, label: str) -> dict[str, str]:
+            if not isinstance(value, dict) or not value:
+                raise RuntimeError(f"MK1 model import {label} must be a non-empty object.")
+            result: dict[str, str] = {}
+            for filename, digest in value.items():
+                path = Path(filename) if isinstance(filename, str) else Path()
+                if (
+                    not isinstance(filename, str)
+                    or not filename
+                    or path.is_absolute()
+                    or path.name != filename
+                    or path.as_posix() != filename
+                    or ".." in path.parts
+                ):
+                    raise RuntimeError(f"MK1 model import {label} contains an invalid filename.")
+                result[filename] = _verify_sha256(digest, f"{context} {label}[{filename!r}]")
+            return result
+
+        files = digest_map(record["files_sha256"], label="files_sha256")
+        source_files = digest_map(record["source_files_sha256"], label="source_files_sha256")
+        if record_name in files or record_name in source_files:
+            raise RuntimeError("MK1 model import record must not include itself in a digest map.")
+
+        actual_files: set[str] = set()
+        for candidate in model_root.iterdir():
+            if candidate.is_dir() or not PerceptronIsaacPolicy._is_package_file(root, candidate):
+                raise RuntimeError(f"MK1 model directory contains a non-package file: {candidate}.")
+            actual_files.add(candidate.name)
+        if actual_files != set(files) | {record_name}:
+            raise RuntimeError(
+                "MK1 model file inventory disagrees with its import record: "
+                f"missing={sorted(set(files) - actual_files)}, "
+                f"unlisted={sorted(actual_files - set(files) - {record_name})}."
+            )
+        for filename, expected in files.items():
+            _verify_sha256(
+                expected,
+                f"{context} files_sha256[{filename!r}]",
+                model_root / filename,
+                f"{context} digest mismatch for {filename}.",
+            )
+
+        required_files = {
+            "config.json",
+            "tokenizer.json",
+            "vocab.json",
+            "model.safetensors.index.json",
+        }
+        missing_required = required_files - set(files)
+        missing_source = (required_files - {"vocab.json"}) - set(source_files)
+        if missing_required or missing_source:
+            raise RuntimeError(
+                "MK1 model import record does not bind all required assets: "
+                f"packaged_missing={sorted(missing_required)}, source_missing={sorted(missing_source)}."
+            )
+
+        index = _load_json_object(model_root / "model.safetensors.index.json", "model.safetensors.index.json")
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError("MK1 model index must contain a non-empty weight_map.")
+        shard_counts: dict[str, int] = {}
+        for tensor_name, shard_name in weight_map.items():
+            if not isinstance(tensor_name, str) or not isinstance(shard_name, str):
+                raise RuntimeError("MK1 model index contains an invalid weight_map entry.")
+            shard_counts[shard_name] = shard_counts.get(shard_name, 0) + 1
+        indexed_shards = set(shard_counts)
+        recorded_shards = record["shards"]
+        if not isinstance(recorded_shards, list) or not recorded_shards:
+            raise RuntimeError("MK1 model import shards must be a non-empty list.")
+        if [item.get("filename") for item in recorded_shards if isinstance(item, dict)] != sorted(
+            indexed_shards
+        ):
+            raise RuntimeError("MK1 model import shard ordering or coverage disagrees with the index.")
+        for item in recorded_shards:
+            if not isinstance(item, dict) or set(item) != {
+                "filename",
+                "source_sha256",
+                "output_sha256",
+                "tensor_count",
+            }:
+                raise RuntimeError("MK1 model import contains a malformed shard record.")
+            filename = item["filename"]
+            count = item["tensor_count"]
+            if (
+                filename not in indexed_shards
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count != shard_counts[filename]
+                or files.get(filename) != _verify_sha256(item["output_sha256"], f"{context} shard output")
+                or source_files.get(filename)
+                != _verify_sha256(item["source_sha256"], f"{context} shard source")
+            ):
+                raise RuntimeError(f"MK1 model import shard record disagrees for {filename!r}.")
+        packaged_safetensors = {name for name in files if name.endswith(".safetensors")}
+        if packaged_safetensors != indexed_shards:
+            raise RuntimeError("MK1 model import safetensors files disagree with the index.")
+
+        for filename in {"config.json", "tokenizer.json", "model.safetensors.index.json"} | indexed_shards:
+            if source_files.get(filename) != files[filename]:
+                raise RuntimeError(f"MK1 byte-copy provenance disagrees for {filename}.")
+
+        vocab = record["qwen35_vocab"]
+        if not isinstance(vocab, dict) or set(vocab) != {
+            "schema",
+            "algorithm",
+            "token_count",
+            "tokenizer_sha256",
+            "vocab_sha256",
+        }:
+            raise RuntimeError("MK1 qwen35_vocab record is malformed.")
+        if (
+            vocab["schema"] != "perceptron_isaac_qwen35_vocab_v1"
+            or vocab["algorithm"] != "extract_tokenizer_json_model_vocab"
+            or vocab["token_count"] != _MK1_BASE_VOCAB_SIZE
+            or _verify_sha256(vocab["tokenizer_sha256"], f"{context} qwen35 tokenizer")
+            != files["tokenizer.json"]
+            or _verify_sha256(vocab["vocab_sha256"], f"{context} qwen35 vocab") != files["vocab.json"]
+        ):
+            raise RuntimeError("MK1 qwen35_vocab record disagrees with packaged tokenizer assets.")
+
+        artifact = record["artifact"]
+        expected_artifact = {
+            "schema_version": 1,
+            "artifact_kind": "trained_policy",
+        }
+        if (
+            not isinstance(artifact, dict)
+            or {key: value for key, value in artifact.items() if key != "trained_steps"} != expected_artifact
+            or config.artifact_kind != "trained_policy"
+        ):
+            raise RuntimeError("MK1 model import artifact identity disagrees with the package config.")
+        raw_config = _load_json_object(model_root / "config.json", "MK1 config.json")
+        if raw_config.get("genesis_artifact") != artifact:
+            raise RuntimeError("MK1 inner config artifact identity disagrees with its import record.")
+
+        try:
+            contract = read_mk1_config(model_root)
+            validate_mk1_tokenizer(model_root, contract)
+        except Mk1CheckpointContractError as exc:
+            raise RuntimeError(f"MK1 inner config contract validation failed: {exc}") from exc
+        if (
+            config.vector_max_states != contract.vector_encoder.max_states
+            or config.max_action_dim != contract.action_expert.action_dim
+            or config.max_action_horizon != contract.action_expert.action_horizon
+        ):
+            raise RuntimeError("MK1 outer checkpoint maxima disagree with the inner model contract.")
+        if (
+            config.action_dim > config.max_action_dim
+            or config.chunk_size > config.max_action_horizon
+            or config.proprio_dim > config.vector_max_states
+        ):
+            raise RuntimeError("MK1 served policy geometry exceeds the checkpoint-owned maxima.")
+
+    @staticmethod
+    def _verify_neutral_debug_manifest(config: PerceptronIsaacConfig, root: Path) -> None:
+        context = "Neutral-debug manifest"
+        manifest_name = "mk1_neutral_debug_manifest.json"
+        manifest_path = root / manifest_name
+        if not PerceptronIsaacPolicy._is_package_file(root, manifest_path):
+            raise RuntimeError(f"Neutral-debug package is missing {manifest_name}.")
+
+        manifest = _load_json_object(manifest_path, context.lower())
+        expected_keys = {
+            "schema_version",
+            "artifact_kind",
+            "source_config_sha256",
+            "source_index_sha256",
+            "model_materialization",
+            "files_sha256",
+        }
+        if not isinstance(manifest, dict) or set(manifest) - {"trained_steps"} != expected_keys:
+            raise RuntimeError("Neutral-debug manifest fields do not match schema version 1.")
+        if (
+            manifest["schema_version"] != 1
+            or manifest["artifact_kind"] != "neutral_debug"
+            or config.artifact_kind != "neutral_debug"
+        ):
+            raise RuntimeError("Neutral-debug manifest identity disagrees with the package config.")
+
+        files = manifest["files_sha256"]
+        if not isinstance(files, dict) or not files:
+            raise RuntimeError("Neutral-debug manifest files_sha256 must be a non-empty object.")
+        expected_files: dict[str, str] = {}
+        for relative, expected_digest in files.items():
+            if not isinstance(relative, str) or not relative:
+                raise RuntimeError("Neutral-debug manifest contains an invalid file path.")
+            raw_path = Path(relative)
+            if raw_path.is_absolute() or raw_path.as_posix() != relative or ".." in raw_path.parts:
+                raise RuntimeError(f"Neutral-debug manifest path is not canonical and local: {relative!r}.")
+            expected_files[relative] = _verify_sha256(
+                expected_digest,
+                f"{context} files_sha256[{relative!r}]",
+            )
+        if manifest_name in expected_files:
+            raise RuntimeError("Neutral-debug manifest must not hash itself.")
+
+        actual_files: set[str] = set()
+        for candidate in root.rglob("*"):
+            if candidate.is_symlink():
+                if not PerceptronIsaacPolicy._is_package_file(root, candidate):
+                    raise RuntimeError(f"Neutral-debug package contains an escaping symlink: {candidate}.")
+                actual_files.add(candidate.relative_to(root).as_posix())
+                continue
+            if candidate.is_dir():
+                continue
+            if not candidate.is_file():
+                raise RuntimeError(f"Neutral-debug package contains a non-regular entry: {candidate}.")
+            actual_files.add(candidate.relative_to(root).as_posix())
+        if actual_files != set(expected_files) | {manifest_name}:
+            raise RuntimeError(
+                "Neutral-debug package file inventory disagrees with its manifest: "
+                f"missing={sorted(set(expected_files) - actual_files)}, "
+                f"unlisted={sorted(actual_files - set(expected_files) - {manifest_name})}."
+            )
+        for relative, expected_digest in expected_files.items():
+            _verify_sha256(
+                expected_digest,
+                f"{context} files_sha256[{relative!r}]",
+                root / relative,
+                f"Neutral-debug package digest mismatch for {relative}.",
+            )
+
+        source_config = _verify_sha256(manifest["source_config_sha256"], f"{context} source_config_sha256")
+        source_index = _verify_sha256(manifest["source_index_sha256"], f"{context} source_index_sha256")
+        if expected_files.get("hf_model/config.json") != source_config:
+            raise RuntimeError("Neutral-debug source config digest disagrees with the packaged model config.")
+        if expected_files.get("hf_model/model.safetensors.index.json") != source_index:
+            raise RuntimeError("Neutral-debug source index digest disagrees with the packaged model index.")
+
+        materialization = manifest["model_materialization"]
+        model_files = {
+            Path(relative).name for relative in expected_files if Path(relative).parent == Path("hf_model")
+        }
+        if (
+            not isinstance(materialization, dict)
+            or set(materialization) != model_files
+            or any(method not in {"copy", "hardlink"} for method in materialization.values())
+        ):
+            raise RuntimeError("Neutral-debug model materialization inventory is malformed.")
+
+    @staticmethod
+    def _is_package_file(root: Path, path: Path) -> bool:
+        """Accept package-local files and immutable HF snapshot links only."""
+        try:
+            root = root.resolve(strict=True)
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return False
+        if not resolved.is_file():
+            return False
+        if resolved.is_relative_to(root):
+            return True
+        return is_hf_snapshot_blob_link(path)
+
+    @staticmethod
+    def _resolve_checkpoint_root(
+        pretrained_name_or_path: str | Path,
+        *,
+        force_download: bool = False,
+        token: str | bool | None = None,
+        cache_dir: str | Path | None = None,
+        local_files_only: bool = False,
+        revision: str | None = None,
+    ) -> Path:
+        from huggingface_hub.errors import HfHubHTTPError
+
+        try:
+            return _resolve_local_or_hub_snapshot(
+                pretrained_name_or_path,
+                revision=revision,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                token=token,
+                local_files_only=local_files_only,
+            )
+        except HfHubHTTPError as exc:
+            raise FileNotFoundError(
+                f"Perceptron Isaac checkpoint not found locally or on the Hugging Face Hub: "
+                f"{pretrained_name_or_path}"
+            ) from exc
+
+    @staticmethod
+    def _resolve_checkpoint_local_paths(
+        config: PerceptronIsaacConfig,
+        pretrained_name_or_path: str | Path,
+        *,
+        allow_missing_relative: bool = False,
+        record_source_root: bool = True,
+    ) -> None:
+        """Resolve sidecars within their package and retain verified ownership records.
+
+        An already-resolved path is accepted only with its matching record.
+        Raw exports admit only the two documented parent-relative asset paths.
+        """
+        root = Path(pretrained_name_or_path)
+        if not root.is_dir():
+            return
+        root = root.resolve()
+        if record_source_root:
+            config._checkpoint_source_root = str(root)
+        relative_paths = dict(getattr(config, "_checkpoint_relative_paths", {}))
+        directory_attrs = {"hf_model_path", "fast_processor_path"}
+        # Every path-typed config field, deliberately: a partial list is the kind of
+        # invariant that regrows the split-brain the next time a consumer is added.
+        # The suite pair is training-time routing input rather than a serving sidecar,
+        # but it is saved checkpoint-local for the same reason (see
+        # PerceptronIsaacConfig._save_pretrained), so it resolves the same way.
+        for attr in (
+            "hf_model_path",
+            "config_toml_path",
+            "stats_path",
+            "native_render_metadata_path",
+            "native_stats_path",
+            "fast_processor_path",
+            "suite_stats_path",
+            "suite_by_task_index_path",
+        ):
+            raw = getattr(config, attr, None)
+            if raw is None or not str(raw).strip():
+                continue
+            path = Path(str(raw))
+            if path.is_absolute():
+                record = relative_paths.get(attr)
+                if isinstance(record, dict) and record.get("absolute") == str(path):
+                    continue
+                raise RuntimeError(f"Checkpoint-local path {attr} must be relative, got {path}.")
+            unresolved_candidate = root / path
+            if ".." in path.parts:
+                portable_parent = root.parent
+                expected_portable_path = None
+                if attr == "hf_model_path" and path == Path(".."):
+                    expected_portable_path = portable_parent
+                elif attr == "fast_processor_path" and path == Path("../fast_processor_pinned"):
+                    expected_portable_path = portable_parent / "fast_processor_pinned"
+                try:
+                    resolved_portable_path = unresolved_candidate.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    resolved_portable_path = None
+                if (
+                    expected_portable_path is not None
+                    and resolved_portable_path == expected_portable_path
+                    and is_portable_isaac05_repository(portable_parent)
+                ):
+                    absolute = str(resolved_portable_path)
+                    relative_paths[attr] = {
+                        "absolute": absolute,
+                        "relative": path.as_posix(),
+                        "root": str(root),
+                    }
+                    setattr(config, attr, absolute)
+                    continue
+                raise RuntimeError(f"Checkpoint-local path {attr} escapes the package root: {path}.")
+            try:
+                candidate = unresolved_candidate.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                if allow_missing_relative:
+                    continue
+                raise RuntimeError(f"Checkpoint-local path {attr} does not exist: {path}.") from exc
+            if attr in directory_attrs:
+                expected_type_matches = (
+                    candidate.is_dir()
+                    and unresolved_candidate.is_dir()
+                    and not unresolved_candidate.is_symlink()
+                )
+                if expected_type_matches:
+                    for child in unresolved_candidate.rglob("*"):
+                        if child.is_symlink() and not PerceptronIsaacPolicy._is_package_file(root, child):
+                            raise RuntimeError(
+                                f"Checkpoint-local directory {attr} contains an escaping symlink: {child}."
+                            )
+            else:
+                expected_type_matches = PerceptronIsaacPolicy._is_package_file(root, unresolved_candidate)
+            if not expected_type_matches:
+                expected_type = "directory" if attr in directory_attrs else "file"
+                raise RuntimeError(f"Checkpoint-local path {attr} must reference a {expected_type}: {path}.")
+            absolute = str(unresolved_candidate)
+            relative_paths[attr] = {
+                "absolute": absolute,
+                "relative": path.as_posix(),
+                "root": str(root),
+            }
+            setattr(config, attr, absolute)
+        config._checkpoint_relative_paths = relative_paths
+
+    @staticmethod
+    def _set_checkpoint_local_vocab_path(
+        config: PerceptronIsaacConfig,
+        *,
+        model_root: Path | None = None,
+        force: bool = False,
+    ) -> None:
+        """Publish verified vocab from its retained owner or the original model root."""
+        import os
+
+        if (
+            not force
+            and not PerceptronIsaacPolicy._config_declares_mk1(config)
+            and os.environ.get("QWEN35_VOCAB_PATH")
+        ):
+            return
+        hf_model_path = model_root if model_root is not None else config.hf_model_path
+        if hf_model_path:
+            vocab = Path(hf_model_path) / "vocab.json"
+            if vocab.is_file():
+                os.environ["QWEN35_VOCAB_PATH"] = str(vocab)

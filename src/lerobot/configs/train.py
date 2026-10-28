@@ -36,7 +36,7 @@ from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
 from .default import DatasetConfig, EMAConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
-from .policies import PreTrainedConfig
+from .policies import PolicyTrainingIntent, PreTrainedConfig
 from .rewards import RewardModelConfig
 
 TRAIN_CONFIG_NAME = "train_config.json"
@@ -191,8 +191,8 @@ class TrainPipelineConfig(HubMixin):
     def trainable_config(self) -> PreTrainedConfig | RewardModelConfig:
         """Return whichever config (policy or reward_model) is active."""
         if self.is_reward_model_training:
-            return self.reward_model  # type: ignore[return-value]
-        return self.policy  # type: ignore[return-value]
+            return self.reward_model
+        return self.policy
 
     def _resolve_pretrained_from_cli(self) -> None:
         """Resolve the pretrained source passed on the CLI into a loaded config.
@@ -218,6 +218,15 @@ class TrainPipelineConfig(HubMixin):
             self.policy.pretrained_path = Path(policy_path)
         elif self.resume:
             self._resolve_resume_checkpoint()
+            if self.policy is not None and self.checkpoint_path is not None:
+                # The run config precedes finalization. Reload the component's final
+                # identities instead of treating a stale nested manifest as a new pin.
+                parent_path = self.policy.pretrained_path
+                overrides = parser.get_yaml_overrides("policy") + (parser.get_cli_overrides("policy") or [])
+                self.policy = PreTrainedConfig.from_pretrained(
+                    self.checkpoint_path / PRETRAINED_MODEL_DIR, cli_overrides=overrides
+                )
+                self.policy.pretrained_path = parent_path
 
     def _resolve_resume_checkpoint(self) -> None:
         """Resolve the checkpoint named by `--config_path` into `checkpoint_path`.
@@ -280,6 +289,20 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.policy is not None and not self.is_reward_model_training:
+            package_root = (
+                self.checkpoint_path / PRETRAINED_MODEL_DIR
+                if self.resume and self.checkpoint_path is not None
+                else self.policy.pretrained_path
+            )
+            self.policy.validate_training_intent(
+                PolicyTrainingIntent(
+                    save_checkpoint=self.save_checkpoint,
+                    publish=self.policy.push_to_hub or self.save_checkpoint_to_hub,
+                    ema=self.ema.enable,
+                    package_root=package_root,
+                )
+            )
         if self.rename_map and active_cfg.pretrained_path is None and not self.resume:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "
@@ -402,11 +425,14 @@ class TrainPipelineConfig(HubMixin):
         return ["policy", "reward_model"]
 
     def to_dict(self) -> dict[str, Any]:
-        return draccus.encode(self)
+        config = draccus.encode(self)
+        if self.policy is not None:
+            config["policy"] = self.policy.to_dict()
+        return config
 
     def _save_pretrained(self, save_directory: Path) -> None:
         with open(save_directory / TRAIN_CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+            draccus.dump(self.to_dict(), f, indent=4)
 
     @classmethod
     def from_pretrained(
@@ -464,6 +490,13 @@ class TrainPipelineConfig(HubMixin):
             with open(config_file) as f:
                 config = json.load(f)
             migrated_config = _migrate_legacy_rabc_fields(config)
+            config = migrated_config if migrated_config is not None else config
+            policy = config.get("policy")
+            if isinstance(policy, dict) and "type" in policy:
+                policy_cls = PreTrainedConfig.get_choice_class(policy["type"])
+                migrated_policy = policy_cls.migrate_config(policy)
+                if migrated_policy != policy:
+                    migrated_config = dict(config, policy=migrated_policy)
             if migrated_config is not None:
                 with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
                     json.dump(migrated_config, f)

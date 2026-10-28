@@ -226,6 +226,15 @@ wallx = [
 pi = ["lerobot[transformers-dep]", "lerobot[scipy-dep]", "lerobot[sentencepiece-dep]"]
 dm05 = ["lerobot[transformers-dep]"]
 molmoact2 = ["lerobot[transformers-dep]", "lerobot[peft-dep]", "lerobot[scipy-dep]"]
+perceptron_isaac = [
+    "lerobot[transformers-dep]",
+    # MK1 subclasses Qwen3.5-MoE internals: keep its tested attention/cache ABI exact.
+    "transformers==5.5.4",
+    "lerobot[accelerate-dep]",
+    "lerobot[scipy-dep]",
+    # Direct immutable requirement works in wheel metadata, without uv-only sources.
+    "mharmony[qwen35] @ git+https://github.com/perceptron-ai-inc/mharmony.git@9a57efbf8ada2d73641fc40081f4e4fa6ff2ab92",
+]
 smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "lerobot[accelerate-dep]"]
 multi_task_dit = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]"]
 groot = [
@@ -349,6 +358,7 @@ all = [
     "lerobot[dm05]",
     "lerobot[fineart_vla]",
     "lerobot[molmoact2]",
+    "lerobot[perceptron_isaac]",
     "lerobot[smolvla]",
     "lerobot[fastwam]",
     "lerobot[flux3]",
