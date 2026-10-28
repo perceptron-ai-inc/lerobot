@@ -80,6 +80,14 @@ Legacy policy configs, saved processors and render metadata with
 recorder lifecycle. Visual history, last-state proprio, mistake conditioning and
 FAST action targets/codecs remain supported.
 
+Online evaluation retains each environment's image/state history and returns
+`[B, D]` actions from `[B, H, D]` model chunks. Vector environments share the
+rollout clock and synchronized chunk refills. The maintained evaluation loop
+freezes completed environments and resets the entire group between rollouts;
+`policy.reset()` clears queued actions and observation histories together.
+Changing the live batch size requires that global reset. Settling emits one idle
+row per environment without adding frames to model history or time.
+
 ## Evidence and limits
 
 Job 113283 proved two dense FP32-master FSDP2 steps with all 35,723,506,864

@@ -1039,28 +1039,30 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 )
             complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] = kept_indices
             return renderer.collate(streams)
-        if len(windows) != 1:
-            raise NotImplementedError("Perceptron Isaac eval rendering currently supports batch_size=1.")
         dtype = _dtype_from_name(self.dtype)
-        stream = renderer.build(
-            observation_window=windows[0],
-            prompt=tasks[0],
-            device=self.device,
-            dtype=dtype,
-            patch_size=self.patch_size,
-            max_num_patches=self.max_num_patches,
-            min_num_patches=self.min_num_patches,
-            pixel_shuffle_scale=self.pixel_shuffle_scale,
-            temporal_patch_size=self.temporal_patch_size,
-            scene_events=None,
-            anchor_timestamp_seconds=anchors[0],
-        )
-        if stream.shape[1] > int(self.train_max_sequence_length):
-            raise ValueError(
-                f"ISAAC inference stream uses {stream.shape[1]} tokens, exceeding the "
-                f"checkpoint-trained max_sequence_length={self.train_max_sequence_length}."
+        streams = []
+        for window, task, anchor in zip(windows, tasks, anchors, strict=True):
+            stream = renderer.build(
+                observation_window=window,
+                prompt=task,
+                device=self.device,
+                dtype=dtype,
+                patch_size=self.patch_size,
+                max_num_patches=self.max_num_patches,
+                min_num_patches=self.min_num_patches,
+                pixel_shuffle_scale=self.pixel_shuffle_scale,
+                temporal_patch_size=self.temporal_patch_size,
+                scene_events=None,
+                anchor_timestamp_seconds=anchor,
             )
-        return stream
+            if stream.shape[1] > int(self.train_max_sequence_length):
+                raise ValueError(
+                    f"ISAAC inference stream uses {stream.shape[1]} tokens, exceeding the "
+                    f"checkpoint-trained max_sequence_length={self.train_max_sequence_length}."
+                )
+            streams.append(stream)
+        # Keep the B=1 stream unchanged; only vector batches need right-padding.
+        return streams[0] if len(streams) == 1 else renderer.collate(streams)
 
     def _batch_validity_collective_device(self) -> torch.device:
         """Device the batch-validity all_reduce must use for the active process group.
@@ -1202,10 +1204,6 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             )
 
         batch_size = self._infer_batch_size(observation, action)
-        if action is None and batch_size != 1:
-            raise NotImplementedError(
-                f"Perceptron Isaac eval/serving currently supports batch_size=1; got batch_size={batch_size}."
-            )
         images = self._extract_image_tensor(observation, batch_size)
         states = self._extract_state_tensor(observation, batch_size)
         if images.shape[:2] != states.shape[:2]:

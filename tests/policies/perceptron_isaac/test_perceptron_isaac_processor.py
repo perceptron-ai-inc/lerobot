@@ -345,6 +345,8 @@ class FakeNativeRenderer:
 
 
 class FakePackedStream:
+    shape = (1, 1)
+
     def __init__(self):
         self.to_calls = []
 
@@ -991,7 +993,7 @@ def test_native_pack_skips_live_single_step_without_anchor(monkeypatch):
     assert fake_renderer.build_calls == []
 
 
-def test_native_pack_rejects_multi_environment_batch(monkeypatch):
+def test_native_pack_defers_multi_environment_live_batch(monkeypatch):
     step = PerceptronIsaacMharmonyPackProcessorStep(
         enabled=True,
         camera_order=["image", "wrist_image"],
@@ -1016,8 +1018,11 @@ def test_native_pack_rejects_multi_environment_batch(monkeypatch):
         TransitionKey.COMPLEMENTARY_DATA: {"task": ["Pick up the mug", "Open the drawer"]},
     }
 
-    with pytest.raises(NotImplementedError, match="batch_size=1.*batch_size=2"):
-        step(transition)
+    output = step(transition)
+    complementary = output[TransitionKey.COMPLEMENTARY_DATA]
+    assert PERCEPTRON_ISAAC_STREAM_KEY not in complementary
+    assert complementary[PERCEPTRON_ISAAC_RENDER_META_KEY]["render_skipped"] is True
+    assert complementary["task"] == ["pick up the mug", "open the drawer"]
 
 
 def test_native_policy_online_rollout_uses_policy_clock(monkeypatch, tmp_path):

@@ -677,11 +677,12 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         parent = package_root.parent
         return parent if is_portable_isaac05_repository(parent) else None
 
-    def reset(self):
-        """Clear per-episode action state."""
-        self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
+    def reset(self) -> None:
+        """Clear the whole vector rollout's queues and shared episode clock."""
+        self._queues: dict[str, deque[Tensor]] = {ACTION: deque(maxlen=self.config.n_action_steps)}
         self._online_image_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
         self._online_state_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
+        self._rollout_batch_size: int | None = None
         self._online_render_step: PerceptronIsaacMharmonyPackProcessorStep | None = None
         self._last_norm_chunk: Tensor | None = None
         self._frame_index: int = -1
@@ -1115,19 +1116,27 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             self._online_render_step.device = device
         return self._online_render_step
 
+    def _bind_rollout_batch_size(self, batch_size: int) -> None:
+        """Bind raw and prepacked inputs to one vector rollout until reset."""
+        if batch_size < 1:
+            raise ValueError("ISAAC online rollout requires a nonempty batch.")
+        if self._rollout_batch_size is not None and self._rollout_batch_size != batch_size:
+            raise ValueError("ISAAC online batch size changed within a rollout; call reset() first.")
+        self._rollout_batch_size = batch_size
+
     def _update_online_rollout_state(self, batch: dict[str, Any]) -> None:
-        """Append the current live observation to the policy-owned history window."""
+        """Retain owned [B, ...] snapshots, including while queued actions drain."""
         render_step = self._ensure_online_render_step()
         batch_size = render_step._infer_batch_size(batch, None)
-        if batch_size != 1:
-            raise NotImplementedError("Perceptron Isaac online rollout state supports batch_size=1 only.")
+        self._bind_rollout_batch_size(batch_size)
         images = render_step._extract_image_tensor(batch, batch_size)
         states = render_step._extract_state_tensor(batch, batch_size)
         if images.shape[:2] != states.shape[:2]:
             raise ValueError(f"Image/state window shape mismatch: {images.shape[:2]} vs {states.shape[:2]}.")
         for idx in range(images.shape[1]):
-            self._online_image_queue.append(images[0, idx])
-            self._online_state_queue.append(states[0, idx])
+            # Vector environments may reuse their observation buffers on the next step.
+            self._online_image_queue.append(images[:, idx].copy())
+            self._online_state_queue.append(states[:, idx].copy())
 
     def _online_anchor_timestamp_seconds(self) -> float:
         self._ensure_native_metadata()
@@ -1208,12 +1217,12 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             pad_count = target_steps - len(image_values)
             image_values = [image_values[0]] * pad_count + image_values
             state_values = [state_values[0]] * pad_count + state_values
-        image_window = np.stack(image_values, axis=0)
-        state_window = np.stack(state_values, axis=0)
+        image_window = np.stack(image_values, axis=1)  # [B, T, N_cam, ...]
+        state_window = np.stack(state_values, axis=1)  # [B, T, D]
         observation = {
-            image_key: image_window[None, :, camera_idx] for camera_idx, image_key in enumerate(image_keys)
+            image_key: image_window[:, :, camera_idx] for camera_idx, image_key in enumerate(image_keys)
         }
-        observation[OBS_STATE] = state_window[None, ...]
+        observation[OBS_STATE] = state_window
         task_source = self._online_task_source(batch)
         if task_source is not None:
             observation["task"] = task_source
@@ -1222,7 +1231,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             "task": task_source,
             PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY: [
                 external_anchor if external_anchor is not None else self._online_anchor_timestamp_seconds()
-            ],
+            ]
+            * int(state_window.shape[0]),
         }
         transition = {
             TransitionKey.OBSERVATION: observation,
@@ -1274,10 +1284,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         stream = batch.get(PERCEPTRON_ISAAC_STREAM_KEY)
         if stream is None:
-            self._frame_index += 1
             self._update_online_rollout_state(batch)
+            self._frame_index += 1
             batch = self._render_online_stream_batch(batch)
             stream = batch[PERCEPTRON_ISAAC_STREAM_KEY]
+        self._bind_rollout_batch_size(int(stream.shape[0]))
         # Follow the loaded model's dtype rather than assuming bf16: an fp32 backbone
         # (train_storage_fp32) is evaluated in-process during training.
         stream = stream.to(device=self._resolve_device(), dtype=self._model_dtype())
@@ -1348,7 +1359,17 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._maybe_adopt_serving_stats(batch)
 
         has_stream = PERCEPTRON_ISAAC_STREAM_KEY in batch
-        settle = int(getattr(self.config, "num_settle_steps", 0) or 0)
+        settle = int(self.config.num_settle_steps or 0)
+        if has_stream:
+            batch_size = int(batch[PERCEPTRON_ISAAC_STREAM_KEY].shape[0])
+        elif self._settle_index < settle and not batch:
+            # The legacy empty-observation settle call is single-env unless a
+            # previous observation already established the vector rollout size.
+            batch_size = self._rollout_batch_size or 1
+        else:
+            batch_size = self._ensure_online_render_step()._infer_batch_size(batch, None)
+        # Reject changed ownership before clocks advance or queued actions drain.
+        self._bind_rollout_batch_size(batch_size)
         # Genesis settles inside the environment reset and counts only executed post-settle
         # steps in its model clock, so idle settle frames must not advance the episode clock.
         if self._settle_index < settle:
@@ -1356,15 +1377,15 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             # Idle settle frames must not enter the model observation window. The first
             # post-settle observation starts the policy-owned history and is padded there.
             self._ensure_native_metadata()
-            idle = np.zeros((1, self.config.action_dim), dtype=np.float32)
+            idle = np.zeros((batch_size, self.config.action_dim), dtype=np.float32)
             idle[:, -1] = float(self.config.settle_gripper)
             assert self._stats is not None
             idle_norm = normalize_isaac_actions(idle, self._stats.action)
             return torch.from_numpy(idle_norm).float()
 
-        self._frame_index += 1
         if not has_stream:
             self._update_online_rollout_state(batch)
+        self._frame_index += 1
 
         if len(self._queues[ACTION]) == 0:
             action_prefix, prefix_length = None, None

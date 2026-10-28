@@ -118,6 +118,8 @@ def _config(tmp_path, **overrides):
 
 
 class _FakeStream:
+    shape: tuple[int, int] = (1, 1)
+
     def to(self, *args, **kwargs):
         return self
 
