@@ -88,7 +88,7 @@ def data_config(
         n_action_steps=2,
         action_dim=2,
         proprio_dim=2,
-        camera_order=["image"],
+        camera_order=("image",),
         image_size=image_size,
         target_fps=20.0,
         native_stats_path=str(stats_path),

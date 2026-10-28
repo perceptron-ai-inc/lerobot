@@ -436,7 +436,7 @@ def _tiny_policy(
     )
     policy = PerceptronIsaacPolicy(config)
     # Processor tests intentionally inject a narrow fake backend, not a complete VLA.
-    policy._isaac_model = model  # type: ignore[assignment]
+    policy._isaac_model = model
     return policy
 
 
@@ -656,15 +656,17 @@ def test_render_registry_configs_round_trip_without_schema_drift(tmp_path):
 
 def test_native_backend_factory_uses_mharmony_pack_step(tmp_path):
     stats_path = tmp_path / "native_stats.json"
+    metadata_path = tmp_path / "native_render.json"
     _write_native_stats(stats_path)
     cfg = PerceptronIsaacConfig(
         device="cpu",
-        native_render_metadata_path="/tmp/native_render.json",
+        native_render_metadata_path=str(metadata_path),
         native_stats_path=str(stats_path),
         mharmony_version=SUPPORTED_MHARMONY_VERSION,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
+    metadata_path.write_text(json.dumps(IsaacMharmonyRenderMetadata.from_config(cfg).to_json_dict()))
     preprocessor, postprocessor = make_perceptron_isaac_pre_post_processors(cfg)
 
     native_step = next(
@@ -678,7 +680,7 @@ def test_native_backend_factory_uses_mharmony_pack_step(tmp_path):
 
     assert native_step.enabled is True
     assert native_step.inference_backend == "native_mharmony"
-    assert native_step.native_render_metadata_path == "/tmp/native_render.json"
+    assert native_step.native_render_metadata_path == str(metadata_path)
     assert native_step.native_stats_path == str(stats_path)
     assert native_step.mharmony_version == SUPPORTED_MHARMONY_VERSION
     assert action_step.stats_path == str(stats_path)

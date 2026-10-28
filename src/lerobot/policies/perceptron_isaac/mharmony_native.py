@@ -884,9 +884,9 @@ class IsaacNativeMharmonyRenderer:
 
         ``terminal`` mirrors Genesis's ``_action_completion_metadata``: a chunk whose last
         action step is the trajectory's terminal step keeps the ``<|end|>`` footer, while every
-        non-terminal chunk is supervised with ``<|return|>``. Genesis's LeRobot-native training
-        builder emits a synthetic window that never reaches the terminal step, so non-terminal
-        is the correct default here.
+        non-terminal chunk is supervised with ``<|return|>``. The dataset processor supplies
+        terminality from the last real action and its authoritative episode endpoint.
+        Without that metadata, non-terminal remains the conservative default.
 
         ``stats`` overrides the builder's normalization for this one sample, which is what
         multi-suite LIBERO training needs: Genesis normalizes each LIBERO suite by its own

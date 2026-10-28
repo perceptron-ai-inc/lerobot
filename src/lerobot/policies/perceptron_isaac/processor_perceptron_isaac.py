@@ -8,7 +8,7 @@ policy device, and normalized actions are unnormalized on the way back to CPU.
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields as dataclass_fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -420,12 +420,14 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             )
         self._stream_builder: IsaacNativeMharmonyRenderer | None = None
         self._stats: IsaacNormalizationStats | None = None
-        self._fast_processor = None
+        self._fast_processor: Callable[[np.ndarray], list[list[int]]] | None = None
         self._suite_stats: dict[str, IsaacNormalizationStats] | None = None
         self._suite_by_task_index: dict[int, str] | None = None
         # Run-local, factory-injected: the training dataset's declared fps, used to
         # cross-check the checkpoint-owned clock in _frame_index_anchors. Never serialized.
         self._dataset_declared_fps: float | None = None
+        # Run-local episode endpoints, never serialized into a portable policy.
+        self._dataset_metadata: LeRobotDatasetMetadata | None = None
         self._warned_dataset_fps_mismatch = False
 
     def reset(self) -> None:
@@ -951,6 +953,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 )
             fast_processor = self._ensure_fast_processor()
             pad_rows = self._action_padding_rows(complementary, len(windows))
+            terminals = self._training_terminal_rows(complementary, pad_rows)
             suite_stats = self._suite_stats_for(complementary, len(windows))
             streams = []
             kept_indices = []
@@ -970,6 +973,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                     action_chunk=actions[index].detach().cpu().numpy(),
                     fast_processor=fast_processor,
                     action_is_pad=pad_rows[index],
+                    terminal=terminals[index],
                     clip_normalized_actions=bool(self.train_clip_normalized_actions),
                     clip_normalized_max=float(self.clip_normalized_max),
                     fast_clip_normalized_max=float(self.fast_clip_normalized_max),
@@ -1096,6 +1100,72 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             )
         self._fast_processor = load_fast_action_processor(path, expected_tree_sha256=tree_sha256)
         return self._fast_processor
+
+    @staticmethod
+    def _episode_index_values(raw: Any, batch_size: int, *, name: str) -> list[int] | None:
+        """Read exact dataset indices without the clock helper's float32 rounding/broadcast."""
+        if raw is None:
+            return None
+        values = _to_numpy(raw)
+        if values.size != batch_size or not np.issubdtype(values.dtype, np.integer):
+            raise ValueError(f"ISAAC terminal routing requires one integer {name} per sample.")
+        indices = [int(value) for value in values.reshape(-1).tolist()]
+        if any(value < 0 for value in indices):
+            raise ValueError(f"ISAAC terminal routing requires nonnegative {name}.")
+        return indices
+
+    def _training_terminal_rows(
+        self, complementary: dict[str, Any], pad_rows: list[list[bool]]
+    ) -> list[bool]:
+        """Match MDS last-real-action completion using authoritative episode endpoints.
+
+        Current observation DONE/TRUNCATED is not an episode-wide terminal index.
+        Both explicit truncation and implicit last-step termination count in frozen MDS.
+        """
+        batch_size = len(pad_rows)
+        metadata = self._dataset_metadata
+        if metadata is None or "episode_index" not in metadata.features:
+            return [False] * batch_size
+        episodes = metadata.episodes
+        if episodes is None:
+            return [False] * batch_size
+        episode_indices = self._episode_index_values(
+            complementary.get("episode_index"), batch_size, name="episode_index"
+        )
+        frame_indices = self._episode_index_values(
+            complementary.get("frame_index"), batch_size, name="frame_index"
+        )
+        if episode_indices is None or frame_indices is None:
+            return [False] * batch_size
+        absolute_indices = self._episode_index_values(complementary.get("index"), batch_size, name="index")
+        terminals = []
+        for sample, (episode_index, frame, padding) in enumerate(
+            zip(episode_indices, frame_indices, pad_rows, strict=True)
+        ):
+            if episode_index >= len(episodes):
+                raise ValueError(f"ISAAC terminal routing has no metadata for episode {episode_index}.")
+            episode = episodes[episode_index]
+            start, end = int(episode["dataset_from_index"]), int(episode["dataset_to_index"])
+            if (
+                int(episode["episode_index"]) != episode_index
+                or start < 0
+                or end <= start
+                or frame >= end - start
+            ):
+                raise ValueError("ISAAC terminal routing episode bounds or frame index are inconsistent.")
+            anchor = start + frame
+            if absolute_indices is not None and absolute_indices[sample] != anchor:
+                raise ValueError(
+                    "ISAAC terminal routing absolute index disagrees with episode/frame metadata."
+                )
+            positions = [anchor + delta for delta in range(len(padding))]
+            if padding != [position >= end for position in positions]:
+                raise ValueError("ISAAC terminal routing action padding disagrees with episode bounds.")
+            real_positions = [
+                position for position, padded in zip(positions, padding, strict=True) if not padded
+            ]
+            terminals.append(bool(real_positions) and real_positions[-1] == end - 1)
+        return terminals
 
     def _action_padding_rows(self, complementary: dict[str, Any], batch_size: int) -> list[list[bool]]:
         raw = complementary.get("action_is_pad")
@@ -1322,7 +1392,7 @@ class PerceptronIsaacActionUnnormalizeProcessorStep(ProcessorStep):
             profile_scope=self.normalization_profile_scope,
             validation_status=self.normalization_validation_status,
         )
-        self._stats = None
+        self._stats: IsaacNormalizationStats | None = None
 
     def get_config(self) -> dict[str, Any]:
         return {
@@ -1523,6 +1593,7 @@ def make_perceptron_isaac_pre_post_processors(
         suite_stats_path=config.suite_stats_path,
         suite_by_task_index_path=config.suite_by_task_index_path,
     )
+    render_step._dataset_metadata = dataset_meta
     declared_fps = dataset_meta.fps if dataset_meta is not None else None
     if declared_fps is not None:
         # Hand the anchor derivation the training dataset's declared clock so a genuine
@@ -1933,6 +2004,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     for step in preprocessor.steps:
         if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep):
             step.device = str(config.device)
+            step._dataset_metadata = dataset_meta
             if step.render_metadata is not None:
                 IsaacMharmonyRenderMetadata(**step.render_metadata).validate_image_preprocess_for_config(
                     config
