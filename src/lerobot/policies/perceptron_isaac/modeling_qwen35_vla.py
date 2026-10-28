@@ -1284,6 +1284,11 @@ class DiTActionExpertArgs:
     #   materializes K/V (memory grows with K). Both are proven equal to the serial loop (see the k-batched tests).
     k_batched_cross_attn_backend: str = "flash_gqa"
 
+    @property
+    def clean_at_0(self) -> bool:
+        """Native DiT always predicts action minus noise on the clean-at-one clock."""
+        return False
+
     def __post_init__(self) -> None:
         integer_fields = (
             ("action_dim", self.action_dim),

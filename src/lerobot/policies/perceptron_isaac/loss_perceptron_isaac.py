@@ -376,7 +376,7 @@ def _flow_loss(
     )
     targets = flow.targets.unsqueeze(0)
     x_tau = tau_grid * eps + (1.0 - tau_grid) * targets
-    clean_at_0 = bool(getattr(expert.args, "clean_at_0", True))
+    clean_at_0 = expert.args.clean_at_0
     velocity_target = eps - targets if clean_at_0 else targets - eps
 
     activations = output.final_activations.detach() if detach_vlm_activations else output.final_activations

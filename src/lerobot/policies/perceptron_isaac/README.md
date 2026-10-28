@@ -88,6 +88,11 @@ freezes completed environments and resets the entire group between rollouts;
 Changing the live batch size requires that global reset. Settling emits one idle
 row per environment without adding frames to model history or time.
 
+## Training objective
+
+Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
+`action-noise`.
+
 ## Evidence and limits
 
 Job 113283 proved two dense FP32-master FSDP2 steps with all 35,723,506,864
