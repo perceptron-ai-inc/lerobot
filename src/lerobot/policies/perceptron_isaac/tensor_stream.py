@@ -473,8 +473,69 @@ class Stream:
 class TensorStream:
     streams: list[Stream]
     _device: torch.device | None = None
+    # A finite collective-only payload is not real supervision or router traffic.
+    collective_only: bool = False
+
+    @classmethod
+    def collective_dummy(cls) -> TensorStream:
+        event = Event.from_text_tokens(
+            torch.zeros(2, dtype=torch.long), time=(0.0, 0.0), type=TextType.text, role="user"
+        )
+        return cls([create_stream([event], list(TextType))], collective_only=True)
+
+    def training_state(self) -> dict[str, Any]:
+        """Safe tensor/primitive representation for rank-local prepared-input checkpoints."""
+        return {
+            "collective_only": self.collective_only,
+            "streams": [
+                {
+                    "priority": [kind.value for kind in stream.priority],
+                    "events": [
+                        {
+                            "data": event.data,
+                            "time": event.time,
+                            "type": event.type.value,
+                            "role": event.role,
+                            "dims_virtual": event.dims_virtual,
+                            "dims_real": event.dims_real,
+                            "idx_range": event.idx_range,
+                            "tags": event.tags,
+                        }
+                        for event in stream.events
+                    ],
+                }
+                for stream in self.streams
+            ],
+        }
+
+    @classmethod
+    def from_training_state(cls, state: dict[str, Any]) -> TensorStream:
+        """Rebuild only the owned stream record, never load arbitrary Python classes."""
+        return cls(
+            [
+                create_stream(
+                    [Event(**{**event, "type": ALL_TYPES[event["type"]]}) for event in sample["events"]],
+                    [ALL_TYPES[kind] for kind in sample["priority"]],
+                )
+                for sample in state["streams"]
+            ],
+            collective_only=state["collective_only"],
+        )
 
     def __post_init__(self):
+        if self.collective_only:
+            # The empty contribution cannot be used to hide real supervision or padding.
+            if len(self.streams) != 1 or len(self.streams[0].events) != 1:
+                raise ValueError("ISAAC collective-only stream must contain one finite sentinel event.")
+            sentinel = self.streams[0].events[0]
+            if (
+                sentinel.type != TextType.text
+                or sentinel.role != "user"
+                or tuple(sentinel.data.shape) != (2, 1)
+                or bool(sentinel.data.ne(0).any())
+                or sentinel.tags
+            ):
+                raise ValueError("ISAAC collective-only stream cannot contain real supervision.")
         for stream in self.streams:
             for event in stream.events:
                 assert isinstance(event.data, torch.Tensor)

@@ -50,6 +50,7 @@ from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_metadata,
+    load_training_window,
     publish_trained_model,
     push_checkpoint_to_hub,
     resume_after_prepare,
@@ -57,6 +58,14 @@ from lerobot.common.train_utils import (
     save_checkpoint,
     should_save_checkpoint,
     update_last_checkpoint,
+)
+from lerobot.common.training_window import (
+    PreparedTrainingWindow,
+    TrainingWindowCheckpoint,
+    agree_training_window_error,
+    plan_training_window,
+    prepare_training_input,
+    validate_training_normalizer,
 )
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import EvalConfig, JobConfig, parser
@@ -82,6 +91,7 @@ from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.policies.factory import ProcessorConfigKwargs
+from lerobot.policies.training_loss_normalization import TrainingLossNormalization
 from lerobot.processor import ImageAugmentationProcessorStep
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
@@ -94,7 +104,7 @@ from lerobot.utils.import_utils import (
     require_package,
 )
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
-from lerobot.utils.random_utils import set_seed
+from lerobot.utils.random_utils import deserialize_rng_state, serialize_rng_state, set_seed
 from lerobot.utils.sample_weighting import SampleWeighter
 from lerobot.utils.utils import (
     cycle,
@@ -110,6 +120,7 @@ else:
     PeftModel = None
 
 if TYPE_CHECKING or _accelerate_available:
+    from accelerate.data_loader import DataLoaderShard
     from accelerate.utils import send_to_device
 
 from .lerobot_eval import eval_policy_all
@@ -208,6 +219,7 @@ def update_policy(
     lr_scheduler: LRScheduler | None = None,
     lock: AbstractContextManager[Any] | None = None,
     sample_weighter: SampleWeighter | None = None,
+    training_loss_normalization: TrainingLossNormalization | None = None,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -278,6 +290,8 @@ def update_policy(
                     output_dict = {}
                 for key, value in weight_stats.items():
                     output_dict[f"sample_weight_{key}"] = value
+            elif training_loss_normalization is not None:
+                loss, output_dict = policy(batch, training_loss_normalization=training_loss_normalization)
             else:
                 loss, output_dict = policy(batch)
 
@@ -348,16 +362,17 @@ def make_dataloaders(
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader | None]:
     """Build the train (and optional eval) dataloader, including the sampler resume offset.
 
-    The sampler offset is *derived* from `step` (`resume_before_prepare` loads step + RNG only):
-    each loop step consumes `batch_size` samples on each of the `dp_world_size` distinct
-    data-parallel workers — no grad-accumulation factor, since `step` counts micro-batches.
+    The sampler offset is *derived* from the data read cursor `step`: each read consumes
+    `batch_size` samples on each distinct data-parallel worker, without a grad-accumulation
+    factor. Usually this is the processed microbatch counter. Objective-window resume passes
+    its saved read-ahead cursor instead, since the pending prefix/suffix is already prepared.
 
     Args:
         cfg (TrainPipelineConfig): The training config (batch size, workers, streaming, resume, seed).
         dataset (LeRobotDataset | StreamingLeRobotDataset): The training dataset.
         eval_dataset (LeRobotDataset | None): Optional held-out split; when provided, an eval
             dataloader is built (subsampled per task when `cfg.max_eval_samples > 0`).
-        step (int): The loop step to resume the sampler from (0 for a fresh run).
+        step (int): The data read cursor to resume the sampler from (0 for a fresh run).
         parallel_dims (ParallelDims): The resolved parallelism topology; provides the device type
             and the fallback dp world size for the resume offset.
 
@@ -645,6 +660,16 @@ def train(cfg: TrainPipelineConfig) -> None:
             pretrained_path=resume_pretrained_dir,
         )
 
+    normalizer = policy.get_training_loss_normalizer() if isinstance(policy, PreTrainedPolicy) else None
+    validate_training_normalizer(
+        normalizer,
+        accelerator,
+        sample_weighting=cfg.sample_weighting is not None,
+        context_parallel=cfg.parallelism.context_parallel.ring_degree
+        * cfg.parallelism.context_parallel.ulysses_degree
+        > 1,
+    )
+
     peft_model = None
     if cfg.peft is not None:
         if cfg.is_reward_model_training:
@@ -741,7 +766,18 @@ def train(cfg: TrainPipelineConfig) -> None:
     if cfg.resume:
         step = resume_before_prepare(cfg)  # step + RNG only; sharded state loads after prepare
 
-    dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
+    saved_window = (
+        load_training_window(cfg, accelerator, step, normalizer=normalizer)
+        if cfg.resume and normalizer is not None
+        else None
+    )
+    read_step = step if saved_window is None else saved_window.read_step
+    dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, read_step, parallel_dims)
+    loader_resume_epoch = None
+    if cfg.resume and normalizer is not None and not cfg.dataset.streaming:
+        if not isinstance(dataloader.sampler, EpisodeAwareSampler):
+            raise TypeError("Training window resume requires the stock episode-aware sampler.")
+        loader_resume_epoch = int(dataloader.sampler.state_dict()["epoch"])
 
     # --- prepare & resume phase 2 ---------------------------------------------------------------
     # The FSDP wrap-unit class names resolve right before prepare: user override, else the
@@ -763,6 +799,12 @@ def train(cfg: TrainPipelineConfig) -> None:
             policy, optimizer, dataloader, lr_scheduler
         )
     finalize_sharded_policy(policy, parallel_dims)
+    if loader_resume_epoch is not None:
+        if not isinstance(dataloader, DataLoaderShard):
+            raise TypeError("Training window resume requires the Accelerator map-style dataloader.")
+        # DataLoaderShard.__iter__ calls set_epoch(iteration). Position that counter
+        # too, or it overwrites the sampler's saved read-ahead epoch with zero.
+        dataloader.set_epoch(loader_resume_epoch)
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
 
@@ -919,17 +961,86 @@ def train(cfg: TrainPipelineConfig) -> None:
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    def prepare_batch() -> dict[str, Any]:
+        start = time.perf_counter()
+        raw_batch = next(dl_iter)
+        if cfg.dataset.streaming:
+            raw_batch = send_to_device(raw_batch, device, non_blocking=device.type == "cuda")
+        preprocessing_start = time.perf_counter()
+        train_tracker.dataloading_s = preprocessing_start - start
+        if image_augmentation is not None:
+            raw_batch = image_augmentation.observation(raw_batch)
+        prepared = _preprocess_dataset_batch(
+            raw_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
+        )
+        train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
+        return prepared
+
+    window: PreparedTrainingWindow | None = None
+    if saved_window is not None:
+        error = None
+        try:
+            deserialize_rng_state(saved_window.continuation_rng)
+            if image_augmentation is not None:
+                image_augmentation.load_state_dict(saved_window.augmentation)
+            elif saved_window.augmentation:
+                raise ValueError("Training window resume is missing its saved image augmentation step.")
+        except Exception as invalid:
+            error = invalid
+        agree_training_window_error(error, accelerator, phase="private state restoration")
+        window = saved_window.window
+        if window is not None:
+            assert normalizer is not None
+            required = min(accelerator.gradient_accumulation_steps, cfg.steps - window.start_step)
+            # A saved short final tail can become a full update on continuation. Count the
+            # newly available suffix before reconstructing its already-consumed prefix.
+            while len(window.inputs) < required:
+                window.inputs.append(prepare_training_input(prepare_batch, normalizer, accelerator))
+            window = plan_training_window(
+                window.start_step, window.inputs, normalizer, accelerator, forward_rng=window.forward_rng
+            )
+            continuation_rng = saved_window.continuation_rng
+            assert accelerator.step % accelerator.gradient_accumulation_steps == 0
+            assert 0 < window.consumed < accelerator.gradient_accumulation_steps
+            for index, forward_rng in enumerate(window.forward_rng):
+                deserialize_rng_state(forward_rng)
+                batch = normalizer.decode_batch(window.inputs[index], device)
+                update_policy(
+                    train_tracker,
+                    policy,
+                    batch,
+                    optimizer,
+                    cfg.optimizer.grad_clip_norm,
+                    accelerator=accelerator,
+                    lr_scheduler=None,
+                    training_loss_normalization=window.normalization,
+                )
+                # The prepared optimizer must skip every reconstructed call. No scheduler,
+                # trainer step, save/eval/log, EMA or synchronized policy update is replayed.
+                assert not accelerator.sync_gradients
+                del batch
+            deserialize_rng_state(continuation_rng)
+            train_tracker.reset_averages()
+        saved_window = None
+
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
-        batch = next(dl_iter)
-        if cfg.dataset.streaming:
-            batch = send_to_device(batch, device, non_blocking=device.type == "cuda")
-        preprocessing_start = time.perf_counter()
-        train_tracker.dataloading_s = preprocessing_start - step_start
-        if image_augmentation is not None:
-            batch = image_augmentation.observation(batch)
-        batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
-        train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
+        normalization = None
+        if normalizer is None:
+            batch = prepare_batch()
+        else:
+            if window is None:
+                assert accelerator.step % accelerator.gradient_accumulation_steps == 0
+                size = min(accelerator.gradient_accumulation_steps, cfg.steps - step)
+                window = plan_training_window(
+                    step,
+                    [prepare_training_input(prepare_batch, normalizer, accelerator) for _ in range(size)],
+                    normalizer,
+                    accelerator,
+                )
+            batch = normalizer.decode_batch(window.inputs[window.consumed], device)
+            normalization = window.normalization
+            window.record_forward_rng()
 
         train_tracker, _ = update_policy(
             train_tracker,
@@ -940,7 +1051,15 @@ def train(cfg: TrainPipelineConfig) -> None:
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            training_loss_normalization=normalization,
         )
+        if normalizer is not None:
+            # TensorStream.to mutates its payload. Only the decoded active input reaches
+            # the device; immutable encoded prefix/suffix records remain on the host.
+            del batch
+            if accelerator.sync_gradients:
+                assert window is not None and window.consumed == accelerator.gradient_accumulation_steps
+                window = None
         train_tracker.step_s = time.perf_counter() - step_start
 
         # Pull one optimizer step of the live weights into the EMA shadow (main process only).
@@ -1021,6 +1140,18 @@ def train(cfg: TrainPipelineConfig) -> None:
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
                 accelerator=accelerator,
+                training_window=None
+                if normalizer is None
+                else TrainingWindowCheckpoint(
+                    step=step,
+                    read_step=step if window is None else window.read_step,
+                    world_size=accelerator.num_processes,
+                    process_index=accelerator.process_index,
+                    backward_divisor=accelerator.gradient_accumulation_steps,
+                    window=window,
+                    continuation_rng=serialize_rng_state(),
+                    augmentation={} if image_augmentation is None else image_augmentation.state_dict(),
+                ),
             )
             if is_main_process():
                 if ema is not None:

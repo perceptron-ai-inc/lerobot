@@ -15,7 +15,6 @@ from lerobot.policies.perceptron_isaac.isaac_stats import (
     normalize_isaac_actions,
     unnormalize_isaac_actions,
 )
-from lerobot.policies.perceptron_isaac.mharmony_native import IsaacActionOutlierError
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY,
     PERCEPTRON_ISAAC_RENDER_META_KEY,
@@ -68,9 +67,18 @@ def test_raw_gripper_quantile_outlier_is_rejected_even_when_physical_value_is_sm
     pack, fast = data_pack(config)
     batch = data_batch()
     batch[ACTION] = torch.tensor([[[0.5, 0.8], [0.5, 0.8]]])
-    with pytest.raises(IsaacActionOutlierError, match="(?i)outlier|threshold"):
-        pack(batch_to_transition(batch))
+    transition = pack(batch_to_transition(batch))
+    complementary = transition[TransitionKey.COMPLEMENTARY_DATA]
+    assert complementary[PERCEPTRON_ISAAC_STREAM_KEY].collective_only
+    assert complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == []
     assert not fast.inputs, "Outlier filtering precedes FAST encoding."
+
+    # Local emptiness is now deferred to the window, but quantile filtering still applies.
+    batch[ACTION] = torch.tensor([[[0.5, 0.005], [0.5, 0.005]]])
+    retained = pack(batch_to_transition(batch))[TransitionKey.COMPLEMENTARY_DATA]
+    assert not retained[PERCEPTRON_ISAAC_STREAM_KEY].collective_only
+    assert retained[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == [0]
+    assert fast.inputs
 
 
 def test_default_normalized_gripper_remains_quantile_flow_and_fast(tmp_path: Path) -> None:

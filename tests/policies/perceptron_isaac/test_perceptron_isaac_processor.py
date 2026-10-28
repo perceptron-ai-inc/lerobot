@@ -249,7 +249,12 @@ def test_trainer_forwards_metadata_to_actual_processor_factories(
     cfg.checkpoint_path = checkpoint if cfg.resume else None
     monkeypatch.setattr(cfg, "validate", lambda: None)
     accelerator = SimpleNamespace(
-        device=torch.device("cpu"), num_processes=1, process_index=0, wait_for_everyone=lambda: None
+        device=torch.device("cpu"),
+        num_processes=1,
+        process_index=0,
+        gradient_accumulation_steps=cfg.accelerator.gradient_accumulation.steps,
+        gather=lambda value: value,
+        wait_for_everyone=lambda: None,
     )
     monkeypatch.setattr(lerobot_train, "make_accelerator", lambda cfg: accelerator)
     monkeypatch.setattr(lerobot_train, "init_logging", lambda **kwargs: None)
@@ -437,7 +442,7 @@ def _tiny_policy(
     )
     policy = PerceptronIsaacPolicy(config)
     # Processor tests intentionally inject a narrow fake backend, not a complete VLA.
-    policy._isaac_model = model
+    policy._isaac_model = model  # type: ignore[assignment]
     return policy
 
 
@@ -1517,15 +1522,17 @@ def test_frame_index_anchor_accepts_matching_dataset_fps(monkeypatch):
     np.testing.assert_allclose([renderer.build_training_calls[0]["anchor_timestamp_seconds"]], [4 / 20])
 
 
-def test_all_outlier_microbatch_fails_loud_single_process(monkeypatch):
-    """Without collectives to keep in lockstep, an all-outlier microbatch must abort."""
+def test_all_outlier_microbatch_defers_empty_objective_check_to_window(monkeypatch):
+    """An empty microbatch may have usable peers or a later usable input in its window."""
     step = _training_step()
     renderer = _install_fake_native_renderer(step, monkeypatch)
     action = torch.zeros(1, 30, 7)
     action[0, 0, 0] = -999.0
 
-    with pytest.raises(IsaacActionOutlierError, match="normalization stats"):
-        step(_training_transition(action, ["pick"], timestamp=torch.tensor([0.0])))
+    out = step(_training_transition(action, ["pick"], timestamp=torch.tensor([0.0])))
+    complementary = out[TransitionKey.COMPLEMENTARY_DATA]
+    assert complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == []
+    assert complementary[PERCEPTRON_ISAAC_STREAM_KEY].collective_only
 
     # Single-process keeps the renderer's own fail-loud over-length check.
     assert renderer.build_training_calls[0]["max_sequence_length"] == 4096
@@ -1542,7 +1549,7 @@ def _mock_distributed_batch_validation(monkeypatch, *, peer_has_no_usable_sample
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
 
 
-def test_all_outlier_microbatch_fails_collectively_distributed(monkeypatch):
+def test_all_outlier_microbatch_prepares_collective_only_input_distributed(monkeypatch):
     _mock_distributed_batch_validation(monkeypatch)
     step = _training_step()
     renderer = ThresholdAwareFakeNativeRenderer()
@@ -1550,8 +1557,10 @@ def test_all_outlier_microbatch_fails_collectively_distributed(monkeypatch):
     action = torch.zeros(2, 30, 7)
     action[:, 0, 0] = -999.0
 
-    with pytest.raises(IsaacActionOutlierError, match="distributed rank has no usable samples"):
-        step(_training_transition(action, ["pick", "place"], timestamp=torch.tensor([0.0, 0.05])))
+    out = step(_training_transition(action, ["pick", "place"], timestamp=torch.tensor([0.0, 0.05])))
+    complementary = out[TransitionKey.COMPLEMENTARY_DATA]
+    assert complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == []
+    assert complementary[PERCEPTRON_ISAAC_STREAM_KEY].collective_only
 
     # The threshold is never disabled just to keep collectives alive.
     assert all(call["skip_outlier_threshold"] > 0.0 for call in renderer.build_training_calls)
@@ -1575,38 +1584,40 @@ def test_distributed_over_length_sample_is_skipped_not_fatal(monkeypatch):
     assert renderer.build_training_calls[0]["max_sequence_length"] == 2**31 - 1
 
 
-def test_distributed_all_over_length_microbatch_fails_collectively(monkeypatch):
+def test_distributed_all_over_length_microbatch_prepares_collective_only_input(monkeypatch):
     _mock_distributed_batch_validation(monkeypatch)
     step = _training_step(train_max_sequence_length=5)
     renderer = ThresholdAwareFakeNativeRenderer(lengths_by_prompt={"pick": 10, "place": 11})
     step._stream_builder = renderer
 
-    with pytest.raises(IsaacActionOutlierError, match="distributed rank has no usable samples"):
-        step(
-            _training_transition(
-                torch.zeros(2, 30, 7),
-                ["pick", "place"],
-                timestamp=torch.tensor([0.0, 0.05]),
-            )
+    out = step(
+        _training_transition(
+            torch.zeros(2, 30, 7),
+            ["pick", "place"],
+            timestamp=torch.tensor([0.0, 0.05]),
         )
+    )
+    complementary = out[TransitionKey.COMPLEMENTARY_DATA]
+    assert complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == []
+    assert complementary[PERCEPTRON_ISAAC_STREAM_KEY].collective_only
 
 
-def test_distributed_valid_rank_fails_before_loss_collectives_when_peer_is_invalid(monkeypatch):
+def test_distributed_valid_rank_keeps_real_input_when_peer_is_empty(monkeypatch):
     _mock_distributed_batch_validation(monkeypatch, peer_has_no_usable_samples=True)
     step = _training_step()
     renderer = ThresholdAwareFakeNativeRenderer()
     step._stream_builder = renderer
 
-    with pytest.raises(IsaacActionOutlierError, match="distributed rank has no usable samples"):
-        step(
-            _training_transition(
-                torch.zeros(1, 30, 7),
-                ["pick"],
-                timestamp=torch.tensor([0.0]),
-            )
+    out = step(
+        _training_transition(
+            torch.zeros(1, 30, 7),
+            ["pick"],
+            timestamp=torch.tensor([0.0]),
         )
+    )
 
-    assert renderer.collate_calls == []
+    assert out[TransitionKey.COMPLEMENTARY_DATA][PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == [0]
+    assert len(renderer.collate_calls) == 1
 
 
 def test_render_processor_conforms_resolution_and_rejects_undecidable_layouts():

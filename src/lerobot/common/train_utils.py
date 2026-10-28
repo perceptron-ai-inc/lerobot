@@ -31,6 +31,7 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import torch
 import torch.distributed as dist
 from huggingface_hub import HfApi, ModelCard, ModelCardData, is_offline_mode, model_info, snapshot_download
 from huggingface_hub.errors import HFValidationError, OfflineModeIsEnabled
@@ -38,6 +39,14 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from lerobot.__version__ import __version__
+from lerobot.common.training_window import (
+    TRAINING_WINDOW_VERSION,
+    TrainingWindowCheckpoint,
+    TrainingWindowResumePlan,
+    agree_training_window_error,
+    count_training_inputs,
+    validate_training_window_plan,
+)
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
@@ -59,6 +68,7 @@ from lerobot.optim import (
     save_scheduler_state,
 )
 from lerobot.policies import PreTrainedPolicy
+from lerobot.policies.training_loss_normalization import TrainingLossNormalizer
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import (
     CHECKPOINTS_DIR,
@@ -140,7 +150,13 @@ def update_last_checkpoint(checkpoint_dir: Path) -> None:
 # ---------------------------------------------------------------------------------------------
 
 
-def save_training_metadata(step: int, save_dir: Path, cfg: TrainPipelineConfig) -> None:
+def save_training_metadata(
+    step: int,
+    save_dir: Path,
+    cfg: TrainPipelineConfig,
+    *,
+    training_window: TrainingWindowCheckpoint | None = None,
+) -> None:
     """Record the step counter plus everything a resume needs to reason about topology changes.
 
     `step` counts loop iterations (= micro-batches), so
@@ -154,12 +170,16 @@ def save_training_metadata(step: int, save_dir: Path, cfg: TrainPipelineConfig) 
         save_dir (Path): The `training_state/` directory to write `training_step.json` into.
         cfg (TrainPipelineConfig): The training config whose batch size, gradient-accumulation,
             precision, and parallelism settings are snapshotted alongside the step.
+        training_window (TrainingWindowCheckpoint | None): When supplied, records its actual
+            backward divisor and requires versioned rank-local sidecars even at a boundary.
     """
     state: dict[str, Any] = {
         "step": step,
         "dp_world_size": cfg.parallelism.dp_world_size,
         "batch_size": cfg.batch_size,
-        "grad_accum_steps": cfg.accelerator.gradient_accumulation.steps,
+        "grad_accum_steps": cfg.accelerator.gradient_accumulation.steps
+        if training_window is None
+        else training_window.backward_divisor,
         "mixed_precision": cfg.accelerator.mixed_precision,
         "parallelism": {
             "dp_replicate": cfg.parallelism.dp_replicate,
@@ -168,14 +188,19 @@ def save_training_metadata(step: int, save_dir: Path, cfg: TrainPipelineConfig) 
             "ulysses_degree": cfg.parallelism.context_parallel.ulysses_degree,
         },
     }
+    # Boundary checkpoints still own private RNG/augmentation sidecars.
+    if training_window is not None:
+        state["training_window_version"] = TRAINING_WINDOW_VERSION
     write_json(state, save_dir / TRAINING_STEP)
 
 
 def load_training_metadata(training_state_dir: Path) -> dict[str, Any]:
     """Read everything `save_training_metadata` recorded, in a single pass.
 
-    Every key is always present: fields a checkpoint predates come back as None, so a caller
-    reading `metadata["batch_size"]` gets a KeyError on a typo rather than a silent None.
+    Historical snapshot fields a checkpoint predates come back as None, so a caller reading
+    `metadata["batch_size"]` gets a KeyError on a typo rather than a silent None. The optional
+    `training_window_version` key retains absence, distinct from a malformed/null marker.
+    A recorded `grad_accum_steps` must be a positive integer; only an absent field is unknown.
 
     Args:
         training_state_dir (Path): The checkpoint's `training_state/` directory.
@@ -186,7 +211,11 @@ def load_training_metadata(training_state_dir: Path) -> dict[str, Any]:
             not recorded).
     """
     state = load_json(training_state_dir / TRAINING_STEP)
-    return {
+    if "grad_accum_steps" in state and (
+        type(state["grad_accum_steps"]) is not int or state["grad_accum_steps"] < 1
+    ):
+        raise ValueError("Training metadata grad_accum_steps must be a positive integer when recorded.")
+    metadata = {
         "step": int(state["step"]),
         "dp_world_size": state.get("dp_world_size", state.get("num_processes")),
         "batch_size": state.get("batch_size"),
@@ -194,6 +223,10 @@ def load_training_metadata(training_state_dir: Path) -> dict[str, Any]:
         "mixed_precision": state.get("mixed_precision"),
         "parallelism": state.get("parallelism"),
     }
+    # Preserve absence separately from malformed/null markers in the optional new format.
+    if "training_window_version" in state:
+        metadata["training_window_version"] = state["training_window_version"]
+    return metadata
 
 
 # ---------------------------------------------------------------------------------------------
@@ -211,6 +244,7 @@ def save_checkpoint(
     preprocessor: PolicyProcessorPipeline | None = None,
     postprocessor: PolicyProcessorPipeline | None = None,
     accelerator: "Accelerator | None" = None,
+    training_window: TrainingWindowCheckpoint | None = None,
 ) -> None:
     """This function creates the following directory structure:
 
@@ -231,6 +265,7 @@ def save_checkpoint(
         ├── rng_state.safetensors  # rng states
         ├── scheduler_state.json  # scheduler state (if scheduler provided)
         ├── scaler_state.json  # fp16 loss-scaler state (mixed_precision=fp16 only)
+        ├── training_window_rank_<rank>.pt  # optional safe prepared inputs, cursors and rank-local RNG
         └── training_step.json  # step + dp_world_size/batch_size/grad_accum/precision + topology
 
     Collective: MUST be called on every rank. Rank-0-only writes are gated internally, so the
@@ -250,6 +285,8 @@ def save_checkpoint(
         accelerator (Accelerator | None, optional): The accelerator the policy was prepared with;
             used to unwrap the model and required on sharded runs, where it owns the DCP save
             channels. Defaults to None (plain single-process saves).
+        training_window (TrainingWindowCheckpoint | None): Rank-local objective-window state;
+            supplied only by policies opting into count-normalized stock training.
     """
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
     fmt = cfg.checkpoint_format
@@ -287,7 +324,15 @@ def save_checkpoint(
         policy_to_save.finalize_pretrained_package(pretrained_dir)
 
     save_training_state(
-        checkpoint_dir, step, cfg, optimizer, scheduler, accelerator, sharded=sharded, model=policy_to_save
+        checkpoint_dir,
+        step,
+        cfg,
+        optimizer,
+        scheduler,
+        accelerator,
+        sharded=sharded,
+        model=policy_to_save,
+        training_window=training_window,
     )
     if accelerator is not None:
         accelerator.wait_for_everyone()
@@ -303,6 +348,7 @@ def save_training_state(
     *,
     sharded: bool = False,
     model: PreTrainedPolicy | None = None,
+    training_window: TrainingWindowCheckpoint | None = None,
 ) -> None:
     """Write training_state/. Collective under sharding: call on every rank.
 
@@ -335,8 +381,24 @@ def save_training_state(
         # Collective — all ranks write their DCP shards into optimizer_0/.
         save_sharded_optimizer(accelerator, optimizer, model, save_dir)
 
+    if training_window is not None:
+        if (
+            accelerator is None
+            or training_window.step != step
+            or training_window.backward_divisor != accelerator.gradient_accumulation_steps
+        ):
+            raise ValueError(
+                "Saving a training window requires its accelerator, exact processed step and actual backward divisor."
+            )
+        # Safe tensor/primitive state only. Each rank owns its relative file; moving the
+        # checkpoint never refers back to the original data or run directory.
+        torch.save(
+            training_window.state_dict(),
+            save_dir / f"training_window_rank_{accelerator.process_index}.pt",
+        )
+
     if is_main_process():  # ONE grouped gate for the whole rank-0-only region
-        save_training_metadata(step, save_dir, cfg)
+        save_training_metadata(step, save_dir, cfg, training_window=training_window)
         save_rng_state(save_dir)
         if scheduler is not None:
             save_scheduler_state(scheduler, save_dir)
@@ -363,12 +425,103 @@ def _resume_checkpoint_dir(cfg: TrainPipelineConfig) -> Path:
     return cfg.checkpoint_path
 
 
+def load_training_window(
+    cfg: TrainPipelineConfig,
+    accelerator: "Accelerator",
+    step: int,
+    *,
+    normalizer: TrainingLossNormalizer | None = None,
+) -> TrainingWindowCheckpoint | None:
+    """All ranks validate local sidecars and agree their plan before dataloader positioning.
+
+    The trainer binds image augmentation to accelerator.device before this call; probe its
+    private generator state on that same device without restoring or advancing any live RNG.
+    """
+    error = None
+    state = None
+    plan = None
+    try:
+        directory = _resume_checkpoint_dir(cfg) / TRAINING_STATE_DIR
+        path = directory / f"training_window_rank_{accelerator.process_index}.pt"
+        metadata = load_training_metadata(directory)
+        version = metadata.get("training_window_version")
+        if "training_window_version" in metadata and (
+            type(version) is not int or version != TRAINING_WINDOW_VERSION
+        ):
+            raise ValueError("Training window metadata version is unsupported.")
+        saved_divisor = metadata["grad_accum_steps"]
+        for value in (saved_divisor, metadata["dp_world_size"], metadata["batch_size"]):
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError("Training window metadata topology and cadence must be positive integers.")
+        if metadata["step"] != step:
+            raise ValueError("Training window metadata step differs from the resumed counter.")
+        if path.is_file():
+            state = TrainingWindowCheckpoint.from_state_dict(
+                torch.load(path, map_location="cpu", weights_only=True)
+            )
+            if state.augmentation:
+                generator = torch.Generator(device=accelerator.device)
+                generator.set_state(state.augmentation["generator_state"].cpu())
+            if (
+                state.step != step
+                or state.world_size != accelerator.num_processes
+                or state.process_index != accelerator.process_index
+                or metadata["batch_size"] != cfg.batch_size
+                or metadata["dp_world_size"] not in (None, state.world_size)
+                or saved_divisor not in (None, state.backward_divisor)
+                or (
+                    state.window is not None
+                    and state.backward_divisor != accelerator.gradient_accumulation_steps
+                )
+            ):
+                raise ValueError(
+                    "Training window resume requires the saved step, world size, batch size and pending backward divisor."
+                )
+            if cfg.steps < state.read_step:
+                raise ValueError("Training window resume cannot discard an already prepared suffix.")
+            if state.window is not None and normalizer is not None:
+                if state.window.normalization.schema != normalizer.schema:
+                    raise ValueError("Training window resume objective schema differs from the saved plan.")
+                count_training_inputs(state.window.inputs, normalizer)
+        elif version is not None:
+            raise ValueError("Training window checkpoint is missing its required rank-local sidecar.")
+        # Historical absence leaves cadence unknown; only a recorded divisor proves a prefix.
+        elif saved_divisor is not None and step % saved_divisor:
+            raise ValueError("Cannot resume a pending objective window without rank-local prepared inputs.")
+        window = None if state is None else state.window
+        plan = TrainingWindowResumePlan(
+            metadata_version=version,
+            sidecar_version=None if state is None else TRAINING_WINDOW_VERSION,
+            step=step,
+            read_step=step if state is None else state.read_step,
+            saved_world_size=metadata["dp_world_size"],
+            saved_batch_size=metadata["batch_size"],
+            saved_backward_divisor=saved_divisor if state is None else state.backward_divisor,
+            start_step=None if window is None else window.start_step,
+            input_length=None if window is None else len(window.inputs),
+            consumed=None if window is None else window.consumed,
+            schema=None if window is None else window.normalization.schema.names,
+            global_totals=None if window is None else window.normalization.totals,
+            requested_endpoint=cfg.steps,
+            requested_backward_divisor=accelerator.gradient_accumulation_steps,
+        )
+    except Exception as invalid:
+        # No collective is inside deserialization: every peer reaches the same error handshake.
+        error = invalid
+    agree_training_window_error(error, accelerator, phase="sidecar validation")
+    assert plan is not None
+    validate_training_window_plan(plan, accelerator)
+    return state
+
+
 def resume_before_prepare(cfg: TrainPipelineConfig) -> int:
     """Phase 1 — before `accelerator.prepare()`: restore RNG and return the step counter.
 
-    Pure loaders only. The sampler resume offset is *derived* from the returned step inside the
-    dataloader factory, and everything bound to sharded objects (model DCP shards, optimizer,
-    scheduler) loads in `resume_after_prepare`.
+    Local loaders finish before collective error agreement when a process group is initialized:
+    call on ALL ranks before any peer enters prepare/DCP. Outside distributed runs, original
+    local exceptions are preserved. The sampler resume offset is *derived* from the returned step
+    inside the dataloader factory, and everything bound to sharded objects (model DCP shards,
+    optimizer, scheduler) loads in `resume_after_prepare`.
 
     Args:
         cfg (TrainPipelineConfig): The resumed training config; `cfg.checkpoint_path` locates
@@ -380,14 +533,37 @@ def resume_before_prepare(cfg: TrainPipelineConfig) -> int:
     Raises:
         NotADirectoryError: If the checkpoint has no `training_state/` directory.
         ValueError: If `cfg.checkpoint_path` is unset, or if the resumed topology crosses the
-            sharded/non-sharded boundary relative to the one recorded in the checkpoint.
+            sharded/non-sharded boundary relative to the one recorded in the checkpoint. With
+            an initialized process group, any rank's local failure is reported on every rank,
+            preserving the original local exception as its cause.
     """
-    training_state_dir = _resume_checkpoint_dir(cfg) / TRAINING_STATE_DIR
-    if not training_state_dir.is_dir():
-        raise NotADirectoryError(training_state_dir)
-    metadata = load_training_metadata(training_state_dir)
-    _guard_resume_changes(cfg, metadata)
-    load_rng_state(training_state_dir)
+    error = None
+    metadata = None
+    try:
+        training_state_dir = _resume_checkpoint_dir(cfg) / TRAINING_STATE_DIR
+        if not training_state_dir.is_dir():
+            raise NotADirectoryError(training_state_dir)
+        metadata = load_training_metadata(training_state_dir)
+        _guard_resume_changes(cfg, metadata)
+        load_rng_state(training_state_dir)
+    except Exception as invalid:
+        error = invalid
+    # No collective runs inside local metadata/guard/RNG loading, including filesystem errors.
+    if dist.is_initialized():
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if dist.get_backend() == "nccl"
+            else torch.device("cpu")
+        )
+        failed = torch.tensor(int(error is not None), dtype=torch.int64, device=device)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if bool(failed):
+            raise ValueError(
+                "Training resume phase-one metadata/guard/RNG loading failed on at least one rank."
+            ) from error
+    elif error is not None:
+        raise error
+    assert metadata is not None
     return metadata["step"]
 
 

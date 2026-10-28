@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,6 +21,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     torch_recurrent_gated_delta_rule,
 )
 
+from .loss_perceptron_isaac import _global_sum_detached
 from .mk1_checkpoint_contract import (
     Mk1CheckpointContract,
     SafetensorsInventory,
@@ -40,6 +42,7 @@ from .modeling_qwen36_moe import (
     Mk1Qwen36MoeConfig,
 )
 from .moe_auxiliary_losses import materialize_router_auxiliaries
+from .tensor_stream import TensorStream
 from .trained_package import VerifiedTrainedTensorStorage
 
 TORCH_SDPA_ATTENTION_BACKEND: Literal["torch_sdpa_v1"] = "torch_sdpa_v1"
@@ -99,6 +102,7 @@ class Mk1Qwen36VLAModel(GenesisQwen36Model):
     _embed_text = Qwen35VLAModel._embed_text
     _embed_vector = Qwen35VLAModel._embed_vector
     _embed_vision = Qwen35VLAModel._embed_vision
+    _embed_sharded_modalities = Qwen35VLAModel._embed_sharded_modalities
     embed_stream = Qwen35VLAModel.embed_stream
     forward = Qwen35VLAModel.forward
 
@@ -123,17 +127,48 @@ class Mk1Qwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
     action_expert = Qwen35VLAForActionGeneration.action_expert
     sample_action = Qwen35VLAForActionGeneration.sample_action
 
-    def train_forward(self, tensor_stream: Any) -> ModelOutput:
+    def train_forward(self, tensor_stream: TensorStream) -> ModelOutput:
         """Capture every forwarded router position without retaining mutable per-layer loss state."""
         out = self.model(tensor_stream, output_router_auxiliaries=True)
         layers = out.get("router_auxiliaries", ())
         if len(layers) != len(self.model.language_model.layers):
             raise RuntimeError("Native training must return one router auxiliary per backbone layer.")
+        if tensor_stream.collective_only:
+            # Keep the finite collective forward, but do not materialize dummy router
+            # positions or top-k dispatch counts. Genuine padding is never masked here.
+            layers = tuple(
+                replace(
+                    layer,
+                    physical_logits=layer.physical_logits[:0],
+                    logical_probabilities=layer.logical_probabilities[:0],
+                    selected_experts=layer.selected_experts[:0],
+                )
+                for layer in layers
+            )
+        positions = out.last_hidden_state.new_tensor(
+            0
+            if tensor_stream.collective_only
+            else out.last_hidden_state.shape[0] * out.last_hidden_state.shape[1]
+        )
+        if bool(_global_sum_detached(positions) > 0):
+            additional_info = materialize_router_auxiliaries(layers)
+        else:
+            # A whole empty microbatch can belong to a nonempty update window.
+            # There is no router objective for it, but all ranks keep its graph.
+            zeros = [layer.physical_logits.sum() * 0 for layer in layers]
+            additional_info = {
+                "load_balancing_loss": zeros,
+                "router_z_loss": zeros,
+                "router_token_count": [positions.detach() for _ in layers],
+                "router_dispatch_counts": [
+                    positions.new_zeros(layer.num_real_experts + layer.num_null_experts) for layer in layers
+                ],
+            }
         return ModelOutput(
             final_activations=out.last_hidden_state,
             final_embedding=self.lm_head,
             flow_matching_expert=self.model.action_expert,
-            additional_info=materialize_router_auxiliaries(layers),
+            additional_info=additional_info,
         )
 
 

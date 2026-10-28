@@ -36,6 +36,7 @@ from lerobot.utils.hub import HubMixin
 from lerobot.utils.import_utils import _peft_available, require_package
 
 from .chunk import ChunkPolicySpec, ExecutionMode, FeatureSpec
+from .training_loss_normalization import TrainingLossNormalizer
 from .utils import log_model_loading_keys
 
 if TYPE_CHECKING or _peft_available:
@@ -124,6 +125,10 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 "Override supports_text_generation() too (returning True, or a "
                 "checkpoint-conditional value), otherwise the text head is never used."
             )
+
+    def get_training_loss_normalizer(self) -> TrainingLossNormalizer | None:
+        """Opt into stock accumulation-window objective counting before distributed wrapping."""
+        return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
         """Serialize this policy's parameters (and config) into `save_directory`.

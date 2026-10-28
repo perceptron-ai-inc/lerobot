@@ -15,12 +15,17 @@ from typing import Any, Literal, Optional
 from collections.abc import Sequence
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+from torch.distributed.fsdp import FSDPModule
 
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5PreTrainedModel
+
+from lerobot.utils.random_utils import deserialize_rng_state, serialize_rng_state
 
 # --- Genesis TensorStream layout / mrope / context-mask utilities ---
 from .mk1_checkpoint_contract import reject_unsupported_action_expert_semantics
@@ -30,7 +35,7 @@ from .rtc import (
     ActionExpertStepModulation,
     reject_rtc_prefix,
 )
-from .tensor_stream import TensorStream, TextType, VisionType, group_streams
+from .tensor_stream import ModalityType, TensorStream, TextType, VectorType, VisionType, group_streams
 from .tensor_stream_utils import (
     build_action_context_mask,
     compute_mrope_pos_tensor,
@@ -42,6 +47,19 @@ from .tensor_stream_utils import (
 # The continuous-action marker type that delimits where the action chunk begins. Genesis sets
 # FLOW_ACTION_TEXT_TYPE = TextType.action_c (value 15); the expert never attends to action tokens.
 FLOW_ACTION_TEXT_TYPE = TextType.action_c
+
+
+def _ordered_modality_input(payload: torch.Tensor, preceding: torch.Tensor) -> torch.Tensor:
+    """Keep exact input bytes while ordering encoder backward through one unused element."""
+    if not preceding.requires_grad:
+        return payload
+    # The unselected scalar retains a zero-gradient edge without a whole-tensor sum,
+    # arithmetic on real input bytes (including signed zero), or detached active math.
+    return torch.where(
+        torch.ones((), dtype=torch.bool, device=payload.device),
+        payload,
+        preceding.reshape(-1)[0].to(device=payload.device, dtype=payload.dtype),
+    )
 
 
 def normalize_vector_tokens(vector_tokens: torch.Tensor, max_states: int | None) -> torch.Tensor:
@@ -1484,6 +1502,76 @@ class Qwen35VLAModel(Qwen3_5Model):
         feats = self.get_image_features(patches, image_grid_thw=grid_thw)
         return torch.cat(list(feats.pooler_output), dim=0)
 
+    def _embed_sharded_modalities(
+        self,
+        tensor_stream: TensorStream,
+        payloads: dict[ModalityType, torch.Tensor],
+        grids: dict[Any, list[list[int]]],
+    ) -> tuple[dict[ModalityType, torch.Tensor], torch.Tensor]:
+        """Run the same encoder schedule on every training rank, without adding stream events."""
+        conditional_types = (VectorType.vector, VisionType.I, VisionType.P)
+        presence = torch.tensor(
+            [int(kind in payloads) for kind in conditional_types],
+            device=tensor_stream.device,
+            dtype=torch.int64,
+        )
+        dist.all_reduce(presence, op=dist.ReduceOp.MAX)
+
+        token_types = [kind for kind in payloads if not isinstance(kind, (VectorType, VisionType))]
+        token_payload = (
+            torch.cat([payloads[kind] for kind in token_types])
+            if token_types
+            else torch.zeros((1, 1), device=tensor_stream.device, dtype=torch.long)
+        )
+        rng = serialize_rng_state() if not token_types else None
+        try:
+            tokens = self._embed_text(token_payload)
+        finally:
+            if rng is not None:
+                deserialize_rng_state(rng)
+        # Token lookup is row-independent; one call can be split back into the original types.
+        embedded = (
+            dict(
+                zip(token_types, tokens.split([payloads[kind].shape[0] for kind in token_types]), strict=True)
+            )
+            if token_types
+            else {}
+        )
+        preceding = tokens
+        vcfg = self.config.vision_config
+        merge = vcfg.spatial_merge_size
+        for kind, present in zip(conditional_types, presence.tolist(), strict=True):
+            if not present:
+                continue
+            missing = kind not in payloads
+            encoder = self.vector_embedding if kind == VectorType.vector else self.visual
+            if not missing:
+                payload = payloads[kind]
+            elif kind == VectorType.vector:
+                payload = tokens.new_zeros(1, self.config.vector_max_states)
+            else:
+                patch_width = vcfg.in_channels * vcfg.temporal_patch_size * vcfg.patch_size**2
+                payload = tokens.new_zeros(merge**2, patch_width)
+            # Do not turn a frozen encoder into an input-gradient/backbone backward path.
+            if payload.requires_grad or any(parameter.requires_grad for parameter in encoder.parameters()):
+                payload = _ordered_modality_input(payload, preceding)
+            rng = serialize_rng_state() if missing else None
+            try:
+                if kind == VectorType.vector:
+                    result = self._embed_vector(payload)
+                else:
+                    grid = [[1, merge, merge]] if missing else grids[kind]
+                    grid_thw = torch.tensor(grid, dtype=torch.long, device=tensor_stream.device)
+                    result = self._embed_vision(payload, grid_thw)
+            finally:
+                if rng is not None:
+                    deserialize_rng_state(rng)
+            if not missing:
+                embedded[kind] = result
+            if result.requires_grad:
+                preceding = result
+        return embedded, preceding
+
     def embed_stream(self, tensor_stream: TensorStream) -> torch.Tensor:
         """Embed each modality in place and compact -> ``[B, T, D]`` interleaved embeddings.
 
@@ -1501,19 +1589,35 @@ class Qwen35VLAModel(Qwen3_5Model):
             for event in stream:
                 grids[event.type].append(event.dims(virtual=False))
 
-        embedded: dict[Any, torch.Tensor] = {}
-        for stype, payload in per_modality_compact.items():
-            mod_name = stype.modality.__name__
-            if mod_name == "VisionType":
-                grid_thw = torch.tensor(grids[stype], dtype=torch.long, device=tensor_stream.device)
-                embedded[stype] = self._embed_vision(payload, grid_thw)
-            elif mod_name == "VectorType":
-                embedded[stype] = self._embed_vector(payload)
-            else:
-                embedded[stype] = self._embed_text(payload)
+        # Serving and ordinary local calls keep their original encoder/RNG semantics.
+        sharded_training = (
+            self.training
+            and torch.is_grad_enabled()
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and any(isinstance(module, FSDPModule) for module in self.modules())
+        )
+        preceding = None
+        embedded: dict[Any, torch.Tensor]
+        if sharded_training:
+            embedded, preceding = self._embed_sharded_modalities(tensor_stream, per_modality_compact, grids)
+        else:
+            embedded = {}
+            for stype, payload in per_modality_compact.items():
+                mod_name = stype.modality.__name__
+                if mod_name == "VisionType":
+                    grid_thw = torch.tensor(grids[stype], dtype=torch.long, device=tensor_stream.device)
+                    embedded[stype] = self._embed_vision(payload, grid_thw)
+                elif mod_name == "VectorType":
+                    embedded[stype] = self._embed_vector(payload)
+                else:
+                    embedded[stype] = self._embed_text(payload)
 
         embedded_ts = reconstruct_tensor_stream_from_compact_dict(tensor_stream, embedded)
-        return embedded_ts.compact()  # [B, T, D]
+        compact = embedded_ts.compact()  # [B, T, D]
+        # Even a text-only rank must backward through the last scheduled encoder first.
+        return compact if preceding is None else _ordered_modality_input(compact, preceding)
 
     def forward(self, tensor_stream: TensorStream, **kwargs: Any) -> BaseModelOutputWithPast:
         """Run the VLM over the rendered stream and return post-final-norm activations.

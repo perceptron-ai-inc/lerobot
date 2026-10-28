@@ -946,6 +946,8 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                     "ISAAC training requires an explicit episode-relative dataset timestamp; "
                     "the stateless processor never synthesizes model time."
                 )
+            if not bool(torch.isfinite(actions).all()):
+                raise ValueError("ISAAC training actions must contain only finite values before filtering.")
             if actions.ndim != 3:
                 raise ValueError(
                     f"ISAAC training actions must be shaped [B, H, D], got {tuple(actions.shape)}."
@@ -1017,27 +1019,13 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                     continue
                 streams.append(stream)
                 kept_indices.append(index)
-            if distributed and not self._all_distributed_ranks_have_usable_samples(bool(streams)):
-                # Every rank participates in this validation collective before any rank can enter
-                # denominator/model collectives. Fail together instead of keeping an outlier with
-                # the threshold disabled or letting one rank raise alone and hang its peers.
-                raise IsaacActionOutlierError(
-                    "At least one distributed rank has no usable samples after ISAAC outlier and "
-                    f"max_sequence_length={max_sequence_length} filtering. Aborting this update on "
-                    "every rank before loss collectives; verify normalization stats, suite routing, "
-                    "and the sequence-length budget."
-                )
-            if not streams:
-                # No collectives to keep in lockstep: an all-outlier microbatch means the
-                # normalization stats do not match the data, and training on it clipped
-                # would only converge to a silently wrong policy.
-                raise IsaacActionOutlierError(
-                    "Every ISAAC training sample in this microbatch exceeded "
-                    f"train_skip_outlier_threshold={self.train_skip_outlier_threshold}. This "
-                    "usually means the normalization stats do not match the dataset (wrong "
-                    "stats file or wrong per-suite routing)."
-                )
             complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] = kept_indices
+            if not streams:
+                # Window-level counts decide global eligibility. Do not duplicate rejected
+                # samples to make a rank participate in model/loss collectives.
+                from .tensor_stream import TensorStream
+
+                return TensorStream.collective_dummy()
             return renderer.collate(streams)
         dtype = _dtype_from_name(self.dtype)
         streams = []

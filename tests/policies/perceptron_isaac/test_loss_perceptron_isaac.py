@@ -134,7 +134,7 @@ def test_joint_loss_sums_token_normalized_ce_and_chunk_normalized_flow():
     assert result.metrics["flow_chunk_count"] == 1
 
 
-def test_loss_denominators_count_valid_elements_across_all_flow_draws():
+def test_loss_denominators_count_chunks_independent_of_elements_and_draws():
     stream = flow_stream(action_is_pad=[False, True])
 
     denominators = perceptron_isaac_loss_denominators(
@@ -147,8 +147,8 @@ def test_loss_denominators_count_valid_elements_across_all_flow_draws():
         exclude_non_agent_roles=True,
     )
 
-    # One valid action row x two action dimensions x eight flow draws.
-    torch.testing.assert_close(denominators["flow"], torch.tensor(16.0))
+    # Every chunk has equal weight after its valid entries and draws are averaged.
+    torch.testing.assert_close(denominators["flow"], torch.tensor(1.0))
 
 
 def test_loss_denominators_include_joint_text_tokens():
@@ -163,7 +163,7 @@ def test_loss_denominators_include_joint_text_tokens():
     )
 
     assert set(denominators) == {"flow", "text"}
-    torch.testing.assert_close(denominators["flow"], torch.tensor(4.0))
+    torch.testing.assert_close(denominators["flow"], torch.tensor(1.0))
     assert denominators["text"] > 0
 
 
