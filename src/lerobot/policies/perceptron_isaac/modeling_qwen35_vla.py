@@ -23,6 +23,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5PreTrainedModel
 
 # --- Genesis TensorStream layout / mrope / context-mask utilities ---
+from .mk1_checkpoint_contract import reject_unsupported_action_expert_semantics
 from .rtc import (
     DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION,
     DIT_ACTION_EXPERT_CONFIG_V1_FIELDS,
@@ -1370,12 +1371,13 @@ class DiTActionExpertArgs:
 
 
 def _validate_action_expert_contract(action_expert_cfg: dict[str, Any]) -> DiTActionExpertArgs:
+    reject_unsupported_action_expert_semantics(action_expert_cfg)
     schema_version = action_expert_cfg.get("schema_version")
     if schema_version != DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION:
         raise ValueError(
             "action_expert metadata must carry "
             f"schema_version={DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION}; got {schema_version!r}. "
-            "Re-export the checkpoint with the current converter."
+            "This action-expert schema is unsupported."
         )
     expert_type = action_expert_cfg.get("type")
     if expert_type != "dit":

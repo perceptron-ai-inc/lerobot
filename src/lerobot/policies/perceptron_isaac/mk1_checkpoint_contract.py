@@ -97,6 +97,26 @@ class Mk1CheckpointContractError(ValueError):
     """The checkpoint cannot be interpreted as the allowlisted MK1 VLA ABI."""
 
 
+def reject_unsupported_action_expert_semantics(action: Mapping[str, Any]) -> None:
+    """Refuse schema-2/per-layer conditioning before model construction."""
+    schema = action.get("schema_version")
+    layer_fields = {"context_source", "context_layers", "context_hidden_norm"} & action.keys()
+    if schema == 2 or layer_fields:
+        raise Mk1CheckpointContractError(
+            f"action_expert schema_version={schema!r}: per-layer/layer_hidden context conditioning "
+            "is unsupported; only the schema-1 final-hidden context contract is implemented."
+        )
+
+
+def validate_checkpoint_action_expert_semantics(raw: Mapping[str, Any]) -> None:
+    """Check every declared action block without normalizing or rewriting source metadata."""
+    for block in (raw, raw.get("isaac05_vla"), raw.get("genesis_vla")):
+        if isinstance(block, Mapping):
+            action = block.get("action_expert")
+            if isinstance(action, Mapping):
+                reject_unsupported_action_expert_semantics(action)
+
+
 @dataclass(frozen=True)
 class Mk1MoeContract:
     num_real_experts: int
@@ -288,6 +308,7 @@ class Mk1CheckpointContract:
         therefore never accept a tiny checkpoint accidentally.
         """
         root = _object(raw_config, "config")
+        validate_checkpoint_action_expert_semantics(root)
         native_format = root.get("model_type") == "isaac_0_5"
         if native_format:
             root = _normalize_isaac05(root)

@@ -1559,6 +1559,13 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             )
         cls._resolve_checkpoint_local_paths(config, checkpoint_root)
         verified_storage = cls._verify_packaged_contract_digests(config, checkpoint_root)
+        # Lazy FP32 loading must refuse unsupported context semantics as early as eager loading.
+        if config.hf_model_path:
+            from .mk1_checkpoint_contract import validate_checkpoint_action_expert_semantics
+
+            validate_checkpoint_action_expert_semantics(
+                load_json_object(Path(config.hf_model_path) / "config.json")
+            )
         cls._set_checkpoint_local_vocab_path(config)
         policy = cls(config, verified_tensor_storage=verified_storage)
         # Raw exports keep their documented parent-relative inference assets.
