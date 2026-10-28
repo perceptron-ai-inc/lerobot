@@ -926,7 +926,7 @@ def test_portable_isaac05_loads_native_fp32_without_checkpoint_python(tmp_path: 
     source_bytes = (root / "config.json").read_bytes()
     action = raw["action_expert"]
 
-    for field, value_override in (("rtc_probability", 0.75), ("unknown_field", True)):
+    for field, value_override in (("rtc_probability", 1.25), ("unknown_field", True)):
         invalid = copy.deepcopy(raw)
         invalid["action_expert"][field] = value_override
         invalid["isaac05_vla"]["action_expert"][field] = value_override

@@ -1,13 +1,11 @@
-"""Native DiT/RTC contracts, analytic row conditioning, and legacy MolmoAct compatibility."""
+"""Native DiT metadata, retired RTC refusal, and ordinary MolmoAct compatibility."""
 
 import pytest
 import torch
 
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
-from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
-    build_action_expert_head,
-)
+from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import build_action_expert_head
 
 _VLM_DIM = 16
 
@@ -91,28 +89,17 @@ def test_unknown_expert_type_still_fails_loud():
         build_action_expert_head({"type": "genesis-flow-v2"}, vlm_dim=_VLM_DIM)
 
 
-def test_sample_rejects_prefix_beyond_declared_rtc_capability():
-    """The checkpoint contract's rtc_max_delay_steps gates prefix inpainting.
-
-    Genesis gates serve-time RTC on the checkpoint's own trained budget; a non-RTC
-    expert (budget 0) must reject any pinned prefix instead of silently inpainting.
-    """
-    head = build_action_expert_head(_dit_contract(), vlm_dim=_VLM_DIM)
-    vlm_activations = torch.zeros(1, 3, _VLM_DIM)
-    prefix = torch.zeros(1, 2, 4)
-    with pytest.raises(ValueError, match="maximum supported RTC prefix"):
-        head.sample(vlm_activations, action_prefix=prefix, prefix_length=2)
-
-
-def test_sample_accepts_prefix_within_an_explicitly_configured_budget():
-    """A developer-supplied molmoact config may opt in to a prefix budget; a genesis
-    contract may not (see the rejection test below) because the vendored sampler's
-    single-flow-time conditioning differs from genesis's RTC regime."""
-    head = build_action_expert_head(_molmoact_cfg(rtc_max_delay_steps=2), vlm_dim=_VLM_DIM)
-    vlm_activations = torch.zeros(1, 3, _VLM_DIM)
-    prefix = torch.zeros(1, 2, 4)
-    actions = head.sample(vlm_activations, action_prefix=prefix, prefix_length=2)
-    assert actions.shape == (1, 6, 4)
+@pytest.mark.parametrize("kind", ["dit", "molmoact"])
+@pytest.mark.parametrize("budget", [0, 2])
+def test_source_rtc_budget_never_enables_execution(kind, budget):
+    config = (
+        _dit_contract(rtc_max_delay_steps=budget)
+        if kind == "dit"
+        else _molmoact_cfg(rtc_max_delay_steps=budget)
+    )
+    head = build_action_expert_head(config, vlm_dim=_VLM_DIM)
+    with pytest.raises(ValueError, match="RTC"):
+        head.sample(torch.zeros(1, 3, _VLM_DIM), action_prefix=torch.zeros(1, 2, 4), prefix_length=2)
 
 
 def test_dit_contract_declaring_rtc_training_is_supported():
@@ -122,87 +109,24 @@ def test_dit_contract_declaring_rtc_training_is_supported():
         build_action_expert_head(_dit_contract(rtc_max_delay_steps=0, rtc_probability=0.5), vlm_dim=_VLM_DIM)
 
 
-@pytest.mark.parametrize("case", ["conditioning", "sampling", "rows_and_k", "legacy"])
-def test_dit_rtc_analytic_core(case):
-    # Construction is the declared RED gate; no checkpoint source is imported.
+def test_ordinary_dit_matches_legacy_values_and_rng():
     head = build_action_expert_head(
-        _dit_contract(rtc_max_delay_steps=2, rtc_probability=0.5, rtc_delay_sampling="poisson"),
-        vlm_dim=_VLM_DIM,
-    )
-    torch.manual_seed(123)
+        _dit_contract(rtc_max_delay_steps=2, rtc_probability=0.5), vlm_dim=_VLM_DIM
+    ).eval()
+    legacy = build_action_expert_head(_molmoact_cfg(), vlm_dim=_VLM_DIM).eval()
     with torch.no_grad():
         for parameter in head.parameters():
             parameter.uniform_(-0.2, 0.2)
-    head.eval()
-    ae = head.action_expert
+    legacy.load_state_dict(head.state_dict(), strict=True)
     vlm = torch.randn(2, 3, _VLM_DIM)
     vlm_mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
-    row_mask = torch.tensor(
-        [[True, False, False, False, False, False], [True, True, False, False, False, False]]
-    )
+    x = torch.randn(2, 6, 4)
     times = torch.tensor([0.25, 0.75])
-    if case == "conditioning":
-        from lerobot.policies.perceptron_isaac.rtc import project_rtc_modulation
-
-        suffix, prefix, mask = ae.prepare_rtc_conditioning(times, row_mask)
-        torch.testing.assert_close(suffix, ae._time_conditioning(times), rtol=0, atol=0)
-        torch.testing.assert_close(prefix, ae._time_conditioning(torch.ones(1)), rtol=0, atol=0)
-        for layer, chunks in [(ae.blocks[0], 9), (ae.final_layer, 2)]:
-            actual = torch.cat(
-                project_rtc_modulation(suffix, prefix, mask, modulation=layer.modulation, chunks=chunks),
-                dim=-1,
-            )
-            expected = torch.where(mask, layer.modulation(prefix)[:, None], layer.modulation(suffix)[:, None])
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    elif case == "sampling":
-        prefix = torch.randn(2, 2, 3)
-        observed = []
-
-        def record(module, args, kwargs):
-            observed.append((args[0].detach().clone(), kwargs["rtc_prefix_conditioning"].detach().clone()))
-
-        handle = ae.blocks[0].register_forward_pre_hook(record, with_kwargs=True)
-        try:
-            actions = head.sample(vlm, vlm_mask, action_prefix=prefix, prefix_length=[1, 2], action_dim=3)
-        finally:
-            handle.remove()
-        torch.testing.assert_close(actions[0, :1, :3], prefix[0, :1], rtol=0, atol=0)
-        torch.testing.assert_close(actions[1, :2, :3], prefix[1, :2], rtol=0, atol=0)
-        assert torch.count_nonzero(actions[..., 3:]) == 0
-        assert len(observed) == 2
-        for _, conditioning in observed:
-            torch.testing.assert_close(conditioning, ae._time_conditioning(torch.ones(1)), rtol=0, atol=0)
-        with pytest.raises(ValueError, match="maximum supported RTC prefix"):
-            head.sample(vlm, action_prefix=torch.zeros(2, 3, 4))
-    elif case == "rows_and_k":
-        x = torch.randn(2, 6, 4)
-        valid = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 0]])
-        context = head._build_single_context(
-            vlm, vlm_mask, valid, seq_len=6, batch_size=2, device=x.device, dtype=x.dtype
-        )
-        rtc = ae.prepare_rtc_conditioning(times, row_mask)
-        row_times = torch.where(row_mask, 1.0, times[:, None])
-        compact = ae.forward_with_context(x, times, context=context, rtc_conditioning=rtc)
-        rows = ae.forward_with_context(x, row_times, context=context)
-        torch.testing.assert_close(compact, rows)
-        assert torch.count_nonzero(rows * (1 - valid[..., None])) == 0
-        altered = vlm.clone()
-        altered[~vlm_mask.bool()] += 100
-        outputs = head(
-            vlm, vlm_mask, torch.stack([x, x]), torch.stack([1 - row_times, 1 - row_times]), action_mask=valid
-        )
-        torch.testing.assert_close(outputs[0], rows)
-        torch.testing.assert_close(outputs[1], rows)
-        torch.testing.assert_close(head(altered, vlm_mask, x, 1 - row_times, action_mask=valid), rows)
-    else:
-        legacy = build_action_expert_head(_molmoact_cfg(), vlm_dim=_VLM_DIM).eval()
-        legacy.load_state_dict(head.state_dict(), strict=True)
-        x = torch.randn(2, 6, 4)
-        torch.testing.assert_close(
-            head(vlm, vlm_mask, x, times), legacy(vlm, vlm_mask, x, times), rtol=0, atol=0
-        )
-        torch.manual_seed(99)
-        actual = head.sample(vlm, vlm_mask)
-        torch.manual_seed(99)
-        expected = legacy.sample(vlm, vlm_mask)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(head(vlm, vlm_mask, x, times), legacy(vlm, vlm_mask, x, times), rtol=0, atol=0)
+    torch.manual_seed(99)
+    actual = head.sample(vlm, vlm_mask)
+    actual_rng = torch.get_rng_state()
+    torch.manual_seed(99)
+    expected = legacy.sample(vlm, vlm_mask)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(actual_rng, torch.get_rng_state())

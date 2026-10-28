@@ -152,16 +152,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # Settle frames never advance the episode clock -- see PerceptronIsaacPolicy.select_action.
     num_settle_steps: int = 0
     settle_gripper: float = -1.0
-    # RTC (real-time chunking): NOT SUPPORTED -- __post_init__ rejects any non-zero value, so
-    # this must stay 0. Two independent gates keep it off: (1) the vendored MolmoAct expert
-    # (pre-genesis-#3402) collapses per-token tau in its SinusoidalTimeEmbedding
-    # (`timesteps.view(B,-1)[:,0]`), so per-row prefix timesteps are ignored -- genesis HEAD's
-    # DiT expert has since fixed this, so that argument is vendored-head-specific; and (2) the
-    # checkpoint contract declares its trained RTC budget (`rtc_max_delay_steps`, 0 for every
-    # deployed package), which MolmoActExpertHead.sample enforces against any requested
-    # action prefix. Reproducing the Genesis flow-eval regime (exec horizon 12 with a 4-row
-    # pinned prefix) would require an RTC-trained checkpoint plus enabling the prefix branch
-    # in select_action.
+    # Compatibility-only RTC-off field. RTC execution is retired even for RTC-capable source weights.
     rtc_prefix_length: int = 0
 
     # --- vision / cameras ---
@@ -475,7 +466,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         self.config_toml_path = None
         self.per_suite_stats_dir = None
         if self.rtc_prefix_length != 0:
-            raise ValueError("Perceptron Isaac MolmoAct no-scene LIBERO eval requires rtc_prefix_length=0.")
+            raise ValueError("Perceptron Isaac RTC execution is unsupported; rtc_prefix_length must be 0.")
         if self.train_samples_per_chunk < 1:
             raise ValueError("train_samples_per_chunk must be >= 1.")
         if self.train_skip_outlier_threshold < 0.0:

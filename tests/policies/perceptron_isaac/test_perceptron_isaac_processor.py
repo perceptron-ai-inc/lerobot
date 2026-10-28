@@ -1858,8 +1858,6 @@ def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
             "num_steps": 12,
             "action_dim": 7,
             "num_action_steps": 50,
-            "action_prefix": None,
-            "prefix_length": None,
             "num_flow_samples": 4,
         }
     ]

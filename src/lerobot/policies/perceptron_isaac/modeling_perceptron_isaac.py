@@ -66,6 +66,7 @@ from .processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_STREAM_KEY,
     PerceptronIsaacMharmonyPackProcessorStep,
 )
+from .rtc import reject_rtc_prefix
 from .trained_package import (
     CANONICAL_INNER_MODEL_STORAGE,
     MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
@@ -684,7 +685,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._online_state_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
         self._rollout_batch_size: int | None = None
         self._online_render_step: PerceptronIsaacMharmonyPackProcessorStep | None = None
-        self._last_norm_chunk: Tensor | None = None
         self._frame_index: int = -1
         # Settle frames are counted separately so they never advance the episode clock.
         self._settle_index: int = 0
@@ -1265,14 +1265,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         postprocessor is responsible for action unnormalization and clipping.
         """
         self._require_deployable_action_artifact()
-        # Fail fast on the RTC inference engine: it calls this method directly (bypassing
-        # select_action's online history + settle clock) and passes RTC-specific kwargs that this
-        # policy does not implement. The MolmoAct expert is not RTC-trained; use --inference.type=sync.
+        reject_rtc_prefix(action_prefix, prefix_length)
+        # Fail before loading or advancing clocks on retired RTC inference requests.
         if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
             raise NotImplementedError(
-                "perceptron_isaac does not support RTC inference (the MolmoAct expert is not "
-                "RTC-trained and this policy owns its own observation clock). Use "
-                "--inference.type=sync."
+                "perceptron_isaac does not support RTC inference. Use --inference.type=sync."
             )
         self.eval()
         if self._isaac_model is None:
@@ -1301,8 +1298,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 num_steps=self.config.num_inference_steps,
                 action_dim=self.config.action_dim,
                 num_action_steps=self.config.chunk_size,
-                action_prefix=action_prefix,
-                prefix_length=prefix_length,
                 num_flow_samples=n_flow,
             )
 
@@ -1342,12 +1337,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         if not bool(torch.isfinite(actions_norm).all()):
             raise RuntimeError("Perceptron Isaac model returned non-finite normalized actions.")
-        self._last_norm_chunk = actions_norm[0].detach()
         return actions_norm[:, :, : self.config.action_dim].float()
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Any], **kwargs) -> Tensor:
         """Serve one normalized action per call; refill chunks through ``predict_action_chunk``."""
+        reject_rtc_prefix(kwargs.get("action_prefix"), kwargs.get("prefix_length"))
+        if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
+            raise NotImplementedError("perceptron_isaac does not support RTC inference; use sync inference.")
         self._require_deployable_action_artifact()
         self.eval()
         if ACTION in batch:
@@ -1388,18 +1385,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._frame_index += 1
 
         if len(self._queues[ACTION]) == 0:
-            action_prefix, prefix_length = None, None
-            rtc_p = int(getattr(self.config, "rtc_prefix_length", 0) or 0)
-            prev = getattr(self, "_last_norm_chunk", None)
-            if rtc_p > 0 and prev is not None:
-                start = self.config.n_action_steps
-                if start + rtc_p <= prev.shape[0]:
-                    action_prefix = prev[start : start + rtc_p].unsqueeze(0)
-                    prefix_length = rtc_p
             model_batch = batch if has_stream else self._render_online_stream_batch(batch)
-            actions = self.predict_action_chunk(
-                model_batch, action_prefix=action_prefix, prefix_length=prefix_length
-            )
+            actions = self.predict_action_chunk(model_batch)
             actions = actions[:, : self.config.n_action_steps]
             self._queues[ACTION].extend(actions.transpose(0, 1))
         return self._queues[ACTION].popleft()

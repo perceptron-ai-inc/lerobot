@@ -93,12 +93,9 @@ class _ProprioChunkSampler(nn.Module):
         num_steps: int,
         action_dim: int,
         num_action_steps: int,
-        action_prefix: Tensor | None,
-        prefix_length: int | None,
         num_flow_samples: int,
     ) -> Tensor:
         assert num_steps == num_flow_samples == 1
-        assert action_prefix is None and prefix_length is None
         self.inputs.append(stream)
         states = torch.stack([_state_event(stream, index)[:action_dim] for index in range(stream.shape[0])])
         offsets = torch.arange(num_action_steps, dtype=states.dtype) * 0.02

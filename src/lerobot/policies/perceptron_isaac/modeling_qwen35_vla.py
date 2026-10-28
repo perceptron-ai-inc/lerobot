@@ -28,11 +28,7 @@ from .rtc import (
     DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION,
     DIT_ACTION_EXPERT_CONFIG_V1_FIELDS,
     ActionExpertStepModulation,
-    integrate_rtc_euler,
-    materialize_rtc_action_prefix,
-    prepare_rtc_conditioning,
-    project_rtc_modulation,
-    resolve_rtc_action_prefix,
+    reject_rtc_prefix,
 )
 from .tensor_stream import TensorStream, TextType, VisionType, group_streams
 from .tensor_stream_utils import (
@@ -512,23 +508,8 @@ class ActionExpertBlock(nn.Module):
         is_causal: bool = False,
         modulation: tuple[torch.Tensor, ...] | None = None,
         rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-        rtc_suffix_conditioning: torch.Tensor | None = None,
-        rtc_prefix_conditioning: torch.Tensor | None = None,
-        rtc_prefix_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if rtc_suffix_conditioning is not None:
-            assert rtc_prefix_conditioning is not None
-            assert rtc_prefix_mask is not None
-            if modulation is not None:
-                raise ValueError("precomputed modulation and RTC conditioning are mutually exclusive.")
-            modulation = project_rtc_modulation(
-                rtc_suffix_conditioning,
-                rtc_prefix_conditioning,
-                rtc_prefix_mask,
-                modulation=self.modulation,
-                chunks=9,
-            )
-        elif modulation is None:
+        if modulation is None:
             modulation = self.modulation(conditioning).chunk(9, dim=-1)
         (
             shift_msa,
@@ -572,23 +553,8 @@ class ActionExpertFinalLayer(nn.Module):
         conditioning: torch.Tensor,
         *,
         modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
-        rtc_suffix_conditioning: torch.Tensor | None = None,
-        rtc_prefix_conditioning: torch.Tensor | None = None,
-        rtc_prefix_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if rtc_suffix_conditioning is not None:
-            assert rtc_prefix_conditioning is not None
-            assert rtc_prefix_mask is not None
-            if modulation is not None:
-                raise ValueError("precomputed modulation and RTC conditioning are mutually exclusive.")
-            modulation = project_rtc_modulation(
-                rtc_suffix_conditioning,
-                rtc_prefix_conditioning,
-                rtc_prefix_mask,
-                modulation=self.modulation,
-                chunks=2,
-            )
-        elif modulation is None:
+        if modulation is None:
             modulation = self.modulation(conditioning).chunk(2, dim=-1)
         shift, scale = modulation
         return self.linear(_modulate(self.norm(x), shift, scale))
@@ -716,17 +682,6 @@ class ActionExpert(nn.Module):
         for module in list(self.time_embed.children())[1:]:
             conditioning = module(conditioning)
         return conditioning
-
-    def prepare_rtc_conditioning(
-        self,
-        base_timesteps: torch.Tensor,
-        prefix_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return prepare_rtc_conditioning(
-            base_timesteps,
-            prefix_mask,
-            time_conditioning=self._time_conditioning,
-        )
 
     def _project_kv_tensor(self, x: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
         flat = self.context_norm(proj(x))
@@ -863,7 +818,6 @@ class ActionExpert(nn.Module):
         *,
         context: ActionExpertContext,
         modulation: ActionExpertStepModulation | None = None,
-        rtc_conditioning: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         bsz, seq_len, _ = actions.shape
         if seq_len > self.config.max_action_horizon:
@@ -871,20 +825,13 @@ class ActionExpert(nn.Module):
                 f"Action sequence length {seq_len} exceeds configured max_action_horizon={self.config.max_action_horizon}"
             )
         block_modulations: Sequence[tuple[torch.Tensor, ...] | None]
-        if rtc_conditioning is not None:
-            if modulation is not None:
-                raise ValueError("precomputed modulation and RTC conditioning are mutually exclusive.")
-            rtc_suffix_conditioning, rtc_prefix_conditioning, rtc_prefix_mask = rtc_conditioning
-            conditioning = rtc_suffix_conditioning
-            block_modulations = [None] * len(self.blocks)
-            final_modulation = None
-        elif modulation is None:
-            rtc_suffix_conditioning = rtc_prefix_conditioning = rtc_prefix_mask = None
+        if timesteps.shape != (bsz,):
+            raise ValueError("RTC/per-row time conditioning is unsupported; timesteps must have shape [B].")
+        if modulation is None:
             conditioning = self._time_conditioning(timesteps)
             block_modulations = [None] * len(self.blocks)
             final_modulation = None
         else:
-            rtc_suffix_conditioning = rtc_prefix_conditioning = rtc_prefix_mask = None
             conditioning = modulation.conditioning
             block_modulations = modulation.block_modulations
             final_modulation = modulation.final_modulation
@@ -903,9 +850,6 @@ class ActionExpert(nn.Module):
                 is_causal=self.config.causal_attn,
                 modulation=block_modulation,
                 rope_cache=context.rope_cache,
-                rtc_suffix_conditioning=rtc_suffix_conditioning,
-                rtc_prefix_conditioning=rtc_prefix_conditioning,
-                rtc_prefix_mask=rtc_prefix_mask,
             )
             if context.valid_action is not None:
                 x = x * context.valid_action
@@ -913,9 +857,6 @@ class ActionExpert(nn.Module):
             x,
             conditioning,
             modulation=final_modulation,
-            rtc_suffix_conditioning=rtc_suffix_conditioning,
-            rtc_prefix_conditioning=rtc_prefix_conditioning,
-            rtc_prefix_mask=rtc_prefix_mask,
         )
         if context.valid_action is not None:
             out = out * context.valid_action
@@ -990,9 +931,6 @@ class MolmoActExpertTrainArgs:
     timestep_sampling_scale: float = 0.999
     timestep_sampling_offset: float = 0.001
     train_samples_per_chunk: int = 1
-    dual_timestep_ratio: float = 0.0
-    rtc_max_delay_steps: int = 0
-    rtc_delay_sampling: str = "uniform"
     mask_padded_action_rows: bool = False
     drop_action_dim_overflow: bool = False
 
@@ -1015,10 +953,6 @@ class MolmoActExpertHead(ActionExpertHead):
         self.action_horizon = int(c["action_horizon"])
         self.num_inference_steps = int(c.get("num_inference_steps", 10))
         self.clean_at_0 = bool(c.get("clean_at_0", False))
-        # RTC capability declared by the checkpoint contract (genesis rtc_max_delay_steps):
-        # the maximum pinned-prefix length the expert was trained to inpaint. 0 = not
-        # RTC-trained; sample() rejects any action prefix beyond this budget.
-        self.rtc_max_delay_steps = int(c.get("rtc_max_delay_steps", 0) or 0)
         cfg = MolmoAct2ActionExpertConfig(
             hidden_size=int(c["hidden_dim"]),
             num_layers=int(c["num_layers"]),
@@ -1145,6 +1079,7 @@ class MolmoActExpertHead(ActionExpertHead):
         prefix_length=None,
         num_flow_samples: int = 1,
     ):
+        reject_rtc_prefix(action_prefix, prefix_length)
         num_steps = num_steps or self.num_inference_steps
         horizon = num_action_steps or self.action_horizon
         full_dim = self.action_dim
@@ -1171,41 +1106,6 @@ class MolmoActExpertHead(ActionExpertHead):
             dim_mask = torch.zeros(1, 1, full_dim, dtype=state_dtype, device=device)
             dim_mask[:, :, :out_dim] = 1.0
 
-        prefix_tensor = None
-        prefix_mask = None
-        if action_prefix is not None:
-            if prefix_length is None:
-                lengths = torch.full((batch_size,), action_prefix.shape[1], device=device, dtype=torch.long)
-            elif isinstance(prefix_length, int):
-                lengths = torch.full((batch_size,), prefix_length, device=device, dtype=torch.long)
-            else:
-                lengths = prefix_length.to(device=device, dtype=torch.long)
-            prefix_source_dim = action_prefix.shape[-1]
-            max_prefix = int(lengths.max().item())
-            # Capability gate mirroring genesis's serve-time RTC guard: a pinned prefix
-            # is inpainting the expert must have been trained for. Without this, any
-            # caller could pin rows on a non-RTC expert and get silently wrong chunks.
-            if max_prefix > self.rtc_max_delay_steps:
-                raise ValueError(
-                    f"action_prefix pins {max_prefix} rows, but this expert's checkpoint "
-                    f"contract declares rtc_max_delay_steps={self.rtc_max_delay_steps}; "
-                    "it was not trained to inpaint a prefix of that length."
-                )
-            prefix_tensor = torch.zeros(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
-            prefix_tensor[:, :max_prefix, :prefix_source_dim] = action_prefix[:, :max_prefix].to(
-                device=device, dtype=state_dtype
-            )
-            if dim_mask is not None:
-                prefix_tensor = prefix_tensor * dim_mask
-            prefix_mask = torch.arange(horizon, device=device).view(1, horizon, 1) < lengths.view(
-                batch_size, 1, 1
-            )
-
-        def _apply_prefix(state):
-            if prefix_mask is None or prefix_tensor is None:
-                return state
-            return torch.where(prefix_mask, prefix_tensor, state)
-
         clean_at_0 = self.clean_at_0
         dt = -1.0 / num_steps if clean_at_0 else 1.0 / num_steps
 
@@ -1213,7 +1113,6 @@ class MolmoActExpertHead(ActionExpertHead):
             x = torch.randn(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
             if dim_mask is not None:
                 x = x * dim_mask
-            x = _apply_prefix(x)
             for step in range(num_steps):
                 tau_value = 1.0 - step / num_steps  # noise level, 1 -> 1/N
                 flow_time = tau_value if clean_at_0 else (1.0 - tau_value)
@@ -1223,12 +1122,9 @@ class MolmoActExpertHead(ActionExpertHead):
                 )
                 if dim_mask is not None:
                     v = v * dim_mask
-                if prefix_mask is not None:
-                    v = torch.where(prefix_mask, torch.zeros_like(v), v)
                 x = x + dt * v
                 if dim_mask is not None:
                     x = x * dim_mask
-                x = _apply_prefix(x)
             return x
 
         sample_count = max(1, int(num_flow_samples or 1))
@@ -1402,13 +1298,7 @@ def _validate_action_expert_contract(action_expert_cfg: dict[str, Any]) -> DiTAc
 
 
 class DiTActionExpertHead(MolmoActExpertHead):
-    """Isaac05 DiT/RTC extension of the shared MolmoAct geometry.
-
-    Bounded port from Isaac05's owned modeling_qwen35_vla.py (DiTActionExpertHead),
-    itself derived from MolmoAct2. State keys and clean-at-1 operations are retained.
-    The outer legacy action_expert_type label does not select the RTC semantics.
-    Training prefix sampling/loss orchestration is not implemented by this head.
-    """
+    """Isaac05 clean-at-one DiT with source-compatible weights and metadata, without RTC execution."""
 
     expert_type = "dit"
     args: DiTActionExpertArgs
@@ -1431,6 +1321,7 @@ class DiTActionExpertHead(MolmoActExpertHead):
         num_flow_samples: int = 1,
         allow_ood_rtc_prefix: bool = False,
     ) -> torch.Tensor:
+        reject_rtc_prefix(action_prefix, prefix_length)
         num_steps = self.num_inference_steps if num_steps is None else int(num_steps)
         horizon = self.action_horizon if num_action_steps is None else int(num_action_steps)
         if num_steps < 1:
@@ -1443,19 +1334,9 @@ class DiTActionExpertHead(MolmoActExpertHead):
         model_dtype = vlm_activations.dtype
         state_dtype = torch.float32
 
-        resolved_prefix = resolve_rtc_action_prefix(
-            action_prefix=action_prefix,
-            prefix_length=prefix_length,
-            action_dim=action_dim,
-            batch_size=batch_size,
-            action_horizon=horizon,
-            expert_action_dim=full_dim,
-            rtc_max_delay_steps=self.args.rtc_max_delay_steps,
-            rtc_probability=self.args.rtc_probability,
-            device=device,
-            allow_ood=bool(allow_ood_rtc_prefix),
-        )
-        out_dim = resolved_prefix.output_dim
+        out_dim = full_dim if action_dim is None else int(action_dim)
+        if not 1 <= out_dim <= full_dim:
+            raise ValueError(f"action_dim must be in [1, {full_dim}]; got {out_dim}.")
 
         context = self._build_single_context(
             vlm_activations,
@@ -1472,44 +1353,27 @@ class DiTActionExpertHead(MolmoActExpertHead):
             dim_mask = torch.zeros(1, 1, full_dim, dtype=state_dtype, device=device)
             dim_mask[:, :, :out_dim] = 1.0
 
-        prefix_tensor, prefix_mask = materialize_rtc_action_prefix(
-            resolved_prefix,
-            action_prefix,
-            batch_size=batch_size,
-            action_horizon=horizon,
-            expert_action_dim=full_dim,
-            device=device,
-            dtype=state_dtype,
-            dim_mask=dim_mask,
-        )
-
         def velocity_fn(state: torch.Tensor, flow_time: float):
-            # Preserve the released checkpoint path exactly when RTC is not requested:
-            # scalar [B] timesteps and no per-action conditioning tensors.
             t_tensor = torch.full((batch_size,), flow_time, dtype=model_dtype, device=device)
-            rtc_conditioning = None
-            if prefix_mask is not None:
-                rtc_conditioning = self.action_expert.prepare_rtc_conditioning(
-                    t_tensor,
-                    prefix_mask.squeeze(-1),
-                )
             return self.action_expert.forward_with_context(
                 state.to(model_dtype),
                 t_tensor,
                 context=context,
-                rtc_conditioning=rtc_conditioning,
             ).to(state_dtype)
 
         def sample_once() -> torch.Tensor:
             x = torch.randn(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
-            return integrate_rtc_euler(
-                x,
-                num_steps=num_steps,
-                velocity_fn=velocity_fn,
-                prefix_tensor=prefix_tensor,
-                prefix_mask=prefix_mask,
-                dim_mask=dim_mask,
-            )
+            if dim_mask is not None:
+                x = x * dim_mask
+            dt = 1.0 / num_steps
+            for step in range(num_steps):
+                velocity = velocity_fn(x, step / num_steps)
+                if dim_mask is not None:
+                    velocity = velocity * dim_mask
+                x = x + dt * velocity
+                if dim_mask is not None:
+                    x = x * dim_mask
+            return x
 
         sample_count = max(1, int(num_flow_samples or 1))
         if sample_count == 1:
@@ -1526,7 +1390,7 @@ ACTION_EXPERT_HEADS = {
 def build_action_expert_head(action_expert_cfg, vlm_dim):
     """Construct the action-expert head selected by ``action_expert_cfg['type']``.
 
-    Schema-v1 DiT metadata selects the native per-row clean-time RTC head.
+    Schema-v1 DiT metadata selects the native clean-at-one head.
     Legacy MolmoAct metadata retains its existing scalar-time sampling path.
     """
     if action_expert_cfg is None:
@@ -1734,6 +1598,7 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
         build the pre-action context mask (excludes action-marker positions), and run the expert's
         clean-at-1 Euler ODE. Output is in normalized action space (caller unnormalizes).
         """
+        reject_rtc_prefix(action_prefix, prefix_length)
         expert = self.model.action_expert
         if expert is None:
             raise RuntimeError(
@@ -1801,12 +1666,11 @@ def setup_qwen35_vla_for_training(
 
     Does NOT touch the offset-norm correction (applied once at load).
     """
+    if rtc_max_delay_steps != 0 or dual_timestep_ratio != 0:
+        raise ValueError("RTC delay and dual-timestep training are unsupported.")
     expert = model.model.action_expert
-    if expert is not None and hasattr(expert, "args"):
+    if expert is not None:
         expert.args.train_samples_per_chunk = int(train_samples_per_chunk)
-        expert.args.rtc_max_delay_steps = int(rtc_max_delay_steps)
-        expert.args.rtc_delay_sampling = str(rtc_delay_sampling)
-        expert.args.dual_timestep_ratio = float(dual_timestep_ratio)
         expert.args.mask_padded_action_rows = bool(mask_padded_action_rows)
     model.train()
     if train_expert_only:

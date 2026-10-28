@@ -88,10 +88,15 @@ freezes completed environments and resets the entire group between rollouts;
 Changing the live batch size requires that global reset. Settling emits one idle
 row per environment without adding frames to model history or time.
 
-## Training objective
+## Training objective and retired RTC
 
 Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
 `action-noise`.
+
+RTC execution, prefix pinning and dual-time conditioning are retired. Legacy
+RTC-off settings remain readable. Released RTC-capable source metadata and
+weights remain authenticated and unchanged; source recipe values do not enable
+RTC at runtime. Enabled requests fail before sampling or changing rollout clocks.
 
 ## Evidence and limits
 

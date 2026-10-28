@@ -855,7 +855,7 @@ def finalize_mk1_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     temporary_index.replace(index_path)
 
 
-# Isaac05 schema-1 training/sampling semantics are pinned, not discarded aliases.
+# Isaac05 schema-1 semantics remain pinned; retired RTC recipe values are provenance only.
 _ISAAC05_ACTION_VALUES = {
     "type": "dit",
     "schema_version": 1,
@@ -865,10 +865,6 @@ _ISAAC05_ACTION_VALUES = {
     "timestep_sampling_scale": 0.999,
     "timestep_sampling_offset": 0.001,
     "train_samples_per_chunk": 8,
-    "rtc_max_delay_steps": 12,
-    "rtc_probability": 0.5,
-    "rtc_delay_sampling": "poisson",
-    "rtc_poisson_mean": 5.0,
     "mask_padded_action_rows": True,
     "drop_action_dim_overflow": False,
     "k_batched_cross_attn": True,
@@ -917,7 +913,12 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
     root["text_config"]["genesis_moe"] = copy.deepcopy(normalized_moe)
     vla = _object_field(root, "genesis_vla")
     _require_exact_keys(vla, _VLA_KEYS - {"backbone_family"}, "isaac05_vla")
-    if _object_field(root, "action_expert") != _object_field(vla, "action_expert"):
+    nested_action = _object_field(vla, "action_expert")
+    root_action = _object_field(root, "action_expert")
+    # Validate both copies before equality, which aliases booleans with numeric RTC values.
+    _validate_native_action_metadata(nested_action, path="isaac05_vla.action_expert")
+    _validate_native_action_metadata(root_action, path="action_expert")
+    if root_action != nested_action:
         _fail("root and isaac05_vla action_expert blocks must be identical")
     vector = _object_field(vla, "vector_encoder")
     if _integer(root, "vector_max_states") != _integer(vector, "max_states"):
@@ -1284,6 +1285,29 @@ def _parse_special_tokens(
     return Mk1SpecialTokenContract(**values)
 
 
+def _validate_native_action_metadata(action_raw: Mapping[str, Any], *, path: str) -> None:
+    """Validate native action schema and typed RTC provenance without pinning its recipe."""
+    _require_exact_keys(
+        action_raw,
+        (_ACTION_KEYS - {"clean_at_0"})
+        | set(_ISAAC05_ACTION_VALUES)
+        | {"rtc_max_delay_steps", "rtc_probability", "rtc_delay_sampling", "rtc_poisson_mean"},
+        path,
+    )
+    _require_values(action_raw, _ISAAC05_ACTION_VALUES, path)
+    if _integer(action_raw, "rtc_max_delay_steps", path) < 0:
+        _fail(f"{path}.rtc_max_delay_steps must be nonnegative source metadata")
+    probability = action_raw["rtc_probability"]
+    if probability is not None and not 0 <= _number(action_raw, "rtc_probability", path) <= 1:
+        _fail(f"{path}.rtc_probability must be None or in [0, 1]")
+    if action_raw["rtc_max_delay_steps"] == 0 and probability not in (None, 0.0):
+        _fail(f"{path}.rtc_probability > 0 requires rtc_max_delay_steps > 0")
+    if action_raw["rtc_delay_sampling"] not in ("uniform", "exponential", "poisson"):
+        _fail(f"{path}.rtc_delay_sampling has unsupported source metadata")
+    if _number(action_raw, "rtc_poisson_mean", path) <= 0:
+        _fail(f"{path}.rtc_poisson_mean must be positive source metadata")
+
+
 def _parse_vla(
     raw: Mapping[str, Any], *, text: Mk1TextContract, test_geometry: bool
 ) -> tuple[Mk1VectorEncoderContract, Mk1ActionExpertContract]:
@@ -1320,12 +1344,7 @@ def _parse_vla(
     native = action_raw.get("type") == "dit"
     metadata = tuple(sorted(action_raw.items())) if native else ()
     if native:
-        _require_exact_keys(
-            action_raw,
-            (_ACTION_KEYS - {"clean_at_0"}) | set(_ISAAC05_ACTION_VALUES),
-            "isaac05_vla.action_expert",
-        )
-        _require_values(action_raw, _ISAAC05_ACTION_VALUES, "isaac05_vla.action_expert")
+        _validate_native_action_metadata(action_raw, path="isaac05_vla.action_expert")
         action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
         action_raw = dict(action_raw, type="molmoact", clean_at_0=False)
     _require_exact_keys(action_raw, _ACTION_KEYS, "genesis_vla.action_expert")
