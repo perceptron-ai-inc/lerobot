@@ -34,6 +34,15 @@ NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
 NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
 
 
+def reject_legacy_action_conditioning(enabled: bool) -> None:
+    """Reject historical executed-action conditioning without removing FAST targets."""
+    if enabled:
+        raise ValueError(
+            "ISAAC historical executed-action conditioning is no longer supported; "
+            "action_conditioning must be false. FAST action targets remain supported."
+        )
+
+
 def is_portable_isaac05_repository(model_dir: Path) -> bool:
     """True when ``model_dir`` holds a raw Isaac-0.5 export's model assets.
 
@@ -217,7 +226,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     include_scene_description: bool = False  # scene-free serving by default (reproducible)
     vector_max_states: int = 128  # proprio is padded to this width before the encoder
     normalize_task_text: bool = True
-    action_conditioning: bool = False
+    action_conditioning: bool = False  # Legacy wire field; enabled requests are rejected.
     action_conditioning_role: str = "user"
     mistake_conditioning: bool = False
 
@@ -350,6 +359,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        reject_legacy_action_conditioning(self.action_conditioning)
         if self.apply_offset_norm is not False:
             raise ValueError("Native MK1 checkpoints forbid apply_offset_norm=True.")
         if self.use_peft or self.train_expert_only:

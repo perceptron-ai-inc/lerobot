@@ -42,6 +42,7 @@ from lerobot.utils.constants import (
 from .configuration_perceptron_isaac import (
     PerceptronIsaacConfig,
     is_portable_isaac05_repository,
+    reject_legacy_action_conditioning,
 )
 from .fast_processor import load_fast_action_processor
 from .isaac_stats import (
@@ -80,7 +81,6 @@ if TYPE_CHECKING:
 PERCEPTRON_ISAAC_STREAM_KEY = "perceptron_isaac_stream"
 PERCEPTRON_ISAAC_RENDER_META_KEY = "perceptron_isaac_render_meta"
 PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY = "perceptron_isaac_anchor_timestamp_seconds"
-PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY = "perceptron_isaac_previous_actions"
 # Backward-compatible policy-specific alias for the shared filtered-batch protocol.
 PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY = RETAINED_SAMPLE_INDICES_KEY
 # When online single-step serving skips rendering (the anchor arrives only after
@@ -400,6 +400,9 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
     state_feature_names: list[str] | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
 
     def __post_init__(self) -> None:
+        reject_legacy_action_conditioning(self.action_conditioning)
+        if self.render_metadata is not None:
+            IsaacMharmonyRenderMetadata(**self.render_metadata)
         self.mharmony_version = normalize_mharmony_version_marker(self.mharmony_version)
         require_closed_loop_safe_isaac_profile(
             profile_id=self.normalization_profile_id,
@@ -1039,11 +1042,9 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         if len(windows) != 1:
             raise NotImplementedError("Perceptron Isaac eval rendering currently supports batch_size=1.")
         dtype = _dtype_from_name(self.dtype)
-        fast_processor = self._ensure_fast_processor() if renderer.metadata.action_conditioning else None
         stream = renderer.build(
             observation_window=windows[0],
             prompt=tasks[0],
-            fast_processor=fast_processor,
             device=self.device,
             dtype=dtype,
             patch_size=self.patch_size,
@@ -1250,19 +1251,6 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             build_perceptron_isaac_observation_window(images[idx], states[idx], tuple(self.camera_order))
             for idx in range(batch_size)
         ]
-        previous_action_batches = complementary.get(PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY)
-        if previous_action_batches is not None:
-            if not isinstance(previous_action_batches, list) or len(previous_action_batches) != batch_size:
-                raise ValueError(
-                    f"{PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY} must contain one history per batch item."
-                )
-            for window, previous_actions in zip(windows, previous_action_batches, strict=True):
-                if not isinstance(previous_actions, list) or len(previous_actions) != len(window):
-                    raise ValueError(
-                        f"{PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY} histories must align with observation windows."
-                    )
-                for frame, previous_action in zip(window, previous_actions, strict=True):
-                    frame["previous_action"] = previous_action
         anchors = self._anchor_timestamps(complementary, batch_size)
         complementary[self.stream_key] = self._render_streams(
             windows=windows,

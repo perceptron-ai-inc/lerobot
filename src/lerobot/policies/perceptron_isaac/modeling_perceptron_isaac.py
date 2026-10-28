@@ -61,7 +61,6 @@ from .mharmony_native import (
 from .processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY,
     PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY,
-    PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY,
     PERCEPTRON_ISAAC_RENDER_META_KEY,
     PERCEPTRON_ISAAC_SERVING_STATS_KEY,
     PERCEPTRON_ISAAC_STREAM_KEY,
@@ -683,11 +682,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
         self._online_image_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
         self._online_state_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
-        self._online_action_queue: deque[np.ndarray | None] = deque(
-            maxlen=max(1, int(self.config.n_obs_steps))
-        )
-        self._pending_executed_action: np.ndarray | None = None
-        self._record_action_for_history = False
         self._online_render_step: PerceptronIsaacMharmonyPackProcessorStep | None = None
         self._last_norm_chunk: Tensor | None = None
         self._frame_index: int = -1
@@ -695,30 +689,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._settle_index: int = 0
         self._last_external_timestamp_seconds: float | None = None
         self._flow_seed_index: int = -1
-
-    def record_executed_action(self, action: Tensor | np.ndarray) -> None:
-        """Record one postprocessed action for the next causal observation."""
-        if not self.config.action_conditioning or not self._record_action_for_history:
-            return
-        if self._pending_executed_action is not None:
-            raise RuntimeError("record_executed_action called twice before the next observation.")
-        self._ensure_native_metadata()
-        action_array = (
-            action.detach().cpu().numpy() if isinstance(action, Tensor) else np.asarray(action)
-        ).astype(np.float32, copy=False)
-        action_vector = action_array.reshape(-1)
-        expected_shape = (int(self.config.action_dim),)
-        if action_vector.shape != expected_shape:
-            raise ValueError(f"Executed action must have shape {expected_shape}, got {action_array.shape}.")
-        if not np.isfinite(action_vector).all():
-            raise ValueError("Executed action must contain only finite values.")
-        assert self._stats is not None
-        normalized = normalize_isaac_actions(action_vector[None, :], self._stats.action)[0]
-        clip_max = float(self.config.fast_clip_normalized_max)
-        self._pending_executed_action = np.clip(normalized, -clip_max, clip_max).astype(
-            np.float32, copy=False
-        )
-        self._record_action_for_history = False
 
     def get_optim_params(self) -> list[dict[str, Any]]:
         """Return shell optimizer groups after enforcing the native training guard."""
@@ -1155,20 +1125,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         states = render_step._extract_state_tensor(batch, batch_size)
         if images.shape[:2] != states.shape[:2]:
             raise ValueError(f"Image/state window shape mismatch: {images.shape[:2]} vs {states.shape[:2]}.")
-        if self.config.action_conditioning and images.shape[1] != 1:
-            raise ValueError(
-                "Action-conditioned online rollout requires one observation per select_action call."
-            )
         for idx in range(images.shape[1]):
             self._online_image_queue.append(images[0, idx])
             self._online_state_queue.append(states[0, idx])
-            if self.config.action_conditioning:
-                self._online_action_queue.append(
-                    None if self._frame_index == 0 else self._pending_executed_action
-                )
-                self._pending_executed_action = None
-            else:
-                self._online_action_queue.append(None)
 
     def _online_anchor_timestamp_seconds(self) -> float:
         self._ensure_native_metadata()
@@ -1244,14 +1203,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         image_keys = render_step._resolve_image_keys(batch)
         image_values = list(self._online_image_queue)
         state_values = list(self._online_state_queue)
-        action_values = list(self._online_action_queue)
         target_steps = max(1, int(self.config.n_obs_steps))
         if len(image_values) < target_steps:
             pad_count = target_steps - len(image_values)
             image_values = [image_values[0]] * pad_count + image_values
             state_values = [state_values[0]] * pad_count + state_values
-            missing_actions: list[np.ndarray | None] = [None] * pad_count
-            action_values = missing_actions + action_values
         image_window = np.stack(image_values, axis=0)
         state_window = np.stack(state_values, axis=0)
         observation = {
@@ -1267,7 +1223,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY: [
                 external_anchor if external_anchor is not None else self._online_anchor_timestamp_seconds()
             ],
-            PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY: [action_values],
         }
         transition = {
             TransitionKey.OBSERVATION: observation,
@@ -1407,15 +1362,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             idle_norm = normalize_isaac_actions(idle, self._stats.action)
             return torch.from_numpy(idle_norm).float()
 
-        if (
-            self.config.action_conditioning
-            and not has_stream
-            and self._frame_index >= 0
-            and self._pending_executed_action is None
-        ):
-            raise RuntimeError(
-                "Action-conditioned rollout requires record_executed_action after each selected action."
-            )
         self._frame_index += 1
         if not has_stream:
             self._update_online_rollout_state(batch)
@@ -1435,9 +1381,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             )
             actions = actions[:, : self.config.n_action_steps]
             self._queues[ACTION].extend(actions.transpose(0, 1))
-        selected_action = self._queues[ACTION].popleft()
-        self._record_action_for_history = bool(self.config.action_conditioning and not has_stream)
-        return selected_action
+        return self._queues[ACTION].popleft()
 
     def forward(
         self,

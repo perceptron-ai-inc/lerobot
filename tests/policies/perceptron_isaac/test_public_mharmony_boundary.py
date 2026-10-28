@@ -39,13 +39,13 @@ def test_mharmony_boundary_does_not_import_genesis(monkeypatch) -> None:
     assert imported == ["mharmony"]
 
 
-def test_policy_config_exposes_causal_conditioning_contract() -> None:
+def test_policy_config_rejects_history_but_preserves_mistake_conditioning() -> None:
     from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
 
-    config = PerceptronIsaacConfig(action_conditioning=True, mistake_conditioning=True)
-
-    assert config.action_conditioning is True
-    assert config.action_conditioning_role == "user"
+    with pytest.raises(ValueError, match="action_conditioning must be false"):
+        PerceptronIsaacConfig(action_conditioning=True, mistake_conditioning=True)
+    config = PerceptronIsaacConfig(mistake_conditioning=True)
+    assert config.action_conditioning is False
     assert config.mistake_conditioning is True
 
 

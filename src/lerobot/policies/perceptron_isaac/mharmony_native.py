@@ -18,7 +18,7 @@ from typing import Any, TypedDict
 import numpy as np
 
 from .checkpoint_integrity import load_json_object
-from .configuration_perceptron_isaac import PerceptronIsaacConfig
+from .configuration_perceptron_isaac import PerceptronIsaacConfig, reject_legacy_action_conditioning
 from .fast_processor import encode_fast_action_tokens
 from .isaac_stats import (
     IsaacNormalizationStats,
@@ -114,6 +114,7 @@ class IsaacMharmonyRenderMetadata:
     training_proprio_contract: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        reject_legacy_action_conditioning(self.action_conditioning)
         if self.image_resize_size is not None and (
             not isinstance(self.image_resize_size, list)
             or len(self.image_resize_size) != 2
@@ -677,7 +678,6 @@ def build_isaac_mharmony_content_plan(
     anchor_timestamp_seconds: float | None = None,
     normalized_action_target: np.ndarray | None = None,
     fast_action_tokens: list[int] | None = None,
-    historical_fast_action_tokens: list[list[int] | None] | None = None,
     action_is_pad: list[bool] | None = None,
     terminal: bool = False,
 ) -> IsaacMharmonyContentPlan:
@@ -718,34 +718,7 @@ def build_isaac_mharmony_content_plan(
             },
         }
     ]
-    aligned_historical_tokens: list[list[int] | None]
-    if historical_fast_action_tokens is None:
-        aligned_historical_tokens = [None for _ in range(int(metadata.n_obs_steps))]
-    else:
-        aligned_historical_tokens = historical_fast_action_tokens
-    if len(aligned_historical_tokens) != int(metadata.n_obs_steps):
-        raise ValueError(
-            "historical_fast_action_tokens must align with the checkpoint observation window; "
-            f"got {len(aligned_historical_tokens)} for n_obs_steps={metadata.n_obs_steps}."
-        )
-    if not metadata.action_conditioning and any(tokens is not None for tokens in aligned_historical_tokens):
-        raise ValueError("Historical FAST action tokens require action_conditioning=true.")
-
-    for step_idx, (frame, timestamp_seconds, action_tokens) in enumerate(
-        zip(history, timestamps, aligned_historical_tokens, strict=True)
-    ):
-        if action_tokens is not None:
-            if step_idx == 0:
-                raise ValueError("Historical FAST action tokens cannot precede the first observation.")
-            if not action_tokens:
-                raise ValueError("Historical FAST action token spans must be non-empty.")
-            user_content.append(
-                {
-                    "kind": "tokens",
-                    "tokens": [int(token) for token in action_tokens],
-                    "tags": _historical_fast_action_tags(metadata, step_idx),
-                }
-            )
+    for step_idx, (frame, timestamp_seconds) in enumerate(zip(history, timestamps, strict=True)):
         user_content.append(_timestamp_content_item(step_idx, timestamp_seconds, metadata))
         for camera_idx, camera in enumerate(metadata.camera_order):
             user_content.append(
@@ -815,7 +788,6 @@ class IsaacNativeMharmonyRenderer:
         *,
         observation_window: list[dict[str, Any]],
         prompt: str,
-        fast_processor: Any | None = None,
         device: Any = "cuda",
         dtype: Any = None,
         patch_size: int | None = None,
@@ -828,22 +800,12 @@ class IsaacNativeMharmonyRenderer:
     ):
         if scene_events:
             raise ValueError("native_mharmony supports no-scene LIBERO inference only.")
-        historical_fast_action_tokens = None
-        if self.metadata.action_conditioning:
-            if fast_processor is None:
-                raise ValueError("Native action-conditioned inference requires the packaged FAST processor.")
-            historical_fast_action_tokens = encode_isaac_historical_fast_actions(
-                observation_window=observation_window,
-                metadata=self.metadata,
-                fast_processor=fast_processor,
-            )
         plan = build_isaac_mharmony_content_plan(
             observation_window=observation_window,
             prompt=prompt,
             metadata=self.metadata,
             stats=self.stats,
             anchor_timestamp_seconds=anchor_timestamp_seconds,
-            historical_fast_action_tokens=historical_fast_action_tokens,
         )
         return self._render_plan_to_tensor_stream(
             plan,
@@ -1182,7 +1144,6 @@ def _normalize_observation_history(
             {
                 "images": {camera: images[camera] for camera in metadata.camera_order},
                 "proprio": proprio,
-                "previous_action": frame.get("previous_action"),
             }
         )
     return normalized
@@ -1200,42 +1161,6 @@ def _fast_action_reserved_pool_size(metadata: IsaacMharmonyRenderMetadata) -> in
             "ISAAC mharmony metadata must expose exactly one reserved group for the FAST action tokenizer."
         )
     return group_sizes[0]
-
-
-def encode_isaac_historical_fast_actions(
-    *,
-    observation_window: list[dict[str, Any]],
-    metadata: IsaacMharmonyRenderMetadata,
-    fast_processor: Any,
-) -> list[list[int] | None]:
-    """FAST-tokenize normalized executed actions before their causal observations."""
-    if not metadata.action_conditioning:
-        raise ValueError("Historical FAST action encoding requires action_conditioning=true.")
-    if metadata.action_conditioning_role != "user":
-        raise ValueError("Native historical FAST action encoding supports only the user role.")
-    history = _normalize_observation_history(observation_window, metadata)
-    reserved_pool_size = _fast_action_reserved_pool_size(metadata)
-    token_spans: list[list[int] | None] = []
-    for observation_index, frame in enumerate(history):
-        previous_action = frame["previous_action"]
-        if observation_index == 0 or previous_action is None:
-            token_spans.append(None)
-            continue
-        normalized_action = np.asarray(previous_action, dtype=np.float32).reshape(-1)
-        expected_shape = (int(metadata.action_dim),)
-        if normalized_action.shape != expected_shape:
-            raise ValueError(
-                "Historical normalized action must match checkpoint action_dim; "
-                f"expected {expected_shape}, got {normalized_action.shape}."
-            )
-        token_spans.append(
-            encode_fast_action_tokens(
-                fast_processor,
-                normalized_action.reshape(1, 1, -1),
-                reserved_pool_size=reserved_pool_size,
-            )
-        )
-    return token_spans
 
 
 def _build_preamble(*, prompt: str, metadata: IsaacMharmonyRenderMetadata, fps: float) -> str:
@@ -1438,22 +1363,6 @@ def _flow_action_tags(
         "stats_key": "action",
         "normalized": True,
         "flow_matching_target": True,
-    }
-
-
-def _historical_fast_action_tags(
-    metadata: IsaacMharmonyRenderMetadata, observation_index: int
-) -> dict[str, Any]:
-    return {
-        "action_conditioning": "fast",
-        "action_conditioning_indices": [0],
-        "action_conditioning_observation_window": [observation_index - 1, observation_index],
-        "action_dim": int(metadata.action_dim),
-        "action_horizon": 1,
-        "normalized": False,
-        "token_group": FAST_ACTION_TOKEN_GROUP_NAME,
-        "tokenizer": FAST_ACTION_TOKENIZER_NAME,
-        GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION,
     }
 
 

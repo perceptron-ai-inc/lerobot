@@ -16,7 +16,6 @@ import torch
 # install it (see .github/workflows/fast_tests.yml).
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
-import lerobot.policies.perceptron_isaac.mharmony_native as mharmony_native
 import lerobot.policies.perceptron_isaac.modeling_perceptron_isaac as policy_module
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.lerobot_types import TransitionKey
@@ -1088,13 +1087,13 @@ def test_native_policy_online_rollout_uses_policy_clock(monkeypatch, tmp_path):
     assert settled_policy._frame_index == 0
 
 
-def test_online_renderer_inherits_conditioning_contract(tmp_path):
+def test_online_renderer_preserves_mistake_conditioning_without_action_history(tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     config = PerceptronIsaacConfig(
         device="cpu",
         native_stats_path=str(stats_path),
-        action_conditioning=True,
+        action_conditioning=False,
         action_conditioning_role="user",
         mistake_conditioning=True,
         input_features=_features(),
@@ -1103,16 +1102,16 @@ def test_online_renderer_inherits_conditioning_contract(tmp_path):
 
     step = PerceptronIsaacPolicy(config)._ensure_online_render_step()
 
-    assert step.action_conditioning is True
+    assert step.action_conditioning is False
     assert step.action_conditioning_role == "user"
     assert step.mistake_conditioning is True
     step._ensure_renderer()
-    assert step._stream_builder.metadata.action_conditioning is True
+    assert step._stream_builder.metadata.action_conditioning is False
     assert step._stream_builder.metadata.action_conditioning_role == "user"
     assert step._stream_builder.metadata.mistake_conditioning is True
 
 
-def test_native_policy_requires_and_resets_executed_action_history(monkeypatch, tmp_path):
+def test_native_policy_needs_no_executed_actions_between_observations(monkeypatch, tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     config = PerceptronIsaacConfig(
@@ -1121,7 +1120,7 @@ def test_native_policy_requires_and_resets_executed_action_history(monkeypatch, 
         n_obs_steps=3,
         n_action_steps=1,
         chunk_size=30,
-        action_conditioning=True,
+        action_conditioning=False,
         clip_normalized_max=10.0,
         fast_clip_normalized_max=1.0,
         input_features=_features(),
@@ -1140,41 +1139,21 @@ def test_native_policy_requires_and_resets_executed_action_history(monkeypatch, 
     policy._isaac_model = FakeIsaacModel()
     render_step = policy._ensure_online_render_step()
     renderer = _install_fake_native_renderer(render_step, monkeypatch)
-    renderer.metadata.action_conditioning = True
-    render_step._fast_processor = object()
-
     policy.select_action(batch(0))
-    assert [frame.get("previous_action") for frame in renderer.build_calls[-1]["observation_window"]] == [
-        None,
-        None,
-        None,
-    ]
-
-    with pytest.raises(RuntimeError, match="record_executed_action"):
-        policy.select_action(batch(1))
-    assert policy._frame_index == 0
-
-    with pytest.raises(ValueError, match="finite"):
-        policy.record_executed_action(np.full(7, np.nan, dtype=np.float32))
-
-    executed_action = np.full(7, 2.0, dtype=np.float32)
-    policy.record_executed_action(executed_action)
     policy.select_action(batch(1))
-    expected = normalize_isaac_actions(executed_action[None, :], load_isaac_stats(stats_path).action)[0]
-    expected = np.clip(expected, -config.fast_clip_normalized_max, config.fast_clip_normalized_max)
-    np.testing.assert_allclose(
-        renderer.build_calls[-1]["observation_window"][-1]["previous_action"],
-        expected,
-    )
+    assert policy._frame_index == 1
+    window = renderer.build_calls[-1]["observation_window"]
+    assert [float(frame["proprio"][0]) for frame in window] == [0.0, 0.0, 1.0]
+    assert all("previous_action" not in frame for frame in window)
 
     policy.reset()
-    assert list(policy._online_action_queue) == []
-    assert policy._pending_executed_action is None
     first_step = policy._ensure_online_render_step()
     first_renderer = _install_fake_native_renderer(first_step, monkeypatch)
-    first_renderer.metadata.action_conditioning = True
-    first_step._fast_processor = object()
     policy.select_action(batch(0))
+    assert policy._frame_index == 0
+    assert all(
+        float(frame["proprio"][0]) == 0.0 for frame in first_renderer.build_calls[-1]["observation_window"]
+    )
 
 
 def test_native_policy_external_timestamp_is_monotonic_and_resettable(monkeypatch, tmp_path):
@@ -2683,65 +2662,26 @@ def _libero_content_plan_window() -> list[dict[str, object]]:
     ]
 
 
-def test_native_mharmony_places_historical_fast_actions_before_next_observation(tmp_path):
+def test_native_mharmony_rejects_historical_fast_action_conditioning():
+    with pytest.raises(ValueError, match="action_conditioning must be false"):
+        IsaacMharmonyRenderMetadata(action_conditioning=True)
+
+
+def test_native_mharmony_ignores_unused_previous_action_values(tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    plan = build_isaac_mharmony_content_plan(
-        observation_window=_libero_content_plan_window(),
-        prompt="pick up the mug",
-        metadata=IsaacMharmonyRenderMetadata(action_conditioning=True),
-        stats=load_isaac_stats(stats_path),
-        anchor_timestamp_seconds=0.1,
-        historical_fast_action_tokens=[None, [17, 18], [19]],
-    )
-
-    kinds = [item["kind"] for item in plan.user_content]
-    assert kinds == [
-        "text",
-        "timestamp",
-        "image",
-        "image",
-        "tokens",
-        "timestamp",
-        "image",
-        "image",
-        "tokens",
-        "timestamp",
-        "image",
-        "image",
-        "vector",
-    ]
-    action_items = [item for item in plan.user_content if item["kind"] == "tokens"]
-    assert [item["tokens"] for item in action_items] == [[17, 18], [19]]
-    assert [item["tags"]["action_conditioning_observation_window"] for item in action_items] == [
-        [0, 1],
-        [1, 2],
-    ]
-    assert all(item["tags"]["token_group"] == "fast_action" for item in action_items)
-
-
-def test_native_mharmony_encodes_normalized_executed_actions_as_fast_history():
-    class RecordingFastProcessor:
-        def __init__(self):
-            self.actions = []
-
-        def __call__(self, actions):
-            self.actions.append(np.asarray(actions))
-            return [[23, 24]]
-
-    processor = RecordingFastProcessor()
     window = _libero_content_plan_window()
     window[1]["previous_action"] = np.arange(7, dtype=np.float32)
-
-    tokens = mharmony_native.encode_isaac_historical_fast_actions(
+    plan = build_isaac_mharmony_content_plan(
         observation_window=window,
-        metadata=IsaacMharmonyRenderMetadata(action_conditioning=True),
-        fast_processor=processor,
+        prompt="pick up the mug",
+        metadata=IsaacMharmonyRenderMetadata(),
+        stats=load_isaac_stats(stats_path),
+        anchor_timestamp_seconds=0.1,
     )
-
-    assert tokens == [None, [23, 24], None]
-    assert len(processor.actions) == 1
-    np.testing.assert_allclose(processor.actions[0], np.arange(7, dtype=np.float32).reshape(1, 1, 7))
+    assert not any(item["kind"] == "tokens" for item in plan.user_content)
+    assert len([item for item in plan.user_content if item["kind"] == "image"]) == 6
+    assert len([item for item in plan.user_content if item["kind"] == "vector"]) == 1
 
 
 def test_native_mharmony_renders_mistake_false_when_checkpoint_trained_with_support(tmp_path):

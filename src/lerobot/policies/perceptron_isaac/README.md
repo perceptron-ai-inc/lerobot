@@ -72,6 +72,14 @@ qualified hardware/ABI is H100 SM90 / CUDA 12.8. Budget for the 143 GB package,
 full model host materialization and optimizer state; the mechanics proof used
 16 H100s over two hosts, not a laptop or single-GPU recipe.
 
+## Observation conditioning
+
+Historical executed-action conditioning is unsupported in training and inference.
+Legacy policy configs, saved processors and render metadata with
+`action_conditioning=true` fail explicitly; use `false`. There is no executed-action
+recorder lifecycle. Visual history, last-state proprio, mistake conditioning and
+FAST action targets/codecs remain supported.
+
 ## Evidence and limits
 
 Job 113283 proved two dense FP32-master FSDP2 steps with all 35,723,506,864
