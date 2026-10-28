@@ -612,9 +612,10 @@ def normalize_isaac_proprio(
     return _apply_normalize_mask(normalized, arr, stats.mask)
 
 
-def normalize_isaac_actions(
+def normalize_isaac_action_quantiles(
     x: np.ndarray, stats: IsaacStatsBlock, *, eps: float = NATIVE_NORMALIZATION_EPS
 ) -> np.ndarray:
+    """Normalize every action channel for outlier screening and FAST, including raw grippers."""
     arr = np.asarray(x, dtype=np.float32)
     if arr.ndim != 2 or arr.shape[1] != stats.dim:
         raise ValueError(f"action prefix must have shape [P, {stats.dim}], got {arr.shape}.")
@@ -626,7 +627,14 @@ def normalize_isaac_actions(
         eps=eps,
         error_prefix="normalize_isaac_actions",
     )
-    return _apply_normalize_mask(normalized, arr, stats.mask)
+    return normalized
+
+
+def normalize_isaac_actions(
+    x: np.ndarray, stats: IsaacStatsBlock, *, eps: float = NATIVE_NORMALIZATION_EPS
+) -> np.ndarray:
+    """Normalize model action channels while preserving physical-unit passthrough dimensions."""
+    return _apply_normalize_mask(normalize_isaac_action_quantiles(x, stats, eps=eps), x, stats.mask)
 
 
 def unnormalize_isaac_actions(
@@ -638,19 +646,18 @@ def unnormalize_isaac_actions(
 ) -> np.ndarray:
     lower, upper = stats.effective_action_bounds()
     arr = np.asarray(x_norm, dtype=np.float32)
+    passthrough = arr
     if clip:
         bound = float(clip_normalized_max)
-        if bound <= 0.0:
-            raise ValueError(f"clip_normalized_max must be > 0, got {clip_normalized_max!r}.")
+        if not math.isfinite(bound) or bound <= 0.0:
+            raise ValueError(f"clip_normalized_max must be finite and > 0, got {clip_normalized_max!r}.")
         arr = np.clip(arr, -bound, bound)
+        passthrough = np.clip(passthrough, lower, upper)
     unnormalized = _unnormalize_quantile(
         arr,
         lower,
         upper,
         error_prefix="unnormalize_isaac_actions",
     )
-    # MolmoAct2 reassigns its working array to the clipped values before masking, so the
-    # passthrough carries the clipped model output rather than the raw one. Mirror that:
-    # for a gripper already living in physical [0, 1] the clip is inert, but the two
-    # stacks stay bit-comparable on out-of-range predictions.
-    return _apply_normalize_mask(unnormalized, arr, stats.mask)
+    # Physical-unit channels use effective robot bounds, never a normalized-unit cap.
+    return _apply_normalize_mask(unnormalized, passthrough, stats.mask)

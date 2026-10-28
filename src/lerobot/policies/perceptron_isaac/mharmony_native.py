@@ -23,6 +23,7 @@ from .fast_processor import encode_fast_action_tokens
 from .isaac_stats import (
     IsaacNormalizationStats,
     load_isaac_stats,
+    normalize_isaac_action_quantiles,
     normalize_isaac_actions,
     normalize_isaac_proprio,
 )
@@ -901,7 +902,7 @@ class IsaacNativeMharmonyRenderer:
             raise ValueError(
                 f"ISAAC training action_chunk must have shape {expected_shape}, got {action.shape}."
             )
-        normalized = normalize_isaac_actions(action, stats.action).astype(np.float32, copy=False)
+        normalized = normalize_isaac_action_quantiles(action, stats.action).astype(np.float32, copy=False)
         max_abs = float(np.max(np.abs(normalized))) if normalized.size else 0.0
         if skip_outlier_threshold > 0.0 and max_abs > skip_outlier_threshold:
             raise IsaacActionOutlierError(
@@ -917,6 +918,12 @@ class IsaacNativeMharmonyRenderer:
             normalized = np.clip(normalized, -clip_normalized_max, clip_normalized_max)
         else:
             fast_normalized = normalized
+        if stats.action.mask is not None:
+            raw = action
+            if clip_normalized_actions:
+                lower, upper = stats.action.effective_action_bounds()
+                raw = np.clip(raw, lower, upper)
+            normalized = np.where(stats.action.mask, normalized, raw).astype(np.float32, copy=False)
         if action_is_pad is None:
             action_is_pad = [False] * expected_shape[0]
         if len(action_is_pad) != expected_shape[0] or any(
