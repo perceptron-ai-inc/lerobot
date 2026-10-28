@@ -39,6 +39,16 @@ T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class PolicyTrainingIntent:
+    """Artifact operations requested before training allocates runtime resources."""
+
+    save_checkpoint: bool
+    publish: bool
+    ema: bool
+    package_root: Path | None
+
+
 @dataclass
 class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     """
@@ -108,6 +118,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         return str(value).removeprefix("torch.")
 
     def __post_init__(self) -> None:
+        # Loader provenance is runtime-only; keep Hub IDs and serialized paths unchanged.
+        self._pretrained_config_directory: Path | None = None
         if self.dtype is not None and not isinstance(self.dtype, torch.dtype):
             raise ValueError(f"config.dtype must be a torch.dtype or None, got {self.dtype!r}.")
 
@@ -201,6 +213,9 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         """Project historical JSON into runtime fields without modifying source bytes."""
         return config
 
+    def validate_training_intent(self, intent: PolicyTrainingIntent) -> None:
+        """Reject unsupported artifact operations using config metadata only."""
+
     def _save_pretrained(self, save_directory: Path) -> None:
         with open(save_directory / CONFIG_NAME, "w") as f:
             json.dump(self.to_dict(), f, indent=4)
@@ -247,6 +262,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         if config_file is None:
             raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
+        # Preserve the snapshot directory, not a Hub config symlink's blob target or parse tempdir.
+        config_directory = Path(config_file).parent.resolve()
         with open(config_file) as f:
             config = json.load(f)
 
@@ -270,4 +287,6 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(config_cls, config_file, args=cli_overrides)
+            policy_config: T = draccus.parse(config_cls, config_file, args=cli_overrides)
+        policy_config._pretrained_config_directory = config_directory
+        return policy_config

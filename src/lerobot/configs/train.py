@@ -36,7 +36,7 @@ from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
 from .default import DatasetConfig, EMAConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
-from .policies import PreTrainedConfig
+from .policies import PolicyTrainingIntent, PreTrainedConfig
 from .rewards import RewardModelConfig
 
 TRAIN_CONFIG_NAME = "train_config.json"
@@ -289,6 +289,20 @@ class TrainPipelineConfig(HubMixin):
             )
 
         active_cfg = self.trainable_config
+        if self.policy is not None and not self.is_reward_model_training:
+            package_root = (
+                self.checkpoint_path / PRETRAINED_MODEL_DIR
+                if self.resume and self.checkpoint_path is not None
+                else self.policy.pretrained_path
+            )
+            self.policy.validate_training_intent(
+                PolicyTrainingIntent(
+                    save_checkpoint=self.save_checkpoint,
+                    publish=self.policy.push_to_hub or self.save_checkpoint_to_hub,
+                    ema=self.ema.enable,
+                    package_root=package_root,
+                )
+            )
         if self.rename_map and active_cfg.pretrained_path is None and not self.resume:
             raise ValueError(
                 "`rename_map` requires a pretrained policy checkpoint. "

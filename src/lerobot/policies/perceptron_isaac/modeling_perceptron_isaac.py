@@ -373,15 +373,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         """Refuse deferred export layouts before collective gathering or filesystem writes."""
         if self.config.use_peft:
             raise RuntimeError("Perceptron ISAAC PEFT saving is unsupported.")
-        model_path = self.config.hf_model_path
-        source_root = self._local_checkpoint_source_root()
-        raw_layout = source_root is not None and self._portable_export_root(source_root) is not None
-        unbound_export = (
-            model_path
-            and is_portable_isaac05_repository(Path(model_path))
-            and not (self.config.mk1_model_import_sha256 or self.config.mk1_source_model_import_sha256)
-        )
-        if raw_layout or unbound_export:
+        if self.config.raw_export_saving_unsupported(self._local_checkpoint_source_root()):
             raise RuntimeError(
                 "Raw/portable-export saving is unsupported; use a source-bound native MK1 package."
             )

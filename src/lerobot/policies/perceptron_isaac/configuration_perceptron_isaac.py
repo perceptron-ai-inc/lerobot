@@ -16,6 +16,7 @@ import torch
 from huggingface_hub.constants import CONFIG_NAME
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTrainedConfig
+from lerobot.configs.policies import PolicyTrainingIntent
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -317,6 +318,35 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     def migrate_config(cls, config: dict[str, Any]) -> dict[str, Any]:
         """Retire the model count only in memory; authenticated files stay byte-exact."""
         return {key: value for key, value in config.items() if key != "trained_steps"}
+
+    def raw_export_saving_unsupported(self, package_root: Path | None = None) -> bool:
+        """Recognize raw layouts without allocating a policy or changing relative paths."""
+        root = package_root if package_root is not None else self.pretrained_path
+        if root is not None and is_portable_isaac05_repository(Path(root).parent):
+            return True
+        if not self.hf_model_path:
+            return False
+        model_root = Path(self.hf_model_path)
+        if not model_root.is_absolute() and root is not None:
+            model_root = Path(root) / model_root
+        return is_portable_isaac05_repository(model_root) and not (
+            self.mk1_model_import_sha256 or self.mk1_source_model_import_sha256
+        )
+
+    def validate_training_intent(self, intent: PolicyTrainingIntent) -> None:
+        # Resolve relative assets against the loaded component, never a Hub ID as a cwd path.
+        package_root = (
+            self._pretrained_config_directory
+            if self._pretrained_config_directory is not None
+            else intent.package_root
+        )
+        if (intent.save_checkpoint or intent.publish or intent.ema) and self.raw_export_saving_unsupported(
+            package_root
+        ):
+            raise ValueError(
+                "Raw/portable-export save, publish and EMA training intents are unsupported; "
+                "disable checkpoint saving, Hub publishing and EMA, or use a source-bound native MK1 package."
+            )
 
     def __post_init__(self) -> None:
         super().__post_init__()
