@@ -28,7 +28,16 @@ These select Torch 2.10.0+cu128, torchvision 0.25.0+cu128, Accelerate 1.15.0,
 Transformers 5.5.4 and immutable mharmony 0.1.0 source. Access to the mharmony
 Git repository is required. No flash-attn or kernels extra is required.
 The generic upstream lock remains unchanged and does not qualify this extra.
+ISAAC CI uses a separate `.venv-isaac` environment and these constraints, not the
+generic lock. It checks the Torch/torchvision/CUDA build versions even in CPU tests.
 Clean noneditable installation on this new upstream base remains a merge gate.
+
+Historical execution records directly establish Torch 2.10.0+cu128,
+torchvision 0.25.0+cu128 and CUDA 12.8, with mharmony named in configuration.
+They do not provide a complete historical pip freeze. The current offline CPU
+environment uses Python 3.12.7, Transformers 5.5.4, mharmony 0.1.0,
+tokenizers 0.22.2 and Accelerate 1.15.0. The SDK source remains pinned to
+`9a57efbf8ada2d73641fc40081f4e4fa6ff2ab92`; CPU checks are not new GPU qualification.
 
 ## Preconverted package and training entry point
 
