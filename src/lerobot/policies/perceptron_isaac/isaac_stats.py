@@ -8,7 +8,9 @@ code normalize and unnormalize actions without external runtime helpers.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, replace
+import math
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -202,6 +204,44 @@ class IsaacStatsBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class IsaacNormalizationProfile:
+    """Validated six-field profile metadata; source authentication stays with artifact admission."""
+
+    profile_id: str
+    profile_sha256: str
+    action_stats_sha256: str
+    proprio_stats_sha256: str
+    clip_normalized_proprio: bool
+    proprio_clip_normalized_max: float
+
+    def __post_init__(self) -> None:
+        if not self.profile_id or self.profile_id != self.profile_id.strip():
+            raise ValueError("ISAAC normalization profile_id must be a non-empty trimmed string.")
+        for digest in (self.profile_sha256, self.action_stats_sha256, self.proprio_stats_sha256):
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise ValueError("ISAAC normalization profile SHA256 must be lowercase 64-character hex.")
+        cap = self.proprio_clip_normalized_max
+        if self.clip_normalized_proprio is not True:
+            raise ValueError("ISAAC normalization profile clip_normalized_proprio must be true.")
+        if isinstance(cap, bool) or not isinstance(cap, int | float) or not math.isfinite(cap) or cap <= 0:
+            raise ValueError("ISAAC normalization profile clip must be finite and positive.")
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> IsaacNormalizationProfile | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, dict) or set(raw) != set(cls.__dataclass_fields__):
+            raise ValueError("ISAAC normalization _profile must contain exactly the six profile fields.")
+        if not isinstance(raw["profile_id"], str):
+            raise ValueError("ISAAC normalization profile_id must be a string.")
+        return cls(**raw)
+
+
+@dataclass(frozen=True, slots=True)
 class IsaacNormalizationStats:
     action: IsaacStatsBlock
     proprio: IsaacStatsBlock
@@ -211,6 +251,7 @@ class IsaacNormalizationStats:
     profile_id: str | None = None
     profile_scope: str | None = None
     validation_status: str | None = None
+    profile: IsaacNormalizationProfile | None = None
 
     @property
     def action_dim(self) -> int:
@@ -298,7 +339,7 @@ def load_isaac_suite_stats(path: str | Path) -> dict[str, IsaacNormalizationStat
     return scopes
 
 
-def isaac_stats_from_dict(raw: dict[str, Any]) -> IsaacNormalizationStats:
+def isaac_stats_from_dict(raw: Mapping[str, Any]) -> IsaacNormalizationStats:
     action = _stats_block_from_json(raw["action"])
     proprio = _stats_block_from_json(raw["proprio"])
     action_dim = int(raw["action_dim"])
@@ -313,6 +354,7 @@ def isaac_stats_from_dict(raw: dict[str, Any]) -> IsaacNormalizationStats:
         target_fps=float(raw["target_fps"]) if raw.get("target_fps") is not None else None,
         action_horizon=int(raw["action_horizon"]),
         schema=str(raw["schema"]),
+        profile=IsaacNormalizationProfile.from_dict(raw.get("_profile")),
         profile_id=str(raw["profile_id"]) if raw.get("profile_id") is not None else None,
         profile_scope=str(raw["profile_scope"]) if raw.get("profile_scope") is not None else None,
         validation_status=(
@@ -338,7 +380,7 @@ def isaac_stats_to_dict(stats: IsaacNormalizationStats) -> dict[str, Any]:
     the gripper passthrough itself, because the loading step's `normalize_gripper`
     flag defaults to True and would otherwise silently drop the mask.
     """
-    return {
+    result = {
         "action": _stats_block_to_json(stats.action),
         "proprio": _stats_block_to_json(stats.proprio),
         "action_dim": int(stats.action_dim),
@@ -350,6 +392,9 @@ def isaac_stats_to_dict(stats: IsaacNormalizationStats) -> dict[str, Any]:
         "profile_scope": stats.profile_scope,
         "validation_status": stats.validation_status,
     }
+    if stats.profile is not None:
+        result["_profile"] = asdict(stats.profile)
+    return result
 
 
 def save_isaac_stats(stats: IsaacNormalizationStats, path: str | Path) -> None:
@@ -386,11 +431,15 @@ def isaac_stats_value_differences(a: IsaacNormalizationStats, b: IsaacNormalizat
     problems = _block_value_differences("action", a.action, b.action)
     problems += _block_value_differences("proprio", a.proprio, b.proprio)
     if (a.target_fps is None) != (b.target_fps is None) or (
-        a.target_fps is not None and float(a.target_fps) != float(b.target_fps)
+        a.target_fps is not None and b.target_fps is not None and float(a.target_fps) != float(b.target_fps)
     ):
         problems.append(f"target_fps: {a.target_fps} != {b.target_fps}")
     if int(a.action_horizon) != int(b.action_horizon):
         problems.append(f"action_horizon: {a.action_horizon} != {b.action_horizon}")
+    a_clip = None if a.profile is None else a.profile.proprio_clip_normalized_max
+    b_clip = None if b.profile is None else b.profile.proprio_clip_normalized_max
+    if a_clip != b_clip:
+        problems.append(f"proprio profile clip: {a_clip} != {b_clip}")
     return problems
 
 
@@ -438,6 +487,8 @@ def isaac_stats_to_state_dict(stats: IsaacNormalizationStats) -> dict[str, torch
     # ablation-labeled profile could drive a robot. safetensors stores tensors only, so encode
     # the strings as UTF-8 bytes.
     state["metadata.schema"] = _encode_label(stats.schema)
+    if stats.profile is not None:
+        state["metadata._profile"] = _encode_label(json.dumps(asdict(stats.profile), allow_nan=False))
     for key, value in (
         ("profile_id", stats.profile_id),
         ("profile_scope", stats.profile_scope),
@@ -485,7 +536,7 @@ def isaac_stats_from_state_dict(state: dict[str, torch.Tensor]) -> IsaacNormaliz
         maximum=_array("proprio.max") if "proprio.max" in state else None,
         mask=_mask("proprio.mask"),
     )
-    target_fps = float(state["metadata.target_fps"].item())
+    target_fps: float | None = float(state["metadata.target_fps"].item())
     if np.isnan(target_fps):
         target_fps = None
     action_dim = int(state["metadata.action_dim"].item())
@@ -497,6 +548,9 @@ def isaac_stats_from_state_dict(state: dict[str, torch.Tensor]) -> IsaacNormaliz
         target_fps=target_fps,
         action_horizon=int(state["metadata.action_horizon"].item()),
         schema=_decode_label(state, "metadata.schema") or "flow_matching_stats_v1",
+        profile=IsaacNormalizationProfile.from_dict(
+            json.loads(_decode_label(state, "metadata._profile") or "null")
+        ),
         profile_id=_decode_label(state, "metadata.profile_id"),
         profile_scope=_decode_label(state, "metadata.profile_scope"),
         validation_status=_decode_label(state, "metadata.validation_status"),
@@ -533,7 +587,11 @@ def require_closed_loop_safe_isaac_stats(stats: IsaacNormalizationStats) -> None
 
 
 def normalize_isaac_proprio(
-    x: np.ndarray, stats: IsaacStatsBlock, *, eps: float = NATIVE_NORMALIZATION_EPS
+    x: np.ndarray,
+    stats: IsaacStatsBlock,
+    *,
+    eps: float = NATIVE_NORMALIZATION_EPS,
+    profile: IsaacNormalizationProfile | None = None,
 ) -> np.ndarray:
     arr = np.asarray(x, dtype=np.float32)
     if arr.shape != stats.q01.shape:
@@ -546,6 +604,9 @@ def normalize_isaac_proprio(
         eps=eps,
         error_prefix="normalize_isaac_proprio",
     )
+    if profile is not None:
+        cap = profile.proprio_clip_normalized_max
+        normalized = np.clip(normalized, -cap, cap)
     # MolmoAct2 masks against the original raw input here (its clip writes to a separate
     # name), so a passthrough dimension reaches the model in physical units.
     return _apply_normalize_mask(normalized, arr, stats.mask)

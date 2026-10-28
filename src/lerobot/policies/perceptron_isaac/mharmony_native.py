@@ -1185,7 +1185,9 @@ def _vector_content_item(
     metadata: IsaacMharmonyRenderMetadata,
     stats: IsaacNormalizationStats,
 ) -> dict[str, Any]:
-    normalized = normalize_isaac_proprio(np.asarray(proprio, dtype=np.float32).reshape(-1), stats.proprio)
+    normalized = normalize_isaac_proprio(
+        np.asarray(proprio, dtype=np.float32).reshape(-1), stats.proprio, profile=stats.profile
+    )
     fallback_dims = _effective_bounds_fallback_dim_count(
         stats.proprio.q01, stats.proprio.q99, stats.proprio.minimum, stats.proprio.maximum
     )
