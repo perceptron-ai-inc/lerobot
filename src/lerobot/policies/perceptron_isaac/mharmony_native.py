@@ -231,7 +231,9 @@ class IsaacMharmonyRenderMetadata:
             raise ValueError(
                 "Isaac mharmony metadata requires robot_type for the robotics configuration block."
             )
-        if str(self.robot_type) != str(config.robot_type):
+        if str(self.robot_type) != str(config.robot_type) and not _matches_source_bound_libero_prompt(
+            self, config
+        ):
             raise ValueError(
                 f"Isaac mharmony robot_type {self.robot_type!r} does not match config {config.robot_type!r}."
             )
@@ -283,6 +285,66 @@ class IsaacMharmonyRenderMetadata:
                 dataset_name=self.dataset_name,
                 proprio_dim=self.proprio_dim,
             )
+
+
+def _matches_source_bound_libero_prompt(
+    metadata: IsaacMharmonyRenderMetadata, config: PerceptronIsaacConfig
+) -> bool:
+    """Reconcile an admitted source prompt, never weaken the physical LIBERO ABI.
+
+    Artifact admission authenticates the checkpoint-local recipe. This check
+    requires its selected source profile; a bare robot-name alias is insufficient.
+    """
+    if not (
+        config.strict_environment_feature_contract is True
+        and config.robot_type == "libero"
+        and config.control_mode == "ee"
+        and config.dataset_name == "libero"
+        and config.policy_state_dataset == "libero"
+        and metadata.dataset_name == "libero"
+        and metadata.robot_type == "franka"
+        and metadata.control_mode is None
+        and metadata.objective_form == "Flow"
+        and metadata.action_representation == "absolute"
+        and metadata.action_dim == 7
+        and metadata.proprio_dim == 8
+    ):
+        return False
+    if not config.hf_model_path or not config.normalization_profile_scope:
+        return False
+    path = Path(config.hf_model_path) / "policy_inference_recipe.json"
+    if not path.is_file():
+        return False
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict) or not isinstance(raw.get("recipes"), list):
+        raise ValueError("Source-bound LIBERO prompt requires a recipe object/list.")
+    selected = [
+        entry
+        for entry in raw["recipes"]
+        if isinstance(entry, dict)
+        and entry.get("policy_state_dataset") == config.policy_state_dataset
+        and entry.get("normalization_scope") == config.normalization_profile_scope
+        and entry.get("objective") == "Flow"
+    ]
+    if len(selected) != 1:
+        return False
+    profile = selected[0].get("deployment_profile")
+    if not isinstance(profile, dict):
+        return False
+    camera = profile.get("camera")
+    state_action = profile.get("state_action_schema")
+    if not isinstance(camera, dict) or not isinstance(state_action, dict):
+        return False
+    return (
+        profile.get("robot_type") == metadata.robot_type
+        and camera.get("observation_keys") == metadata.camera_order == ["image", "wrist_image"]
+        and camera.get("prompt_views") == metadata.camera_views == ["primary", "wrist"]
+        and state_action.get("name") == "gripper_7"
+        and state_action.get("control_mode") is metadata.control_mode
+        and state_action.get("components")
+        == metadata.action_layout
+        == ["world_vector", "rotation_delta", "gripper_closedness_action"]
+    )
 
 
 def build_isaac_training_proprio_contract(
