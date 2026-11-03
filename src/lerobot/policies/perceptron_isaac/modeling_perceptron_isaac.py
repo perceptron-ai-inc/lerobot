@@ -1259,12 +1259,15 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         batch: dict[str, Any],
         action_prefix: Tensor | None = None,
         prefix_length: int | None = None,
+        *,
+        flow_noise: Tensor | None = None,
         **kwargs,
     ) -> Tensor:
         """Run the flow expert on a native mharmony stream.
 
         Returns normalized actions shaped ``[B, chunk_size, action_dim]``. The
         postprocessor is responsible for action unnormalization and clipping.
+        Optional ``flow_noise`` supplies sample-major full-width DiT noise without RNG draws.
         """
         self._require_deployable_action_artifact()
         reject_rtc_prefix(action_prefix, prefix_length)
@@ -1295,12 +1298,16 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         n_flow = max(1, int(getattr(self.config, "num_flow_samples", 1) or 1))
 
         def _sample() -> Tensor:
+            noise_kwargs: dict[str, Any] = {}
+            if flow_noise is not None:
+                noise_kwargs["flow_noise"] = flow_noise
             return model.sample_action(
                 stream,
                 num_steps=self.config.num_inference_steps,
                 action_dim=self.config.action_dim,
                 num_action_steps=self.config.chunk_size,
                 num_flow_samples=n_flow,
+                **noise_kwargs,
             )
 
         def _run_samples() -> Tensor:
@@ -1342,8 +1349,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         return actions_norm[:, :, : self.config.action_dim].float()
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Any], **kwargs) -> Tensor:
-        """Serve one normalized action per call; refill chunks through ``predict_action_chunk``."""
+    def select_action(self, batch: dict[str, Any], *, flow_noise: Tensor | None = None, **kwargs) -> Tensor:
+        """Serve one action; optional ``flow_noise`` is used only when refilling the chunk."""
         reject_rtc_prefix(kwargs.get("action_prefix"), kwargs.get("prefix_length"))
         if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
             raise NotImplementedError("perceptron_isaac does not support RTC inference; use sync inference.")
@@ -1388,7 +1395,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         if len(self._queues[ACTION]) == 0:
             model_batch = batch if has_stream else self._render_online_stream_batch(batch)
-            actions = self.predict_action_chunk(model_batch)
+            actions = (
+                self.predict_action_chunk(model_batch)
+                if flow_noise is None
+                else self.predict_action_chunk(model_batch, flow_noise=flow_noise)
+            )
             actions = actions[:, : self.config.n_action_steps]
             self._queues[ACTION].extend(actions.transpose(0, 1))
         return self._queues[ACTION].popleft()

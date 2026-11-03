@@ -1430,7 +1430,13 @@ class DiTActionExpertHead(MolmoActExpertHead):
         prefix_length: int | Sequence[int] | torch.Tensor | None = None,
         num_flow_samples: int = 1,
         allow_ood_rtc_prefix: bool = False,
+        noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Batch candidate integration while preserving the historical client's per-candidate RNG draws.
+
+        Optional noise is [H,Dfull] (broadcast) or [K*B,H,Dfull] in sample-major order.
+        Supplied noise consumes no sampling RNG and is never modified in place.
+        """
         reject_rtc_prefix(action_prefix, prefix_length)
         num_steps = self.num_inference_steps if num_steps is None else int(num_steps)
         horizon = self.action_horizon if num_action_steps is None else int(num_action_steps)
@@ -1448,13 +1454,31 @@ class DiTActionExpertHead(MolmoActExpertHead):
         out_dim = full_dim if action_dim is None else int(action_dim)
         if not 1 <= out_dim <= full_dim:
             raise ValueError(f"action_dim must be in [1, {full_dim}]; got {out_dim}.")
+        if vlm_mask is not None and vlm_mask.shape != first.shape[:2]:
+            raise ValueError("action expert context mask shape must match [B,L].")
 
+        sample_count = max(1, int(num_flow_samples or 1))
+        sample_batch_size = sample_count * batch_size
+
+        def expand_candidates(tensor: torch.Tensor) -> torch.Tensor:
+            expanded = tensor.unsqueeze(0).expand(sample_count, *tensor.shape)
+            return expanded.reshape(sample_batch_size, *tensor.shape[1:])
+
+        # Expand raw contexts before projection, as the serving batch-eight path does.
+        # For B=1, expand keeps the raw context as a zero-stride view instead of copying it K times.
+        if sample_count > 1:
+            if isinstance(vlm_activations, torch.Tensor):
+                vlm_activations = expand_candidates(vlm_activations)
+            else:
+                vlm_activations = tuple(expand_candidates(layer) for layer in vlm_activations)
+            if vlm_mask is not None:
+                vlm_mask = expand_candidates(vlm_mask)
         context = self._build_single_context(
             vlm_activations,
             vlm_mask,
             action_mask=None,
             seq_len=horizon,
-            batch_size=batch_size,
+            batch_size=sample_batch_size,
             device=device,
             dtype=model_dtype,
         )
@@ -1464,32 +1488,39 @@ class DiTActionExpertHead(MolmoActExpertHead):
             dim_mask = torch.zeros(1, 1, full_dim, dtype=state_dtype, device=device)
             dim_mask[:, :, :out_dim] = 1.0
 
-        def velocity_fn(state: torch.Tensor, flow_time: float):
-            t_tensor = torch.full((batch_size,), flow_time, dtype=model_dtype, device=device)
-            return self.action_expert.forward_with_context(
-                state.to(model_dtype),
-                t_tensor,
-                context=context,
+        if noise is None:
+            # Benchmark 102799's client drew K tensors separately, not one randn(K*B,H,D).
+            # CUDA draw geometry matters even when the scalar seed and element count agree.
+            draws = [
+                torch.randn(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
+                for _ in range(sample_count)
+            ]
+            x = torch.stack(draws).reshape(sample_batch_size, horizon, full_dim)
+        else:
+            expected_shape = (sample_batch_size, horizon, full_dim)
+            if noise.ndim == 2 and noise.shape == (horizon, full_dim):
+                noise = noise.unsqueeze(0).expand(sample_batch_size, -1, -1)
+            elif noise.shape != expected_shape:
+                raise ValueError(
+                    f"noise shape must be {(horizon, full_dim)} or {expected_shape}; got {tuple(noise.shape)}."
+                )
+            x = noise.to(device=device, dtype=state_dtype).contiguous()
+        if dim_mask is not None:
+            x = x * dim_mask
+        dt = 1.0 / num_steps
+        for step in range(num_steps):
+            t_tensor = torch.full((sample_batch_size,), step / num_steps, dtype=model_dtype, device=device)
+            velocity = self.action_expert.forward_with_context(
+                x.to(model_dtype), t_tensor, context=context
             ).to(state_dtype)
-
-        def sample_once() -> torch.Tensor:
-            x = torch.randn(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
+            if dim_mask is not None:
+                velocity = velocity * dim_mask
+            x = x + dt * velocity
             if dim_mask is not None:
                 x = x * dim_mask
-            dt = 1.0 / num_steps
-            for step in range(num_steps):
-                velocity = velocity_fn(x, step / num_steps)
-                if dim_mask is not None:
-                    velocity = velocity * dim_mask
-                x = x + dt * velocity
-                if dim_mask is not None:
-                    x = x * dim_mask
-            return x
-
-        sample_count = max(1, int(num_flow_samples or 1))
         if sample_count == 1:
-            return sample_once()
-        return torch.stack([sample_once() for _ in range(sample_count)], dim=0).mean(dim=0)
+            return x
+        return x.reshape(sample_count, batch_size, horizon, full_dim).mean(dim=0)
 
 
 ACTION_EXPERT_HEADS = {
@@ -1807,6 +1838,7 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
         action_prefix: torch.Tensor | None = None,
         prefix_length: int | None = None,
         num_flow_samples: int = 1,
+        flow_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Integrate the flow expert into a ``[B, num_action_steps or H, action_dim]`` chunk.
 
@@ -1841,6 +1873,11 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
             final_norm=self.model.language_model.norm,
             backbone_num_layers=len(self.model.language_model.layers),
         )
+        noise_kwargs: dict[str, Any] = {}
+        if flow_noise is not None:
+            if not isinstance(expert, DiTActionExpertHead):
+                raise ValueError("flow_noise requires the native DiT action expert.")
+            noise_kwargs["noise"] = flow_noise
         actions = expert.sample(
             vlm_activations=context,
             vlm_mask=vlm_mask,
@@ -1850,6 +1887,7 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
             action_prefix=action_prefix,
             prefix_length=prefix_length,
             num_flow_samples=num_flow_samples,
+            **noise_kwargs,
         )
         if action_dim is not None and action_dim < expert.action_dim:
             actions = actions[:, :, :action_dim].contiguous()
