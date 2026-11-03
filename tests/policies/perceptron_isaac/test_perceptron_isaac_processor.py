@@ -61,6 +61,7 @@ from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     make_perceptron_isaac_pre_post_processors_from_pretrained,
     normalize_perceptron_isaac_task_text,
 )
+from lerobot.policies.perceptron_isaac.rtc import SharedFinalContext
 from lerobot.processor import PolicyProcessorPipeline, batch_to_transition, transition_to_batch
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -505,6 +506,9 @@ def _write_native_stats(
 def test_molmoact_expert_averages_flow_samples_with_one_context_build():
     head = MolmoActExpertHead.__new__(MolmoActExpertHead)
     torch.nn.Module.__init__(head)
+    # This narrow sampler fixture bypasses __init__, so supply its required context contract.
+    head.conditioning = SharedFinalContext()
+    head.vlm_dim = 4
     head.num_inference_steps = 1
     head.action_dim = 1
     head.action_horizon = 1

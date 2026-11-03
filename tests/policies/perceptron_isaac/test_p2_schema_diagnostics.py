@@ -1,4 +1,8 @@
-"""P2.15: accurate eager schema refusal without misleading conversion advice."""
+"""Malformed declarations and integrity checks precede model construction.
+
+Approved schema-2 support supersedes P2's blanket refusal of valid layerwise
+metadata. Positive acceptance and numeric oracles live in test_layerwise_*.py.
+"""
 
 from __future__ import annotations
 
@@ -25,47 +29,42 @@ from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _write_
 from tests.policies.perceptron_isaac.test_portable_model_repo import _native_portable_package
 
 
-def _assert_unsupported_layerwise(message: str) -> None:
-    lowered = message.lower()
-    assert "unsupported" in lowered or "not supported" in lowered
-    assert "per-layer" in lowered or "layerwise" in lowered or "layer_hidden" in lowered
-    assert "re-export" not in lowered, "the current converter emits the same unsupported schema"
+def _assert_invalid_layerwise(message: str) -> None:
+    fields = ("schema_version", "context_source", "context_layers", "context_hidden_norm")
+    assert any(field in message for field in fields)
+    assert "re-export" not in message.lower(), "malformed metadata needs a field diagnostic"
 
 
 @pytest.mark.parametrize("schema", [1, 2])
-def test_hf_validator_names_unsupported_layerwise_semantics(schema: int) -> None:
+def test_hf_validator_names_malformed_layerwise_semantics(schema: int) -> None:
     action = _dit_contract(
         schema_version=schema,
         context_source="layer_hidden",
-        context_layers=[0],
+        context_layers=[0, 0],  # Not one unique layer for the single expert block.
         context_hidden_norm="final_norm",
     )
     with pytest.raises(ValueError) as caught:
         _validate_action_expert_contract(action)
-    _assert_unsupported_layerwise(str(caught.value))
-    if schema == 2:
-        assert "2" in str(caught.value)
+    _assert_invalid_layerwise(str(caught.value))
 
 
 @pytest.mark.parametrize("schema", [1, 2])
-def test_mk1_validator_names_unsupported_layerwise_semantics(tmp_path: Path, schema: int) -> None:
+def test_mk1_validator_names_malformed_layerwise_semantics(tmp_path: Path, schema: int) -> None:
     _, raw, _ = _write_portable_isaac05_checkpoint(tmp_path / "model")
     raw["action_expert"].update(
         schema_version=schema,
         context_source="layer_hidden",
-        context_layers=[0, 1],
+        context_layers=[0, 2],  # Tiny backbone has only two layers.
         context_hidden_norm="final_norm",
     )
     raw["isaac05_vla"]["action_expert"] = copy.deepcopy(raw["action_expert"])
     with pytest.raises(Mk1CheckpointContractError) as caught:
         Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
-    _assert_unsupported_layerwise(str(caught.value))
-    if schema == 2:
-        assert "2" in str(caught.value)
+    _assert_invalid_layerwise(str(caught.value))
 
 
 @pytest.mark.parametrize("lazy", [True, False], ids=["fp32_lazy", "bf16_eager"])
-def test_public_load_refuses_schema2_before_model_allocation(
+def test_public_load_refuses_out_of_range_schema2_before_model_allocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lazy: bool
 ) -> None:
     import lerobot.policies.perceptron_isaac.modeling_mk1_vla as native
@@ -77,7 +76,7 @@ def test_public_load_refuses_schema2_before_model_allocation(
     raw["action_expert"].update(
         schema_version=2,
         context_source="layer_hidden",
-        context_layers=[0, 1],
+        context_layers=[0, 2],
         context_hidden_norm="final_norm",
     )
     raw["isaac05_vla"]["action_expert"] = copy.deepcopy(raw["action_expert"])
@@ -85,13 +84,12 @@ def test_public_load_refuses_schema2_before_model_allocation(
     original_bytes = source_path.read_bytes()
 
     def forbid_model(*args: object, **kwargs: object) -> None:
-        raise AssertionError("unsupported schema reached model allocation")
+        raise AssertionError("out-of-range schema2 reached model allocation")
 
     monkeypatch.setattr(native, "Mk1Qwen36VLAForActionGeneration", forbid_model)
     with pytest.raises((ValueError, RuntimeError)) as caught:
         PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
-    _assert_unsupported_layerwise(str(caught.value))
-    assert "2" in str(caught.value)
+    assert "context_layers" in str(caught.value)
     assert source_path.read_bytes() == original_bytes
 
 
@@ -110,14 +108,15 @@ def test_schema1_unknown_field_is_still_refused() -> None:
 def test_schema2_without_layer_fields_is_not_treated_as_convertible_schema1() -> None:
     with pytest.raises(ValueError) as caught:
         _validate_action_expert_contract(_dit_contract(schema_version=2))
-    _assert_unsupported_layerwise(str(caught.value))
-    assert "2" in str(caught.value)
+    assert any(
+        field in str(caught.value) for field in ("context_source", "context_layers", "context_hidden_norm")
+    )
 
 
 Corruption = Literal["policy-count", "manifest", "source-config", "unlisted"]
 
 
-def _authenticated_layerwise_package(root: Path, *, schema: int, lazy: bool) -> None:
+def _authenticated_layerwise_package(root: Path, *, schema: int, lazy: bool, malformed: bool = False) -> None:
     config = _source_package(root)
     config.train_storage_fp32 = lazy
     path = root / "hf_model/config.json"
@@ -125,12 +124,12 @@ def _authenticated_layerwise_package(root: Path, *, schema: int, lazy: bool) -> 
     raw["action_expert"].update(
         schema_version=schema,
         context_source="layer_hidden",
-        context_layers=[0, 1],
+        context_layers=[0, 2] if malformed else [0, 1],
         context_hidden_norm="final_norm",
     )
     raw["isaac05_vla"]["action_expert"] = copy.deepcopy(raw["action_expert"])
     path.write_text(json.dumps(raw))
-    # Bind the unsupported semantics honestly before testing diagnostic precedence.
+    # Bind the declaration honestly before testing diagnostic precedence.
     finalize_canonical_trained_package(
         config, root, mk1_source_model_import_sha256=config.mk1_source_model_import_sha256
     )
@@ -152,19 +151,18 @@ def _construction_tripwires(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize("schema", [1, 2], ids=["schema1-per-layer", "schema2-per-layer"])
 @pytest.mark.parametrize("lazy", [True, False], ids=["fp32-lazy", "bf16-eager"])
-def test_authenticated_layerwise_refusal_precedes_policy_and_native_construction(
+def test_authenticated_malformed_layerwise_refusal_precedes_policy_and_native_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema: int, lazy: bool
 ) -> None:
     root = tmp_path / "package"
-    _authenticated_layerwise_package(root, schema=schema, lazy=lazy)
+    _authenticated_layerwise_package(root, schema=schema, lazy=lazy, malformed=True)
     before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
     _construction_tripwires(monkeypatch)
 
     with pytest.raises(ValueError) as caught:
         PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
 
-    _assert_unsupported_layerwise(str(caught.value))
-    assert f"schema_version={schema}" in str(caught.value)
+    _assert_invalid_layerwise(str(caught.value))
     assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
 
 

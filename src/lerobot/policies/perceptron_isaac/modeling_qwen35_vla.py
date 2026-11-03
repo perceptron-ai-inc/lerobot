@@ -28,12 +28,14 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5Pr
 from lerobot.utils.random_utils import deserialize_rng_state, serialize_rng_state
 
 # --- Genesis TensorStream layout / mrope / context-mask utilities ---
-from .mk1_checkpoint_contract import reject_unsupported_action_expert_semantics
 from .rtc import (
-    DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION,
     DIT_ACTION_EXPERT_CONFIG_V1_FIELDS,
+    ActionExpertConditioning,
     ActionExpertStepModulation,
+    LayerHiddenContext,
     reject_rtc_prefix,
+    validate_action_context,
+    validate_dit_action_metadata,
 )
 from .tensor_stream import ModalityType, TensorStream, TextType, VectorType, VisionType, group_streams
 from .tensor_stream_utils import (
@@ -714,7 +716,7 @@ class ActionExpert(nn.Module):
                 f"Expected {len(self.blocks)} KV layers for per-layer conditioning, got {len(encoder_kv_states)}."
             )
         kv_contexts = []
-        for block, (k_in, v_in) in zip(self.blocks, encoder_kv_states, strict=False):
+        for block, (k_in, v_in) in zip(self.blocks, encoder_kv_states, strict=True):
             k_ctx = self._project_kv_tensor(k_in, self.context_k_proj)
             v_ctx = self._project_kv_tensor(v_in, self.context_v_proj)
             k_norm = block.cross_attn.k_norm
@@ -853,11 +855,13 @@ class ActionExpert(nn.Module):
             conditioning = modulation.conditioning
             block_modulations = modulation.block_modulations
             final_modulation = modulation.final_modulation
+        if len(context.kv_contexts) != len(self.blocks) or len(block_modulations) != len(self.blocks):
+            raise ValueError("action expert context and modulation counts must match the expert block count.")
         x = self.action_embed(actions)
         if context.valid_action is not None:
             x = x * context.valid_action
         for _idx, (block, kv_context, block_modulation) in enumerate(
-            zip(self.blocks, context.kv_contexts, block_modulations, strict=False)
+            zip(self.blocks, context.kv_contexts, block_modulations, strict=True)
         ):
             x = block(
                 x,
@@ -906,8 +910,8 @@ class ActionExpert(nn.Module):
 
 # ---------------------------------------------------------------------------
 # Pluggable action-expert head. The vendored ActionExpert (above) is driven from
-# the backbone's FINAL-layer activations as a single shared cross-attention
-# context (clean-at-1), ported from genesis MolmoActFlowExpert. Geometry comes
+# schema-1 FINAL-layer activations as a shared context or schema-2 ordered
+# post-residual layer contexts (clean-at-1), ported from genesis MolmoActFlowExpert. Geometry comes
 # from IsaacConfig.action_expert; weights nest as action_expert.action_expert.*
 # (mirrors genesis flow_matching_expert.action_expert.* -> pure converter prefix swap).
 # ---------------------------------------------------------------------------
@@ -954,7 +958,7 @@ class MolmoActExpertTrainArgs:
 
 
 class MolmoActExpertHead(ActionExpertHead):
-    """Vendored MolmoAct2 ActionExpert wired to a single shared final-layer context.
+    """Vendored MolmoAct2 ActionExpert with shared-final or ordered layerwise context.
 
     Ported from genesis ``MolmoActFlowExpert``: context_k/v_proj project vlm_dim->hidden
     (the genesis-wired projections ARE the trained weights), every other weight loads
@@ -963,9 +967,24 @@ class MolmoActExpertHead(ActionExpertHead):
 
     expert_type = "molmoact"
 
-    def __init__(self, action_expert_cfg: dict, vlm_dim: int) -> None:
+    def __init__(
+        self,
+        action_expert_cfg: dict[str, Any],
+        vlm_dim: int,
+        *,
+        conditioning: ActionExpertConditioning | None = None,
+    ) -> None:
         super().__init__()
         c = dict(action_expert_cfg)
+        if c.get("type") == "dit":
+            declared = validate_dit_action_metadata(c)
+        else:
+            declared = validate_action_context(
+                c, schema_version=2 if isinstance(conditioning, LayerHiddenContext) else 1
+            )
+        if conditioning is not None and conditioning != declared:
+            raise ValueError("action expert context conditioning disagrees with its metadata.")
+        self.conditioning = declared
         self.vlm_dim = int(vlm_dim)
         self.action_dim = int(c["action_dim"])
         self.action_horizon = int(c["action_horizon"])
@@ -988,8 +1007,8 @@ class MolmoActExpertHead(ActionExpertHead):
             context_layer_norm=bool(c.get("context_layer_norm", True)),
             causal_attn=bool(c.get("causal_attn", False)),
         )
-        # llm_kv_dim=vlm_dim => context_k/v_proj are vlm_dim->hidden; one shared context fed
-        # to all blocks, so llm_num_layers is nominal (satisfies the one-block-per-layer assert).
+        # llm_kv_dim=vlm_dim keeps the same shared projections for either context form;
+        # llm_num_layers counts expert context slots, not the full backbone depth.
         self.action_expert = ActionExpert(
             cfg, llm_dim=vlm_dim, llm_kv_dim=vlm_dim, llm_num_layers=cfg.num_layers
         )
@@ -1007,14 +1026,97 @@ class MolmoActExpertHead(ActionExpertHead):
         # Genesis tau is the noise level (1=noise); MolmoAct2 is clean-at-1, so feed 1-tau.
         return tau if self.clean_at_0 else (1.0 - tau)
 
+    def _context_tensors(
+        self, vlm_activations: torch.Tensor | Sequence[torch.Tensor]
+    ) -> tuple[torch.Tensor, ...]:
+        """Validate context form and geometry before projection, attention or sampling RNG draws."""
+        if isinstance(self.conditioning, LayerHiddenContext):
+            if isinstance(vlm_activations, torch.Tensor) or not isinstance(vlm_activations, Sequence):
+                raise ValueError(
+                    "layerwise context requires a sequence of Tensor layers, not a final Tensor."
+                )
+            tensors = tuple(vlm_activations)
+            if len(tensors) != len(self.action_expert.blocks):
+                raise ValueError("layerwise context count must equal the expert block count.")
+        else:
+            if not isinstance(vlm_activations, torch.Tensor):
+                raise ValueError("shared final context requires a Tensor, not a layer sequence.")
+            tensors = (vlm_activations,)
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 3:
+                raise ValueError("action expert context must contain rank-3 Tensor layers [B,L,D].")
+            if tensor.shape[-1] != self.vlm_dim or min(tensor.shape[:2]) < 1:
+                raise ValueError(
+                    "action expert context shape must have nonempty batch/tokens and backbone width."
+                )
+            if not tensor.is_floating_point():
+                raise ValueError("action expert context dtype must be floating point.")
+        first = tensors[0]
+        for tensor in tensors[1:]:
+            if tensor.shape != first.shape:
+                raise ValueError("action expert context layer shapes must match [B,L,D].")
+            if tensor.dtype != first.dtype or tensor.device != first.device:
+                raise ValueError("action expert context layer dtype and device must match.")
+        return tensors
+
+    def select_backbone_context(
+        self, output: BaseModelOutputWithPast, *, final_norm: nn.Module, backbone_num_layers: int
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Map decoder i to HF boundary i+1; the final slot already has its learned final norm."""
+        if not isinstance(self.conditioning, LayerHiddenContext):
+            return output.last_hidden_state
+        hidden_states = output.hidden_states
+        if hidden_states is None or len(hidden_states) != backbone_num_layers + 1:
+            raise ValueError("layerwise context requires every post-residual backbone hidden-state boundary.")
+        selected = []
+        for index in self.conditioning.context_layers:
+            if index >= backbone_num_layers:
+                raise ValueError("context_layers index is outside the backbone decoder bounds.")
+            if index == backbone_num_layers - 1:
+                if self.conditioning.context_hidden_norm != "final_norm":
+                    raise ValueError("context_hidden_norm='none' cannot use the unexposed raw last layer.")
+                selected.append(output.last_hidden_state)
+            else:
+                raw = hidden_states[index + 1]
+                selected.append(
+                    final_norm(raw) if self.conditioning.context_hidden_norm == "final_norm" else raw
+                )
+        return tuple(selected)
+
     def _build_single_context(
-        self, vlm_activations, vlm_mask, action_mask, *, seq_len, batch_size, device, dtype
-    ):
+        self,
+        vlm_activations: torch.Tensor | Sequence[torch.Tensor],
+        vlm_mask: torch.Tensor | None,
+        action_mask: torch.Tensor | None,
+        *,
+        seq_len: int,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> ActionExpertContext:
+        tensors = self._context_tensors(vlm_activations)
+        first = tensors[0]
+        if first.shape[0] != batch_size or first.device != device or first.dtype != dtype:
+            raise ValueError("action expert context batch, device and dtype must match the action input.")
+        if vlm_mask is not None and vlm_mask.shape != first.shape[:2]:
+            raise ValueError("action expert context mask shape must match [B,L].")
+        if action_mask is not None and action_mask.shape != (batch_size, seq_len):
+            raise ValueError("action expert context action mask shape must match [B,H].")
         ae = self.action_expert
         encoder_attention_mask = None if vlm_mask is None else vlm_mask.to(device=device, dtype=dtype)
         action_attention_mask = None if action_mask is None else action_mask.to(device=device)
-        k_base = ae._project_kv_tensor(vlm_activations, ae.context_k_proj)  # noqa: SLF001
-        v_ctx = ae._project_kv_tensor(vlm_activations, ae.context_v_proj)  # noqa: SLF001
+        if isinstance(self.conditioning, LayerHiddenContext):
+            return ae.prepare_context(
+                encoder_kv_states=[(tensor, tensor) for tensor in tensors],
+                encoder_attention_mask=encoder_attention_mask,
+                action_attention_mask=action_attention_mask,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
+        k_base = ae._project_kv_tensor(first, ae.context_k_proj)  # noqa: SLF001
+        v_ctx = ae._project_kv_tensor(first, ae.context_v_proj)  # noqa: SLF001
         kv_contexts = []
         for block in ae.blocks:
             k_ctx = k_base
@@ -1050,7 +1152,7 @@ class MolmoActExpertHead(ActionExpertHead):
 
     def forward(
         self,
-        vlm_activations: torch.Tensor,
+        vlm_activations: torch.Tensor | Sequence[torch.Tensor],
         vlm_mask: torch.Tensor | None,
         x_tau: torch.Tensor,
         tau: torch.Tensor,
@@ -1058,7 +1160,7 @@ class MolmoActExpertHead(ActionExpertHead):
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Differentiable single-step velocity prediction (training). Mirrors genesis
-        ``MolmoActFlowExpert.forward``: build the shared final-layer context once, run the expert at the
+        ``MolmoActFlowExpert.forward``: build the declared contexts once, run the expert at the
         clean-at-1 flow time. ``x_tau`` is ``[B,H,D]`` or ``[K,B,H,D]`` (K MC samples looped against the
         shared context to bound memory). ``horizon_emb`` is ignored (positions come from RoPE)."""
         del horizon_emb
@@ -1104,9 +1206,10 @@ class MolmoActExpertHead(ActionExpertHead):
         out_dim = full_dim if action_dim is None else int(action_dim)
         if out_dim > full_dim:
             raise ValueError(f"action_dim={out_dim} exceeds expert action_dim={full_dim}")
-        batch_size = vlm_activations.shape[0]
-        device = vlm_activations.device
-        model_dtype = vlm_activations.dtype
+        first = self._context_tensors(vlm_activations)[0]
+        batch_size = first.shape[0]
+        device = first.device
+        model_dtype = first.dtype
         state_dtype = torch.float32
 
         context = self._build_single_context(
@@ -1290,25 +1393,8 @@ class DiTActionExpertArgs:
 
 
 def _validate_action_expert_contract(action_expert_cfg: dict[str, Any]) -> DiTActionExpertArgs:
-    reject_unsupported_action_expert_semantics(action_expert_cfg)
-    schema_version = action_expert_cfg.get("schema_version")
-    if schema_version != DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION:
-        raise ValueError(
-            "action_expert metadata must carry "
-            f"schema_version={DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION}; got {schema_version!r}. "
-            "This action-expert schema is unsupported."
-        )
-    expert_type = action_expert_cfg.get("type")
-    if expert_type != "dit":
-        raise ValueError(f"only the 'dit' action expert is supported; got {expert_type!r}")
-    required = DIT_ACTION_EXPERT_CONFIG_V1_FIELDS
-    missing = [key for key in required if key not in action_expert_cfg]
-    if missing:
-        raise ValueError(f"action_expert metadata is missing required fields: {missing}.")
-    unexpected = sorted(set(action_expert_cfg) - set(required) - {"schema_version", "type"})
-    if unexpected:
-        raise ValueError(f"action_expert metadata has unexpected fields for schema v1: {unexpected}.")
-    values = {key: action_expert_cfg[key] for key in required}
+    validate_dit_action_metadata(action_expert_cfg)
+    values = {key: action_expert_cfg[key] for key in DIT_ACTION_EXPERT_CONFIG_V1_FIELDS}
     try:
         return DiTActionExpertArgs(**values)
     except (TypeError, ValueError) as exc:
@@ -1321,15 +1407,21 @@ class DiTActionExpertHead(MolmoActExpertHead):
     expert_type = "dit"
     args: DiTActionExpertArgs
 
-    def __init__(self, action_expert_cfg: dict[str, Any], vlm_dim: int) -> None:
+    def __init__(
+        self,
+        action_expert_cfg: dict[str, Any],
+        vlm_dim: int,
+        *,
+        conditioning: ActionExpertConditioning | None = None,
+    ) -> None:
         args = _validate_action_expert_contract(action_expert_cfg)
-        super().__init__(action_expert_cfg, vlm_dim)
+        super().__init__(action_expert_cfg, vlm_dim, conditioning=conditioning)
         self.args = args
 
     @torch.no_grad()
     def sample(
         self,
-        vlm_activations: torch.Tensor,
+        vlm_activations: torch.Tensor | Sequence[torch.Tensor],
         vlm_mask: torch.Tensor | None = None,
         num_steps: int | None = None,
         num_action_steps: int | None = None,
@@ -1347,9 +1439,10 @@ class DiTActionExpertHead(MolmoActExpertHead):
         if horizon < 1 or horizon > self.action_horizon:
             raise ValueError(f"num_action_steps must be in [1, {self.action_horizon}]; got {horizon}.")
         full_dim = self.action_dim
-        batch_size = vlm_activations.shape[0]
-        device = vlm_activations.device
-        model_dtype = vlm_activations.dtype
+        first = self._context_tensors(vlm_activations)[0]
+        batch_size = first.shape[0]
+        device = first.device
+        model_dtype = first.dtype
         state_dtype = torch.float32
 
         out_dim = full_dim if action_dim is None else int(action_dim)
@@ -1405,11 +1498,17 @@ ACTION_EXPERT_HEADS = {
 }
 
 
-def build_action_expert_head(action_expert_cfg, vlm_dim):
+def build_action_expert_head(
+    action_expert_cfg: dict[str, Any] | None,
+    vlm_dim: int,
+    *,
+    context_schema_version: int = 1,
+    backbone_num_layers: int | None = None,
+) -> MolmoActExpertHead | None:
     """Construct the action-expert head selected by ``action_expert_cfg['type']``.
 
-    Schema-v1 DiT metadata selects the native clean-at-one head.
-    Legacy MolmoAct metadata retains its existing scalar-time sampling path.
+    DiT schemas 1 and 2 share the native clean-at-one head and weight ABI.
+    Migrated MolmoAct conditioning is versioned by its VLA envelope, not the action block.
     """
     if action_expert_cfg is None:
         return None
@@ -1422,7 +1521,13 @@ def build_action_expert_head(action_expert_cfg, vlm_dim):
         )
     if head_type not in ACTION_EXPERT_HEADS:
         raise ValueError(f"unknown action_expert type {head_type!r}; known: {sorted(ACTION_EXPERT_HEADS)}")
-    return ACTION_EXPERT_HEADS[head_type](cfg, vlm_dim=vlm_dim)
+    if head_type == "dit":
+        conditioning = validate_dit_action_metadata(cfg, backbone_num_layers=backbone_num_layers)
+    else:
+        conditioning = validate_action_context(
+            cfg, schema_version=context_schema_version, backbone_num_layers=backbone_num_layers
+        )
+    return ACTION_EXPERT_HEADS[head_type](cfg, vlm_dim=vlm_dim, conditioning=conditioning)
 
 
 # === Config ===
@@ -1469,7 +1574,9 @@ class Qwen35VLAModel(Qwen3_5Model):
         super().__init__(config)
         hidden = config.text_config.hidden_size
         self.vector_embedding = build_vector_encoder(config.vector_max_states, hidden)
-        self.action_expert = build_action_expert_head(config.action_expert, vlm_dim=hidden)
+        self.action_expert = build_action_expert_head(
+            config.action_expert, vlm_dim=hidden, backbone_num_layers=config.text_config.num_hidden_layers
+        )
 
     # -- per-modality embedders --
 
@@ -1620,7 +1727,7 @@ class Qwen35VLAModel(Qwen3_5Model):
         return compact if preceding is None else _ordered_modality_input(compact, preceding)
 
     def forward(self, tensor_stream: TensorStream, **kwargs: Any) -> BaseModelOutputWithPast:
-        """Run the VLM over the rendered stream and return post-final-norm activations.
+        """Run one VLM pass, retaining hidden-state boundaries only for layerwise conditioning.
 
         Replicates genesis ``PerceptronTransformer.forward``: interleave -> MRoPE positions ->
         next-token-prediction truncation ``[:, :-1]`` -> native hybrid decoder -> final norm.
@@ -1651,6 +1758,8 @@ class Qwen35VLAModel(Qwen3_5Model):
         router_output_kwargs = {}
         if kwargs.get("output_router_auxiliaries", False):
             router_output_kwargs["output_router_auxiliaries"] = True
+        if self.action_expert is not None and isinstance(self.action_expert.conditioning, LayerHiddenContext):
+            router_output_kwargs["output_hidden_states"] = True
         out = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
@@ -1702,7 +1811,7 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
         """Integrate the flow expert into a ``[B, num_action_steps or H, action_dim]`` chunk.
 
         Numerically mirrors genesis ``PerceptronTransformer.sample_action``: one VLM forward over the
-        stream, take the post-norm final activations (already ``[:, :-1]``-truncated by ``forward``),
+        stream, select the declared context (already ``[:, :-1]``-truncated by ``forward``),
         build the pre-action context mask (excludes action-marker positions), and run the expert's
         clean-at-1 Euler ODE. Output is in normalized action space (caller unnormalizes).
         """
@@ -1727,8 +1836,13 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
             l_model=l_model,
             device=device,
         )
+        context = expert.select_backbone_context(
+            output,
+            final_norm=self.model.language_model.norm,
+            backbone_num_layers=len(self.model.language_model.layers),
+        )
         actions = expert.sample(
-            vlm_activations=final,
+            vlm_activations=context,
             vlm_mask=vlm_mask,
             num_steps=num_steps,
             num_action_steps=num_action_steps,

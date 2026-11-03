@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Any, Never
 
 from .checkpoint_integrity import load_json_object
+from .rtc import (
+    DIT_CONTEXT_CONDITIONING_FIELDS,
+    ActionExpertConditioning,
+    SharedFinalContext,
+    validate_action_context,
+    validate_dit_action_metadata,
+)
 
 MK1_MODEL_TYPE = "qwen3_5_moe"
 MK1_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
@@ -97,24 +104,37 @@ class Mk1CheckpointContractError(ValueError):
     """The checkpoint cannot be interpreted as the allowlisted MK1 VLA ABI."""
 
 
-def reject_unsupported_action_expert_semantics(action: Mapping[str, Any]) -> None:
-    """Refuse schema-2/per-layer conditioning before model construction."""
-    schema = action.get("schema_version")
-    layer_fields = {"context_source", "context_layers", "context_hidden_norm"} & action.keys()
-    if schema == 2 or layer_fields:
-        raise Mk1CheckpointContractError(
-            f"action_expert schema_version={schema!r}: per-layer/layer_hidden context conditioning "
-            "is unsupported; only the schema-1 final-hidden context contract is implemented."
-        )
-
-
 def validate_checkpoint_action_expert_semantics(raw: Mapping[str, Any]) -> None:
-    """Check every declared action block without normalizing or rewriting source metadata."""
-    for block in (raw, raw.get("isaac05_vla"), raw.get("genesis_vla")):
+    """Validate both native copies or the migrated envelope before eager or lazy construction."""
+    text = _object_field(raw, "text_config")
+    depth = _integer(text, "num_hidden_layers", "text_config")
+    for path, block in (
+        ("isaac05_vla.action_expert", raw.get("isaac05_vla")),
+        ("action_expert", raw),
+        ("genesis_vla.action_expert", raw.get("genesis_vla")),
+    ):
         if isinstance(block, Mapping):
             action = block.get("action_expert")
             if isinstance(action, Mapping):
-                reject_unsupported_action_expert_semantics(action)
+                if action.get("type") == "dit":
+                    _validate_native_action_metadata(action, path=path, backbone_num_layers=depth)
+                else:
+                    schema = block.get("schema_version")
+                    try:
+                        validate_action_context(action, schema_version=schema, backbone_num_layers=depth)
+                    except ValueError as exc:
+                        _fail(str(exc))
+                    expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
+                    _require_exact_keys(action, expected, path)
+    if raw.get("model_type") == "isaac_0_5":
+        vla = _object_field(raw, "isaac05_vla")
+        if _integer(vla, "schema_version", "isaac05_vla") != 1:
+            _fail(
+                "isaac05_vla.schema_version must remain 1; the native action_expert owns its schema_version"
+            )
+        nested = _object_field(vla, "action_expert")
+        if _object_field(raw, "action_expert") != nested:
+            _fail("root and isaac05_vla action_expert blocks must be identical")
 
 
 @dataclass(frozen=True)
@@ -195,6 +215,7 @@ class Mk1ActionExpertContract:
     timestep_embed_dim: int
     ffn_multiple_of: int
     native_metadata: tuple[tuple[str, Any], ...] = ()
+    conditioning: ActionExpertConditioning = SharedFinalContext()
 
     @property
     def intermediate_size(self) -> int:
@@ -1285,16 +1306,16 @@ def _parse_special_tokens(
     return Mk1SpecialTokenContract(**values)
 
 
-def _validate_native_action_metadata(action_raw: Mapping[str, Any], *, path: str) -> None:
-    """Validate native action schema and typed RTC provenance without pinning its recipe."""
-    _require_exact_keys(
-        action_raw,
-        (_ACTION_KEYS - {"clean_at_0"})
-        | set(_ISAAC05_ACTION_VALUES)
-        | {"rtc_max_delay_steps", "rtc_probability", "rtc_delay_sampling", "rtc_poisson_mean"},
-        path,
-    )
-    _require_values(action_raw, _ISAAC05_ACTION_VALUES, path)
+def _validate_native_action_metadata(
+    action_raw: Mapping[str, Any], *, path: str, backbone_num_layers: int | None = None
+) -> ActionExpertConditioning:
+    """Validate versioned native action semantics and typed RTC provenance without rewriting metadata."""
+    try:
+        conditioning = validate_dit_action_metadata(action_raw, backbone_num_layers=backbone_num_layers)
+    except ValueError as exc:
+        _fail(f"{path} fields are invalid: {exc}")
+    pinned = {key: value for key, value in _ISAAC05_ACTION_VALUES.items() if key != "schema_version"}
+    _require_values(action_raw, pinned, path)
     if _integer(action_raw, "rtc_max_delay_steps", path) < 0:
         _fail(f"{path}.rtc_max_delay_steps must be nonnegative source metadata")
     probability = action_raw["rtc_probability"]
@@ -1306,16 +1327,19 @@ def _validate_native_action_metadata(action_raw: Mapping[str, Any], *, path: str
         _fail(f"{path}.rtc_delay_sampling has unsupported source metadata")
     if _number(action_raw, "rtc_poisson_mean", path) <= 0:
         _fail(f"{path}.rtc_poisson_mean must be positive source metadata")
+    return conditioning
 
 
 def _parse_vla(
     raw: Mapping[str, Any], *, text: Mk1TextContract, test_geometry: bool
 ) -> tuple[Mk1VectorEncoderContract, Mk1ActionExpertContract]:
     _require_exact_keys(raw, _VLA_KEYS, "genesis_vla")
+    schema = _integer(raw, "schema_version", "genesis_vla")
+    if schema not in (1, 2):
+        _fail("genesis_vla.schema_version must be 1 or 2")
     _require_values(
         raw,
         {
-            "schema_version": MK1_VLA_SCHEMA_VERSION,
             "backbone_family": MK1_BACKBONE_FAMILY,
             "state_dict_schema": MK1_STATE_DICT_SCHEMA,
             "rmsnorm_weight_convention": MK1_RMSNORM_CONVENTION,
@@ -1344,9 +1368,25 @@ def _parse_vla(
     native = action_raw.get("type") == "dit"
     metadata = tuple(sorted(action_raw.items())) if native else ()
     if native:
-        _validate_native_action_metadata(action_raw, path="isaac05_vla.action_expert")
+        if schema != 1:
+            _fail(
+                "isaac05_vla.schema_version must remain 1; the native action_expert owns its schema_version"
+            )
+        conditioning = _validate_native_action_metadata(
+            action_raw, path="isaac05_vla.action_expert", backbone_num_layers=text.num_hidden_layers
+        )
         action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
         action_raw = dict(action_raw, type="molmoact", clean_at_0=False)
+    else:
+        try:
+            conditioning = validate_action_context(
+                action_raw, schema_version=schema, backbone_num_layers=text.num_hidden_layers
+            )
+        except ValueError as exc:
+            _fail(f"genesis_vla.action_expert: {exc}")
+        expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
+        _require_exact_keys(action_raw, expected, "genesis_vla.action_expert")
+        action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
     _require_exact_keys(action_raw, _ACTION_KEYS, "genesis_vla.action_expert")
     _require_values(
         action_raw,
@@ -1389,8 +1429,7 @@ def _parse_vla(
         _fail("action expert hidden_dim must be divisible by num_heads")
     if not test_geometry and action != Mk1ActionExpertContract(64, 64, 36, 768, 8, 4.0, 256, 256):
         _fail("production MK1 action expert geometry does not match the 36-layer MolmoAct contract")
-    if native:
-        action = replace(action, native_metadata=metadata)
+    action = replace(action, native_metadata=metadata, conditioning=conditioning)
     return vector, action
 
 

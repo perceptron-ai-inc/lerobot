@@ -76,6 +76,7 @@ class Mk1Qwen36VLAConfig(Mk1Qwen36MoeConfig):
         *,
         vector_max_states: int,
         action_expert: dict[str, Any],
+        action_context_schema_version: int = 1,
         **kwargs: Any,
     ) -> None:
         kwargs["tie_word_embeddings"] = False
@@ -83,6 +84,7 @@ class Mk1Qwen36VLAConfig(Mk1Qwen36MoeConfig):
         self.tie_word_embeddings = False
         self.vector_max_states = int(vector_max_states)
         self.action_expert = dict(action_expert)
+        self.action_context_schema_version = action_context_schema_version
 
 
 class Mk1Qwen36VLAModel(GenesisQwen36Model):
@@ -94,7 +96,12 @@ class Mk1Qwen36VLAModel(GenesisQwen36Model):
         super().__init__(config)
         hidden = int(config.text_config.hidden_size)
         self.vector_embedding = build_vector_encoder(config.vector_max_states, hidden)
-        self.action_expert = build_action_expert_head(config.action_expert, vlm_dim=hidden)
+        self.action_expert = build_action_expert_head(
+            config.action_expert,
+            vlm_dim=hidden,
+            context_schema_version=config.action_context_schema_version,
+            backbone_num_layers=config.text_config.num_hidden_layers,
+        )
 
     # These methods are the reviewed PR #3154 VLA shell. Assigning the method
     # descriptors keeps one implementation of rendering, mRoPE, masking, and
@@ -197,6 +204,7 @@ def _build_config(
     config = Mk1Qwen36VLAConfig(
         vector_max_states=contract.vector_encoder.max_states,
         action_expert=action_expert,
+        action_context_schema_version=normalized["genesis_vla"]["schema_version"],
         **normalized,
     )
     if config.tie_word_embeddings or config.text_config.tie_word_embeddings:
