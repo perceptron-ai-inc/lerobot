@@ -742,6 +742,7 @@ def build_isaac_mharmony_content_plan(
     fast_action_tokens: list[int] | None = None,
     action_is_pad: list[bool] | None = None,
     terminal: bool = False,
+    inference_clip_normalized_proprio: bool = True,
 ) -> IsaacMharmonyContentPlan:
     """Build the native LIBERO no-scene mharmony content plan.
 
@@ -749,6 +750,9 @@ def build_isaac_mharmony_content_plan(
     contract for the supported native eval surface: Flow actions, explicit deltas,
     timestamps, RGB images, last-state-only proprio, and no scene description.
     """
+    if not isinstance(inference_clip_normalized_proprio, bool):
+        raise ValueError("inference_clip_normalized_proprio must be a boolean.")
+    training_prompt = normalized_action_target is not None or fast_action_tokens is not None
     _validate_native_inference_contract(metadata, stats)
     history = _normalize_observation_history(observation_window, metadata)
     fps = _metadata_fps(metadata, stats)
@@ -798,7 +802,14 @@ def build_isaac_mharmony_content_plan(
             )
         if step_idx == metadata.n_obs_steps - 1:
             user_content.append(
-                _vector_content_item(frame["proprio"], step_idx, timestamp_seconds, metadata, stats)
+                _vector_content_item(
+                    frame["proprio"],
+                    step_idx,
+                    timestamp_seconds,
+                    metadata,
+                    stats,
+                    clip_normalized_proprio=True if training_prompt else inference_clip_normalized_proprio,
+                )
             )
 
     flow_tags = _flow_action_tags(
@@ -808,7 +819,6 @@ def build_isaac_mharmony_content_plan(
         action_is_pad=action_is_pad,
         terminal=terminal,
     )
-    training_prompt = normalized_action_target is not None or fast_action_tokens is not None
     if training_prompt:
         flow_tags = _project_genesis_training_action_tags(flow_tags)
     assistant_content = [
@@ -859,6 +869,7 @@ class IsaacNativeMharmonyRenderer:
         temporal_patch_size: int | None = None,
         anchor_timestamp_seconds: float | None = None,
         scene_events: Any = None,
+        inference_clip_normalized_proprio: bool = True,
     ):
         if scene_events:
             raise ValueError("native_mharmony supports no-scene LIBERO inference only.")
@@ -868,6 +879,7 @@ class IsaacNativeMharmonyRenderer:
             metadata=self.metadata,
             stats=self.stats,
             anchor_timestamp_seconds=anchor_timestamp_seconds,
+            inference_clip_normalized_proprio=inference_clip_normalized_proprio,
         )
         return self._render_plan_to_tensor_stream(
             plan,
@@ -1299,9 +1311,14 @@ def _vector_content_item(
     timestamp_seconds: float,
     metadata: IsaacMharmonyRenderMetadata,
     stats: IsaacNormalizationStats,
+    *,
+    clip_normalized_proprio: bool = True,
 ) -> dict[str, Any]:
     normalized = normalize_isaac_proprio(
-        np.asarray(proprio, dtype=np.float32).reshape(-1), stats.proprio, profile=stats.profile
+        np.asarray(proprio, dtype=np.float32).reshape(-1),
+        stats.proprio,
+        profile=stats.profile,
+        clip_normalized=clip_normalized_proprio,
     )
     fallback_dims = _effective_bounds_fallback_dim_count(
         stats.proprio.q01, stats.proprio.q99, stats.proprio.minimum, stats.proprio.maximum

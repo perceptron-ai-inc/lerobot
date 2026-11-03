@@ -387,6 +387,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
     action_conditioning_role: str = field(default="user", metadata=_PACK_CONFIG_METADATA)
     mistake_conditioning: bool = field(default=False, metadata=_PACK_CONFIG_METADATA)
     render_metadata: dict[str, Any] | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
+    inference_clip_normalized_proprio: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     train_clip_normalized_actions: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     clip_normalized_max: float = field(default=10.0, metadata=_PACK_CONFIG_METADATA)
     # FAST tokenizer input cap; Genesis lowers FAST and Flow with independent caps.
@@ -401,6 +402,8 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
 
     def __post_init__(self) -> None:
         reject_legacy_action_conditioning(self.action_conditioning)
+        if not isinstance(self.inference_clip_normalized_proprio, bool):
+            raise ValueError("inference_clip_normalized_proprio must be a boolean.")
         if self.render_metadata is not None:
             IsaacMharmonyRenderMetadata(**self.render_metadata)
         self.mharmony_version = normalize_mharmony_version_marker(self.mharmony_version)
@@ -440,6 +443,10 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         config: dict[str, Any] = {}
         for config_field in dataclass_fields(self):
             name = config_field.name
+            # Preserve legacy processor JSON exactly; only the explicit deployment
+            # override needs a new wire field. Missing still means source clipping.
+            if name == "inference_clip_normalized_proprio" and self.inference_clip_normalized_proprio:
+                continue
             if not self._serialize_pack_fields and config_field.metadata.get("pack_config"):
                 continue
             value = getattr(self, name)
@@ -1041,6 +1048,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 pixel_shuffle_scale=self.pixel_shuffle_scale,
                 temporal_patch_size=self.temporal_patch_size,
                 scene_events=None,
+                inference_clip_normalized_proprio=self.inference_clip_normalized_proprio,
                 anchor_timestamp_seconds=anchor,
             )
             if stream.shape[1] > int(self.train_max_sequence_length):
@@ -1329,6 +1337,7 @@ class PerceptronIsaacMharmonyPackProcessorStep(PerceptronIsaacRenderProcessorSte
             normalization_profile_scope=config.normalization_profile_scope,
             normalization_validation_status=config.normalization_validation_status,
             render_metadata=None if metadata is None else metadata.to_json_dict(),
+            inference_clip_normalized_proprio=config.inference_clip_normalized_proprio,
             train_clip_normalized_actions=bool(config.train_clip_normalized_actions),
             clip_normalized_max=float(config.clip_normalized_max),
             fast_clip_normalized_max=float(config.fast_clip_normalized_max),

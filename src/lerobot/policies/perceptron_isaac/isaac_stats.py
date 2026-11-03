@@ -592,7 +592,11 @@ def normalize_isaac_proprio(
     *,
     eps: float = NATIVE_NORMALIZATION_EPS,
     profile: IsaacNormalizationProfile | None = None,
+    clip_normalized: bool = True,
 ) -> np.ndarray:
+    """Quantile-normalize while keeping a deployment clamp override separate from source identity."""
+    if not isinstance(clip_normalized, bool):
+        raise ValueError("clip_normalized must be a boolean.")
     arr = np.asarray(x, dtype=np.float32)
     if arr.shape != stats.q01.shape:
         raise ValueError(f"proprio shape {arr.shape} does not match stats {stats.q01.shape}.")
@@ -604,7 +608,7 @@ def normalize_isaac_proprio(
         eps=eps,
         error_prefix="normalize_isaac_proprio",
     )
-    if profile is not None:
+    if profile is not None and clip_normalized:
         cap = profile.proprio_clip_normalized_max
         normalized = np.clip(normalized, -cap, cap)
     # MolmoAct2 masks against the original raw input here (its clip writes to a separate

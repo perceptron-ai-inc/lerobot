@@ -117,6 +117,9 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # mean the normalized chunks before unnormalize. 1 = single sample (no averaging).
     num_flow_samples: int = 1
     flow_seed_base: int | None = None
+    # Deployment-only clamp control. Quantile normalization and authenticated source
+    # profiles remain unchanged; training/replay always retain their source clipping.
+    inference_clip_normalized_proprio: bool = True
     # Flow-target clip. This is the checkpoint-owned value: the inference recipe carries it on
     # the ``flow_action`` wire, and the importer copies it from there.
     clip_normalized_max: float = 10.0
@@ -353,6 +356,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         reject_legacy_action_conditioning(self.action_conditioning)
+        if not isinstance(self.inference_clip_normalized_proprio, bool):
+            raise ValueError("inference_clip_normalized_proprio must be a boolean.")
         if self.apply_offset_norm is not False:
             raise ValueError("Native MK1 checkpoints forbid apply_offset_norm=True.")
         if self.use_peft or self.train_expert_only:
