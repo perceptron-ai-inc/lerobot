@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.distributed as dist
 
+from lerobot.policies.perceptron_isaac import loss_perceptron_isaac as loss_module
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import (
     _global_objective_mean,
-    perceptron_isaac_loss_denominators,
     perceptron_isaac_training_loss,
 )
 from tests.policies.perceptron_isaac._fixtures import (
@@ -134,65 +135,36 @@ def test_joint_loss_sums_token_normalized_ce_and_chunk_normalized_flow():
     assert result.metrics["flow_chunk_count"] == 1
 
 
-def test_loss_denominators_count_chunks_independent_of_elements_and_draws():
+@pytest.mark.parametrize("draws", [1, 8])
+def test_loss_reports_current_batch_counts_for_all_draws(draws: int) -> None:
     stream = flow_stream(action_is_pad=[False, True])
-
-    denominators = perceptron_isaac_loss_denominators(
+    result = perceptron_isaac_training_loss(
+        flow_output(stream, ZeroExpert()),
         stream,
-        loss_plan="flow_matching_action_prediction",
-        action_dim=2,
-        action_horizon=2,
-        train_samples_per_chunk=8,
-        flow_mask_padded_action_rows=True,
-        exclude_non_agent_roles=True,
+        train_samples_per_chunk=draws,
+        flow_timesteps=torch.full((draws, 1), 0.5),
+        flow_noise=torch.zeros(draws, 1, 2, 2),
     )
-
-    # Every chunk has equal weight after its valid entries and draws are averaged.
-    torch.testing.assert_close(denominators["flow"], torch.tensor(1.0))
-
-
-def test_loss_denominators_include_joint_text_tokens():
-    denominators = perceptron_isaac_loss_denominators(
-        flow_stream(),
-        loss_plan="text_ntp_fast_flow_action",
-        action_dim=2,
-        action_horizon=2,
-        train_samples_per_chunk=1,
-        flow_mask_padded_action_rows=True,
-        exclude_non_agent_roles=True,
-    )
-
-    assert set(denominators) == {"flow", "text"}
-    torch.testing.assert_close(denominators["flow"], torch.tensor(1.0))
-    assert denominators["text"] > 0
+    assert result.metrics["flow_chunk_count"].item() == 1
+    assert result.metrics["text_token_count"].item() == 2
+    assert result.metrics["flow_element_count"].item() == 2 * draws
 
 
-def test_update_wide_denominator_matches_one_global_objective_under_accumulation():
-    first_numerator = torch.tensor(4.0, requires_grad=True)
-    second_numerator = torch.tensor(18.0, requires_grad=True)
-    update_denominator = torch.tensor(8.0)
-
-    first_loss, first_metric, _ = _global_objective_mean(
-        first_numerator,
-        torch.tensor(2.0),
-        global_denominator=update_denominator,
-        accumulation_scale=2,
-    )
-    second_loss, second_metric, _ = _global_objective_mean(
-        second_numerator,
-        torch.tensor(6.0),
-        global_denominator=update_denominator,
-        accumulation_scale=2,
-    )
-    # Accelerate divides each backward contribution by the accumulation count.
-    accumulated_objective = (first_loss + second_loss) / 2
-    accumulated_metric = (first_metric + second_metric) / 2
-
-    torch.testing.assert_close(accumulated_objective, torch.tensor(22.0 / 8.0))
-    torch.testing.assert_close(accumulated_metric, torch.tensor(22.0 / 8.0))
-    accumulated_objective.backward()
-    torch.testing.assert_close(first_numerator.grad, torch.tensor(1.0 / 8.0))
-    torch.testing.assert_close(second_numerator.grad, torch.tensor(1.0 / 8.0))
+def test_distributed_batch_mean_corrects_ddp_rank_averaging(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Local sum/count 4/2 plus remote 18/6 gives a global mean of 22/8.
+    totals = iter((22.0, 8.0))
+    monkeypatch.setattr(loss_module, "_global_sum_detached", lambda value: value.new_tensor(next(totals)))
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    numerator = torch.tensor(4.0, requires_grad=True)
+    loss, metric, count = _global_objective_mean(numerator, torch.tensor(2.0))
+    torch.testing.assert_close(loss, torch.tensor(22.0 / 8.0))
+    torch.testing.assert_close(metric, loss.detach())
+    torch.testing.assert_close(count, torch.tensor(8.0))
+    loss.backward()
+    # DDP subsequently divides the summed rank gradients by two.
+    torch.testing.assert_close(numerator.grad, torch.tensor(2.0 / 8.0))
 
 
 def test_flow_randomness_shapes_fail_closed():

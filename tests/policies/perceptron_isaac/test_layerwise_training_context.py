@@ -163,7 +163,14 @@ def test_flow_only_detach_controls_every_selected_context_gradient(
 
 
 @pytest.mark.parametrize(("draws", "detach"), [(1, False), (8, True)])
-def test_collective_only_context_keeps_zero_counts_rng_and_backward(draws: int, detach: bool) -> None:
+def test_collective_only_context_keeps_zero_local_gradients_and_rng(
+    draws: int, detach: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lerobot.policies.perceptron_isaac import loss_perceptron_isaac as loss_module
+
+    # This rank is empty; a peer supplies one Flow chunk and two text labels.
+    totals = iter((2.0, 1.0, 1.0, float(4 * draws), 3.0, 2.0, 2.0))
+    monkeypatch.setattr(loss_module, "_global_sum_detached", lambda value: value.new_tensor(next(totals)))
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(1997)
         model = _training_model(draws=draws)
@@ -175,14 +182,12 @@ def test_collective_only_context_keeps_zero_counts_rng_and_backward(draws: int, 
             stream,
             train_samples_per_chunk=draws,
             flow_matching_detach_vlm_activations=detach,
-            global_denominators={"flow": torch.tensor(1), "text": torch.tensor(2)},
         )
         assert torch.equal(torch.random.get_rng_state(), rng)
-        assert result.loss.item() == 0
-        assert all(
-            result.metrics[name].item() == 0
-            for name in ("flow_chunk_count", "text_token_count", "flow_element_count")
-        )
+        assert result.loss.item() == 3.5
+        assert result.metrics["flow_chunk_count"].item() == 1
+        assert result.metrics["text_token_count"].item() == 2
+        assert result.metrics["flow_element_count"].item() == 4 * draws
         result.loss.backward()
         head = model.model.action_expert
         assert head is not None

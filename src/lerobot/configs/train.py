@@ -301,6 +301,7 @@ class TrainPipelineConfig(HubMixin):
                     publish=self.policy.push_to_hub or self.save_checkpoint_to_hub,
                     ema=self.ema.enable,
                     package_root=package_root,
+                    gradient_accumulation_steps=self.accelerator.gradient_accumulation.steps,
                 )
             )
         if self.rename_map and active_cfg.pretrained_path is None and not self.resume:

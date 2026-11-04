@@ -85,8 +85,8 @@ def materialize_router_auxiliaries(
             dim=-1,
         )
         z_sum = partition_logits.logsumexp(-1).square().sum()
-        balance, _, _ = _global_objective_mean(balance_sum, local_token_count, global_denominator=token_count)
-        z, _, _ = _global_objective_mean(z_sum, local_token_count, global_denominator=token_count)
+        balance, _, _ = _global_objective_mean(balance_sum, local_token_count)
+        z, _, _ = _global_objective_mean(z_sum, local_token_count)
         result["load_balancing_loss"].append(balance)
         result["router_z_loss"].append(z)
         result["router_dispatch_counts"].append(counts)

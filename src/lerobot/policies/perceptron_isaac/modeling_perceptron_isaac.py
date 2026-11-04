@@ -30,7 +30,6 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
 from ..pretrained import PreTrainedPolicy
-from ..training_loss_normalization import TrainingLossNormalization, TrainingLossNormalizer
 from .checkpoint_integrity import (
     DirectorySnapshot,
     file_sha256,
@@ -82,7 +81,6 @@ from .trained_package import (
     rewrite_trained_processor_paths,
     verify_trained_package_manifest,
 )
-from .training_perceptron_isaac import IsaacTrainingLossNormalizer
 
 if TYPE_CHECKING:
     from .modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
@@ -1404,23 +1402,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             self._queues[ACTION].extend(actions.transpose(0, 1))
         return self._queues[ACTION].popleft()
 
-    def get_training_loss_normalizer(self) -> TrainingLossNormalizer:
-        # Read geometry only; no model tensors, forward, or diffusion RNG during counting.
-        expert = None if self._isaac_model is None else self._isaac_model.action_expert
-        return IsaacTrainingLossNormalizer(
-            self.config,
-            self.config.action_dim if expert is None else int(expert.args.action_dim),
-            self.config.max_action_horizon if expert is None else int(expert.args.action_horizon),
-            self._aligned_flow_fixture_tensors,
-        )
-
     def forward(
         self,
         batch: dict[str, Any],
         reduction: str = "mean",
-        loss_denominators: dict[str, Tensor] | None = None,
-        loss_accumulation_scale: int = 1,
-        training_loss_normalization: TrainingLossNormalization | None = None,
     ) -> tuple[Tensor, dict]:
         self._require_native_training_supported()
         stream = batch.get(PERCEPTRON_ISAAC_STREAM_KEY)
@@ -1435,15 +1420,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._verify_fp32_masters_once()
         stream = stream.to(device=self._resolve_device(), dtype=self._model_dtype())
         model_output = self._isaac_model.train_forward(stream)
-        if training_loss_normalization is not None:
-            schema = self.get_training_loss_normalizer().schema
-            if training_loss_normalization.schema != schema or loss_denominators is not None:
-                raise ValueError("ISAAC stock training normalization schema conflicts with forward inputs.")
-            loss_denominators = {
-                name: torch.tensor(total, device=stream.device, dtype=torch.int64)
-                for name, total in zip(schema.names, training_loss_normalization.totals, strict=True)
-            }
-            loss_accumulation_scale = training_loss_normalization.backward_divisor
         flow_fixture_tensors = self._aligned_flow_fixture_tensors(
             batch, 0 if stream.collective_only else len(stream.streams)
         )
@@ -1461,8 +1437,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             flow_timesteps=flow_fixture_tensors[ISAAC_FLOW_TIMESTEPS_KEY],
             flow_noise=flow_fixture_tensors[ISAAC_FLOW_NOISE_KEY],
             flow_loss_mask=flow_fixture_tensors[ISAAC_FLOW_LOSS_MASK_KEY],
-            global_denominators=loss_denominators,
-            accumulation_scale=loss_accumulation_scale,
             reduction=reduction,
         )
         metrics = {

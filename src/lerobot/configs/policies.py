@@ -41,12 +41,13 @@ logger = getLogger(__name__)
 
 @dataclass(frozen=True)
 class PolicyTrainingIntent:
-    """Artifact operations requested before training allocates runtime resources."""
+    """Training capabilities and artifact operations checked before runtime allocation."""
 
     save_checkpoint: bool
     publish: bool
     ema: bool
     package_root: Path | None
+    gradient_accumulation_steps: int = 1
 
 
 @dataclass

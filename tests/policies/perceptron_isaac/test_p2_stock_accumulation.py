@@ -1,9 +1,9 @@
-"""P2.08 stock-loop contracts; runtime RED belongs to the parent CPU gate.
+"""Single-step ISAAC and ordinary-policy accumulation through the real stock trainer.
 
-Only dataset/model/token serialization and synthetic model-artifact IO are leaves.
-The real train loop, pack filtering/normalization, policy forward/counting,
-Accelerator/DDP, update_policy and training-state save/resume remain in circuit.
-No test supplies update-window denominators or runs a replacement trainer.
+Only dataset, tiny model and vocabulary serialization are leaves. Pack filtering,
+policy forward, per-step global loss means, Accelerator/DDP and optimizer updates
+remain in circuit. ISAAC cases use accumulation one; ordinary-policy cases cover
+native accumulation and partial tails.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, TypedDict
 from unittest.mock import patch
 
 import numpy as np
@@ -27,19 +27,17 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as functional
 from accelerate import Accelerator
-from safetensors.torch import load_file
 from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 pytest.importorskip("transformers", reason="requires the parent offline ISAAC environment")
 pytest.importorskip("mharmony", reason="requires the parent offline ISAAC environment")
 
-from lerobot.common.train_utils import save_checkpoint
 from lerobot.configs.accelerator import AcceleratorConfig, GradientAccumulationConfig
 from lerobot.configs.default import DatasetConfig
-from lerobot.configs.train import TRAIN_CONFIG_NAME, TrainPipelineConfig
+from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.distributed.factory import make_accelerator
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -72,14 +70,13 @@ from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
 from lerobot.policies.perceptron_isaac.tensor_stream import Event, TensorStream, TextType, create_stream
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import (
-    ImageAugmentationProcessorStep,
     PolicyProcessorPipeline,
     batch_to_transition,
     transition_to_batch,
 )
 from lerobot.scripts import lerobot_train
-from lerobot.transforms import ImageTransformConfig, ImageTransformsConfig
-from lerobot.utils.constants import ACTION, OBS_STATE, PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
+from lerobot.utils.constants import ACTION, OBS_STATE, TRAINING_STATE_DIR, TRAINING_STEP
+from lerobot.utils.io_utils import write_json
 from tests.fixtures.dummy_checkpoint_policy import DummyCheckpointConfig, DummyCheckpointPolicy
 from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config as _native_config
 from tests.policies.perceptron_isaac.test_modeling_training import _config
@@ -91,21 +88,17 @@ class Case(str, Enum):
     NATIVE_EMPTY_CHUNKS = "native_empty_chunks"
     EMPTY_TEXT = "empty_text"
     CROSSING = "crossing"
-    TAIL = "tail"
     AUXILIARY = "auxiliary"
     ORDINARY = "ordinary"
-    RESUME = "resume"
 
 
 @dataclass(frozen=True)
 class Run:
     case: Case
     steps: int = 2
-    accumulation: int = 2
+    accumulation: int = 1
     draws: int = 2
-    checkpoint: Path | None = None
-    interrupt_at: int | None = None
-    sync_each_batch: bool = False
+    data_resume_step: int = 0
 
 
 @dataclass(frozen=True)
@@ -144,14 +137,10 @@ class Receipt(TypedDict):
     final: dict[str, Tensor]
     gradients: list[dict[str, Tensor]]
     pending: dict[str, Tensor]
-    optimizer: dict[str, Any]
     scheduler: dict[str, Any]
     scaler: dict[str, Any] | None
     forwards: list[ForwardRecord]
     preprocessed: list[Tensor]
-    uniform: Tensor
-    normal: Tensor
-    augmentation: Tensor | None
     backward_divisor: int
     native_router: list[NativeRouterRecord]
     policy_updates: int
@@ -237,22 +226,6 @@ class StockModel(nn.Module):
                 else {}
             ),
         )
-
-
-class ArtifactIOPolicy(PerceptronIsaacPolicy):
-    """Synthetic model-artifact IO only; forward and normalization capability are inherited.
-
-    This is not an authenticated ISAAC package fixture. It isolates package copying
-    from the stock trainer's real optimizer/RNG/pending-window checkpoint contract.
-    No production reader/hash check is patched or waived.
-    """
-
-    def _save_pretrained(self, save_directory: Path, state_dict: dict[str, Tensor] | None = None) -> None:
-        assert state_dict is None
-        PreTrainedPolicy._save_pretrained(self, save_directory)
-
-    def finalize_pretrained_package(self, save_directory: str | Path) -> None:
-        PreTrainedPolicy.finalize_pretrained_package(self, save_directory)
 
 
 class TokenLeaf:
@@ -341,11 +314,11 @@ class LocalDataset(Dataset[dict[str, Any]]):
         position = self.positions[index]
         global_batch, within = divmod(position, 3)
         retained = (1, 2, 3, 1)[global_batch]
-        if self.run.case in {Case.CROSSING, Case.RESUME}:
+        if self.run.case == Case.CROSSING:
             retained = (1, 3, 3, 3)[global_batch]  # Only two rejected rows; every later triple is usable.
         if self.run.case in {Case.EMPTY_CHUNKS, Case.NATIVE_EMPTY_CHUNKS} and global_batch % 2 == 0:
             retained = 0
-        if self.run.accumulation == 1 or self.run.case in {Case.TAIL, Case.ORDINARY}:
+        if self.run.case == Case.ORDINARY:
             retained = 3
         target = torch.tensor([[0.2 + position / 10, -0.4], [0.8, 0.1 + within / 5]])
         if within >= retained:
@@ -401,8 +374,6 @@ class PreparedProcessor:
     def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
         self.indices.append(batch["index"].clone())
         prepared = self.pipeline(batch)
-        if self.run.case == Case.RESUME:
-            return prepared  # No injected noise or timesteps on the checkpoint path.
         count = batch[ACTION].shape[0]
         masks = (~batch["action_is_pad"])[None, :, :, None].expand(self.run.draws, -1, -1, 2).float().clone()
         masks[-1, :, 0, 0] = 0.25
@@ -417,10 +388,6 @@ class PreparedProcessor:
 
     def save_pretrained(self, directory: Path) -> None:
         self.pipeline.save_pretrained(directory)
-
-
-class StopAtCheckpointError(Exception):
-    pass
 
 
 def _named_gradients(policy: nn.Module) -> dict[str, Tensor]:
@@ -486,7 +453,7 @@ def _worker(rank: int, rendezvous: str, directory: str, run: Run) -> None:
     policy_config = _config()
     policy_config.push_to_hub = False
     policy_config.train_samples_per_chunk = run.draws
-    policy = ArtifactIOPolicy(policy_config)
+    policy = PerceptronIsaacPolicy(policy_config)
     policy._isaac_model = model
     policy._training_parameters_configured = True
     ordinary = CadencePolicy(DummyCheckpointConfig(device="cpu", hidden=2, push_to_hub=False))
@@ -501,10 +468,9 @@ def _worker(rank: int, rendezvous: str, directory: str, run: Run) -> None:
     optimizers: list[Optimizer] = []
     schedulers: list[LRScheduler] = []
     accelerators: list[Accelerator] = []
-    augmentations: list[ImageAugmentationProcessorStep] = []
     draw: DrawRecord = {"x": torch.empty(0), "tau": torch.empty(0)}
     cfg = TrainPipelineConfig(
-        dataset=DatasetConfig(repo_id="fixture/stock-window"),
+        dataset=DatasetConfig(repo_id="fixture/stock-step"),
         policy=active.config,
         output_dir=root / "output",
         seed=83,
@@ -515,32 +481,37 @@ def _worker(rank: int, rendezvous: str, directory: str, run: Run) -> None:
         dataloader_multiprocessing_context=None,
         log_freq=0,
         env_eval_freq=0,
-        save_checkpoint=run.interrupt_at is not None,
-        save_freq=run.interrupt_at or 0,
+        save_checkpoint=False,
         use_policy_training_preset=False,
         optimizer=SGDConfig(lr=0.01, momentum=0.3, grad_clip_norm=0.0),
         scheduler=ConstantWithWarmupSchedulerConfig(num_warmup_steps=0),
         accelerator=AcceleratorConfig(
-            gradient_accumulation=GradientAccumulationConfig(
-                steps=run.accumulation, sync_each_batch=run.sync_each_batch
-            )
+            gradient_accumulation=GradientAccumulationConfig(steps=run.accumulation)
         ),
     )
-    if run.checkpoint is not None:
-        saved_config = run.checkpoint / PRETRAINED_MODEL_DIR / TRAIN_CONFIG_NAME
-        cfg = TrainPipelineConfig.from_pretrained(
-            saved_config,
-            cli_args=["--resume=true", f"--steps={run.steps}", f"--output_dir={root / 'output'}"],
-        )
-        assert cfg.policy is not None
-        cfg.policy.push_to_hub = False
-        cfg.save_checkpoint = False
-        active.config = cfg.policy
-        active.load_state_dict(load_file(run.checkpoint / PRETRAINED_MODEL_DIR / "model.safetensors"))
-
     real_optimizer_factory = make_optimizer_and_scheduler
     real_accelerator_factory = make_accelerator
-    real_save = save_checkpoint
+    real_dataloader_factory = lerobot_train.make_dataloaders
+
+    def dataloader_factory(
+        config: TrainPipelineConfig, supplied_dataset: Any, evaluation: Any, step: int, parallel_dims: Any
+    ) -> tuple[DataLoader, DataLoader | None]:
+        if not run.data_resume_step:
+            return real_dataloader_factory(config, supplied_dataset, evaluation, step, parallel_dims)
+        # Only the saved data-position metadata is a leaf; sampler/wrapper/train remain real.
+        checkpoint = root / "sampler-checkpoint"
+        if rank == 0:
+            state = checkpoint / TRAINING_STATE_DIR
+            state.mkdir(parents=True, exist_ok=True)
+            write_json(
+                {"step": run.data_resume_step, "dp_world_size": 2, "batch_size": 3}, state / TRAINING_STEP
+            )
+        dist.barrier()
+        resumed_config = copy.copy(config)
+        resumed_config.resume, resumed_config.checkpoint_path = True, checkpoint
+        return real_dataloader_factory(
+            resumed_config, supplied_dataset, evaluation, run.data_resume_step, parallel_dims
+        )
 
     def optimizer_factory(
         config: TrainPipelineConfig, supplied_policy: PreTrainedPolicy
@@ -559,30 +530,6 @@ def _worker(rank: int, rendezvous: str, directory: str, run: Run) -> None:
         accelerators.append(accelerator)
         return accelerator
 
-    def augmentation_factory(*_args: Any) -> ImageAugmentationProcessorStep | None:
-        if run.case != Case.RESUME:
-            return None
-        # Same real augmentation implementation and private generator, placed on CPU for this gate.
-        augmentation = ImageAugmentationProcessorStep(
-            config=ImageTransformsConfig(
-                enable=True,
-                max_num_transforms=1,
-                tfs={
-                    "brightness": ImageTransformConfig(type="ColorJitter", kwargs={"brightness": (0.5, 1.5)})
-                },
-            ),
-            image_keys=["observation.images.image"],
-            device="cpu",
-            seed=193 + rank,
-        )
-        augmentations.append(augmentation)
-        return augmentation
-
-    def save_then_interrupt(*args: Any, **kwargs: Any) -> None:
-        real_save(*args, **kwargs)
-        if kwargs["step"] == run.interrupt_at:
-            raise StopAtCheckpointError
-
     def observe_forward(
         _module: nn.Module, args: tuple[Any, ...], result: tuple[Tensor, dict[str, float]]
     ) -> None:
@@ -593,24 +540,18 @@ def _worker(rank: int, rendezvous: str, directory: str, run: Run) -> None:
 
     handle = active.register_forward_hook(observe_forward) if run.case != Case.ORDINARY else None
     expert_handle = model.action_expert.register_forward_hook(observe_expert)
-    argv = ["lerobot-train"]
-    if run.checkpoint is not None:
-        argv.append(f"--config_path={run.checkpoint / PRETRAINED_MODEL_DIR / TRAIN_CONFIG_NAME}")
     try:
         with (
-            patch.object(sys, "argv", argv),
+            patch.object(sys, "argv", ["lerobot-train"]),
             patch.object(lerobot_train, "make_train_eval_datasets", return_value=(dataset, None)),
+            patch.object(lerobot_train, "make_dataloaders", side_effect=dataloader_factory),
             patch.object(lerobot_train, "make_policy", return_value=active),
             patch.object(lerobot_train, "make_pre_post_processors", return_value=(processor, processor)),
             patch.object(lerobot_train, "make_optimizer_and_scheduler", side_effect=optimizer_factory),
             patch.object(lerobot_train, "make_accelerator", side_effect=accelerator_factory),
-            patch.object(lerobot_train, "_make_image_augmentation", side_effect=augmentation_factory),
-            patch.object(lerobot_train, "save_checkpoint", side_effect=save_then_interrupt),
         ):
             try:
                 lerobot_train.train(cfg)
-            except StopAtCheckpointError:
-                assert run.interrupt_at is not None
             except (IsaacActionOutlierError, ValueError) as error:
                 if run.case in {Case.EMPTY_CHUNKS, Case.NATIVE_EMPTY_CHUNKS, Case.EMPTY_TEXT} and (
                     "no usable samples" in str(error)
@@ -620,27 +561,18 @@ def _worker(rank: int, rendezvous: str, directory: str, run: Run) -> None:
                     raise AssertionError(
                         f"stock train rejected legitimate {run.case.value} support: {error}"
                     ) from error
-                raise  # Setup/malformed-input failures are NOT accepted as P2.08 RED.
+                raise  # Setup/malformed-input failures are never accepted as a regression pass.
         assert len(accelerators) == len(optimizers) == len(schedulers) == 1
         accelerator = accelerators[0]
-        augmentation_state = None
-        if augmentations:
-            generator = augmentations[0]._generator
-            assert generator is not None
-            augmentation_state = generator.get_state()
         receipt: Receipt = {
             "initial": initial,
             "final": {name: value.detach().clone() for name, value in active.state_dict().items()},
             "gradients": gradients,
             "pending": _named_gradients(active),
-            "optimizer": optimizers[0].state_dict(),
             "scheduler": schedulers[0].state_dict(),
             "scaler": None if accelerator.scaler is None else accelerator.scaler.state_dict(),
             "forwards": forwards,
             "preprocessed": processor.indices,
-            "uniform": torch.rand(8),
-            "normal": torch.randn(8),
-            "augmentation": augmentation_state,
             "backward_divisor": accelerator.gradient_accumulation_steps,
             "native_router": model.router_records if isinstance(model, NativeCaptureModel) else [],
             "policy_updates": ordinary.applied_updates,
@@ -704,43 +636,40 @@ def _oracle_loss(model: StockModel, records: list[ForwardRecord], auxiliary: boo
 
 
 def _assert_reference(receipts: list[Receipt], run: Run) -> None:
+    assert run.accumulation == 1
     reference = StockModel(run.case == Case.AUXILIARY)
     reference.load_state_dict(
         {key.removeprefix("_isaac_model."): value for key, value in receipts[0]["initial"].items()}
     )
     optimizer = torch.optim.SGD(reference.parameters(), lr=0.01, momentum=0.3)
-    for start in range(0, run.steps, run.accumulation):
-        stop = min(start + run.accumulation, run.steps)
-        records = [record for receipt in receipts for record in receipt["forwards"][start:stop]]
-        primary, aux = _oracle_loss(reference, records, run.case == Case.AUXILIARY)
-        # A partial tail uses Accelerator's real divisor, not its shorter buffered length.
-        fraction = (stop - start) / run.accumulation
-        (primary + fraction * aux).backward()
-        if stop - start == run.accumulation:
-            for receipt in receipts:
-                observed_gradients = receipt["gradients"][start // run.accumulation]
-                for name, parameter in reference.named_parameters():
-                    if parameter.grad is not None:
-                        torch.testing.assert_close(
-                            observed_gradients[f"_isaac_model.{name}"], parameter.grad, atol=2e-6, rtol=2e-5
-                        )
-            optimizer.step()
-            optimizer.zero_grad()
-        observed = (
-            sum(record["metrics"]["loss"] for record in receipts[0]["forwards"][start:stop])
-            / run.accumulation
-        )
+    for step in range(run.steps):
+        records = [receipt["forwards"][step] for receipt in receipts]
+        primary, auxiliary = _oracle_loss(reference, records, run.case == Case.AUXILIARY)
+        expected = primary + auxiliary
+        expected.backward()
+        for receipt in receipts:
+            gradients = receipt["gradients"][step]
+            for name, parameter in reference.named_parameters():
+                if parameter.grad is not None:
+                    torch.testing.assert_close(
+                        gradients[f"_isaac_model.{name}"], parameter.grad, atol=2e-6, rtol=2e-5
+                    )
+        optimizer.step()
+        optimizer.zero_grad()
         torch.testing.assert_close(
-            torch.tensor(observed), (primary + fraction * aux).detach(), atol=2e-5, rtol=2e-5
+            torch.tensor(receipts[0]["forwards"][step]["metrics"]["loss"]),
+            expected.detach(),
+            atol=2e-5,
+            rtol=2e-5,
         )
     for receipt in receipts:
         for name, parameter in reference.named_parameters():
             torch.testing.assert_close(
                 receipt["final"][f"_isaac_model.{name}"], parameter, atol=2e-6, rtol=2e-5
             )
-        assert len(receipt["gradients"]) == run.steps // run.accumulation
+        assert len(receipt["gradients"]) == run.steps
         assert receipt["scheduler"]["last_epoch"] == run.steps
-        assert receipt["backward_divisor"] == run.accumulation
+        assert receipt["backward_divisor"] == 1
 
 
 pytestmark = pytest.mark.skipif(
@@ -748,29 +677,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("case", [Case.JOINT, Case.EMPTY_CHUNKS, Case.EMPTY_TEXT, Case.AUXILIARY])
-def test_stock_sync_each_batch_accumulation8_matches_global_window_oracle(tmp_path: Path, case: Case) -> None:
-    run = Run(case, steps=16, accumulation=8, draws=8, sync_each_batch=True)
-    receipts = _launch(tmp_path / case.value, run)
-    for receipt in receipts:
-        assert all(torch.isfinite(value).all() for value in receipt["final"].values())
-        for gradients in receipt["gradients"]:
-            assert gradients
-            assert all(torch.isfinite(value).all() for value in gradients.values())
-    if case in {Case.EMPTY_CHUNKS, Case.EMPTY_TEXT}:
-        key: Literal["targets", "labels"] = "targets" if case == Case.EMPTY_CHUNKS else "labels"
-        # Epoch shuffling can move empty local support to either rank; require a real
-        # zero-local/nonempty-peer microbatch instead of assuming one rank stays empty.
-        assert any(
-            any(receipt["forwards"][step][key].numel() == 0 for receipt in receipts)
-            and any(receipt["forwards"][step][key].numel() > 0 for receipt in receipts)
-            for step in range(run.steps)
-        )
-    _assert_reference(receipts, run)
-
-
 @pytest.mark.parametrize("draws", [1, 2])
-def test_stock_train_global_window_matches_concatenated_joint_objective(tmp_path: Path, draws: int) -> None:
+def test_stock_train_global_batch_matches_concatenated_joint_objective(tmp_path: Path, draws: int) -> None:
     run = Run(Case.JOINT, draws=draws)
     receipts = _launch(tmp_path / "joint", run)
     counts = [[len(record["targets"]) for record in receipt["forwards"]] for receipt in receipts]
@@ -788,17 +696,11 @@ def test_stock_train_zero_local_chunks_matches_global_reference(tmp_path: Path) 
     _assert_reference(receipts, run)
 
 
-@pytest.mark.parametrize(
-    "run",
-    [
-        Run(Case.NATIVE_EMPTY_CHUNKS),
-        Run(Case.NATIVE_EMPTY_CHUNKS, steps=16, accumulation=8, draws=8, sync_each_batch=True),
-    ],
-    ids=["legacy", "sync_each_batch_accum8"],
-)
+@pytest.mark.parametrize("draws", [1, 8])
 def test_stock_train_empty_rank_native_router_excludes_dummy_but_keeps_real_padding(
-    tmp_path: Path, run: Run
+    tmp_path: Path, draws: int
 ) -> None:
+    run = Run(Case.NATIVE_EMPTY_CHUNKS, draws=draws)
     receipts = _launch(tmp_path / "native-empty", run)
     assert sum(record["padding"] for record in receipts[1]["forwards"]) > 0
     for receipt in receipts:
@@ -807,7 +709,7 @@ def test_stock_train_empty_rank_native_router_excludes_dummy_but_keeps_real_padd
         assert all(torch.isfinite(value).all() for value in receipt["final"].values())
         for step, routers in enumerate(receipt["native_router"]):
             # Real padding counts, but neither rank's collective-only dummy does.
-            # The empty rank can switch when this window crosses shuffled epochs.
+            # The empty rank can switch when training crosses shuffled epochs.
             real_positions = sum(
                 peer["forwards"][step]["positions"]
                 for peer in receipts
@@ -827,10 +729,10 @@ def test_stock_train_zero_local_text_preserves_flow_objective(tmp_path: Path) ->
     _assert_reference(receipts, run)
 
 
-def test_stock_train_window_crosses_dataloader_boundary(tmp_path: Path) -> None:
+def test_stock_train_sampler_crosses_dataloader_epochs(tmp_path: Path) -> None:
     run = Run(Case.CROSSING)
     receipts = _launch(tmp_path / "crossing", run)
-    # Six raw frames / (three samples * two ranks): every window spans two epochs.
+    # Six raw frames / (three samples * two ranks): each step starts a new epoch.
     assert all(len(receipt["preprocessed"]) == 2 for receipt in receipts)
     sampler = EpisodeAwareSampler([0], [6], shuffle=True, seed=83)
     for step in range(2):
@@ -840,13 +742,6 @@ def test_stock_train_window_crosses_dataloader_boundary(tmp_path: Path) -> None:
                 receipt["forwards"][step]["indices"], torch.tensor(order[rank * 3 : (rank + 1) * 3])
             )
     _assert_reference(receipts, run)
-
-
-def test_stock_train_partial_tail_preserves_update_and_scheduler_counters(tmp_path: Path) -> None:
-    run = Run(Case.TAIL, steps=3)
-    receipts = _launch(tmp_path / "tail", run)
-    _assert_reference(receipts, run)
-    assert all(receipt["pending"] for receipt in receipts), "no forced partial-tail optimizer step"
 
 
 @pytest.mark.parametrize(("accumulation", "steps"), [(1, 2), (2, 2), (2, 3)])
@@ -875,17 +770,29 @@ def test_stock_train_ordinary_policy_preserves_signature_and_cadence(
         assert len(receipt["gradients"]) == run.steps // accumulation
         assert receipt["scheduler"]["last_epoch"] == run.steps
         assert receipt["policy_updates"] == run.steps // accumulation
+        if steps % accumulation:
+            assert receipt["pending"], "native accumulation must retain the partial-tail gradients"
         assert receipt["scaler"] is None  # CPU Accelerator has no fp16 scaler; never invent one.
         for name, parameter in reference.named_parameters():
             torch.testing.assert_close(receipt["final"][name], parameter)
 
 
-def test_stock_train_accumulation_one_is_preserved(tmp_path: Path) -> None:
-    run = Run(Case.JOINT, accumulation=1)
-    _assert_reference(_launch(tmp_path / "one", run), run)
+def test_stock_train_map_resume_keeps_sampler_epoch_through_prepare(tmp_path: Path) -> None:
+    receipts = _launch(tmp_path / "sampler-resume", Run(Case.ORDINARY, data_resume_step=5))
+    # 12 frames / (batch 3 * two ranks): step 5 means epoch 2, offset 6.
+    expected_sampler = EpisodeAwareSampler([0], [12], shuffle=True, seed=83)
+    expected_sampler.load_state_dict({"epoch": 2, "start_index": 6})
+    expected_batches = [list(expected_sampler), list(expected_sampler)[:6]]
+    for step, indices in enumerate(expected_batches):
+        for rank, receipt in enumerate(receipts):
+            torch.testing.assert_close(
+                receipt["preprocessed"][step],
+                torch.tensor(indices[rank * 3 : (rank + 1) * 3]),
+                msg="resumed sampler must keep its epoch through Accelerate preparation",
+            )
 
 
-def test_stock_train_auxiliary_scaling_is_not_multiplied_by_window_size(tmp_path: Path) -> None:
+def test_stock_train_auxiliary_regularizers_apply_once_per_step(tmp_path: Path) -> None:
     run = Run(Case.AUXILIARY)
     receipts = _launch(tmp_path / "auxiliary", run)
     initial = torch.tensor(0.7, requires_grad=True)
@@ -908,50 +815,3 @@ def _assert_tree_equal(actual: Any, expected: Any) -> None:
             _assert_tree_equal(left, right)
     else:
         assert actual == expected
-
-
-def _assert_checkpoint_resume(tmp_path: Path, steps: int, checkpoint_budget: int) -> None:
-    uninterrupted = _launch(tmp_path / "full", Run(Case.RESUME, steps=steps))
-    interrupted = _launch(tmp_path / "interrupted", Run(Case.RESUME, steps=checkpoint_budget, interrupt_at=1))
-    checkpoint = tmp_path / "interrupted" / "output" / "checkpoints" / "000001"
-    metadata = checkpoint / TRAINING_STATE_DIR / "training_step.json"
-    assert metadata.is_file(), "real stock checkpoint must finish before simulating interruption"
-    moved = tmp_path / "moved-checkpoint"
-    checkpoint.rename(moved)
-    resumed = _launch(tmp_path / "resumed", Run(Case.RESUME, steps=steps, checkpoint=moved))
-    for full, prefix, continuation in zip(uninterrupted, interrupted, resumed, strict=True):
-        for key in (
-            "final",
-            "optimizer",
-            "scheduler",
-            "scaler",
-            "pending",
-            "uniform",
-            "normal",
-            "augmentation",
-        ):
-            _assert_tree_equal(continuation[key], full[key])
-        assert len(prefix["gradients"]) == 0, "save after nonsync step, before any optimizer update"
-        assert len(continuation["gradients"]) == steps // 2
-        # Reconstructed prefix is allowed once; compare logical suffix, not replay bookkeeping.
-        suffix = continuation["forwards"][-(steps - 1) :]
-        for actual, expected in zip(suffix, full["forwards"][1:], strict=True):
-            _assert_tree_equal(actual["indices"], expected["indices"])
-            _assert_tree_equal(actual["images"], expected["images"])
-            _assert_tree_equal(actual["draws"], expected["draws"])
-            _assert_tree_equal(actual["targets"], expected["targets"])
-            _assert_tree_equal(actual["pads"], expected["pads"])
-        _assert_tree_equal(prefix["forwards"][0]["draws"], full["forwards"][0]["draws"])
-
-
-@pytest.mark.parametrize("steps", [3, 4])
-def test_stock_train_midwindow_resume_matches_uninterrupted_run(tmp_path: Path, steps: int) -> None:
-    _assert_checkpoint_resume(tmp_path, steps, checkpoint_budget=steps)
-
-
-@pytest.mark.parametrize("steps", [3, 4])
-def test_stock_train_saved_partial_tail_extends_without_losing_pending_window(
-    tmp_path: Path, steps: int
-) -> None:
-    # The saved run knew only one available batch. Extending it must replan totals and replay the prefix.
-    _assert_checkpoint_resume(tmp_path, steps, checkpoint_budget=1)

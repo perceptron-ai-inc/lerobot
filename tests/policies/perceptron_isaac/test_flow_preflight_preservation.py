@@ -1,4 +1,4 @@
-"""Shared count/forward randomness contracts, without model allocation or sampling in counts."""
+"""Live Flow randomness validation preserves supplied fixtures and draw order."""
 
 from __future__ import annotations
 
@@ -7,12 +7,13 @@ import torch
 from torch import Tensor
 
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import (
+    _coerce_flow_noise,
     _coerce_flow_randomness,
+    _coerce_flow_timesteps,
     _collect_flow_batch,
-    perceptron_isaac_loss_denominators,
-    perceptron_isaac_objective_counts,
+    perceptron_isaac_training_loss,
 )
-from tests.policies.perceptron_isaac._fixtures import flow_stream
+from tests.policies.perceptron_isaac._fixtures import ZeroExpert, flow_output, flow_stream
 
 
 def test_forward_randomness_keeps_timestep_then_noise_draw_order() -> None:
@@ -45,59 +46,45 @@ def test_forward_randomness_keeps_timestep_then_noise_draw_order() -> None:
         torch.set_rng_state(live)
 
 
-@pytest.mark.parametrize("supplied", ["neither", "timesteps", "noise", "both"])
-def test_counts_validate_only_supplied_randomness_and_keep_padded_grid_rows(supplied: str) -> None:
-    # Padded timesteps need not equal valid rows, but still must lie in [0, 1].
-    timesteps = torch.tensor([[[[0.25], [0.75]]]], dtype=torch.float64)
-    noise = torch.ones(1, 2, 2, dtype=torch.float64)  # Supported single-draw shorthand.
-    original_timesteps, original_noise = timesteps.clone(), noise.clone()
-    flow_timesteps = timesteps if supplied in {"timesteps", "both"} else None
-    flow_noise = noise if supplied in {"noise", "both"} else None
-    live = torch.get_rng_state()
-    assert perceptron_isaac_objective_counts(
+@pytest.mark.parametrize("supplied", ["timesteps", "noise", "both"])
+def test_flow_fixture_validation_is_rng_free_and_preserves_inputs(supplied: str) -> None:
+    flow = _collect_flow_batch(
         flow_stream(action_is_pad=[False, True]),
-        loss_plan="flow_matching_action_prediction",
         action_dim=2,
         action_horizon=2,
-        train_samples_per_chunk=1,
-        flow_mask_padded_action_rows=True,
-        exclude_non_agent_roles=True,
-        flow_timesteps=flow_timesteps,
-        flow_noise=flow_noise,
-    ) == {"flow": 1}
-    denominators = perceptron_isaac_loss_denominators(
-        flow_stream(action_is_pad=[False, True]),
-        loss_plan="flow_matching_action_prediction",
-        action_dim=2,
-        action_horizon=2,
-        train_samples_per_chunk=1,
-        flow_mask_padded_action_rows=True,
-        exclude_non_agent_roles=True,
-        flow_timesteps=flow_timesteps,
-        flow_noise=flow_noise,
+        mask_padded_action_rows=True,
+        device=torch.device("cpu"),
     )
-    assert denominators["flow"].item() == 1
+    timesteps = torch.tensor([[[[0.25], [0.75]]]], dtype=torch.float64)
+    noise = torch.ones(1, 2, 2, dtype=torch.float64)
+    original_timesteps, original_noise = timesteps.clone(), noise.clone()
+    live = torch.get_rng_state()
+    if supplied in {"timesteps", "both"}:
+        grid, tau = _coerce_flow_timesteps(flow=flow, sample_count=1, timesteps=timesteps)
+        assert grid.dtype == tau.dtype == torch.float32
+    if supplied in {"noise", "both"}:
+        validated_noise = _coerce_flow_noise(flow=flow, sample_count=1, noise=noise)
+        assert validated_noise.dtype == torch.float32
     assert torch.equal(torch.get_rng_state(), live)
     assert timesteps.dtype == noise.dtype == torch.float64
     assert torch.equal(timesteps, original_timesteps) and torch.equal(noise, original_noise)
 
 
 @pytest.mark.parametrize("invalid", ["grid", "noise", "timestep-range"])
-def test_direct_count_and_denominator_apis_refuse_supplied_randomness(invalid: str) -> None:
+def test_live_loss_refuses_invalid_flow_randomness_before_sampling(invalid: str) -> None:
     timesteps = torch.tensor([[[[0.25], [0.75]]]]) if invalid == "grid" else torch.tensor([[0.5]])
     noise = torch.zeros(1, 1, 2, 3 if invalid == "noise" else 2)
     if invalid == "timestep-range":
         timesteps.fill_(2.0)
-    for count in (perceptron_isaac_objective_counts, perceptron_isaac_loss_denominators):
-        with pytest.raises(ValueError, match="ISAAC flow"):
-            count(
-                flow_stream(),
-                loss_plan="flow_matching_action_prediction",
-                action_dim=2,
-                action_horizon=2,
-                train_samples_per_chunk=1,
-                flow_mask_padded_action_rows=True,
-                exclude_non_agent_roles=True,
-                flow_timesteps=timesteps,
-                flow_noise=noise,
-            )
+    stream = flow_stream()
+    output = flow_output(stream, ZeroExpert())
+    live = torch.get_rng_state()
+    with pytest.raises(ValueError, match="ISAAC flow"):
+        perceptron_isaac_training_loss(
+            output,
+            stream,
+            loss_plan="flow_matching_action_prediction",
+            flow_timesteps=timesteps,
+            flow_noise=noise,
+        )
+    assert torch.equal(torch.get_rng_state(), live)

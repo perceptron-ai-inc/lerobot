@@ -60,6 +60,7 @@ accelerate launch --config_file "$FSDP2_CONFIG" -m lerobot.scripts.lerobot_train
   --dataset.video_backend=pyav --policy.train_storage_fp32=true \
   --policy.train_expert_only=false --policy.use_peft=false \
   --parallelism.dp_shard=-1 --accelerator.mixed_precision=bf16 \
+  --accelerator.fsdp.reduce_dtype=float32 --accelerator.gradient_accumulation.steps=1 \
   --policy.push_to_hub=false --save_checkpoint=false --save_checkpoint_to_hub=false \
   --env_eval_freq=0 --eval_steps=0
 ```
@@ -93,10 +94,12 @@ row per environment without adding frames to model history or time.
 Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
 `action-noise`. Flow first averages valid weighted elements within each draw,
 then draws within each chunk, then chunks equally. Text remains token-normalized.
-The loss accepts independent update-wide text-token and flow-chunk denominators
-for DDP/Accelerate accumulation. The stock trainer automatically computes these
-totals across ranks and preprocessed microbatches in each accumulation window,
-including when filtering leaves unequal local sample counts.
+Each forward normalizes text tokens and Flow chunks across data-parallel ranks,
+including unequal local counts after filtering. ISAAC gradient accumulation is
+unsupported: set `accelerator.gradient_accumulation.steps=1`. The standard config
+preflight rejects larger values before allocating the model or engine. Other
+policies retain LeRobot's native gradient accumulation. There is no custom
+prepared-window staging or partial-window checkpoint/replay path.
 
 `moe_auxiliary_losses.py` materializes global logical dispatch counts and router
 probabilities for each layer. Balance (0.02) and router z-loss (0.001) average

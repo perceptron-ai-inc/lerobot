@@ -1,8 +1,8 @@
 """Focused native modality schedule preservation; execution belongs to the parent CPU gate.
 
 The accepted vision-block profile supplies actual Accelerate/FSDP2 preparation. These
-additional cases keep real nonempty streams, both vision kinds, stock counting and
-update_policy, and compare against the same unsharded native objective before wrapping.
+additional cases keep real nonempty streams, both vision kinds and update_policy
+at accumulation=1, with independent per-step objective arithmetic before wrapping.
 """
 
 from __future__ import annotations
@@ -29,12 +29,15 @@ from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.utils.hooks import RemovableHandle
 
-from lerobot.common.training_window import plan_training_window, prepare_training_input
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import (
     ISAAC_FLOW_NOISE_KEY,
     ISAAC_FLOW_TIMESTEPS_KEY,
 )
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import Mk1Qwen36VLAModel
+from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
+    Mk1Qwen36VLAForActionGeneration,
+    Mk1Qwen36VLAModel,
+)
+from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import Qwen35VLAModel, _ordered_modality_input
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY,
@@ -109,6 +112,86 @@ def _assert_rng_equal(actual: dict[str, Tensor], expected: dict[str, Tensor]) ->
         assert torch.equal(value, expected[name]), name
 
 
+def _expected_schedule_metrics(
+    policy: PerceptronIsaacPolicy,
+    model: Mk1Qwen36VLAForActionGeneration,
+    stream: TensorStream,
+) -> dict[str, float]:
+    """Use native predictions, but no production loss or supervision selector as the oracle."""
+    assert model.config.action_context_schema_version == 1
+    output = model.model(stream, output_router_auxiliaries=True)
+    activations = output.last_hidden_state
+    # Fixture suffix: one flow marker, FAST [8, 9, 2], then two padding tokens.
+    prefix_length = stream.shape[1] - 6
+    primary = torch.zeros(6)
+    if not stream.collective_only:
+        target = torch.tensor([[[0.2, -0.4], [0.8, 0.1]]])
+        assert not model.action_expert.args.clean_at_0
+        prediction = model.action_expert(
+            activations,
+            torch.arange(activations.shape[1])[None, :] < prefix_length,
+            0.6 * target,
+            torch.tensor([0.4]),
+            action_mask=torch.ones(1, 2, dtype=torch.bool),
+        )
+        logits = activations[0, prefix_length + 1 : prefix_length + 3] @ model.lm_head.weight.t()
+        text = torch.nn.functional.cross_entropy(logits.float(), torch.tensor([9, 2]), reduction="sum")
+        text += policy.config.softmax_auxiliary_loss_scale * logits.float().logsumexp(-1).square().sum()
+        primary[0] = (prediction.float() - target).square().mean()
+        primary[1] = 1
+        primary[2] = text
+        primary[3] = 2
+        primary[4] = 4
+        # Native router supervision includes forwarded padding, but not collective dummies.
+        primary[5] = stream.shape[1] - 1
+    dist.all_reduce(primary, op=dist.ReduceOp.SUM)
+    flow_loss = primary[0] / primary[1]
+    text_loss = primary[2] / primary[3]
+    metrics = {
+        "flow_loss": float(flow_loss),
+        "flow_chunk_count": float(primary[1]),
+        "flow_element_count": float(primary[4]),
+        "flow_mean_timestep": 0.0 if stream.collective_only else 0.4,
+        "text_loss": float(text_loss),
+        "text_token_count": float(primary[3]),
+    }
+    balances: list[Tensor] = []
+    z_losses: list[Tensor] = []
+    for layer in output["router_auxiliaries"]:
+        logical_experts = layer.num_real_experts + layer.num_null_experts
+        logits = layer.physical_logits[:0] if stream.collective_only else layer.physical_logits
+        probabilities = (
+            layer.logical_probabilities[:0] if stream.collective_only else layer.logical_probabilities
+        )
+        selected = layer.selected_experts[:0] if stream.collective_only else layer.selected_experts
+        dispatch = torch.bincount(selected.reshape(-1), minlength=logical_experts).float()
+        probability_sum = probabilities.float().sum(0)
+        partition = torch.cat(
+            (
+                logits[:, : layer.num_real_experts],
+                logits[:, layer.num_real_experts :] + math.log(layer.num_null_experts),
+            ),
+            dim=-1,
+        )
+        totals = torch.stack(
+            (logits.new_tensor(logits.shape[0]), partition.float().logsumexp(-1).square().sum())
+        )
+        for value in (dispatch, probability_sum, totals):
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        assert totals[0] == primary[5]
+        balances.append(logical_experts * ((dispatch / totals[0]) * (probability_sum / totals[0])).sum())
+        z_losses.append(totals[1] / totals[0])
+    metrics["load_balancing_loss"] = float(torch.stack(balances).mean())
+    metrics["router_z_loss"] = float(torch.stack(z_losses).mean())
+    metrics["loss"] = (
+        metrics["flow_loss"]
+        + metrics["text_loss"]
+        + policy.config.moe_load_balancing_loss_coeff * metrics["load_balancing_loss"]
+        + policy.config.moe_z_loss_coeff * metrics["router_z_loss"]
+    )
+    return metrics
+
+
 def _schedule_worker(rank: int, directory: str, case: ScheduleCase) -> None:
     root = Path(directory)
     handles: list[RemovableHandle] = []
@@ -131,7 +214,8 @@ def _schedule_worker(rank: int, directory: str, case: ScheduleCase) -> None:
             world_size=2,
             timeout=timedelta(seconds=45),
         )
-        accelerator = Accelerator(cpu=True)
+        accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1)
+        assert accelerator.gradient_accumulation_steps == 1
         torch.manual_seed(71)
         policy, model = _tiny_native_policy(ModalityWrap.VISION_BLOCK)
         if case == ScheduleCase.FROZEN:
@@ -146,14 +230,13 @@ def _schedule_worker(rank: int, directory: str, case: ScheduleCase) -> None:
         if not stream.collective_only:
             batch[ISAAC_FLOW_TIMESTEPS_KEY] = torch.tensor([[0.4]])
             batch[ISAAC_FLOW_NOISE_KEY] = torch.zeros(1, 1, 2, 2)
-        normalizer = policy.get_training_loss_normalizer()
-        staged = prepare_training_input(lambda: batch, normalizer, accelerator)
-        window = plan_training_window(0, [staged], normalizer, accelerator)
-        assert normalizer.local_counts(batch) == ((0, 0) if stream.collective_only else (1, 2))
         rng = serialize_rng_state()
         with torch.no_grad():
             expected_embeds = model.model.embed_stream(stream)
-            expected_loss, expected_metrics = policy(batch, training_loss_normalization=window.normalization)
+            expected_metrics = _expected_schedule_metrics(policy, model, stream)
+        expected_counts = (1, 2) if case == ScheduleCase.EMPTY else (2, 4)
+        assert expected_metrics["flow_chunk_count"] == expected_counts[0]
+        assert expected_metrics["text_token_count"] == expected_counts[1]
         deserialize_rng_state(rng)
 
         config = _supported_wrap_config(ModalityWrap.VISION_BLOCK, model)
@@ -235,12 +318,10 @@ def _schedule_worker(rank: int, directory: str, case: ScheduleCase) -> None:
             prepared_optimizer,
             0.0,
             accelerator,
-            training_loss_normalization=window.normalization,
         )
         assert metrics is not None and all(math.isfinite(value) for value in metrics.values())
         for name, value in expected_metrics.items():
             torch.testing.assert_close(torch.tensor(metrics[name]), torch.tensor(value), atol=2e-5, rtol=2e-5)
-        torch.testing.assert_close(torch.tensor(metrics["loss"]), expected_loss, atol=2e-5, rtol=2e-5)
         _assert_rng_equal(serialize_rng_state(), rng)
         expected_forward = [
             "tokens",
@@ -290,7 +371,8 @@ def _schedule_worker(rank: int, directory: str, case: ScheduleCase) -> None:
         assert stream.shape[1] == expected_embeds.shape[1]
         for event, original in zip(stream.flat_stream(), original_bytes, strict=True):
             assert torch.equal(event.data.contiguous().view(torch.uint8), original)
-        assert normalizer.local_counts(batch) == ((0, 0) if stream.collective_only else (1, 2))
+        assert metrics["flow_chunk_count"] == expected_counts[0]
+        assert metrics["text_token_count"] == expected_counts[1]
         (root / f"rank-{rank}.json").write_text(
             json.dumps(
                 {
@@ -298,7 +380,7 @@ def _schedule_worker(rank: int, directory: str, case: ScheduleCase) -> None:
                     "forward_order": forward_order,
                     "backward_order": backward_order,
                     "gradient_names": gradient_names,
-                    "global_counts": window.normalization.totals,
+                    "global_counts": expected_counts,
                     "router_positions_expected": 0 if stream.collective_only else stream.shape[1] - 1,
                     "metrics": metrics,
                 },

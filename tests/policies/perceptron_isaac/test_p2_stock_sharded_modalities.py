@@ -1,7 +1,7 @@
 """Reviewer R1: empty stock inputs must not skip supported FSDP2 modality units.
 
-All modality encoders, hybrid decoder layers, router reductions, flow/text losses,
-stock input staging/counting and update_policy execute unchanged. The measured
+All modality encoders, hybrid decoder layers, router reductions, flow/text losses
+and update_policy execute with direct prepared batches at accumulation=1. The measured
 TensorStream is the supported prepacked input API; no tokenizer assets are needed.
 CPU preparation uses accelerate's real fsdp2_prepare_model with the same minimal
 CPU mesh carrier as the existing FSDP2 tests, not a replacement wrapping policy.
@@ -36,7 +36,6 @@ from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.utils.hooks import RemovableHandle
 
-from lerobot.common.training_window import plan_training_window, prepare_training_input
 from lerobot.configs.accelerator import FSDPConfig
 from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
 from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
@@ -228,7 +227,9 @@ def _assert_master_ownership(policy: PerceptronIsaacPolicy, optimizer: Optimizer
         assert param.to_local().dtype == torch.float32, f"non-F32 optimizer master: {name}"
 
 
-def _sharded_modality_worker(rank: int, directory: str, wrapping: ModalityWrap, empty_rank: bool) -> None:
+def _sharded_modality_worker(
+    rank: int, directory: str, wrapping: ModalityWrap, empty_rank: bool, loss_plan: str
+) -> None:
     root = Path(directory)
     handles: list[RemovableHandle] = []
     os.environ.update(
@@ -250,11 +251,12 @@ def _sharded_modality_worker(rank: int, directory: str, wrapping: ModalityWrap, 
             world_size=2,
             timeout=timedelta(seconds=45),
         )
-        accelerator = Accelerator(cpu=True)
+        accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1)
         assert accelerator.num_processes == 2 and accelerator.device.type == "cpu"
+        assert accelerator.gradient_accumulation_steps == 1
         torch.manual_seed(71)
         policy, model = _tiny_native_policy(wrapping)
-        normalizer = policy.get_training_loss_normalizer()
+        policy.config.loss_plan = loss_plan
         stream = (
             TensorStream.collective_dummy()
             if empty_rank and rank == 1
@@ -264,12 +266,11 @@ def _sharded_modality_worker(rank: int, directory: str, wrapping: ModalityWrap, 
             PERCEPTRON_ISAAC_STREAM_KEY: stream,
             PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY: [] if stream.collective_only else [0],
         }
-        # No test-supplied denominators: actual stock staging and integer SUM planning.
-        state = prepare_training_input(lambda: batch, normalizer, accelerator)
-        window = plan_training_window(0, [state], normalizer, accelerator)
-        local_counts = normalizer.local_counts(normalizer.decode_batch(state, torch.device("cpu")))
-        assert local_counts == ((0, 0) if stream.collective_only else (1, 2))
-        assert window.normalization.totals == ((1, 2) if empty_rank else (2, 4))
+        # One flow chunk and two next-token FAST labels per real fixture, not per dummy.
+        text_count = 2 if loss_plan == "text_ntp_fast_flow_action" else 0
+        local_counts = (0, 0) if stream.collective_only else (1, text_count)
+        real_ranks = 1 if empty_rank else 2
+        expected_counts = (real_ranks, real_ranks * text_count)
         config = _supported_wrap_config(wrapping, model)
         host = CpuFsdpPreparation(
             state=CpuFsdpState(config.build_plugin(), TorchDynamoPlugin()),
@@ -327,17 +328,20 @@ def _sharded_modality_worker(rank: int, directory: str, wrapping: ModalityWrap, 
             {name: AverageMeter(name, ":.6f") for name in ("loss", "lr", "update_s")},
             dp_world_size=2,
         )
-        active_batch = normalizer.decode_batch(state, accelerator.device)
         _, metrics = update_policy(
             tracker,
             prepared,
-            active_batch,
+            batch,
             prepared_optimizer,
             0.0,
             accelerator,
-            training_loss_normalization=window.normalization,
         )
         assert metrics is not None and all(math.isfinite(value) for value in metrics.values())
+        assert metrics["flow_chunk_count"] == expected_counts[0]
+        assert metrics["text_token_count"] == expected_counts[1]
+        assert metrics["flow_element_count"] == 4 * real_ranks
+        if loss_plan == "flow_matching_action_prediction":
+            assert metrics["text_loss"] == 0.0
         assert trace.decoder_entered and trace.decoder_completed
         assert set(trace.required_units) <= trace.completed, "native sharded modality did not finish"
         assert gradients, "real backward produced no optimizer gradients"
@@ -348,8 +352,9 @@ def _sharded_modality_worker(rank: int, directory: str, wrapping: ModalityWrap, 
         assert any(bool(value.ne(0).any()) for value in modality_gradients), (
             "native modality gradient is all zero"
         )
+        if loss_plan == "text_ntp_fast_flow_action":
+            assert any(name.startswith("_isaac_model.lm_head.") for name in gradients)
         for prefix in (
-            "_isaac_model.lm_head.",
             "_isaac_model.model.language_model.layers.0.",
             "_isaac_model.model.language_model.layers.1.",
             "_isaac_model.model.action_expert.",
@@ -362,8 +367,9 @@ def _sharded_modality_worker(rank: int, directory: str, wrapping: ModalityWrap, 
             "rank": rank,
             "wrapping": wrapping.value,
             "collective_only": stream.collective_only,
+            "loss_plan": loss_plan,
             "local_counts": local_counts,
-            "global_counts": window.normalization.totals,
+            "global_counts": expected_counts,
             "required_units": trace.required_units,
             "entered": sorted(trace.entered),
             "completed": sorted(trace.completed),
@@ -384,10 +390,12 @@ def _sharded_modality_worker(rank: int, directory: str, wrapping: ModalityWrap, 
             dist.destroy_process_group()
 
 
-def _run_sharded_modalities(tmp_path: Path, wrapping: ModalityWrap, *, empty_rank: bool) -> None:
+def _run_sharded_modalities(
+    tmp_path: Path, wrapping: ModalityWrap, *, empty_rank: bool, loss_plan: str
+) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     context = mp.spawn(
-        _sharded_modality_worker, args=(str(tmp_path), wrapping, empty_rank), nprocs=2, join=False
+        _sharded_modality_worker, args=(str(tmp_path), wrapping, empty_rank, loss_plan), nprocs=2, join=False
     )
     deadline = time.monotonic() + 180
     try:
@@ -410,14 +418,16 @@ def _run_sharded_modalities(tmp_path: Path, wrapping: ModalityWrap, *, empty_ran
 
 
 @pytest.mark.parametrize("wrapping", list(ModalityWrap), ids=lambda wrapping: wrapping.value)
+@pytest.mark.parametrize("loss_plan", ["text_ntp_fast_flow_action", "flow_matching_action_prediction"])
 def test_stock_empty_rank_enters_sharded_modality_before_decoder(
-    tmp_path: Path, wrapping: ModalityWrap
+    tmp_path: Path, wrapping: ModalityWrap, loss_plan: str
 ) -> None:
-    _run_sharded_modalities(tmp_path, wrapping, empty_rank=True)
+    _run_sharded_modalities(tmp_path, wrapping, empty_rank=True, loss_plan=loss_plan)
 
 
 @pytest.mark.parametrize("wrapping", list(ModalityWrap), ids=lambda wrapping: wrapping.value)
+@pytest.mark.parametrize("loss_plan", ["text_ntp_fast_flow_action", "flow_matching_action_prediction"])
 def test_stock_both_ranks_modality_finishes_real_fsdp2_forward_backward(
-    tmp_path: Path, wrapping: ModalityWrap
+    tmp_path: Path, wrapping: ModalityWrap, loss_plan: str
 ) -> None:
-    _run_sharded_modalities(tmp_path, wrapping, empty_rank=False)
+    _run_sharded_modalities(tmp_path, wrapping, empty_rank=False, loss_plan=loss_plan)

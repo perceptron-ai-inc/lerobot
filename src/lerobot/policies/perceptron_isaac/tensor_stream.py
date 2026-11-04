@@ -483,45 +483,6 @@ class TensorStream:
         )
         return cls([create_stream([event], list(TextType))], collective_only=True)
 
-    def training_state(self) -> dict[str, Any]:
-        """Safe tensor/primitive representation for rank-local prepared-input checkpoints."""
-        return {
-            "collective_only": self.collective_only,
-            "streams": [
-                {
-                    "priority": [kind.value for kind in stream.priority],
-                    "events": [
-                        {
-                            "data": event.data,
-                            "time": event.time,
-                            "type": event.type.value,
-                            "role": event.role,
-                            "dims_virtual": event.dims_virtual,
-                            "dims_real": event.dims_real,
-                            "idx_range": event.idx_range,
-                            "tags": event.tags,
-                        }
-                        for event in stream.events
-                    ],
-                }
-                for stream in self.streams
-            ],
-        }
-
-    @classmethod
-    def from_training_state(cls, state: dict[str, Any]) -> TensorStream:
-        """Rebuild only the owned stream record, never load arbitrary Python classes."""
-        return cls(
-            [
-                create_stream(
-                    [Event(**{**event, "type": ALL_TYPES[event["type"]]}) for event in sample["events"]],
-                    [ALL_TYPES[kind] for kind in sample["priority"]],
-                )
-                for sample in state["streams"]
-            ],
-            collective_only=state["collective_only"],
-        )
-
     def __post_init__(self):
         if self.collective_only:
             # The empty contribution cannot be used to hide real supervision or padding.

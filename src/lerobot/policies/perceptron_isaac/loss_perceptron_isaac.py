@@ -119,20 +119,6 @@ def _text_loss(
     return numerators, counts, per_sample
 
 
-def _text_label_count(
-    stream: TensorStream,
-    *,
-    exclude_non_agent_roles: bool,
-) -> Tensor:
-    if stream.collective_only:
-        return torch.zeros((), dtype=torch.int64)
-    metadata = resolve_tensor_stream_metadata(stream, None)
-    roles = ("agent", "assistant", None) if exclude_non_agent_roles else tuple(ROLE_TO_IDX)
-    tokens, valid_tokens = set_data(stream, _TEXT_LOSS_TYPES, roles=roles, metadata=metadata)
-    _, valid_labels = _valid_next_token_labels(tokens, valid_tokens)
-    return valid_labels[:, : stream.shape[1] - 1].sum(dtype=torch.int64)
-
-
 def _collect_flow_batch(
     stream: TensorStream,
     *,
@@ -328,81 +314,6 @@ def _coerce_flow_loss_mask(
     return mask, denominators
 
 
-def perceptron_isaac_objective_counts(
-    stream: TensorStream,
-    *,
-    loss_plan: str,
-    action_dim: int,
-    action_horizon: int,
-    train_samples_per_chunk: int,
-    flow_mask_padded_action_rows: bool,
-    exclude_non_agent_roles: bool,
-    flow_loss_mask: Tensor | None = None,
-    flow_timesteps: Tensor | None = None,
-    flow_noise: Tensor | None = None,
-) -> dict[str, int]:
-    """Count local objectives and validate supplied flow inputs without sampling or a model forward."""
-    if loss_plan not in {"text_ntp_fast_flow_action", "flow_matching_action_prediction"}:
-        raise ValueError(f"Unsupported ISAAC loss plan {loss_plan!r}.")
-    if train_samples_per_chunk < 1:
-        raise ValueError("train_samples_per_chunk must be >= 1.")
-    flow = _collect_flow_batch(
-        stream,
-        action_dim=action_dim,
-        action_horizon=action_horizon,
-        mask_padded_action_rows=flow_mask_padded_action_rows,
-        device=torch.device("cpu"),
-        exclude_non_agent_roles=exclude_non_agent_roles,
-    )
-    _coerce_flow_loss_mask(
-        flow=flow,
-        sample_count=train_samples_per_chunk,
-        loss_mask=flow_loss_mask,
-    )
-    if flow_timesteps is not None:
-        _coerce_flow_timesteps(flow=flow, sample_count=train_samples_per_chunk, timesteps=flow_timesteps)
-    if flow_noise is not None:
-        _coerce_flow_noise(flow=flow, sample_count=train_samples_per_chunk, noise=flow_noise)
-    # Each draw is normalized within its chunk; the update denominator counts chunks only.
-    denominators = {"flow": flow.targets.shape[0]}
-    if loss_plan == "text_ntp_fast_flow_action":
-        text_count = _text_label_count(
-            stream,
-            exclude_non_agent_roles=exclude_non_agent_roles,
-        )
-        denominators["text"] = int(text_count.item())
-    return denominators
-
-
-def perceptron_isaac_loss_denominators(
-    stream: TensorStream,
-    *,
-    loss_plan: str,
-    action_dim: int,
-    action_horizon: int,
-    train_samples_per_chunk: int,
-    flow_mask_padded_action_rows: bool,
-    exclude_non_agent_roles: bool,
-    flow_loss_mask: Tensor | None = None,
-    flow_timesteps: Tensor | None = None,
-    flow_noise: Tensor | None = None,
-) -> dict[str, Tensor]:
-    """Keep the existing tensor-denominator API; stock preparation uses integer counts."""
-    counts = perceptron_isaac_objective_counts(
-        stream,
-        loss_plan=loss_plan,
-        action_dim=action_dim,
-        action_horizon=action_horizon,
-        train_samples_per_chunk=train_samples_per_chunk,
-        flow_mask_padded_action_rows=flow_mask_padded_action_rows,
-        exclude_non_agent_roles=exclude_non_agent_roles,
-        flow_loss_mask=flow_loss_mask,
-        flow_timesteps=flow_timesteps,
-        flow_noise=flow_noise,
-    )
-    return {name: torch.tensor(count, dtype=torch.float32) for name, count in counts.items()}
-
-
 def _flow_loss(
     output: ModelOutput,
     stream: TensorStream,
@@ -521,28 +432,15 @@ def _global_objective_mean(
     numerator: Tensor,
     denominator: Tensor,
     *,
-    global_denominator: Tensor | None = None,
-    accumulation_scale: int = 1,
     allow_empty: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Normalize local gradients by one global count spanning the complete optimizer update."""
-    if accumulation_scale < 1:
-        raise ValueError("ISAAC loss accumulation_scale must be >= 1.")
+    """Normalize local gradients by the valid-target count across this distributed batch."""
     denominator = denominator.to(device=numerator.device, dtype=torch.float32)
     global_numerator = _global_sum_detached(numerator)
     world_size = 1
     if dist.is_available() and dist.is_initialized():
         world_size = dist.get_world_size()
-    if global_denominator is None:
-        global_denominator = _global_sum_detached(denominator)
-        metric_scale = 1.0
-    else:
-        global_denominator = torch.as_tensor(
-            global_denominator,
-            device=numerator.device,
-            dtype=torch.float32,
-        )
-        metric_scale = float(accumulation_scale)
+    global_denominator = _global_sum_detached(denominator)
     if global_denominator.numel() != 1 or not bool(torch.isfinite(global_denominator)):
         raise ValueError("ISAAC global objective denominator must be one finite scalar.")
     if allow_empty and bool(global_denominator == 0):
@@ -551,8 +449,8 @@ def _global_objective_mean(
         return numerator * 0, global_numerator * 0, global_denominator
     if not bool(global_denominator > 0):
         raise ValueError("ISAAC global objective denominator must be positive.")
-    backward = numerator * (world_size * metric_scale / global_denominator)
-    value = global_numerator * metric_scale / global_denominator
+    backward = numerator * (world_size / global_denominator)
+    value = global_numerator / global_denominator
     # The public scalar is global; DDP still averages only rank-local derivatives.
     return backward + (value - backward.detach()), value, global_denominator
 
@@ -572,8 +470,6 @@ def perceptron_isaac_training_loss(
     flow_timesteps: Tensor | None = None,
     flow_noise: Tensor | None = None,
     flow_loss_mask: Tensor | None = None,
-    global_denominators: dict[str, Tensor] | None = None,
-    accumulation_scale: int = 1,
     reduction: str = "mean",
 ) -> IsaacLossOutput:
     """Compute ISAAC's objective-normalized native training loss."""
@@ -588,11 +484,6 @@ def perceptron_isaac_training_loss(
     ):
         if not math.isfinite(coefficient) or coefficient < 0:
             raise ValueError(f"{name} must be finite and nonnegative.")
-    if accumulation_scale < 1:
-        raise ValueError("ISAAC loss accumulation_scale must be >= 1.")
-    expected_denominators = {"flow", "text"} if loss_plan == "text_ntp_fast_flow_action" else {"flow"}
-    if global_denominators is not None and set(global_denominators) != expected_denominators:
-        raise ValueError(f"ISAAC global denominators must define {sorted(expected_denominators)} exactly.")
 
     flow_num, flow_count, flow_per_sample, mean_timestep, element_count = _flow_loss(
         output,
@@ -608,8 +499,6 @@ def perceptron_isaac_training_loss(
     flow_backward, flow_global, flow_global_count = _global_objective_mean(
         flow_num,
         flow_count,
-        global_denominator=None if global_denominators is None else global_denominators["flow"],
-        accumulation_scale=accumulation_scale,
         allow_empty=True,
     )
     flow_chunk_count = _global_sum_detached(flow_count)
@@ -634,8 +523,6 @@ def perceptron_isaac_training_loss(
         text_backward, text_global, text_global_count = _global_objective_mean(
             text_num,
             text_count,
-            global_denominator=None if global_denominators is None else global_denominators["text"],
-            accumulation_scale=accumulation_scale,
             allow_empty=True,
         )
         total_backward = total_backward + text_backward
@@ -649,7 +536,7 @@ def perceptron_isaac_training_loss(
             }
         )
     if not bool(flow_global_count + text_global_count > 0):
-        raise ValueError("ISAAC primary objective window is globally empty.")
+        raise ValueError("ISAAC primary objective batch is globally empty.")
     auxiliary = total_backward.new_zeros(())
     for key, coefficient in (
         ("load_balancing_loss", moe_load_balancing_loss_coeff),

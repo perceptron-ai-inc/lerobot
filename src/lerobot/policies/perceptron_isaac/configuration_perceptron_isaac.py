@@ -339,6 +339,11 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         )
 
     def validate_training_intent(self, intent: PolicyTrainingIntent) -> None:
+        if intent.gradient_accumulation_steps != 1:
+            raise ValueError(
+                "ISAAC training does not support gradient accumulation; "
+                "set accelerator.gradient_accumulation.steps=1."
+            )
         # Resolve relative assets against the loaded component, never a Hub ID as a cwd path.
         package_root = (
             self._pretrained_config_directory
