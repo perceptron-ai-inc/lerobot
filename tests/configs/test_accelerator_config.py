@@ -198,3 +198,42 @@ class TestRuntimeBuilders:
         assert ga_plugin.num_steps == 4
         assert ga_plugin.sync_with_dataloader is False
         assert "gradient_accumulation_steps" not in captured
+
+
+class TestSyncEachBatch:
+    """Per-microbatch gradient synchronization must not change accumulation boundaries."""
+
+    def test_legacy_gradient_accumulation_config_defaults_to_no_sync(self) -> None:
+        config = draccus.decode(GradientAccumulationConfig, {"steps": 8})
+        assert config.steps == 8
+        assert config.sync_each_batch is False
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_sync_each_batch_typed_json_roundtrip(self, enabled: bool) -> None:
+        payload = {"gradient_accumulation": {"steps": 8, "sync_each_batch": enabled}}
+        config = draccus.decode(AcceleratorConfig, payload)
+        assert config.gradient_accumulation.sync_each_batch is enabled
+        encoded = json.loads(json.dumps(draccus.encode(config)))
+        assert encoded["gradient_accumulation"]["sync_each_batch"] is enabled
+        assert draccus.decode(AcceleratorConfig, encoded) == config
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_sync_each_batch_reaches_real_accelerate_plugin(self, enabled: bool) -> None:
+        plugin = GradientAccumulationConfig(steps=8, sync_each_batch=enabled).build_plugin()
+        assert plugin.num_steps == 8
+        assert plugin.sync_each_batch is enabled
+        assert plugin.sync_with_dataloader is False
+
+    def test_sync_each_batch_true_is_a_typed_cli_field(self) -> None:
+        config = draccus.parse(
+            AcceleratorConfig,
+            args=["--gradient_accumulation.steps=8", "--gradient_accumulation.sync_each_batch=true"],
+        )
+        assert config.gradient_accumulation.steps == 8
+        assert config.gradient_accumulation.sync_each_batch is True
+
+    def test_default_real_plugin_keeps_existing_sync_and_dataloader_behavior(self) -> None:
+        plugin = GradientAccumulationConfig(steps=8).build_plugin()
+        assert plugin.num_steps == 8
+        assert plugin.sync_each_batch is False
+        assert plugin.sync_with_dataloader is False

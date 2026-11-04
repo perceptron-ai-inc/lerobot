@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 from unittest.mock import patch
 
 import numpy as np
@@ -105,6 +105,7 @@ class Run:
     draws: int = 2
     checkpoint: Path | None = None
     interrupt_at: int | None = None
+    sync_each_batch: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,7 @@ class ForwardRecord(TypedDict):
     metrics: dict[str, float]
     positions: int
     padding: int
+    collective_only: bool
 
 
 class NativeRouterRecord(TypedDict):
@@ -461,6 +463,7 @@ def _record(batch: dict[str, Any], draw: DrawRecord, metrics: dict[str, float], 
         "metrics": metrics,
         "positions": sum(sum(event.num_tokens() for event in sample.events) - 1 for sample in stream.streams),
         "padding": padding,
+        "collective_only": stream.collective_only,
     }
 
 
@@ -518,7 +521,9 @@ def _worker(rank: int, rendezvous: str, directory: str, run: Run) -> None:
         optimizer=SGDConfig(lr=0.01, momentum=0.3, grad_clip_norm=0.0),
         scheduler=ConstantWithWarmupSchedulerConfig(num_warmup_steps=0),
         accelerator=AcceleratorConfig(
-            gradient_accumulation=GradientAccumulationConfig(steps=run.accumulation)
+            gradient_accumulation=GradientAccumulationConfig(
+                steps=run.accumulation, sync_each_batch=run.sync_each_batch
+            )
         ),
     )
     if run.checkpoint is not None:
@@ -743,6 +748,30 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("case", [Case.JOINT, Case.EMPTY_CHUNKS, Case.EMPTY_TEXT, Case.AUXILIARY])
+def test_stock_sync_each_batch_accumulation8_matches_global_window_oracle(tmp_path: Path, case: Case) -> None:
+    run = Run(case, steps=16, accumulation=8, draws=8, sync_each_batch=True)
+    receipts = _launch(tmp_path / case.value, run)
+    for receipt in receipts:
+        assert len(receipt["gradients"]) == 2
+        assert receipt["scheduler"]["last_epoch"] == 16
+        assert receipt["backward_divisor"] == 8
+        assert all(torch.isfinite(value).all() for value in receipt["final"].values())
+        for gradients in receipt["gradients"]:
+            assert gradients
+            assert all(torch.isfinite(value).all() for value in gradients.values())
+    if case in {Case.EMPTY_CHUNKS, Case.EMPTY_TEXT}:
+        key: Literal["targets", "labels"] = "targets" if case == Case.EMPTY_CHUNKS else "labels"
+        # Epoch shuffling can move empty local support to either rank; require a real
+        # zero-local/nonempty-peer microbatch instead of assuming one rank stays empty.
+        assert any(
+            any(receipt["forwards"][step][key].numel() == 0 for receipt in receipts)
+            and any(receipt["forwards"][step][key].numel() > 0 for receipt in receipts)
+            for step in range(run.steps)
+        )
+    _assert_reference(receipts, run)
+
+
 @pytest.mark.parametrize("draws", [1, 2])
 def test_stock_train_global_window_matches_concatenated_joint_objective(tmp_path: Path, draws: int) -> None:
     run = Run(Case.JOINT, draws=draws)
@@ -768,17 +797,31 @@ def test_stock_train_zero_local_chunks_matches_global_reference(tmp_path: Path) 
     _assert_reference(receipts, run)
 
 
-def test_stock_train_empty_rank_native_router_excludes_dummy_but_keeps_real_padding(tmp_path: Path) -> None:
-    run = Run(Case.NATIVE_EMPTY_CHUNKS)
+@pytest.mark.parametrize(
+    "run",
+    [
+        Run(Case.NATIVE_EMPTY_CHUNKS),
+        Run(Case.NATIVE_EMPTY_CHUNKS, steps=16, accumulation=8, draws=8, sync_each_batch=True),
+    ],
+    ids=["legacy", "sync_each_batch_accum8"],
+)
+def test_stock_train_empty_rank_native_router_excludes_dummy_but_keeps_real_padding(
+    tmp_path: Path, run: Run
+) -> None:
     receipts = _launch(tmp_path / "native-empty", run)
     assert sum(record["padding"] for record in receipts[1]["forwards"]) > 0
     for receipt in receipts:
-        assert len(receipt["gradients"]) == 1
+        assert len(receipt["gradients"]) == run.steps // run.accumulation
         assert len(receipt["native_router"]) == run.steps
         assert all(torch.isfinite(value).all() for value in receipt["final"].values())
         for step, routers in enumerate(receipt["native_router"]):
-            # Rank zero has no retained samples. Rank one's actual NTP extent includes real padding.
-            real_positions = receipts[1]["forwards"][step]["positions"]
+            # Real padding counts, but neither rank's collective-only dummy does.
+            # The empty rank can switch when this window crosses shuffled epochs.
+            real_positions = sum(
+                peer["forwards"][step]["positions"]
+                for peer in receipts
+                if not peer["forwards"][step]["collective_only"]
+            )
             assert len(routers["tokens"]) == len(routers["dispatch"]) == 2
             for tokens, dispatch in zip(routers["tokens"], routers["dispatch"], strict=True):
                 assert tokens.item() == real_positions, "collective dummy must add no router positions"

@@ -182,13 +182,16 @@ class GradScalerConfig:
 class GradientAccumulationConfig:
     """Mirror of the `GradientAccumulationPlugin` subset LeRobot supports.
 
-    Only the step count is a knob. ``sync_with_dataloader`` is pinned to False by
-    :meth:`build_plugin`: the training loop cycles a finite dataloader, so accelerate's default
+    ``sync_each_batch=True`` synchronizes gradients on every micro-batch without changing
+    optimizer boundaries; FSDP2 can retain gradient shards instead of full unsharded gradients.
+    ``sync_with_dataloader`` is pinned to False by :meth:`build_plugin`: the training loop
+    cycles a finite dataloader, so accelerate's default
     of syncing at every dataloader end would force an optimizer step at every dataset epoch
     boundary instead of every ``steps`` micro-batches.
     """
 
     steps: int = 1
+    sync_each_batch: bool = False
 
     def __post_init__(self) -> None:
         """Validate the accumulation step count.
@@ -207,12 +210,16 @@ class GradientAccumulationConfig:
         it `to_kwargs()`, so the consumption site, not the inheritance, decides its role.
 
         Returns:
-            GradientAccumulationPlugin: Carrying the mirrored step count, with
+            GradientAccumulationPlugin: Carrying the step count and gradient-sync policy, with
                 ``sync_with_dataloader=False`` pinned (see the class docstring).
         """
         from accelerate.utils import GradientAccumulationPlugin
 
-        return GradientAccumulationPlugin(num_steps=self.steps, sync_with_dataloader=False)
+        return GradientAccumulationPlugin(
+            num_steps=self.steps,
+            sync_each_batch=self.sync_each_batch,
+            sync_with_dataloader=False,
+        )
 
 
 @dataclass
