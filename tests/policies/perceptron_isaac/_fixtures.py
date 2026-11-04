@@ -79,6 +79,7 @@ class TinyIsaacModel(nn.Module):
         activations = self.context_seed.view(1, 1, -1).expand(batch_size, sequence_length - 1, -1)
         return SimpleNamespace(
             final_activations=activations,
+            flow_matching_context=activations,
             final_embedding=self.lm_head,
             flow_matching_expert=self.action_expert,
             additional_info={},

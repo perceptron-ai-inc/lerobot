@@ -118,6 +118,7 @@ def _task_only_output(output: ModelOutput) -> ModelOutput:
     # Reference view of the same real native task graph, without auxiliary attachment.
     return ModelOutput(
         final_activations=output.final_activations,
+        flow_matching_context=output.flow_matching_context,
         final_embedding=output.final_embedding,
         flow_matching_expert=output.flow_matching_expert,
     )

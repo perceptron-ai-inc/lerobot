@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -25,6 +25,10 @@ from .tensor_stream_utils import (
     resolve_tensor_stream_metadata,
     set_data,
 )
+
+if TYPE_CHECKING:
+    from .modeling_qwen35_vla import FlowMatchingContext, ModelOutput
+
 
 ISAAC_FLOW_TIMESTEPS_KEY = "perceptron_isaac_flow_timesteps"
 ISAAC_FLOW_NOISE_KEY = "perceptron_isaac_flow_noise"
@@ -73,7 +77,7 @@ def _valid_next_token_labels(tokens: Tensor, valid: Tensor) -> tuple[Tensor, Ten
 
 
 def _text_loss(
-    output: Any,
+    output: ModelOutput,
     stream: TensorStream,
     *,
     exclude_non_agent_roles: bool,
@@ -400,7 +404,7 @@ def perceptron_isaac_loss_denominators(
 
 
 def _flow_loss(
-    output: Any,
+    output: ModelOutput,
     stream: TensorStream,
     *,
     train_samples_per_chunk: int,
@@ -424,16 +428,21 @@ def _flow_loss(
         device=output.final_activations.device,
         exclude_non_agent_roles=exclude_non_agent_roles,
     )
+    activations = output.final_activations
+    context: FlowMatchingContext = output.flow_matching_context
+    if detach_vlm_activations:
+        context = (
+            context.detach() if isinstance(context, Tensor) else tuple(layer.detach() for layer in context)
+        )
     if stream.collective_only:
         # A finite context traverses the expert without inventing supervision or RNG draws.
-        activations = output.final_activations
         draws = train_samples_per_chunk
         dummy_actions = activations.new_zeros(
             draws, 1, int(expert.args.action_horizon), int(expert.args.action_dim)
         )
         dummy_tau = activations.new_zeros(draws, 1, dtype=torch.float32)
         predicted = expert(
-            activations,
+            context,
             torch.ones(1, activations.shape[1], device=activations.device, dtype=torch.bool),
             dummy_actions[0] if draws == 1 else dummy_actions,
             dummy_tau[0] if draws == 1 else dummy_tau,
@@ -441,7 +450,12 @@ def _flow_loss(
                 1, int(expert.args.action_horizon), device=activations.device, dtype=torch.bool
             ),
         )
-        if not bool(torch.isfinite(predicted).all()) or not bool(torch.isfinite(activations).all()):
+        context_layers = (context,) if isinstance(context, Tensor) else context
+        if (
+            not bool(torch.isfinite(predicted).all())
+            or not bool(torch.isfinite(activations).all())
+            or any(not bool(torch.isfinite(layer).all()) for layer in context_layers)
+        ):
             raise ValueError("ISAAC collective-only forward must be finite.")
         zero = predicted.float().sum() * 0 + activations.float().sum() * 0
         return zero, zero.detach(), zero.reshape(1)[:0], zero.detach(), zero.detach()
@@ -462,7 +476,6 @@ def _flow_loss(
     clean_at_0 = expert.args.clean_at_0
     velocity_target = eps - targets if clean_at_0 else targets - eps
 
-    activations = output.final_activations.detach() if detach_vlm_activations else output.final_activations
     context_mask, _ = build_action_context_mask(
         stream,
         action_batch_indices=flow.batch_indices,
@@ -476,7 +489,7 @@ def _flow_loss(
     expert_input = x_tau[0] if train_samples_per_chunk == 1 else x_tau
     expert_tau = expert_tau[0] if train_samples_per_chunk == 1 else expert_tau
     predicted = expert(
-        activations,
+        context,
         context_mask,
         expert_input.to(dtype=activations.dtype),
         expert_tau,
@@ -545,7 +558,7 @@ def _global_objective_mean(
 
 
 def perceptron_isaac_training_loss(
-    output: Any,
+    output: ModelOutput,
     stream: TensorStream,
     *,
     loss_plan: str = "text_ntp_fast_flow_action",

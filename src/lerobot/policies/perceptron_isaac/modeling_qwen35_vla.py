@@ -11,7 +11,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass
 from numbers import Real
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, TypeAlias
 from collections.abc import Sequence
 
 import torch
@@ -88,14 +88,30 @@ def normalize_vector_tokens(vector_tokens: torch.Tensor, max_states: int | None)
     return vector_tokens
 
 
-class ModelOutput:
-    """Minimal local training-output container retained for API compatibility."""
+FlowMatchingContext: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 
-    def __init__(self, final_activations, final_embedding, additional_info=None, flow_matching_expert=None):
+
+class ModelOutput:
+    """Keep final text activations separate from the expert's declared Flow context."""
+
+    def __init__(
+        self,
+        final_activations: torch.Tensor,
+        final_embedding: nn.Module,
+        additional_info: dict[str, Any] | None = None,
+        flow_matching_expert: nn.Module | None = None,
+        *,
+        flow_matching_context: FlowMatchingContext | None = None,
+    ) -> None:
         self.final_activations = final_activations
         self.final_embedding = final_embedding
         self.additional_info = additional_info if additional_info is not None else {}
         self.flow_matching_expert = flow_matching_expert
+        # Existing schema-1 outputs share the final tensor. A layerwise expert still
+        # rejects that form unless its producer supplies the actual selected layers.
+        self.flow_matching_context: FlowMatchingContext = (
+            final_activations if flow_matching_context is None else flow_matching_context
+        )
         self._logits = None
 
     @property
@@ -1798,6 +1814,18 @@ class Qwen35VLAModel(Qwen3_5Model):
             use_cache=False,
             **router_output_kwargs,
         )
+        if kwargs.get("output_flow_context", False):
+            # Select while the owning VLA forward still holds its FSDP parameters.
+            # Inference keeps its existing selector call and does no extra norm work.
+            out["flow_matching_context"] = (
+                out.last_hidden_state
+                if self.action_expert is None
+                else self.action_expert.select_backbone_context(
+                    out,
+                    final_norm=self.language_model.norm,
+                    backbone_num_layers=len(self.language_model.layers),
+                )
+            )
         return out
 
 
@@ -1893,17 +1921,18 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
             actions = actions[:, :, :action_dim].contiguous()
         return actions
 
-    def train_forward(self, tensor_stream: TensorStream) -> Any:
+    def train_forward(self, tensor_stream: TensorStream) -> ModelOutput:
         """Return differentiable native activations and heads for the policy's joint training loss.
 
         Evaluation uses ``sample_action``; training consumes this output through
         ``perceptron_isaac_training_loss`` without a separate backbone implementation.
         """
-        out = self.model(tensor_stream)
+        out = self.model(tensor_stream, output_flow_context=True)
         return ModelOutput(
             final_activations=out.last_hidden_state,
             final_embedding=self.lm_head,
             flow_matching_expert=self.model.action_expert,
+            flow_matching_context=out["flow_matching_context"],
         )
 
 

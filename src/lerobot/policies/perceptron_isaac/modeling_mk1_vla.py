@@ -136,7 +136,7 @@ class Mk1Qwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
 
     def train_forward(self, tensor_stream: TensorStream) -> ModelOutput:
         """Capture every forwarded router position without retaining mutable per-layer loss state."""
-        out = self.model(tensor_stream, output_router_auxiliaries=True)
+        out = self.model(tensor_stream, output_router_auxiliaries=True, output_flow_context=True)
         layers = out.get("router_auxiliaries", ())
         if len(layers) != len(self.model.language_model.layers):
             raise RuntimeError("Native training must return one router auxiliary per backbone layer.")
@@ -176,6 +176,7 @@ class Mk1Qwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
             final_embedding=self.lm_head,
             flow_matching_expert=self.model.action_expert,
             additional_info=additional_info,
+            flow_matching_context=out["flow_matching_context"],
         )
 
 
