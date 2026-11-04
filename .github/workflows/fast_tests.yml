@@ -25,12 +25,14 @@ on:
   pull_request:
     branches:
       - main
+      - phil/lerobot-upstream-base
     paths:
       - "src/**"
       - "tests/**"
       - ".github/workflows/**"
       - "pyproject.toml"
       - "uv.lock"
+      - "constraints/perceptron_isaac-cu128.txt"
       - "Makefile"
   push:
     branches:
@@ -41,6 +43,7 @@ on:
       - ".github/workflows/**"
       - "pyproject.toml"
       - "uv.lock"
+      - "constraints/perceptron_isaac-cu128.txt"
       - "Makefile"
 
 
@@ -128,3 +131,49 @@ jobs:
 
       - name: "Tier 4 — Test: viz"
         run: uv run pytest tests -vv --maxfail=10
+
+      - name: "Tier 5 — Install: Isaac"
+        run: |
+          uv venv --python "$PYTHON_VERSION" .venv-isaac
+          uv pip install --python .venv-isaac/bin/python \
+            -c constraints/perceptron_isaac-cu128.txt \
+            --index https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match \
+            '.[test,training,perceptron_isaac]'
+
+      - name: "Tier 5 — Verify: Isaac dependencies"
+        run: |
+          .venv-isaac/bin/python - <<'PY'
+          from importlib.metadata import version
+
+          import mharmony
+          import scipy.fft
+          import tokenizers
+          import torch
+          import torchvision
+          import transformers
+          from packaging.version import Version
+          from transformers import PreTrainedTokenizerFast
+
+          from lerobot.policies.perceptron_isaac.mharmony_adapter import SUPPORTED_MHARMONY_VERSION
+
+          assert version("mharmony") == SUPPORTED_MHARMONY_VERSION, version("mharmony")
+          assert transformers.__version__ == "5.5.4", transformers.__version__
+          assert torch.__version__ == "2.10.0+cu128", torch.__version__
+          assert torchvision.__version__ == "0.25.0+cu128", torchvision.__version__
+          assert torch.version.cuda == "12.8", torch.version.cuda
+          assert version("accelerate") == "1.15.0", version("accelerate")
+          assert Version("1.14.0") <= Version(version("scipy")) < Version("2.0.0")
+          for module in (transformers, tokenizers, scipy, mharmony):
+              print(f"{module.__name__}=={version(module.__name__)}")
+          print(f"FAST tokenizer API ready: {PreTrainedTokenizerFast.__name__}")
+          PY
+
+      - name: "Tier 5 — Test: Isaac CPU contracts"
+        env:
+          CUDA_VISIBLE_DEVICES: ""
+          OMP_NUM_THREADS: "2"
+          MKL_NUM_THREADS: "2"
+          HF_HUB_OFFLINE: "1"
+          HF_DATASETS_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: .venv-isaac/bin/python -m pytest tests/policies/perceptron_isaac tests/common/test_checkpoint_save_resume.py -vv --maxfail=10
