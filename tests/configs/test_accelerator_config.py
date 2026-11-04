@@ -44,6 +44,8 @@ class TestFieldValidation:
     def test_mixed_precision_choices(self):
         with pytest.raises(ValueError, match="mixed_precision"):
             AcceleratorConfig(mixed_precision="tf32")
+        with pytest.raises(ValueError, match="reduce_dtype"):
+            FSDPConfig(reduce_dtype="tf32")
 
     def test_gradient_accumulation_positive(self):
         with pytest.raises(ValueError, match="gradient_accumulation.steps"):
@@ -77,6 +79,7 @@ class TestDraccusRoundTrip:
                     wrap_modules=["ACTEncoderLayer", "ACTDecoderLayer"],
                     cpu_offload=True,
                     ignored_modules=r".*pos_embed.*",
+                    reduce_dtype="float32",
                 ),
                 ddp=DDPConfig(find_unused_parameters=False, static_graph=True),
                 grad_scaler=GradScalerConfig(init_scale=1024.0, growth_interval=500),
@@ -99,9 +102,14 @@ class TestDraccusRoundTrip:
     def test_sync_each_batch_true_is_a_typed_cli_field(self) -> None:
         config = draccus.parse(
             AcceleratorConfig,
-            args=["--gradient_accumulation.steps=8", "--gradient_accumulation.sync_each_batch=true"],
+            args=[
+                "--gradient_accumulation.steps=8",
+                "--gradient_accumulation.sync_each_batch=true",
+                "--fsdp.reduce_dtype=float32",
+            ],
         )
         assert config.gradient_accumulation == GradientAccumulationConfig(steps=8, sync_each_batch=True)
+        assert config.fsdp.reduce_dtype == "float32"
 
 
 class TestRuntimeBuilders:
@@ -123,6 +131,38 @@ class TestRuntimeBuilders:
         # LeRobot never switches state_dict_type: FSDP2's SHARDED default must hold
         assert plugin.state_dict_type.name == "SHARDED_STATE_DICT"
         assert not plugin.activation_checkpointing
+        assert plugin.mixed_precision_policy is None
+
+    @pytest.mark.parametrize("mixed_precision", ["no", "fp16", "bf16"])
+    def test_fsdp_fp32_reduction_preserves_compute_precision(
+        self, monkeypatch: pytest.MonkeyPatch, mixed_precision: str
+    ) -> None:
+        import torch
+        from accelerate.utils import FullyShardedDataParallelPlugin
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        captured: dict[str, object] = {}
+
+        class CaptureAccelerator:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr("accelerate.Accelerator", CaptureAccelerator)
+        parallelism = ParallelismConfig(dp_shard=2)
+        parallelism.resolve(2)
+        AcceleratorConfig(mixed_precision=mixed_precision, fsdp=FSDPConfig(reduce_dtype="float32")).build(
+            parallelism, cpu=True
+        )
+        plugin = captured["fsdp_plugin"]
+        assert isinstance(plugin, FullyShardedDataParallelPlugin)
+        if mixed_precision != "no":
+            # Accelerator applies this after plugin construction; the override must survive.
+            plugin.set_mixed_precision(mixed_precision)
+        policy = plugin.mixed_precision_policy
+        assert isinstance(policy, MixedPrecisionPolicy)
+        expected = {"no": None, "fp16": torch.float16, "bf16": torch.bfloat16}[mixed_precision]
+        assert policy.param_dtype == policy.output_dtype == expected
+        assert policy.reduce_dtype == torch.float32
 
     def test_fsdp_plugin_size_based_policy(self):
         plugin = FSDPConfig(min_num_params=1024).build_plugin()

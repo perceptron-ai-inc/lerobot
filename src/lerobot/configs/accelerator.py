@@ -51,15 +51,18 @@ class FSDPConfig:
     wrap_modules: list[str] | None = None
     min_num_params: int | None = None
     cpu_offload: bool = False
+    # None preserves Accelerate's default; "float32" keeps BF16 compute with FP32 reduction.
+    reduce_dtype: str | None = None
     # Regex matched against module FQNs to exclude their parameters from sharding.
     ignored_modules: str | None = None
 
     def __post_init__(self) -> None:
-        """Validate the wrap-policy fields.
+        """Validate wrap policy and the optional gradient-reduction dtype.
 
         Raises:
             ValueError: If both ``wrap_modules`` and ``min_num_params`` are set (they are
-                mutually exclusive wrap policies), or if ``min_num_params`` is < 1.
+                mutually exclusive wrap policies), if ``min_num_params`` is < 1, or if
+                ``reduce_dtype`` is not one of the supported floating-point dtypes.
         """
         if self.wrap_modules is not None and self.min_num_params is not None:
             raise ValueError(
@@ -67,19 +70,40 @@ class FSDPConfig:
             )
         if self.min_num_params is not None and self.min_num_params < 1:
             raise ValueError(f"fsdp.min_num_params must be >= 1, got {self.min_num_params}.")
+        if self.reduce_dtype not in (None, "float32", "float16", "bfloat16"):
+            raise ValueError(f"Invalid fsdp.reduce_dtype: {self.reduce_dtype!r}.")
 
-    def build_plugin(self) -> "FullyShardedDataParallelPlugin":
+    def build_plugin(self, *, mixed_precision: str = "no") -> "FullyShardedDataParallelPlugin":
         """Build the FSDP2 plugin for `Accelerator(fsdp_plugin=...)`.
+
+        Args:
+            mixed_precision: Accelerator compute precision. A reduction override must not
+                replace this with FP32 parameter/output compute.
 
         Returns:
             FullyShardedDataParallelPlugin: FSDP2 (`fsdp_version=2`) plugin carrying the
-                mirrored wrap policy, resharding, CPU-offload, and ignored-modules settings.
+                mirrored wrap, precision, resharding, CPU-offload, and ignored-modules settings.
         """
         from accelerate.utils import FullyShardedDataParallelPlugin
 
+        mixed_precision_policy = None
+        if self.reduce_dtype is not None:
+            import torch
+            from torch.distributed.fsdp import MixedPrecisionPolicy
+
+            compute_dtype = {"no": None, "fp16": torch.float16, "bf16": torch.bfloat16}[mixed_precision]
+            reduction_dtype = {
+                "float32": torch.float32,
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }[self.reduce_dtype]
+            mixed_precision_policy = MixedPrecisionPolicy(
+                param_dtype=compute_dtype, reduce_dtype=reduction_dtype, output_dtype=compute_dtype
+            )
         use_size_policy = self.min_num_params is not None
         return FullyShardedDataParallelPlugin(
             fsdp_version=2,
+            mixed_precision_policy=mixed_precision_policy,
             reshard_after_forward=self.reshard_after_forward,
             auto_wrap_policy="size_based_wrap" if use_size_policy else "transformer_based_wrap",
             # May legitimately still be None here: the policy-declared default is applied right
@@ -315,7 +339,7 @@ class AcceleratorConfig:
         }
         handlers: list = []
         if parallelism.is_sharded:
-            kwargs["fsdp_plugin"] = self.fsdp.build_plugin()
+            kwargs["fsdp_plugin"] = self.fsdp.build_plugin(mixed_precision=self.mixed_precision)
             kwargs["parallelism_config"] = _accelerate_parallelism_config(parallelism)
         elif parallelism.is_replicated_only:
             handlers.append(self.ddp.build_kwargs_handler())
