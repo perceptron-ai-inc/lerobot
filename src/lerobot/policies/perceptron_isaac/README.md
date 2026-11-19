@@ -50,14 +50,14 @@ SHA256SUMS: 85d9743e3f46d19cd5291a00607cfe0abc54eb56d1a40a4fbcd20493e293cc9b
 ```
 
 Stage that complete package without changing its layout or authenticated assets.
-Set `NATIVE_POLICY_DIR` to its `lerobot_policy` directory and `DATASET_REPO_ID`
-to a compatible dataset. Use standard `lerobot-train` through an Accelerate
-FSDP2 launch configuration. Set `STEPS` to the desired training length and use
-the same value for the learning-rate decay.
+Set `NATIVE_POLICY_DIR` to its `lerobot_policy` directory, `DATASET_REPO_ID`
+to a compatible dataset, and `GPUS` to the number of GPUs on the training node.
+Use `torchrun` and set FSDP2 through LeRobot's CLI flags. Set `STEPS` to the
+desired training length and use the same value for the learning-rate decay.
 
 ```sh
 STEPS=100000
-accelerate launch --config_file "$FSDP2_CONFIG" -m lerobot.scripts.lerobot_train \
+torchrun --standalone --nproc_per_node="$GPUS" -m lerobot.scripts.lerobot_train \
   --policy.path="$NATIVE_POLICY_DIR" --dataset.repo_id="$DATASET_REPO_ID" \
   --steps="$STEPS" --policy.max_train_steps="$STEPS" \
   --dataset.video_backend=pyav --policy.train_storage_fp32=true \
