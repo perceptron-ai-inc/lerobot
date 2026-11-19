@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.configs import FeatureType, PolicyFeature
@@ -104,6 +105,7 @@ def data_config(
 
 
 def data_pack(config: PerceptronIsaacConfig) -> tuple[PerceptronIsaacMharmonyPackProcessorStep, FastInputSpy]:
+    pytest.importorskip("mharmony", reason="mharmony is required (install lerobot[perceptron_isaac])")
     preprocessor, _ = make_perceptron_isaac_pre_post_processors(config)
     pack = next(
         step for step in preprocessor.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep)

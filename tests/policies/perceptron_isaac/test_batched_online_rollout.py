@@ -502,6 +502,8 @@ def test_upstream_batched_rollout_freezes_finished_env_and_resets_next_episode_g
     tmp_path: Path, sdk_plans: list[IsaacMharmonyContentPlan]
 ) -> None:
     """Exercise the maintained rollout(), not a new per-environment reset protocol."""
+    pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+
     from lerobot.envs.utils import FreezeAfterEpisodeEnd
     from lerobot.scripts.lerobot_eval import rollout
 
