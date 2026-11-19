@@ -11,12 +11,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as functional
-from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
 from torch import Tensor, nn
 
-pytest.importorskip("transformers", reason="requires lerobot[perceptron_isaac]")
-pytest.importorskip("mharmony", reason="requires lerobot[perceptron_isaac]")
+pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[training])")
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
+pytest.importorskip("mharmony", reason="mharmony is required (install lerobot[perceptron_isaac])")
+
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import (
     ISAAC_FLOW_LOSS_MASK_KEY,

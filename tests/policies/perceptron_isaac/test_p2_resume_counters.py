@@ -7,9 +7,11 @@ from pathlib import Path
 
 import pytest
 import torch
-from accelerate import Accelerator
 
-pytest.importorskip("transformers", reason="requires the parent-owned ISAAC CPU environment")
+pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[training])")
+pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
+
+from accelerate import Accelerator
 
 from lerobot.common.train_utils import resume_after_prepare, resume_before_prepare, save_checkpoint
 from lerobot.configs.train import TRAIN_CONFIG_NAME, TrainPipelineConfig

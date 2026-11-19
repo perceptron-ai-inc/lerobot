@@ -8,6 +8,9 @@ from typing import Literal, cast
 import pytest
 import torch
 
+pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[training])")
+pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
+
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import perceptron_isaac_training_loss
 from lerobot.policies.perceptron_isaac.modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (

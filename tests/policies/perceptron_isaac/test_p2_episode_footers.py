@@ -9,6 +9,9 @@ import numpy as np
 import pytest
 import torch
 
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+pytest.importorskip("mharmony", reason="mharmony is required (install lerobot[perceptron_isaac])")
+
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.utils import delta_window
 from lerobot.lerobot_types import TransitionKey

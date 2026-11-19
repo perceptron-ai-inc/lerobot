@@ -6,7 +6,10 @@ SDK renderer. It proves execution and batch shape, not conditioning quality.
 
 from pathlib import Path
 
+import pytest
 import torch
+
+pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
 from lerobot.policies.perceptron_isaac.mharmony_native import IsaacNativeMharmonyRenderer
 from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf

@@ -26,14 +26,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as functional
-from accelerate import Accelerator
 from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader, Dataset
 
-pytest.importorskip("transformers", reason="requires the parent offline ISAAC environment")
-pytest.importorskip("mharmony", reason="requires the parent offline ISAAC environment")
+pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[training])")
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
+pytest.importorskip("mharmony", reason="mharmony is required (install lerobot[perceptron_isaac])")
+
+from accelerate import Accelerator
 
 from lerobot.configs.accelerator import AcceleratorConfig, GradientAccumulationConfig
 from lerobot.configs.default import DatasetConfig

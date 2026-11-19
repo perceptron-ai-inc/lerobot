@@ -20,14 +20,20 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from accelerate import Accelerator
-from accelerate.utils import TorchDynamoPlugin
-from accelerate.utils.fsdp_utils import fsdp2_prepare_model
 from torch import Tensor, nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.utils.hooks import RemovableHandle
+
+pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[training])")
+pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
+pytest.importorskip("mharmony", reason="mharmony is required (install lerobot[perceptron_isaac])")
+
+from accelerate import Accelerator
+from accelerate.utils import TorchDynamoPlugin
+from accelerate.utils.fsdp_utils import fsdp2_prepare_model
 
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import (
     ISAAC_FLOW_NOISE_KEY,

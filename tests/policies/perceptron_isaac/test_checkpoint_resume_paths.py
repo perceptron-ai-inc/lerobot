@@ -17,10 +17,12 @@ import draccus
 import numpy as np
 import pytest
 import torch
-from accelerate import Accelerator
 from safetensors.torch import load_file
 
-pytest.importorskip("transformers")
+pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[training])")
+pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
+
+from accelerate import Accelerator
 
 from lerobot.common.train_utils import resume_after_prepare, resume_before_prepare, save_checkpoint
 from lerobot.configs.default import DatasetConfig

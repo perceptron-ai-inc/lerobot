@@ -9,10 +9,13 @@ from pathlib import Path
 import pytest
 import torch
 import torch.distributed as dist
-from accelerate import Accelerator
 from torch import nn
 from torch.multiprocessing.spawn import spawn
 from torch.optim import SGD
+
+pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[training])")
+
+from accelerate import Accelerator
 
 from lerobot.configs.accelerator import GradientAccumulationConfig
 
