@@ -36,6 +36,10 @@ def serialize_python_rng_state() -> dict[str, torch.Tensor]:
     return {
         "py_rng_version": torch.tensor([py_state[0]], dtype=torch.int64),
         "py_rng_state": torch.tensor(py_state[1], dtype=torch.int64),
+        "py_rng_has_gauss": torch.tensor([py_state[2] is not None], dtype=torch.bool),
+        "py_rng_cached_gaussian": torch.tensor(
+            [0.0 if py_state[2] is None else py_state[2]], dtype=torch.float64
+        ),
     }
 
 
@@ -43,7 +47,15 @@ def deserialize_python_rng_state(rng_state_dict: dict[str, torch.Tensor]) -> Non
     """
     Restores the rng state for `random` from a dictionary produced by `serialize_python_rng_state()`.
     """
-    py_state = (rng_state_dict["py_rng_version"].item(), tuple(rng_state_dict["py_rng_state"].tolist()), None)
+    # Older checkpoints did not record Python's cached second Gaussian draw.
+    cached_gaussian = None
+    if "py_rng_has_gauss" in rng_state_dict and bool(rng_state_dict["py_rng_has_gauss"].item()):
+        cached_gaussian = rng_state_dict["py_rng_cached_gaussian"].item()
+    py_state = (
+        rng_state_dict["py_rng_version"].item(),
+        tuple(rng_state_dict["py_rng_state"].tolist()),
+        cached_gaussian,
+    )
     random.setstate(py_state)
 
 
@@ -60,7 +72,7 @@ def serialize_numpy_rng_state() -> dict[str, torch.Tensor]:
         "np_rng_state_values": torch.tensor(np_state[1], dtype=torch.int64),
         "np_rng_state_index": torch.tensor([np_state[2]], dtype=torch.int64),
         "np_rng_has_gauss": torch.tensor([np_state[3]], dtype=torch.int64),
-        "np_rng_cached_gaussian": torch.tensor([np_state[4]], dtype=torch.float32),
+        "np_rng_cached_gaussian": torch.tensor([np_state[4]], dtype=torch.float64),
     }
 
 

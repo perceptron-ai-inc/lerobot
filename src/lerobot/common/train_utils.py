@@ -31,6 +31,7 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import torch
 import torch.distributed as dist
 from huggingface_hub import HfApi, ModelCard, ModelCardData, is_offline_mode, model_info, snapshot_download
 from huggingface_hub.errors import HFValidationError, OfflineModeIsEnabled
@@ -174,8 +175,9 @@ def save_training_metadata(step: int, save_dir: Path, cfg: TrainPipelineConfig) 
 def load_training_metadata(training_state_dir: Path) -> dict[str, Any]:
     """Read everything `save_training_metadata` recorded, in a single pass.
 
-    Every key is always present: fields a checkpoint predates come back as None, so a caller
-    reading `metadata["batch_size"]` gets a KeyError on a typo rather than a silent None.
+    Historical snapshot fields a checkpoint predates come back as None, so a caller reading
+    `metadata["batch_size"]` gets a KeyError on a typo rather than a silent None.
+    A recorded `grad_accum_steps` must be a positive integer; only an absent field is unknown.
 
     Args:
         training_state_dir (Path): The checkpoint's `training_state/` directory.
@@ -186,7 +188,11 @@ def load_training_metadata(training_state_dir: Path) -> dict[str, Any]:
             not recorded).
     """
     state = load_json(training_state_dir / TRAINING_STEP)
-    return {
+    if "grad_accum_steps" in state and (
+        type(state["grad_accum_steps"]) is not int or state["grad_accum_steps"] < 1
+    ):
+        raise ValueError("Training metadata grad_accum_steps must be a positive integer when recorded.")
+    metadata = {
         "step": int(state["step"]),
         "dp_world_size": state.get("dp_world_size", state.get("num_processes")),
         "batch_size": state.get("batch_size"),
@@ -194,6 +200,7 @@ def load_training_metadata(training_state_dir: Path) -> dict[str, Any]:
         "mixed_precision": state.get("mixed_precision"),
         "parallelism": state.get("parallelism"),
     }
+    return metadata
 
 
 # ---------------------------------------------------------------------------------------------
@@ -265,7 +272,7 @@ def save_checkpoint(
     elif fmt.wants_safetensors or not sharded:
         # Collective when sharded (full gather); writes happen on the main process only in all
         # multi-rank layouts (the gate lives inside _save_pretrained, next to its collective gather).
-        policy_to_save.save_pretrained(pretrained_dir)
+        policy_to_save.save_pretrained(pretrained_dir, finalize_package=False)
     if fmt.wants_dcp and sharded:
         save_sharded_model(accelerator, policy_to_save, pretrained_dir)
 
@@ -283,9 +290,18 @@ def save_checkpoint(
             preprocessor.save_pretrained(pretrained_dir)
         if postprocessor is not None:
             postprocessor.save_pretrained(pretrained_dir)
+        # Last writer in the directory: lets a policy bind its package over every file above.
+        policy_to_save.finalize_pretrained_package(pretrained_dir)
 
     save_training_state(
-        checkpoint_dir, step, cfg, optimizer, scheduler, accelerator, sharded=sharded, model=policy_to_save
+        checkpoint_dir,
+        step,
+        cfg,
+        optimizer,
+        scheduler,
+        accelerator,
+        sharded=sharded,
+        model=policy_to_save,
     )
     if accelerator is not None:
         accelerator.wait_for_everyone()
@@ -364,9 +380,11 @@ def _resume_checkpoint_dir(cfg: TrainPipelineConfig) -> Path:
 def resume_before_prepare(cfg: TrainPipelineConfig) -> int:
     """Phase 1 — before `accelerator.prepare()`: restore RNG and return the step counter.
 
-    Pure loaders only. The sampler resume offset is *derived* from the returned step inside the
-    dataloader factory, and everything bound to sharded objects (model DCP shards, optimizer,
-    scheduler) loads in `resume_after_prepare`.
+    Local loaders finish before collective error agreement when a process group is initialized:
+    call on ALL ranks before any peer enters prepare/DCP. Outside distributed runs, original
+    local exceptions are preserved. The sampler resume offset is *derived* from the returned step
+    inside the dataloader factory, and everything bound to sharded objects (model DCP shards,
+    optimizer, scheduler) loads in `resume_after_prepare`.
 
     Args:
         cfg (TrainPipelineConfig): The resumed training config; `cfg.checkpoint_path` locates
@@ -378,14 +396,37 @@ def resume_before_prepare(cfg: TrainPipelineConfig) -> int:
     Raises:
         NotADirectoryError: If the checkpoint has no `training_state/` directory.
         ValueError: If `cfg.checkpoint_path` is unset, or if the resumed topology crosses the
-            sharded/non-sharded boundary relative to the one recorded in the checkpoint.
+            sharded/non-sharded boundary relative to the one recorded in the checkpoint. With
+            an initialized process group, any rank's local failure is reported on every rank,
+            preserving the original local exception as its cause.
     """
-    training_state_dir = _resume_checkpoint_dir(cfg) / TRAINING_STATE_DIR
-    if not training_state_dir.is_dir():
-        raise NotADirectoryError(training_state_dir)
-    metadata = load_training_metadata(training_state_dir)
-    _guard_resume_changes(cfg, metadata)
-    load_rng_state(training_state_dir)
+    error = None
+    metadata = None
+    try:
+        training_state_dir = _resume_checkpoint_dir(cfg) / TRAINING_STATE_DIR
+        if not training_state_dir.is_dir():
+            raise NotADirectoryError(training_state_dir)
+        metadata = load_training_metadata(training_state_dir)
+        _guard_resume_changes(cfg, metadata)
+        load_rng_state(training_state_dir)
+    except Exception as invalid:
+        error = invalid
+    # No collective runs inside local metadata/guard/RNG loading, including filesystem errors.
+    if dist.is_initialized():
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if dist.get_backend() == "nccl"
+            else torch.device("cpu")
+        )
+        failed = torch.tensor(int(error is not None), dtype=torch.int64, device=device)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if bool(failed):
+            raise ValueError(
+                "Training resume phase-one metadata/guard/RNG loading failed on at least one rank."
+            ) from error
+    elif error is not None:
+        raise error
+    assert metadata is not None
     return metadata["step"]
 
 

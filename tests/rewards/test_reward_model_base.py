@@ -22,10 +22,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lerobot.common.train_utils import generate_model_card
+from lerobot.common.train_utils import (
+    generate_model_card,
+    resume_after_prepare,
+    resume_before_prepare,
+    save_checkpoint,
+)
+from lerobot.configs.default import DatasetConfig
 from lerobot.configs.rewards import RewardModelConfig
+from lerobot.configs.train import TrainPipelineConfig
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.rewards.pretrained import PreTrainedRewardModel
+from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 
 
 @RewardModelConfig.register_subclass(name="_dummy_hub_reward")
@@ -45,6 +53,49 @@ class _DummyHubReward(PreTrainedRewardModel):
 
     def compute_reward(self, batch):
         return self.bias.expand(1)
+
+
+def test_reward_checkpoint_round_trips_model_and_optimizer(tmp_path: Path) -> None:
+    """The common checkpoint writer must support real reward-model persistence."""
+    model = _DummyHubReward(_DummyHubRewardConfig(device="cpu"))
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.123)
+    loss = (model.compute_reward({}) - 1).square().sum()
+    loss.backward()
+    optimizer.step()
+    assert not torch.equal(model.bias, torch.zeros_like(model.bias))
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="lerobot/dummy"),
+        reward_model=model.config,
+    )
+    cfg.parallelism.resolve(1)
+    accelerator = SimpleNamespace(
+        unwrap_model=lambda model: model,
+        wait_for_everyone=lambda: None,
+        scaler=None,
+    )
+    save_checkpoint(
+        tmp_path,
+        step=7,
+        cfg=cfg,
+        policy=model,
+        optimizer=optimizer,
+        accelerator=accelerator,
+    )
+
+    restored_model = _DummyHubReward.from_pretrained(tmp_path / PRETRAINED_MODEL_DIR, local_files_only=True)
+    assert torch.equal(restored_model.bias, model.bias)
+    restored_optimizer = torch.optim.Adam(restored_model.parameters(), lr=0.999)
+    cfg.checkpoint_path = tmp_path
+    assert resume_before_prepare(cfg) == 7
+    resume_after_prepare(cfg, accelerator, restored_model, restored_optimizer, None)
+    original_state = optimizer.state_dict()
+    restored_state = restored_optimizer.state_dict()
+    assert restored_state["param_groups"] == original_state["param_groups"]
+    assert restored_state["state"].keys() == original_state["state"].keys()
+    for parameter_id, state in original_state["state"].items():
+        for name, tensor in state.items():
+            assert torch.equal(restored_state["state"][parameter_id][name], tensor), name
 
 
 def test_reward_model_config_registry():

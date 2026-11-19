@@ -81,6 +81,49 @@ class TestSaveCheckpoint:
         assert torch.allclose(weights["net.weight"], torch.full_like(weights["net.weight"], 0.5))
         assert not list(pretrained.glob("*.index.json"))
 
+    def test_finalize_hook_runs_last_on_the_complete_pretrained_dir(self, tmp_path, monkeypatch):
+        """A policy that binds a manifest over its package must see every sidecar already written."""
+        policy = make_dummy_policy()
+        seen: list[tuple[str, set[str]]] = []
+
+        def record_finalize(save_directory):
+            seen.append((str(save_directory), {path.name for path in save_directory.iterdir()}))
+
+        monkeypatch.setattr(policy, "finalize_pretrained_package", record_finalize, raising=True)
+        preprocessor = SimpleNamespace(
+            save_pretrained=lambda directory: (directory / "policy_preprocessor.json").write_text("{}\n")
+        )
+        # The postprocessor is the last writer before the hook, and the one whose bytes a
+        # package manifest must bind (the reason the hook exists).
+        postprocessor = SimpleNamespace(
+            save_pretrained=lambda directory: (directory / "policy_postprocessor.json").write_text("{}\n")
+        )
+        save_checkpoint(
+            tmp_path,
+            step=7,
+            cfg=make_cfg(),
+            policy=policy,
+            optimizer=torch.optim.Adam(policy.parameters()),
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            accelerator=passthrough_accelerator(),
+        )
+        pretrained = tmp_path / PRETRAINED_MODEL_DIR
+        assert [directory for directory, _ in seen] == [str(pretrained)]
+        expected = {
+            "model.safetensors",
+            "config.json",
+            "train_config.json",
+            "policy_preprocessor.json",
+            "policy_postprocessor.json",
+        }
+        assert expected <= seen[0][1]
+
+    def test_base_policy_finalize_hook_is_a_no_op(self, tmp_path):
+        policy = make_dummy_policy()
+        policy.finalize_pretrained_package(tmp_path)
+        assert list(tmp_path.iterdir()) == []
+
     def test_training_step_records_topology(self, tmp_path):
         cfg = make_cfg()
         cfg.accelerator.gradient_accumulation.steps = 4

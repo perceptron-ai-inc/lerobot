@@ -110,6 +110,7 @@ else:
     PeftModel = None
 
 if TYPE_CHECKING or _accelerate_available:
+    from accelerate.data_loader import DataLoaderShard
     from accelerate.utils import send_to_device
 
 from .lerobot_eval import eval_policy_all
@@ -673,12 +674,11 @@ def train(cfg: TrainPipelineConfig) -> None:
         # Language fine-tuning must use the active recipe, not the saved processor recipe.
         processor_pretrained_path = None
 
-    processor_kwargs = ProcessorConfigKwargs()
+    # Metadata supplies feature names and the declared frame clock, including on resume.
+    processor_kwargs = ProcessorConfigKwargs(dataset_meta=dataset.meta)
     processor_dataset_stats = rename_stats(dataset.meta.stats, cfg.rename_map)
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         processor_kwargs["dataset_stats"] = processor_dataset_stats
-    if cfg.is_reward_model_training:
-        processor_kwargs["dataset_meta"] = dataset.meta
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
         preprocessor_overrides = {
             "device_processor": {"device": device.type},
@@ -743,6 +743,11 @@ def train(cfg: TrainPipelineConfig) -> None:
         step = resume_before_prepare(cfg)  # step + RNG only; sharded state loads after prepare
 
     dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
+    loader_resume_epoch = (
+        int(dataloader.sampler.state_dict()["epoch"])
+        if isinstance(dataloader.sampler, EpisodeAwareSampler)
+        else 0
+    )
 
     # --- prepare & resume phase 2 ---------------------------------------------------------------
     # The FSDP wrap-unit class names resolve right before prepare: user override, else the
@@ -763,6 +768,9 @@ def train(cfg: TrainPipelineConfig) -> None:
         policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler
         )
+    # Accelerate otherwise resets the restored sampler epoch to zero on first iteration.
+    if isinstance(dataloader, DataLoaderShard):
+        dataloader.set_epoch(loader_resume_epoch)
     finalize_sharded_policy(policy, parallel_dims)
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)

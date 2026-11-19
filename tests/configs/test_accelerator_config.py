@@ -44,6 +44,8 @@ class TestFieldValidation:
     def test_mixed_precision_choices(self):
         with pytest.raises(ValueError, match="mixed_precision"):
             AcceleratorConfig(mixed_precision="tf32")
+        with pytest.raises(ValueError, match="reduce_dtype"):
+            FSDPConfig(reduce_dtype="tf32")
 
     def test_gradient_accumulation_positive(self):
         with pytest.raises(ValueError, match="gradient_accumulation.steps"):
@@ -71,12 +73,13 @@ class TestDraccusRoundTrip:
             AcceleratorConfig(),
             AcceleratorConfig(
                 mixed_precision="bf16",
-                gradient_accumulation=GradientAccumulationConfig(steps=4),
+                gradient_accumulation=GradientAccumulationConfig(steps=4, sync_each_batch=True),
                 fsdp=FSDPConfig(
                     reshard_after_forward=False,
                     wrap_modules=["ACTEncoderLayer", "ACTDecoderLayer"],
                     cpu_offload=True,
                     ignored_modules=r".*pos_embed.*",
+                    reduce_dtype="float32",
                 ),
                 ddp=DDPConfig(find_unused_parameters=False, static_graph=True),
                 grad_scaler=GradScalerConfig(init_scale=1024.0, growth_interval=500),
@@ -90,8 +93,23 @@ class TestDraccusRoundTrip:
         payload = json.loads(json.dumps(draccus.encode(cfg)))
         assert draccus.decode(AcceleratorConfig, payload) == cfg
 
-    def test_pre_existing_config_without_fields_gets_defaults(self):
-        assert draccus.decode(AcceleratorConfig, {}) == AcceleratorConfig()
+    @pytest.mark.parametrize(("payload", "steps"), [({}, 1), ({"gradient_accumulation": {"steps": 8}}, 8)])
+    def test_pre_existing_config_without_fields_gets_defaults(self, payload, steps):
+        config = draccus.decode(AcceleratorConfig, payload)
+        assert config == AcceleratorConfig(gradient_accumulation=GradientAccumulationConfig(steps=steps))
+        assert config.gradient_accumulation.sync_each_batch is False
+
+    def test_sync_each_batch_true_is_a_typed_cli_field(self) -> None:
+        config = draccus.parse(
+            AcceleratorConfig,
+            args=[
+                "--gradient_accumulation.steps=8",
+                "--gradient_accumulation.sync_each_batch=true",
+                "--fsdp.reduce_dtype=float32",
+            ],
+        )
+        assert config.gradient_accumulation == GradientAccumulationConfig(steps=8, sync_each_batch=True)
+        assert config.fsdp.reduce_dtype == "float32"
 
 
 class TestRuntimeBuilders:
@@ -113,6 +131,38 @@ class TestRuntimeBuilders:
         # LeRobot never switches state_dict_type: FSDP2's SHARDED default must hold
         assert plugin.state_dict_type.name == "SHARDED_STATE_DICT"
         assert not plugin.activation_checkpointing
+        assert plugin.mixed_precision_policy is None
+
+    @pytest.mark.parametrize("mixed_precision", ["no", "fp16", "bf16"])
+    def test_fsdp_fp32_reduction_preserves_compute_precision(
+        self, monkeypatch: pytest.MonkeyPatch, mixed_precision: str
+    ) -> None:
+        import torch
+        from accelerate.utils import FullyShardedDataParallelPlugin
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        captured: dict[str, object] = {}
+
+        class CaptureAccelerator:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr("accelerate.Accelerator", CaptureAccelerator)
+        parallelism = ParallelismConfig(dp_shard=2)
+        parallelism.resolve(2)
+        AcceleratorConfig(mixed_precision=mixed_precision, fsdp=FSDPConfig(reduce_dtype="float32")).build(
+            parallelism, cpu=True
+        )
+        plugin = captured["fsdp_plugin"]
+        assert isinstance(plugin, FullyShardedDataParallelPlugin)
+        if mixed_precision != "no":
+            # Accelerator applies this after plugin construction; the override must survive.
+            plugin.set_mixed_precision(mixed_precision)
+        policy = plugin.mixed_precision_policy
+        assert isinstance(policy, MixedPrecisionPolicy)
+        expected = {"no": None, "fp16": torch.float16, "bf16": torch.bfloat16}[mixed_precision]
+        assert policy.param_dtype == policy.output_dtype == expected
+        assert policy.reduce_dtype == torch.float32
 
     def test_fsdp_plugin_size_based_policy(self):
         plugin = FSDPConfig(min_num_params=1024).build_plugin()
@@ -124,9 +174,11 @@ class TestRuntimeBuilders:
         assert handler.find_unused_parameters is False
         assert handler.gradient_as_bucket_view is True
 
-    def test_gradient_accumulation_plugin_translation(self):
-        plugin = GradientAccumulationConfig(steps=4).build_plugin()
+    @pytest.mark.parametrize("sync_each_batch", [False, True])
+    def test_gradient_accumulation_plugin_translation(self, sync_each_batch: bool) -> None:
+        plugin = GradientAccumulationConfig(steps=4, sync_each_batch=sync_each_batch).build_plugin()
         assert plugin.num_steps == 4
+        assert plugin.sync_each_batch is sync_each_batch
         assert plugin.sync_with_dataloader is False
 
     def test_grad_scaler_kwargs_translation(self):

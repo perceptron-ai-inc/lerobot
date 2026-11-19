@@ -116,6 +116,21 @@ class ImageAugmentationProcessorStep(ObservationProcessorStep):
             observation[key] = self._transforms(images, generator=self._generator)
         return observation
 
+    def state_dict(self) -> dict[str, Tensor]:
+        """Save the private image-augmentation generator without touching model RNG."""
+        return {} if self._generator is None else {"generator_state": self._generator.get_state().clone()}
+
+    def load_state_dict(self, state: dict[str, Tensor]) -> None:
+        if not state:
+            return
+        if set(state) != {"generator_state"}:
+            raise ValueError("Image augmentation state must contain only generator_state.")
+        if self._generator is None:
+            if self._device is None:
+                raise ValueError("Restoring image augmentation requires an explicit generator device.")
+            self._generator = self._make_generator(self._device)
+        self._generator.set_state(state["generator_state"].cpu())
+
     def get_config(self) -> dict[str, Any]:
         """Return the serializable configuration."""
         assert isinstance(self.config, ImageTransformsConfig)

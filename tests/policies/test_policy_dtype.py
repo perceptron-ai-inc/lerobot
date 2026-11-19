@@ -24,6 +24,7 @@ import torch
 import lerobot.policies
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TrainPipelineConfig
+from lerobot.policies import PerceptronIsaacConfig
 from lerobot.policies.eo1.configuration_eo1 import EO1Config
 
 # The public package also exports inference settings such as RTCConfig.
@@ -45,8 +46,13 @@ def test_policy_config_json_round_trip(tmp_path, config_cls):
     assert json.loads((tmp_path / "config.json").read_text())["dtype"] == "bfloat16"
     assert PreTrainedConfig.from_pretrained(tmp_path).dtype is torch.bfloat16
     # What `--policy.path=<dir> --policy.dtype=float32` does.
-    overridden = PreTrainedConfig.from_pretrained(tmp_path, cli_overrides=["--dtype=float32"])
-    assert overridden.dtype is torch.float32
+    if config_cls is PerceptronIsaacConfig:
+        with pytest.raises(draccus.utils.ParsingError) as error:
+            PreTrainedConfig.from_pretrained(tmp_path, cli_overrides=["--dtype=float32"])
+        assert "require dtype=torch.bfloat16 compute" in str(error.value.__cause__)
+    else:
+        overridden = PreTrainedConfig.from_pretrained(tmp_path, cli_overrides=["--dtype=float32"])
+        assert overridden.dtype is torch.float32
 
 
 def test_train_config_cli_and_resume(tmp_path):
