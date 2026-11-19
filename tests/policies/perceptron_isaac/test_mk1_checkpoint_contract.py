@@ -4,6 +4,7 @@ import copy
 import json
 import shutil
 from pathlib import Path
+from typing import Any, NotRequired, TypedDict
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
     Mk1CheckpointContract,
     Mk1CheckpointContractError,
     read_and_validate_safetensors_index,
+    read_mk1_config,
     validate_mk1_checkpoint,
     validate_mk1_tokenizer,
 )
@@ -246,6 +248,36 @@ def _parse_test_config(config: dict | None = None) -> Mk1CheckpointContract:
     )
 
 
+class _AddedToken(TypedDict):
+    content: str
+    id: int
+    special: NotRequired[bool]
+
+
+class _TokenizerPayload(TypedDict):
+    model: dict[str, dict[str, int]]
+    added_tokens: list[_AddedToken]
+
+
+def _tokenizer_payload(
+    *,
+    endoftext_id: int = 1,
+    vision_start_id: int = 2,
+    vision_end_id: int = 3,
+    image_id: int = 4,
+    video_id: int = 5,
+) -> _TokenizerPayload:
+    return {
+        "model": {"vocab": {"!": 0, "<|endoftext|>": endoftext_id}},
+        "added_tokens": [
+            {"content": "<|vision_start|>", "id": vision_start_id, "special": True},
+            {"content": "<|vision_end|>", "id": vision_end_id, "special": True},
+            {"content": "<|image_pad|>", "id": image_id, "special": True},
+            {"content": "<|video_pad|>", "id": video_id, "special": True},
+        ],
+    }
+
+
 def _write_checkpoint(
     root: Path,
     *,
@@ -261,17 +293,7 @@ def _write_checkpoint(
     checkpoint_config = _config(test_geometry=True) if config is None else copy.deepcopy(config)
     (root / "config.json").write_text(json.dumps(checkpoint_config), encoding="utf-8")
     (root / "tokenizer.json").write_text(
-        json.dumps(
-            {
-                "model": {"vocab": {"!": 0, "<|endoftext|>": 1}},
-                "added_tokens": [
-                    {"content": "<|vision_start|>", "id": 2, "special": True},
-                    {"content": "<|vision_end|>", "id": 3, "special": True},
-                    {"content": "<|image_pad|>", "id": 4, "special": True},
-                    {"content": "<|video_pad|>", "id": 5, "special": True},
-                ],
-            }
-        ),
+        json.dumps(_tokenizer_payload()),
         encoding="utf-8",
     )
     contract = _parse_test_config(checkpoint_config)
@@ -330,7 +352,6 @@ def test_production_contract_parses_exact_documented_geometry() -> None:
     assert contract.mtp.present is True
     assert contract.coord_tokens.enabled is True
     assert contract.artifact.artifact_kind == "trained_policy"
-    assert contract.artifact.trained_steps == 100_000
     assert contract.excluded_runtime_prefixes == ("mtp.",)
     shapes = contract.expected_tensor_shapes()
     assert shapes["model.language_model.layers.0.mlp.gate.weight"] == (257, 2048)
@@ -345,7 +366,7 @@ def test_production_contract_accepts_actual_non_mtp_coord_disabled_variant() -> 
     contract = Mk1CheckpointContract.parse_allowlisted(config)
     shapes = contract.expected_tensor_shapes()
 
-    assert contract.artifact.trained_steps == 10_000
+    assert contract.artifact.artifact_kind == "trained_policy"
     assert contract.text.vocab_size == 256279
     assert contract.mtp.present is False
     assert contract.coord_tokens.enabled is False
@@ -449,31 +470,24 @@ def test_coord_disabled_contract_accepts_fast_only_and_rejects_coord_group() -> 
 
 def test_tokenizer_special_ids_and_coordinate_reservation_are_checkpoint_owned(tmp_path: Path) -> None:
     contract = _parse_test_config()
-    tokenizer = {
-        "model": {"vocab": {"!": 0, "<|endoftext|>": 1}},
-        "added_tokens": [
-            {"content": "<|vision_start|>", "id": 2, "special": True},
-            {"content": "<|vision_end|>", "id": 3, "special": True},
-            {"content": "<|image_pad|>", "id": 4, "special": True},
-            {"content": "<|video_pad|>", "id": 5, "special": True},
-        ],
-    }
+    tokenizer = _tokenizer_payload()
+    added_tokens = tokenizer["added_tokens"]
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
     validate_mk1_tokenizer(tmp_path, contract)
 
-    tokenizer["added_tokens"][2]["id"] = 6
+    added_tokens[2]["id"] = 6
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
     with pytest.raises(Mk1CheckpointContractError, match="image_pad.*expected 4"):
         validate_mk1_tokenizer(tmp_path, contract)
 
-    tokenizer["added_tokens"][2]["id"] = 4
-    tokenizer["added_tokens"][2]["special"] = False
+    added_tokens[2]["id"] = 4
+    added_tokens[2]["special"] = False
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
     with pytest.raises(Mk1CheckpointContractError, match="image_pad.*not marked special"):
         validate_mk1_tokenizer(tmp_path, contract)
 
-    tokenizer["added_tokens"][2]["special"] = True
-    tokenizer["added_tokens"].append({"content": "<|unexpected_coord|>", "id": 24})
+    added_tokens[2]["special"] = True
+    added_tokens.append({"content": "<|unexpected_coord|>", "id": 24})
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
     with pytest.raises(Mk1CheckpointContractError, match="reserved coordinate range"):
         validate_mk1_tokenizer(tmp_path, contract)
@@ -481,16 +495,8 @@ def test_tokenizer_special_ids_and_coordinate_reservation_are_checkpoint_owned(t
 
 def test_coord_disabled_tokenizer_has_no_reserved_coordinate_collision_check(tmp_path: Path) -> None:
     contract = _parse_test_config(_config(test_geometry=True, mtp_present=False, coord_enabled=False))
-    tokenizer = {
-        "model": {"vocab": {"!": 0, "<|endoftext|>": 1}},
-        "added_tokens": [
-            {"content": "<|vision_start|>", "id": 2, "special": True},
-            {"content": "<|vision_end|>", "id": 3, "special": True},
-            {"content": "<|image_pad|>", "id": 4, "special": True},
-            {"content": "<|video_pad|>", "id": 5, "special": True},
-            {"content": "<|ordinary_token|>", "id": 24, "special": False},
-        ],
-    }
+    tokenizer = _tokenizer_payload()
+    tokenizer["added_tokens"].append({"content": "<|ordinary_token|>", "id": 24, "special": False})
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
 
     validate_mk1_tokenizer(tmp_path, contract)
@@ -504,16 +510,10 @@ def test_production_tokenizer_rejects_explicit_ids_in_reserved_fast_range(
     contract = Mk1CheckpointContract.parse_allowlisted(
         _config(test_geometry=False, mtp_present=False, coord_enabled=coord_enabled)
     )
-    tokenizer = {
-        "model": {"vocab": {"!": 0, "<|endoftext|>": 248044}},
-        "added_tokens": [
-            {"content": "<|vision_start|>", "id": 248053, "special": True},
-            {"content": "<|vision_end|>", "id": 248054, "special": True},
-            {"content": "<|image_pad|>", "id": 248056, "special": True},
-            {"content": "<|video_pad|>", "id": 248057, "special": True},
-            {"content": "<|unexpected_fast|>", "id": 249321, "special": False},
-        ],
-    }
+    tokenizer = _tokenizer_payload(
+        endoftext_id=248044, vision_start_id=248053, vision_end_id=248054, image_id=248056, video_id=248057
+    )
+    tokenizer["added_tokens"].append({"content": "<|unexpected_fast|>", "id": 249321, "special": False})
     (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer), encoding="utf-8")
 
     with pytest.raises(Mk1CheckpointContractError, match="reserved FAST range"):
@@ -552,9 +552,6 @@ def test_reduced_geometry_permission_accepts_unmarked_production_geometry() -> N
         ({"artifact_kind": "trained_policy", "trained_steps": 1}, "missing required"),
         ({"schema_version": 2, "artifact_kind": "trained_policy", "trained_steps": 1}, "schema_version"),
         ({"schema_version": 1, "artifact_kind": "other", "trained_steps": 1}, "artifact_kind"),
-        ({"schema_version": 1, "artifact_kind": "trained_policy", "trained_steps": 0}, "positive"),
-        ({"schema_version": 1, "artifact_kind": "neutral_debug", "trained_steps": 1}, "trained_steps=0"),
-        ({"schema_version": 1, "artifact_kind": "trained_policy", "trained_steps": True}, "integer"),
         (
             {
                 "schema_version": 1,
@@ -586,7 +583,6 @@ def test_neutral_artifact_accepts_inert_exporter_provenance() -> None:
     contract = _parse_test_config(config)
 
     assert contract.artifact.artifact_kind == "neutral_debug"
-    assert contract.artifact.trained_steps == 0
 
 
 @pytest.mark.parametrize(
@@ -740,8 +736,13 @@ def test_missing_unexpected_unindexed_and_duplicate_tensors_fail(
     tmp_path: Path, kind: str, key: str, message: str
 ) -> None:
     model_dir = tmp_path / kind
-    kwargs = {f"{kind}_key": key}
-    _write_checkpoint(model_dir, **kwargs)
+    _write_checkpoint(
+        model_dir,
+        missing_key=key if kind == "missing" else None,
+        extra_key=key if kind == "extra" else None,
+        unindexed_key=key if kind == "unindexed" else None,
+        duplicate_key=key if kind == "duplicate" else None,
+    )
 
     with pytest.raises(Mk1CheckpointContractError, match=message):
         validate_mk1_checkpoint(model_dir, allow_test_only_reduced_geometry=True)
@@ -812,5 +813,178 @@ def test_duplicate_json_keys_are_rejected(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(Mk1CheckpointContractError, match="duplicate JSON key"):
+    with pytest.raises(Mk1CheckpointContractError, match="duplicate.*key"):
         read_and_validate_safetensors_index(model_dir)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b'{"a": 1, "a": 2}', b'{"nested": {"a": 1, "a": 2}}', b"[]", b"{", b"\xff"],
+    ids=["duplicate", "nested-duplicate", "non-object", "malformed-json", "invalid-utf8"],
+)
+def test_config_json_rejects_malformed_objects(tmp_path: Path, payload: bytes) -> None:
+    (tmp_path / "config.json").write_bytes(payload)
+
+    with pytest.raises(Mk1CheckpointContractError, match="config.json"):
+        read_mk1_config(tmp_path)
+
+
+def test_config_json_size_limit_precedes_decoding(tmp_path: Path) -> None:
+    with (tmp_path / "config.json").open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+
+    with pytest.raises(Mk1CheckpointContractError, match="67108864-byte safety limit"):
+        read_mk1_config(tmp_path)
+
+
+def test_config_json_requires_existing_file(tmp_path: Path) -> None:
+    with pytest.raises(Mk1CheckpointContractError, match="required file is missing"):
+        read_mk1_config(tmp_path)
+
+
+def _write_portable_isaac05_checkpoint(
+    root: Path,
+    *,
+    config: dict[str, Any] | None = None,
+) -> tuple[Mk1CheckpointContract, dict, torch.Tensor]:
+    """Write a tiny F32 source; optional geometry must pass the real native parser."""
+    from safetensors.torch import load_file
+
+    native = _config(test_geometry=True, mtp_present=False) if config is None else config
+    raw = copy.deepcopy(native)
+    raw["model_type"] = "isaac_0_5"
+    raw["architectures"] = ["Isaac05ForConditionalGeneration"]
+    raw["auto_map"] = {
+        "AutoConfig": "configuration_isaac05.Isaac05Config",
+        "AutoModelForCausalLM": "modeling_isaac05.Isaac05ForConditionalGeneration",
+        "AutoProcessor": "processing_isaac05.Isaac05Processor",
+    }
+    raw["storage_dtype"] = "float32"
+    raw["runtime_dtype"] = raw["dtype"] = "bfloat16"
+    raw["isaac05_test_only_reduced_geometry"] = raw.pop(MK1_TEST_GEOMETRY_MARKER)
+    for name in ("artifact", "coord_tokens", "moe", "vla"):
+        raw[f"isaac05_{name}"] = raw.pop(f"genesis_{name}")
+    raw["text_config"]["isaac05_moe"] = raw["text_config"].pop("genesis_moe")
+    for moe in (raw["isaac05_moe"], raw["text_config"]["isaac05_moe"]):
+        del moe["null_expert_semantics"], moe["shared_expert_mode"]
+    del raw["isaac05_vla"]["backbone_family"]
+    action = raw["isaac05_vla"]["action_expert"]
+    del action["clean_at_0"]
+    action.update(
+        type="dit",
+        schema_version=1,
+        num_inference_steps=10,
+        timestep_sampling_alpha=1.5,
+        timestep_sampling_beta=1.0,
+        timestep_sampling_scale=0.999,
+        timestep_sampling_offset=0.001,
+        train_samples_per_chunk=8,
+        rtc_max_delay_steps=12,
+        rtc_probability=0.5,
+        rtc_delay_sampling="poisson",
+        rtc_poisson_mean=5.0,
+        mask_padded_action_rows=True,
+        drop_action_dim_overflow=False,
+        k_batched_cross_attn=True,
+        k_batched_cross_attn_backend="flash_gqa",
+    )
+    raw["action_expert"] = copy.deepcopy(action)
+    raw["vector_max_states"] = 4
+    raw["max_sequence_length"] = 128
+    raw["vision_token"] = "<|image_pad|>"
+    raw["vision_rescale_factor"] = 1 / 255
+    raw["isaac05_fast_tokens"] = {
+        "enabled": True,
+        "offset": 28,
+        "size": 4,
+        "tokenizer": "physical-intelligence/fast",
+    }
+    expected = _write_checkpoint(root, config=raw)
+    total_bytes = 0
+    tensor_count = 0
+    value = torch.tensor(0.12345679, dtype=torch.float32)
+    for shard in sorted(root.glob("model-*.safetensors")):
+        state = {key: torch.full(tensor.shape, value.item()) for key, tensor in load_file(shard).items()}
+        total_bytes += sum(tensor.numel() * tensor.element_size() for tensor in state.values())
+        tensor_count += len(state)
+        save_file(state, shard)
+    raw["isaac05_artifact"].update(tensor_count=tensor_count, tensor_bytes=total_bytes)
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["metadata"]["total_size"] = total_bytes
+    index_path.write_text(json.dumps(index))
+    source_bytes = json.dumps(raw).encode()
+    (root / "config.json").write_bytes(source_bytes)
+    return expected, raw, value
+
+
+def test_portable_isaac05_loads_native_fp32_without_checkpoint_python(tmp_path: Path) -> None:
+    """The historical isaac05 JSON is input data, never executable model code."""
+    pytest.importorskip("transformers")
+    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
+
+    root = tmp_path / "portable"
+    expected, raw, value = _write_portable_isaac05_checkpoint(root)
+    source_bytes = (root / "config.json").read_bytes()
+    action = raw["action_expert"]
+
+    for field, value_override in (("rtc_probability", 1.25), ("unknown_field", True)):
+        invalid = copy.deepcopy(raw)
+        invalid["action_expert"][field] = value_override
+        invalid["isaac05_vla"]["action_expert"][field] = value_override
+        with pytest.raises(Mk1CheckpointContractError):
+            _parse_test_config(invalid)
+    invalid = copy.deepcopy(raw)
+    invalid["isaac05_moe"]["top_k"] += 1
+    with pytest.raises(Mk1CheckpointContractError, match="identical"):
+        _parse_test_config(invalid)
+    invalid = copy.deepcopy(raw)
+    invalid["action_expert"]["rtc_probability"] = 0.1
+    with pytest.raises(Mk1CheckpointContractError, match="identical"):
+        _parse_test_config(invalid)
+    invalid = copy.deepcopy(raw)
+    invalid["storage_dtype"] = "bfloat16"
+    with pytest.raises(Mk1CheckpointContractError, match="storage_dtype"):
+        _parse_test_config(invalid)
+
+    with pytest.raises(ValueError, match="training load intent"):
+        load_mk1_vla_from_hf(
+            root,
+            dtype=torch.float32,
+            allow_test_only_reduced_geometry=True,
+            allowed_storage_dtypes=frozenset({"F32"}),
+        )
+    invalid = copy.deepcopy(raw)
+    invalid["vector_max_states"] += 1
+    with pytest.raises(Mk1CheckpointContractError, match="vector_max_states"):
+        _parse_test_config(invalid)
+    invalid = copy.deepcopy(raw)
+    del invalid["action_expert"]["rtc_probability"]
+    del invalid["isaac05_vla"]["action_expert"]["rtc_probability"]
+    with pytest.raises(
+        Mk1CheckpointContractError,
+        match=r"isaac05_vla\.action_expert fields .*missing=\['rtc_probability'\]",
+    ):
+        _parse_test_config(invalid)
+
+    model, config, contract = load_mk1_vla_from_hf(
+        root,
+        dtype=torch.float32,
+        device="cpu",
+        allow_test_only_reduced_geometry=True,
+        allowed_storage_dtypes=frozenset({"F32"}),
+        load_intent="training",
+    )
+
+    assert contract == expected
+    assert type(model).__module__ == "lerobot.policies.perceptron_isaac.modeling_mk1_vla"
+    assert config.model_type == "qwen3_5_moe"
+    assert model.action_expert.expert_type == "dit"
+    assert config.action_expert == action
+    assert set(model.state_dict()) == set(contract.expected_tensor_shapes())
+    assert value.item() != value.bfloat16().float().item()
+    assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+    assert all(torch.equal(parameter, value.expand_as(parameter)) for parameter in model.parameters())
+    assert torch.equal(model.lm_head.weight, value.expand_as(model.lm_head.weight))
+    assert (root / "config.json").read_bytes() == source_bytes
+    assert not model.training

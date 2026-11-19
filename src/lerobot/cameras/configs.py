@@ -16,9 +16,9 @@
 
 import abc
 from dataclasses import dataclass
-from enum import Enum, StrEnum
+from enum import Enum
 
-import draccus  # type: ignore  # TODO: add type stubs for draccus
+import draccus
 
 
 class ColorMode(str, Enum):
@@ -28,24 +28,6 @@ class ColorMode(str, Enum):
     @classmethod
     def _missing_(cls, value: object) -> None:
         raise ValueError(f"`color_mode` is expected to be in {list(cls)}, but {value} is provided.")
-
-
-class OutputResizeMode(StrEnum):
-    STRETCH = "stretch"
-    LETTERBOX = "letterbox"
-
-    @classmethod
-    def _missing_(cls, value: object) -> None:
-        raise ValueError(f"`output_resize_mode` is expected to be in {list(cls)}, but {value} is provided.")
-
-    def validate_dimensions(self, output_width: int | None, output_height: int | None) -> None:
-        """Validate the output geometry required by this resize mode."""
-        if (output_width is None) != (output_height is None):
-            raise ValueError("`output_width` and `output_height` must be set together.")
-        if any(value is not None and value <= 0 for value in (output_width, output_height)):
-            raise ValueError("`output_width` and `output_height` must be positive.")
-        if self is not OutputResizeMode.STRETCH and output_width is None:
-            raise ValueError("`output_resize_mode=letterbox` requires output_width and output_height.")
 
 
 class Cv2Rotation(int, Enum):
@@ -75,7 +57,7 @@ class Cv2Backends(int, Enum):
 
 
 @dataclass(kw_only=True)
-class CameraConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore  # TODO: add type stubs for draccus
+class CameraConfig(draccus.ChoiceRegistry, abc.ABC):
     fps: int | None = None
     width: int | None = None
     height: int | None = None

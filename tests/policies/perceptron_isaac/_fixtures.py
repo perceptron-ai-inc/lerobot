@@ -56,7 +56,7 @@ def flow_stream(*, action_is_pad=None) -> TensorStream:
         _event([8, 9], event_type=TextType.action, role="assistant"),
         _event([2], event_type=TextType.control, role="assistant"),
     ]
-    return TensorStream([create_stream(events, list(TextType), schedule=False)])
+    return TensorStream([create_stream(events, list(TextType))])
 
 
 class TinyIsaacModel(nn.Module):
@@ -79,8 +79,10 @@ class TinyIsaacModel(nn.Module):
         activations = self.context_seed.view(1, 1, -1).expand(batch_size, sequence_length - 1, -1)
         return SimpleNamespace(
             final_activations=activations,
+            flow_matching_context=activations,
             final_embedding=self.lm_head,
             flow_matching_expert=self.action_expert,
+            additional_info={},
         )
 
 

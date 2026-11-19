@@ -25,18 +25,18 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any
 
-from numpy.typing import NDArray  # type: ignore  # TODO: add type stubs for numpy.typing
+from numpy.typing import NDArray
 
 # Fix MSMF hardware transform compatibility for Windows before importing cv2
 if platform.system() == "Windows" and "OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS" not in os.environ:
     os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
-import cv2  # type: ignore  # TODO: add type stubs for OpenCV
+import cv2
 
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..camera import Camera
-from ..utils import get_cv2_rotation, resize_camera_frame
+from ..utils import get_cv2_rotation
 from .configuration_opencv import ColorMode, OpenCVCameraConfig
 
 # NOTE(Steven): The maximum opencv device index depends on your operating system. For instance,
@@ -130,11 +130,11 @@ class OpenCVCamera(Camera):
     def _reset_connection_settings(self) -> None:
         """Restore settings that may have been auto-detected during a failed connection."""
         self.fps = self.config.fps
-        self.capture_width, self.capture_height = self.config.width, self.config.height
+        self.width = self.config.width
+        self.height = self.config.height
+        self.capture_width, self.capture_height = self.width, self.height
         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-            self.capture_width, self.capture_height = self.config.height, self.config.width
-        self.width = self.config.output_width or self.config.width
-        self.height = self.config.output_height or self.config.height
+            self.capture_width, self.capture_height = self.height, self.width
 
     @property
     def is_connected(self) -> bool:
@@ -177,11 +177,6 @@ class OpenCVCamera(Camera):
             self._start_read_thread()
 
             if warmup and self.warmup_s > 0:
-                # First-frame delivery can be much slower than steady-state capture,
-                # especially after handing a USB camera over from another process.
-                self.async_read(timeout_ms=self.config.startup_timeout_s * 1000)
-                # Start the stabilization window only after frames are flowing,
-                # so a slow first frame cannot consume it.
                 start_time = time.time()
                 while time.time() - start_time < self.warmup_s:
                     self.async_read(timeout_ms=self.warmup_s * 1000)
@@ -230,16 +225,12 @@ class OpenCVCamera(Camera):
         default_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
         default_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
 
-        if self.capture_width is None or self.capture_height is None:
+        if self.width is None or self.height is None:
+            self.width, self.height = default_width, default_height
             self.capture_width, self.capture_height = default_width, default_height
-            if (
-                self.config.output_width is None
-                and self.config.output_height is None
-                and self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]
-            ):
+            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
                 self.width, self.height = default_height, default_width
-            elif self.config.output_width is None and self.config.output_height is None:
-                self.width, self.height = default_width, default_height
+                self.capture_width, self.capture_height = default_width, default_height
         else:
             self._validate_width_and_height()
 
@@ -271,7 +262,10 @@ class OpenCVCamera(Camera):
     def _validate_fourcc(self) -> None:
         """Validates and sets the camera's FOURCC code."""
 
-        fourcc_code = cv2.VideoWriter_fourcc(*self.config.fourcc)
+        fourcc = self.config.fourcc
+        if fourcc is None:
+            raise ValueError(f"{self} has no fourcc configured to validate.")
+        fourcc_code = cv2.VideoWriter_fourcc(*fourcc)
 
         if self.videocapture is None:
             raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
@@ -457,14 +451,6 @@ class OpenCVCamera(Camera):
 
         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
             processed_image = cv2.rotate(processed_image, self.rotation)
-
-        if self.width is not None and self.height is not None:
-            processed_image = resize_camera_frame(
-                processed_image,
-                self.width,
-                self.height,
-                resize_mode=self.config.output_resize_mode,
-            )
 
         return processed_image
 

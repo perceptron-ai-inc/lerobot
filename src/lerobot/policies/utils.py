@@ -16,7 +16,6 @@
 
 import logging
 from collections import deque
-from typing import Literal
 
 import numpy as np
 import torch
@@ -24,57 +23,18 @@ from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.lerobot_types import PolicyAction, RobotAction, RobotObservation
-from lerobot.utils.constants import ACTION, OBS_STATE, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
-
-
-def validate_perceptron_direct_chunk_inference(
-    policy_config: object,
-    actions_per_chunk: int | None,
-    *,
-    mode: Literal["async", "temporal"],
-    policy_type: str | None = None,
-) -> int | None:
-    """Reject direct-chunk modes that bypass Perceptron's stateful action selection."""
-    policy_type = policy_type or getattr(policy_config, "type", None)
-    if policy_type != "perceptron_isaac":
-        return actions_per_chunk
-
-    is_async = mode == "async"
-    if int(getattr(policy_config, "n_obs_steps", 1)) != 1:
-        message = (
-            "Async perceptron_isaac n_obs_steps=3 cannot preserve a control-rate observation "
-            "window across chunk inference. Use synchronous inference."
-            if is_async
-            else "Temporal ensemble cannot provide perceptron_isaac n_obs_steps=3 with a "
-            "control-rate observation window. Use synchronous inference until the engine "
-            "can carry the complete window."
-        )
-        raise NotImplementedError(message)
-
-    settle_steps = int(getattr(policy_config, "num_settle_steps", 0) or 0)
-    if settle_steps:
-        engine = "Async inference" if is_async else "Temporal ensemble"
-        raise NotImplementedError(
-            f"{engine} calls predict_action_chunk directly and cannot honor "
-            f"perceptron_isaac num_settle_steps={settle_steps}. Use synchronous inference."
-        )
-
-    n_action_steps = int(getattr(policy_config, "n_action_steps", 0))
-    if not is_async and n_action_steps <= 0:
-        raise ValueError("perceptron_isaac n_action_steps must be positive for temporal inference.")
-    if actions_per_chunk is not None and actions_per_chunk > n_action_steps:
-        engine = "Async" if is_async else "Temporal"
-        raise ValueError(
-            f"{engine} actions_per_chunk={actions_per_chunk} exceeds perceptron_isaac "
-            f"n_action_steps={n_action_steps}."
-        )
-    return actions_per_chunk if is_async or actions_per_chunk is not None else n_action_steps
 
 
 def populate_queues(
     queues: dict[str, deque], batch: dict[str, torch.Tensor], exclude_keys: list[str] | None = None
 ):
+    """Append the batch's values to their per-key deques (filling them on first use).
+
+    Policies using this helper hold the dict as ``self._queues``, one of the names
+    ``PreTrainedPolicy._action_queue_attrs`` knows how to clear.
+    """
     if exclude_keys is None:
         exclude_keys = []
     for key in batch:
@@ -138,24 +98,6 @@ def log_model_loading_keys(missing_keys: list[str], unexpected_keys: list[str]) 
         logging.warning(f"Unexpected key(s) when loading model: {unexpected_keys}")
 
 
-def ensure_vla_feature_contract(
-    input_features: dict[str, PolicyFeature],
-    output_features: dict[str, PolicyFeature],
-    *,
-    state_dim: int,
-    action_dim: int,
-    visual_feature_error: str,
-) -> None:
-    """Require a visual input and add missing state/action features for a VLA policy."""
-    if not any(feature.type == FeatureType.VISUAL for feature in input_features.values()):
-        raise ValueError(visual_feature_error)
-
-    if OBS_STATE not in input_features:
-        input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(state_dim,))
-    if ACTION not in output_features:
-        output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,))
-
-
 # TODO(Steven): Move this function to a proper preprocessor step
 def prepare_observation_for_inference(
     observation: dict[str, np.ndarray],
@@ -168,10 +110,14 @@ def prepare_observation_for_inference(
     This function takes a dictionary of NumPy arrays, performs necessary
     preprocessing, and prepares it for model inference. The steps include:
     1. Converting NumPy arrays to PyTorch tensors.
-    2. Normalizing and permuting image data (if any).
-    3. Adding a batch dimension to each tensor.
-    4. Moving all tensors to the specified compute device.
+    2. Moving each tensor to the specified compute device.
+    3. Normalizing and permuting image data (if any) on that device.
+    4. Adding a batch dimension to each tensor.
     5. Adding task and robot type information to the dictionary.
+
+    Images travel to the device as compact ``uint8`` frames — a 4× smaller
+    copy than their float32 counterpart — and the ``/255`` + permute run on
+    the device, keeping the per-tick CPU cost of the control loop low.
 
     Args:
         observation: A dictionary mapping observation names (str) to NumPy
@@ -187,13 +133,12 @@ def prepare_observation_for_inference(
         to (C, H, W) and normalized to a [0, 1] range.
     """
     for name in observation:
-        observation[name] = torch.from_numpy(observation[name])
+        tensor = torch.from_numpy(observation[name]).to(device)
         if "image" in name:
-            if observation[name].dtype == torch.uint8:
-                observation[name] = observation[name].type(torch.float32) / 255
-            observation[name] = observation[name].permute(2, 0, 1).contiguous()
-        observation[name] = observation[name].unsqueeze(0)
-        observation[name] = observation[name].to(device)
+            if tensor.dtype == torch.uint8:
+                tensor = tensor.type(torch.float32) / 255
+            tensor = tensor.permute(2, 0, 1).contiguous()
+        observation[name] = tensor.unsqueeze(0)
 
     observation["task"] = task if task else ""
     observation["robot_type"] = robot_type if robot_type else ""
@@ -301,6 +246,8 @@ def validate_visual_features_consistency(
         cfg (PreTrainedConfig): The model or policy configuration containing input_features and type.
         features (Dict[str, PolicyFeature]): A mapping of feature names to PolicyFeature objects.
     """
+    if cfg.input_features is None:
+        raise ValueError("`cfg.input_features` must be resolved before validating visual features.")
     expected_visuals = {k for k, v in cfg.input_features.items() if v.type == FeatureType.VISUAL}
     provided_visuals = {k for k, v in features.items() if v.type == FeatureType.VISUAL}
 

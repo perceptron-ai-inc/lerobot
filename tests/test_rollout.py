@@ -17,33 +17,47 @@
 from __future__ import annotations
 
 import dataclasses
-import importlib
+import logging
 import sys
-import time
+import threading
+from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 import torch
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
+
+# Hoisted rather than re-imported inside each test: the module-scoped `importorskip`
+# above already guards everything below it.
+from lerobot.utils.cycle_timer import CycleTimer  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Import smoke tests
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "module_name",
-    ["lerobot.rollout", "lerobot.rollout.inference", "lerobot.rollout.strategies"],
-    ids=["top-level", "inference", "strategies"],
-)
-def test_public_exports(module_name):
-    module = importlib.import_module(module_name)
+def test_rollout_top_level_imports():
+    import lerobot.rollout
 
-    for name in module.__all__:
-        assert hasattr(module, name), f"Missing export: {name}"
+    for name in lerobot.rollout.__all__:
+        assert hasattr(lerobot.rollout, name), f"Missing export: {name}"
+
+
+def test_inference_submodule_imports():
+    import lerobot.inference
+
+    for name in lerobot.inference.__all__:
+        assert hasattr(lerobot.inference, name), f"Missing export: {name}"
+
+
+def test_strategies_submodule_imports():
+    import lerobot.rollout.strategies
+
+    for name in lerobot.rollout.strategies.__all__:
+        assert hasattr(lerobot.rollout.strategies, name), f"Missing export: {name}"
 
 
 # ---------------------------------------------------------------------------
@@ -84,11 +98,7 @@ def test_dagger_config_defaults():
 
 
 def test_inference_config_types():
-    from lerobot.rollout import (
-        RTCInferenceConfig,
-        SyncInferenceConfig,
-        TemporalEnsembleInferenceConfig,
-    )
+    from lerobot.inference import RTCInferenceConfig, SyncInferenceConfig
 
     assert SyncInferenceConfig().type == "sync"
 
@@ -97,10 +107,76 @@ def test_inference_config_types():
     assert rtc.queue_threshold == 30
     assert rtc.rtc is not None
 
-    temporal = TemporalEnsembleInferenceConfig()
-    assert temporal.type == "temporal_ensemble"
-    assert temporal.ensemble_m == 0.5
-    assert temporal.max_step == 15.0
+
+def test_trained_rtc_retries_chunk_when_measured_delay_exceeds_conditioning():
+    from lerobot.inference import trained_overlap_valid
+
+    assert not trained_overlap_valid(conditioned=2, measured=3, maximum=4, has_previous=True)
+    assert trained_overlap_valid(conditioned=2, measured=5, maximum=4, has_previous=False)
+
+
+def test_trained_rtc_bootstraps_first_overlap_with_checkpoint_capacity():
+    from lerobot.inference import ExecutionMode, estimate_delay
+
+    assert estimate_delay(0, 1 / 30, ExecutionMode.RTC_TRAINED, 10, available=0) == 0
+    assert estimate_delay(0, 1 / 30, ExecutionMode.RTC_TRAINED, 10, available=20) == 10
+
+
+def test_trained_rtc_discards_chunk_measured_above_checkpoint_support():
+    """A latency spike past the trained delay discards the chunk; it must not kill the rollout."""
+    from lerobot.inference import trained_overlap_valid
+
+    assert not trained_overlap_valid(conditioned=3, measured=5, maximum=4, has_previous=True)
+
+
+def test_trained_rtc_clamps_prefix_to_checkpoint_and_queue():
+    """Conditioning past the queue tail would hard-inpaint zero padding, so clamp instead."""
+    from lerobot.inference import ExecutionMode, estimate_delay
+
+    # Queue tail is the binding limit.
+    assert estimate_delay(4 / 30, 1 / 30, ExecutionMode.RTC_TRAINED, 10, available=2) == 2
+    # Trained capacity is the binding limit.
+    assert estimate_delay(12 / 30, 1 / 30, ExecutionMode.RTC_TRAINED, 10, available=30) == 10
+    # Neither binds.
+    assert estimate_delay(4 / 30, 1 / 30, ExecutionMode.RTC_TRAINED, 10, available=30) == 4
+
+
+@pytest.mark.parametrize(
+    ("execution_horizon", "queue_threshold", "match"),
+    [
+        (3, 4, "execution_horizon"),
+        (4, 3, "queue_threshold"),
+        # Preserve the conservative admission bound on configured prefix capacity.
+        (17, 20, "at most"),
+    ],
+)
+def test_trained_rtc_rollout_requires_capacity_for_max_delay(execution_horizon, queue_threshold, match):
+    from lerobot.inference import RTCInferenceConfig
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.context import _validate_trained_rtc_rollout_config
+
+    policy_config = SimpleNamespace(type="pi05", rtc_training_max_delay=4, chunk_size=20)
+    inference_config = RTCInferenceConfig(
+        rtc=RTCConfig(mode="trained", execution_horizon=execution_horizon),
+        queue_threshold=queue_threshold,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        _validate_trained_rtc_rollout_config(policy_config, inference_config)
+
+
+def test_trained_rtc_rollout_accepts_valid_capacity():
+    from lerobot.inference import RTCInferenceConfig
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.context import _validate_trained_rtc_rollout_config
+
+    policy_config = SimpleNamespace(type="pi05", rtc_training_max_delay=4, chunk_size=50)
+    inference_config = RTCInferenceConfig(
+        rtc=RTCConfig(mode="trained", execution_horizon=10),
+        queue_threshold=30,
+    )
+
+    _validate_trained_rtc_rollout_config(policy_config, inference_config)
 
 
 def test_sentry_config_defaults():
@@ -143,41 +219,134 @@ def test_rollout_config_passes_policy_pretrained_revision(monkeypatch):
     assert cfg.policy.pretrained_revision == "cli-sha"
 
 
-def test_rollout_config_adopts_and_enforces_checkpoint_fps(monkeypatch):
+@pytest.mark.parametrize("multiplier", [0, -1])
+def test_rollout_config_rejects_a_multiplier_below_one(multiplier):
     from lerobot.rollout import RolloutConfig
     from tests.mocks.mock_robot import MockRobotConfig
 
-    monkeypatch.setattr(sys, "argv", ["lerobot-rollout"])
-    policy = SimpleNamespace(device="cpu", target_fps=20.0)
-
-    cfg = RolloutConfig(robot=MockRobotConfig(), policy=policy)
-    assert cfg.fps == 20.0
-
-    with pytest.raises(ValueError, match="checkpoint target_fps"):
-        RolloutConfig(robot=MockRobotConfig(), policy=policy, fps=30.0)
+    # Validated in __post_init__ ahead of everything else, so the run fails at
+    # parse time rather than after the hardware is already connected.
+    with pytest.raises(ValueError, match="interpolation_multiplier must be >= 1"):
+        RolloutConfig(robot=MockRobotConfig(), interpolation_multiplier=multiplier)
 
 
-def test_rollout_config_prediction_only_is_base_strategy_only(monkeypatch):
-    from lerobot.rollout import RolloutConfig, SentryStrategyConfig
+def test_build_rollout_context_rejects_missing_policy() -> None:
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.rollout import RolloutConfig, build_rollout_context
     from tests.mocks.mock_robot import MockRobotConfig
 
-    monkeypatch.setattr(sys, "argv", ["lerobot-rollout"])
-    policy = SimpleNamespace(device="cpu", target_fps=None)
-    dataset = SimpleNamespace(
-        repo_id="user/rollout_test",
-        fps=30.0,
-        single_task="test",
-        streaming_encoding=True,
-    )
+    cfg = RolloutConfig(robot=MockRobotConfig(), policy=ACTConfig(device="cpu"), device="cpu")
+    # Exercise the context builder's guard, not RolloutConfig.__post_init__ validation.
+    cfg.policy = None
 
-    with pytest.raises(ValueError, match="execute_actions=false"):
-        RolloutConfig(
-            robot=MockRobotConfig(),
-            policy=policy,
-            strategy=SentryStrategyConfig(),
-            dataset=dataset,
-            execute_actions=False,
+    with pytest.raises(ValueError, match="--policy.path is required for rollout"):
+        build_rollout_context(cfg, threading.Event())
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_device", "runtime_device"),
+    [
+        ("cuda", "cpu"),
+        ("mps", "cpu"),
+        ("cpu", "cpu"),
+        ("cpu", None),
+        pytest.param(
+            "cpu", "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+        ),
+    ],
+)
+def test_build_rollout_context_uses_resolved_device(
+    monkeypatch: pytest.MonkeyPatch, checkpoint_device: str, runtime_device: str | None
+) -> None:
+    import lerobot.rollout.context as rollout_context
+    from lerobot.policies.act.configuration_act import ACTConfig
+    from lerobot.processor import (
+        DeviceProcessorStep,
+        PolicyProcessorPipeline,
+        batch_to_transition,
+        transition_to_batch,
+    )
+    from lerobot.rollout import RolloutConfig
+    from lerobot.utils.constants import OBS_STATE
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    policy_config = ACTConfig(device="cpu", pretrained_path=Path("unused-checkpoint"))
+    # Emulate a checkpoint saved on a different host without needing that device locally.
+    policy_config.device = checkpoint_device
+    robot_config = MockRobotConfig(random_values=False, static_values=[0.0, 0.0, 0.0])
+    cfg = RolloutConfig(robot=robot_config, policy=policy_config, device=runtime_device)
+    robot = MockRobot(robot_config)
+    policy = torch.nn.Linear(3, 3)
+
+    def load_policy(config: ACTConfig) -> torch.nn.Linear:
+        # Check at construction time: synchronizing after the load would be too late.
+        assert config.device == cfg.device == (runtime_device or checkpoint_device)
+        return policy
+
+    def make_processors(
+        *, policy_cfg: ACTConfig, preprocessor_overrides: dict[str, dict[str, str]], **kwargs: object
+    ) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
+        assert policy_cfg.device == preprocessor_overrides["device_processor"]["device"]
+        processor = PolicyProcessorPipeline(
+            steps=[DeviceProcessorStep(device=policy_cfg.device)],
+            to_transition=batch_to_transition,
+            to_output=transition_to_batch,
         )
+        return processor, PolicyProcessorPipeline(steps=[])
+
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", load_policy)
+    monkeypatch.setattr(rollout_context, "make_pre_post_processors", make_processors)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+
+    try:
+        ctx = rollout_context.build_rollout_context(cfg, threading.Event())
+        batch = ctx.policy.preprocessor({OBS_STATE: torch.zeros(1, 3)})
+        model_device = next(ctx.policy.policy.parameters()).device
+        assert model_device == batch[OBS_STATE].device
+        assert model_device.type == torch.device(runtime_device or checkpoint_device).type
+        assert policy_config.device == cfg.device
+    finally:
+        if robot.is_connected:
+            robot.disconnect()
+
+
+@pytest.mark.parametrize("failure_stage", ["observation", "processors", "engine"])
+def test_local_setup_failure_disconnects_hardware(monkeypatch, failure_stage):
+    import lerobot.rollout.context as rollout_context
+    from lerobot.policies import ACTConfig
+    from lerobot.processor import PolicyProcessorPipeline
+    from lerobot.rollout import RolloutConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    cfg = RolloutConfig(
+        robot=MockRobotConfig(random_values=False, static_values=[0.0, 0.0, 0.0]),
+        policy=ACTConfig(device="cpu", pretrained_path=Path("unused-checkpoint")),
+        device="cpu",
+    )
+    robot = MockRobot(cfg.robot)
+    failure = RuntimeError("setup failed")
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: torch.nn.Linear(3, 3))
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    if failure_stage == "observation":
+        monkeypatch.setattr(robot, "get_observation", MagicMock(side_effect=failure))
+    elif failure_stage == "processors":
+        monkeypatch.setattr(rollout_context, "make_pre_post_processors", MagicMock(side_effect=failure))
+    else:
+        monkeypatch.setattr(
+            rollout_context,
+            "make_pre_post_processors",
+            lambda **_: (PolicyProcessorPipeline([]), PolicyProcessorPipeline([])),
+        )
+
+        def fail_engine(*args, **kwargs):
+            assert robot.is_connected, "the engine is constructed after hardware is connected"
+            raise failure
+
+        monkeypatch.setattr(rollout_context, "create_inference_engine", fail_engine)
+    with pytest.raises(RuntimeError) as raised:
+        rollout_context.build_rollout_context(cfg, threading.Event())
+    assert raised.value is failure
+    assert not robot.is_connected
 
 
 def test_load_pretrained_policy_passes_revision(monkeypatch):
@@ -204,7 +373,7 @@ def test_load_pretrained_policy_passes_revision(monkeypatch):
     )
 
 
-def test_load_pretrained_peft_policy_delegates_to_shared_loader(monkeypatch):
+def test_load_pretrained_peft_policy_keeps_adapter_and_base_revisions_separate(monkeypatch):
     import lerobot.rollout.context as rollout_context
 
     policy_config = SimpleNamespace(
@@ -214,19 +383,47 @@ def test_load_pretrained_peft_policy_delegates_to_shared_loader(monkeypatch):
         pretrained_revision="adapter-sha",
     )
     policy_class = MagicMock()
+    base_policy = MagicMock()
+    policy_class.from_pretrained.return_value = base_policy
     monkeypatch.setattr(rollout_context, "get_policy_class", lambda _: policy_class)
+
+    peft_config = SimpleNamespace(
+        base_model_name_or_path="user/base-policy",
+        revision="base-sha",
+    )
+    peft_config_from_pretrained = MagicMock(return_value=peft_config)
     adapted_policy = MagicMock()
-    load_peft = MagicMock(return_value=adapted_policy)
-    monkeypatch.setattr(rollout_context, "load_peft_policy", load_peft)
+    peft_model_from_pretrained = MagicMock(return_value=adapted_policy)
+    require_package = MagicMock()
+    monkeypatch.setattr(rollout_context, "require_package", require_package)
+    monkeypatch.setattr(
+        rollout_context,
+        "PeftConfig",
+        SimpleNamespace(from_pretrained=peft_config_from_pretrained),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        rollout_context,
+        "PeftModel",
+        SimpleNamespace(from_pretrained=peft_model_from_pretrained),
+        raising=False,
+    )
 
     policy = rollout_context._load_pretrained_policy(policy_config)
 
     assert policy is adapted_policy
-    load_peft.assert_called_once_with(
-        policy_class,
-        policy_config,
+    require_package.assert_called_once_with("peft", extra="peft")
+    peft_config_from_pretrained.assert_called_once_with("user/adapter", revision="adapter-sha")
+    policy_class.from_pretrained.assert_called_once_with(
+        pretrained_name_or_path="user/base-policy",
+        config=policy_config,
+        revision="base-sha",
+    )
+    peft_model_from_pretrained.assert_called_once_with(
+        base_policy,
         "user/adapter",
-        adapter_revision="adapter-sha",
+        config=peft_config,
+        revision="adapter-sha",
     )
 
 
@@ -343,12 +540,91 @@ def test_create_strategy_dispatches():
 
 
 def test_create_strategy_unknown_raises():
-    from lerobot.rollout import create_strategy
+    from lerobot.rollout import RolloutStrategyConfig, create_strategy
 
-    cfg = MagicMock()
-    cfg.type = "bogus"
-    with pytest.raises(ValueError, match="Unknown strategy type"):
-        create_strategy(cfg)
+    # Registered config, but no ``BogusStrategy`` class importable next to it.
+    @RolloutStrategyConfig.register_subclass("bogus")
+    @dataclasses.dataclass
+    class BogusStrategyConfig(RolloutStrategyConfig):
+        pass
+
+    try:
+        with pytest.raises(ValueError, match="Could not locate device class 'BogusStrategy'"):
+            create_strategy(BogusStrategyConfig())
+    finally:
+        RolloutStrategyConfig.get_known_choices().pop("bogus")
+
+
+# ---------------------------------------------------------------------------
+# Strategy capability declarations (what a third-party strategy relies on)
+# ---------------------------------------------------------------------------
+
+
+def test_rollout_config_enforces_strategy_declarations():
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig, RolloutStrategyConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+    from tests.mocks.mock_teleop import MockTeleopConfig
+
+    @RolloutStrategyConfig.register_subclass("test_recorder")
+    @dataclasses.dataclass
+    class RecorderConfig(RolloutStrategyConfig):
+        dataset_mode: ClassVar[str] = "required"
+        requires_teleop: ClassVar[bool] = True
+
+        def requires_streaming_encoding(self) -> bool:
+            return True
+
+    def make(**kwargs):
+        return RolloutConfig(robot=MockRobotConfig(), policy=SimpleNamespace(device="cpu"), **kwargs)
+
+    dataset = DatasetRecordConfig(repo_id="user/rollout_test")
+    try:
+        with pytest.raises(ValueError, match="test_recorder strategy requires --teleop.type"):
+            make(strategy=RecorderConfig(), dataset=dataset)
+        with pytest.raises(ValueError, match="test_recorder strategy requires --dataset.repo_id"):
+            make(strategy=RecorderConfig(), teleop=MockTeleopConfig())
+        with pytest.raises(ValueError, match="--dataset.repo_id must be set"):
+            make(strategy=RecorderConfig(), teleop=MockTeleopConfig(), dataset=DatasetRecordConfig())
+        with pytest.raises(ValueError, match="base strategy does not record data"):
+            make(strategy=BaseStrategyConfig(), dataset=dataset)
+
+        cfg = make(strategy=RecorderConfig(), teleop=MockTeleopConfig(), dataset=dataset)
+        assert cfg.dataset.streaming_encoding is True
+
+        # requires_streaming_encoding() is a method so it can depend on the config's fields.
+        dagger = make(
+            strategy=DAggerStrategyConfig(record_autonomous=False),
+            teleop=MockTeleopConfig(),
+            dataset=DatasetRecordConfig(repo_id="user/rollout_test"),
+        )
+        assert dagger.dataset.streaming_encoding is False
+    finally:
+        RolloutStrategyConfig.get_known_choices().pop("test_recorder")
+
+
+def test_setup_defaults_to_starting_the_engine():
+    from lerobot.rollout import BaseStrategyConfig, RolloutStrategy
+
+    class MinimalStrategy(RolloutStrategy):
+        def run(self, ctx):
+            pass
+
+        def teardown(self, ctx):
+            pass
+
+    engine = MagicMock()
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(cfg=SimpleNamespace(interpolation_multiplier=2)),
+        policy=SimpleNamespace(inference=engine),
+    )
+    strategy = MinimalStrategy(BaseStrategyConfig())
+
+    strategy.setup(ctx)
+
+    assert strategy._engine is engine
+    assert strategy._interpolator.multiplier == 2
+    engine.start.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +633,7 @@ def test_create_strategy_unknown_raises():
 
 
 def test_create_inference_engine_sync():
-    from lerobot.rollout import SyncInferenceConfig, SyncInferenceEngine, create_inference_engine
+    from lerobot.inference import SyncInferenceConfig, SyncInferenceEngine, create_inference_engine
 
     engine = create_inference_engine(
         SyncInferenceConfig(),
@@ -365,7 +641,6 @@ def test_create_inference_engine_sync():
         preprocessor=MagicMock(),
         postprocessor=MagicMock(),
         robot_wrapper=MagicMock(robot_type="mock"),
-        hw_features={},
         dataset_features={},
         ordered_action_keys=["k"],
         task="test",
@@ -375,577 +650,134 @@ def test_create_inference_engine_sync():
     assert isinstance(engine, SyncInferenceEngine)
 
 
-def test_sync_preflight_generates_and_validates_complete_fresh_chunk():
-    from lerobot.rollout import SyncInferenceEngine
+def test_create_inference_engine_remote_explains_session_construction():
+    from lerobot.inference import RemoteInferenceConfig, create_inference_engine
 
-    policy = MagicMock()
-    policy.config.use_amp = False
-    policy.predict_action_chunk.return_value = torch.tensor([[[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]])
-    preprocessor = MagicMock(side_effect=lambda value: value)
-    postprocessor = MagicMock(side_effect=lambda value: value)
-    engine = SyncInferenceEngine(
-        policy,
-        preprocessor,
-        postprocessor,
-        {"action": {"names": ["b.pos", "a.pos"]}},
-        ["a.pos", "b.pos"],
-        "test",
-        "cpu",
-        "so100_follower",
-    )
-
-    actions = engine.preflight({"observation.state": np.zeros(2, dtype=np.float32)})
-
-    assert torch.equal(actions, torch.tensor([[10.0, 1.0], [20.0, 2.0], [30.0, 3.0]]))
-    policy.predict_action_chunk.assert_called_once()
-    policy.select_action.assert_not_called()
-    policy.reset.assert_called_once()
-
-
-def test_create_inference_engine_temporal_ensemble():
-    from lerobot.rollout import (
-        TemporalEnsembleInferenceConfig,
-        TemporalEnsembleInferenceEngine,
-        create_inference_engine,
-    )
-
-    policy = MagicMock()
-    policy.reset.return_value = None
-    engine = create_inference_engine(
-        TemporalEnsembleInferenceConfig(),
-        policy=policy,
-        preprocessor=MagicMock(),
-        postprocessor=MagicMock(),
-        robot_wrapper=MagicMock(robot_type="so100_follower"),
-        hw_features={},
-        dataset_features={},
-        ordered_action_keys=["joint.pos"],
-        task="test",
-        fps=30.0,
-        device="cpu",
-        preflight_inferences=2,
-    )
-
-    assert isinstance(engine, TemporalEnsembleInferenceEngine)
-    assert engine.ready is False
-
-
-def _perceptron_temporal_policy(*, n_obs_steps=1, n_action_steps=12, num_settle_steps=0):
-    policy = MagicMock()
-    policy.type = "perceptron_isaac"
-    policy.config = SimpleNamespace(
-        n_obs_steps=n_obs_steps,
-        n_action_steps=n_action_steps,
-        num_settle_steps=num_settle_steps,
-        use_amp=False,
-    )
-    return policy
-
-
-def _create_temporal_engine_for_policy(policy, config=None):
-    from lerobot.rollout import TemporalEnsembleInferenceConfig, create_inference_engine
-
-    return create_inference_engine(
-        config or TemporalEnsembleInferenceConfig(),
-        policy=policy,
-        preprocessor=MagicMock(),
-        postprocessor=MagicMock(),
-        robot_wrapper=MagicMock(robot_type="so100_follower"),
-        hw_features={},
-        dataset_features={"action": {"names": ["joint.pos"]}},
-        ordered_action_keys=["joint.pos"],
-        task="test",
-        fps=30.0,
-        device="cpu",
-        preflight_inferences=0,
-    )
-
-
-def test_temporal_perceptron_rejects_history_it_cannot_sample_at_control_rate():
-    with pytest.raises(NotImplementedError, match="n_obs_steps=3.*synchronous"):
-        _create_temporal_engine_for_policy(_perceptron_temporal_policy(n_obs_steps=3))
-
-
-def test_temporal_perceptron_enforces_select_action_chunk_contract():
-    from lerobot.rollout import TemporalEnsembleInferenceConfig
-
-    policy = _perceptron_temporal_policy(n_action_steps=12)
-    engine = _create_temporal_engine_for_policy(policy)
-    assert engine._actions_per_chunk == 12
-
-    with pytest.raises(ValueError, match="actions_per_chunk=13.*n_action_steps=12"):
-        _create_temporal_engine_for_policy(
-            policy,
-            TemporalEnsembleInferenceConfig(actions_per_chunk=13),
+    config = RemoteInferenceConfig(deployment="test", semantics="radians-v1")
+    with pytest.raises(ValueError, match="connected RemoteClient; use build_rollout_context"):
+        create_inference_engine(
+            config,
+            policy=MagicMock(),
+            preprocessor=MagicMock(),
+            postprocessor=MagicMock(),
+            robot_wrapper=MagicMock(),
+            dataset_features={},
+            ordered_action_keys=[],
+            task="test",
+            fps=30.0,
+            device="cpu",
         )
-
-    with pytest.raises(NotImplementedError, match="num_settle_steps"):
-        _create_temporal_engine_for_policy(_perceptron_temporal_policy(num_settle_steps=1))
-
-
-def test_temporal_ensemble_skips_latency_stale_prefix_and_combines_active_chunks():
-    from lerobot.rollout.inference.temporal_ensemble import (
-        TimestampedActionChunk,
-        temporal_ensemble_action,
-    )
-
-    older = torch.arange(30, dtype=torch.float32).unsqueeze(1)
-    newer = (100 + torch.arange(30, dtype=torch.float32)).unsqueeze(1)
-    action, diagnostics = temporal_ensemble_action(
-        [
-            TimestampedActionChunk(older, observation_time=9.5, chunk_id=1),
-            TimestampedActionChunk(newer, observation_time=9.8, chunk_id=2),
-        ],
-        now=10.0,
-        action_fps=30.0,
-        ensemble_m=0.0,
-    )
-
-    # 500 ms and 200 ms old means steps 15 and 5, never stale step zero.
-    assert diagnostics == [(1, 15, 0.5), (2, 5, pytest.approx(0.2))]
-    assert torch.allclose(action, torch.tensor([(15.0 + 105.0) / 2.0]))
-
-
-def test_temporal_ensemble_rejects_expired_chunks():
-    from lerobot.rollout.inference.temporal_ensemble import (
-        TimestampedActionChunk,
-        temporal_ensemble_action,
-    )
-
-    action, diagnostics = temporal_ensemble_action(
-        [TimestampedActionChunk(torch.zeros(30, 2), observation_time=1.0, chunk_id=1)],
-        now=2.01,
-        action_fps=30.0,
-        ensemble_m=0.5,
-    )
-
-    assert action is None
-    assert diagnostics == []
-
-
-def test_direction_preserving_action_cap_scales_complete_delta_vector():
-    from lerobot.rollout.inference.temporal_ensemble import clip_action_direction_preserving
-
-    current = torch.tensor([0.0, 10.0, -5.0])
-    target = torch.tensor([30.0, 20.0, -20.0])
-    clipped = clip_action_direction_preserving(target, current, max_step=15.0)
-
-    assert torch.allclose(clipped, torch.tensor([15.0, 15.0, -12.5]))
-
-
-def test_temporal_engine_discards_complete_warmup_chunks_before_publish(monkeypatch):
-    from lerobot.rollout.inference.temporal_ensemble import TemporalEnsembleInferenceEngine
-
-    policy = MagicMock()
-    policy.reset.return_value = None
-    engine = TemporalEnsembleInferenceEngine(
-        policy,
-        MagicMock(),
-        MagicMock(),
-        robot_type="so100_follower",
-        hw_features={},
-        dataset_features={"action": {"names": ["joint.pos"]}},
-        ordered_action_keys=["joint.pos"],
-        task="test",
-        fps=30.0,
-        device="cpu",
-        max_step=None,
-        warmup_predictions=2,
-    )
-    calls = 0
-
-    def predict(_obs, *, timestep):
-        nonlocal calls
-        calls += 1
-        if calls == 3:
-            engine.pause()
-        return torch.full((30, 1), float(calls))
-
-    monkeypatch.setattr(engine, "_predict", predict)
-    engine.reset()
-    engine.start()
-    engine.notify_observation({"joint.pos": 0.0})
-    engine.resume()
-    deadline = time.monotonic() + 1.0
-    while calls < 3 and time.monotonic() < deadline:
-        time.sleep(0.005)
-    engine.stop()
-
-    assert calls == 3
-    assert engine.ready is True
-    assert len(engine._ring) == 1
-    assert engine._ring[0].chunk_id == 1
-    assert torch.all(engine._ring[0].actions == 3.0)
-    # reset() before start plus a second reset after the final discarded warmup
-    # keeps prediction-only state out of the first live chunk.
-    assert policy.reset.call_count == 2
-
-
-def test_temporal_engine_predicts_each_control_observation_once_with_its_timestep(monkeypatch):
-    from lerobot.rollout.inference.temporal_ensemble import TemporalEnsembleInferenceEngine
-
-    policy = MagicMock()
-    policy.config.use_amp = False
-    engine = TemporalEnsembleInferenceEngine(
-        policy,
-        MagicMock(),
-        MagicMock(),
-        robot_type="so100_follower",
-        hw_features={},
-        dataset_features={"action": {"names": ["joint.pos"]}},
-        ordered_action_keys=["joint.pos"],
-        task="test",
-        fps=30.0,
-        device="cpu",
-        max_step=None,
-        warmup_predictions=0,
-    )
-    predicted_timesteps = []
-
-    def predict(_obs, *, timestep):
-        predicted_timesteps.append(timestep)
-        return torch.zeros(30, 1)
-
-    monkeypatch.setattr(engine, "_predict", predict)
-    engine.reset()
-    engine.notify_observation({"joint.pos": 0.0})
-    engine._producer_iteration(0)
-    _, sleep_s = engine._producer_iteration(0)
-    assert sleep_s is not None
-    assert predicted_timesteps == [0]
-
-    engine.notify_observation({"joint.pos": 1.0})
-    engine._producer_iteration(0)
-    assert predicted_timesteps == [0, 1]
-
-
-def test_temporal_engine_passes_control_timing_to_policy_hook():
-    from lerobot.rollout.inference.temporal_ensemble import TemporalEnsembleInferenceEngine
-
-    policy = MagicMock()
-    policy.config.use_amp = False
-    policy.predict_action_chunk.return_value = torch.zeros(1, 4, 2)
-    policy.adapt_async_observation.side_effect = lambda observation, **_: observation
-    preprocessor = MagicMock(side_effect=lambda value: value)
-    postprocessor = MagicMock(side_effect=lambda value: value)
-    engine = TemporalEnsembleInferenceEngine(
-        policy,
-        preprocessor,
-        postprocessor,
-        robot_type="so100_follower",
-        hw_features={
-            "observation.state": {
-                "dtype": "float32",
-                "shape": (1,),
-                "names": ["joint.pos"],
-            }
-        },
-        dataset_features={"action": {"names": ["joint.pos", "gripper.pos"]}},
-        ordered_action_keys=["joint.pos", "gripper.pos"],
-        task="test",
-        fps=30.0,
-        device="cpu",
-        max_step=None,
-        warmup_predictions=0,
-    )
-
-    engine._predict({"joint.pos": 1.0}, timestep=7)
-
-    policy.adapt_async_observation.assert_called_once()
-    assert policy.adapt_async_observation.call_args.kwargs == {"timestep": 7, "fps": 30.0}
-
-
-def _rollout_context_harness(monkeypatch, robot):
-    import lerobot.rollout.context as rollout_context
-    from lerobot.rollout import BaseStrategyConfig, SyncInferenceConfig
-    from tests.mocks.mock_robot import MockRobotConfig
-
-    policy = MagicMock()
-    policy.type = "mock"
-    policy.to.return_value = policy
-    policy_config = SimpleNamespace(
-        type="mock",
-        pretrained_path="/checkpoint",
-        pretrained_revision=None,
-        input_features={},
-        action_feature_names=None,
-    )
-    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: policy)
-    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
-    cfg = SimpleNamespace(
-        inference=SyncInferenceConfig(),
-        policy=policy_config,
-        use_torch_compile=False,
-        torch_compile_backend="inductor",
-        torch_compile_mode="default",
-        device="cpu",
-        robot=MockRobotConfig(n_motors=2),
-        teleop=None,
-        rename_map={},
-        dataset=None,
-        strategy=BaseStrategyConfig(),
-        resume=False,
-        task="test",
-        fps=30.0,
-        compile_warmup_inferences=0,
-    )
-    return rollout_context, cfg
-
-
-def test_build_rollout_context_validates_processors_before_connect(monkeypatch):
-    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
-
-    events = []
-    robot = MockRobot(MockRobotConfig(n_motors=2))
-    original_connect = robot.connect
-
-    def tracked_connect():
-        events.append("connect")
-        original_connect()
-
-    robot.connect = tracked_connect
-    rollout_context, cfg = _rollout_context_harness(monkeypatch, robot)
-    monkeypatch.setattr(
-        rollout_context,
-        "validate_visual_features_consistency",
-        lambda *_: events.append("visuals"),
-    )
-
-    def tracked_processors(**kwargs):
-        events.append("processors")
-        return preprocessor, postprocessor
-
-    def tracked_engine(*args, **kwargs):
-        events.append("engine")
-        return MagicMock()
-
-    preprocessor = MagicMock(steps=[])
-    postprocessor = MagicMock(steps=[])
-    monkeypatch.setattr(rollout_context, "make_pre_post_processors", tracked_processors)
-    monkeypatch.setattr(rollout_context, "create_inference_engine", tracked_engine)
-
-    ctx = rollout_context.build_rollout_context(cfg, MagicMock())
-
-    assert events == ["visuals", "processors", "engine", "connect"]
-    assert ctx.hardware.robot_wrapper.inner is robot
-    robot.disconnect()
-
-
-def test_build_rollout_context_disconnects_after_early_connect_failure(monkeypatch):
-    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
-
-    robot = MockRobot(MockRobotConfig(n_motors=2))
-    # Seed an unresolved camera resolution so build_rollout_context connects early; the
-    # cached_property is popped after connect, so the real (camera-less) features return.
-    robot.__dict__["observation_features"] = {**robot._motors_ft, "cam": (None, None, 3)}
-    rollout_context, cfg = _rollout_context_harness(monkeypatch, robot)
-    monkeypatch.setattr(
-        rollout_context,
-        "make_pre_post_processors",
-        lambda **kwargs: (MagicMock(steps=[]), MagicMock(steps=[])),
-    )
-
-    def failing_engine(*args, **kwargs):
-        raise RuntimeError("engine construction failed")
-
-    monkeypatch.setattr(rollout_context, "create_inference_engine", failing_engine)
-
-    with pytest.raises(RuntimeError, match="engine construction failed"):
-        rollout_context.build_rollout_context(cfg, MagicMock())
-
-    assert robot.is_connected is False
-
-
-def test_strict_action_contract_fails_instead_of_falling_back():
-    from lerobot.rollout.context import _resolve_action_key_order
-
-    with pytest.raises(ValueError, match="Strict policy action names"):
-        _resolve_action_key_order(["left.pos", "right.pos"], ["a.pos", "b.pos"], strict=True)
-
-
-def test_strict_hardware_contract_validates_order_and_camera_geometry():
-    from lerobot.configs import FeatureType, PolicyFeature
-    from lerobot.rollout.context import _validate_strict_hardware_feature_contract
-
-    policy = SimpleNamespace(
-        strict_hardware_feature_contract=True,
-        state_feature_names=["left.pos", "right.pos"],
-        action_feature_names=["left.pos", "right.pos"],
-        input_features={
-            "observation.images.top": PolicyFeature(
-                type=FeatureType.VISUAL,
-                shape=(3, 256, 256),
-            )
-        },
-    )
-    observations = {"left.pos": float, "right.pos": float, "cam0": (256, 256, 3)}
-    actions = {"left.pos": float, "right.pos": float}
-
-    _validate_strict_hardware_feature_contract(
-        policy,
-        observations,
-        actions,
-        {"observation.images.cam0": "observation.images.top"},
-    )
-
-    with pytest.raises(ValueError, match="expects CHW"):
-        _validate_strict_hardware_feature_contract(
-            policy,
-            {**observations, "cam0": (480, 640, 3)},
-            actions,
-            {"observation.images.cam0": "observation.images.top"},
-        )
-
-
-def test_prediction_only_dispatch_runs_postprocessor_without_sending(monkeypatch):
-    from lerobot.rollout.strategies.core import send_next_action
-    from lerobot.utils.action_interpolator import ActionInterpolator
-
-    engine = MagicMock()
-    engine.get_action.return_value = torch.tensor([1.0, 2.0])
-    robot = MagicMock()
-    action_processor = MagicMock(side_effect=lambda value: value[0])
-    ctx = SimpleNamespace(
-        runtime=SimpleNamespace(cfg=SimpleNamespace(execute_actions=False)),
-        policy=SimpleNamespace(inference=engine),
-        data=SimpleNamespace(dataset_features={}, ordered_action_keys=["a.pos", "b.pos"]),
-        processors=SimpleNamespace(robot_action_processor=action_processor),
-        hardware=SimpleNamespace(robot_wrapper=robot),
-    )
-    monkeypatch.setattr(
-        "lerobot.rollout.strategies.core.build_dataset_frame",
-        lambda *args, **kwargs: {"observation.state": torch.zeros(1)},
-    )
-
-    action = send_next_action({}, {}, ctx, ActionInterpolator(multiplier=1))
-
-    assert action == {"a.pos": 1.0, "b.pos": 2.0}
-    action_processor.assert_called_once()
-    robot.send_action.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("return_to_initial_position", "execute_actions", "expected"),
-    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
-)
-def test_rollout_teardown_context_requires_return_and_execution(
-    return_to_initial_position, execute_actions, expected
-):
-    from lerobot.rollout import BaseStrategy, BaseStrategyConfig
-
-    strategy = BaseStrategy(BaseStrategyConfig())
-    strategy._teardown_hardware = MagicMock()
-    hardware = MagicMock()
-    ctx = SimpleNamespace(
-        hardware=hardware,
-        runtime=SimpleNamespace(
-            cfg=SimpleNamespace(
-                return_to_initial_position=return_to_initial_position,
-                execute_actions=execute_actions,
-            )
-        ),
-    )
-
-    strategy._teardown_context(ctx)
-
-    strategy._teardown_hardware.assert_called_once_with(
-        hardware,
-        return_to_initial_position=expected,
-    )
-
-
-def test_sync_prediction_preflight_never_sends_and_resets(monkeypatch):
-    from lerobot.rollout import BaseStrategy, BaseStrategyConfig, SyncInferenceConfig
-
-    engine = MagicMock()
-    engine.preflight.return_value = torch.tensor([[0.25], [0.5]])
-    robot = MagicMock()
-    robot.get_observation.return_value = {"joint.pos": 0.0}
-    ctx = SimpleNamespace(
-        runtime=SimpleNamespace(
-            cfg=SimpleNamespace(
-                interpolation_multiplier=1,
-                preflight_inferences=2,
-                inference=SyncInferenceConfig(),
-            )
-        ),
-        policy=SimpleNamespace(inference=engine),
-        hardware=SimpleNamespace(robot_wrapper=robot),
-        processors=SimpleNamespace(robot_observation_processor=lambda obs: obs),
-        data=SimpleNamespace(dataset_features={}, ordered_action_keys=["joint.pos"]),
-    )
-    monkeypatch.setattr(
-        "lerobot.rollout.strategies.core.build_dataset_frame",
-        lambda *args, **kwargs: {"observation.state": torch.zeros(1)},
-    )
-
-    BaseStrategy(BaseStrategyConfig()).setup(ctx)
-
-    assert engine.preflight.call_count == 2
-    assert engine.reset.call_count == 2
-    robot.send_action.assert_not_called()
-
-
-def test_cuda_device_process_lock_rejects_competing_owner(tmp_path):
-    from lerobot.utils.device_process_lock import _physical_device_key, exclusive_torch_device_lock
-
-    with exclusive_torch_device_lock("cuda:3", lock_dir=tmp_path) as path:
-        assert path == tmp_path / f"lerobot-cuda-v2-{_physical_device_key(3)}.lock"
-        with (
-            pytest.raises(RuntimeError, match="already owned"),
-            exclusive_torch_device_lock("cuda:3", lock_dir=tmp_path),
-        ):
-            pass
-
-    with exclusive_torch_device_lock("cuda:3", lock_dir=tmp_path):
-        pass
-
-
-def test_cuda_device_lock_key_is_stable_across_visible_devices_spellings(monkeypatch):
-    from lerobot.utils import device_process_lock
-
-    gpu_uuid = "12345678-1234-1234-1234-123456789abc"
-    monkeypatch.setattr(
-        device_process_lock.torch.cuda,
-        "get_device_properties",
-        lambda index: SimpleNamespace(uuid=gpu_uuid),
-    )
-    keys = set()
-    for spelling in (None, "1", f"GPU-{gpu_uuid}"):
-        if spelling is None:
-            monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-        else:
-            monkeypatch.setenv("CUDA_VISIBLE_DEVICES", spelling)
-        keys.add(device_process_lock._physical_device_key(0))
-    assert keys == {f"GPU-{gpu_uuid}"}
-
-
-def test_cuda_device_lock_file_is_world_writable_despite_umask(tmp_path):
-    import os
-
-    from lerobot.utils.device_process_lock import exclusive_torch_device_lock
-
-    prior_umask = os.umask(0o077)
-    try:
-        with exclusive_torch_device_lock("cuda:3", lock_dir=tmp_path) as path:
-            assert (path.stat().st_mode & 0o777) == 0o666
-    finally:
-        os.umask(prior_umask)
-
-
-def test_cuda_device_lock_ignores_unopenable_legacy_lock_file(tmp_path):
-    from lerobot.utils.device_process_lock import exclusive_torch_device_lock
-
-    legacy = tmp_path / "lerobot-cuda-3.lock"
-    legacy.touch(mode=0o000)
-    with exclusive_torch_device_lock("cuda:3", lock_dir=tmp_path) as path:
-        assert path is not None
-        assert path != legacy
 
 
 # ---------------------------------------------------------------------------
 # Pure functions
 # ---------------------------------------------------------------------------
+
+
+def test_align_to_checkpoint_order_reorders_motors_and_preserves_cameras(caplog):
+    from lerobot.rollout.context import _align_to_checkpoint_order
+    from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
+
+    features = {
+        "wrist_camera": (480, 640, 3),
+        "joint_b.pos": float,
+        "joint_a.pos": float,
+    }
+
+    aligned = _align_to_checkpoint_order(features, ["joint_a.pos", "joint_b.pos"], what="state")
+
+    assert list(aligned) == ["joint_a.pos", "joint_b.pos", "wrist_camera"]
+    assert aligned["wrist_camera"] == (480, 640, 3)
+    assert "reordering state" in caplog.text
+
+    dataset_features = hw_to_dataset_features(aligned, "observation")
+    frame = build_dataset_frame(
+        dataset_features,
+        {"joint_a.pos": 1.0, "joint_b.pos": 2.0, "wrist_camera": object()},
+        "observation",
+    )
+    assert frame["observation.state"].tolist() == [1.0, 2.0]
+
+
+def test_align_to_checkpoint_order_aligns_the_action_side_by_the_same_rule(caplog):
+    """One primitive serves both sides; the action dict simply has no camera entries."""
+    from lerobot.rollout.context import _align_to_checkpoint_order
+
+    features = {"joint_b.pos": float, "joint_a.pos": float}
+
+    aligned = _align_to_checkpoint_order(features, ["joint_a.pos", "joint_b.pos"], what="action")
+
+    assert list(aligned) == ["joint_a.pos", "joint_b.pos"]
+    assert "reordering action" in caplog.text
+
+
+@pytest.mark.parametrize("what", ["state", "action"])
+@pytest.mark.parametrize(
+    "policy_action_names",
+    [
+        None,
+        ["joint_b.pos", "joint_a.pos"],  # already in this order
+        ["joint_a.pos"],  # subset
+        ["joint_a.pos", "gripper.pos"],  # different set
+    ],
+)
+def test_align_to_checkpoint_order_is_noop_without_an_exact_name_match(policy_action_names, what):
+    """A set mismatch means the two describe different things: keep the robot's own order."""
+    from lerobot.rollout.context import _align_to_checkpoint_order
+
+    features = {
+        "joint_b.pos": float,
+        "joint_a.pos": float,
+        "wrist_camera": (480, 640, 3),
+    }
+
+    aligned = _align_to_checkpoint_order(features, policy_action_names, what=what)
+
+    assert aligned is features
+    assert list(aligned) == ["joint_b.pos", "joint_a.pos", "wrist_camera"]
+
+
+def test_assert_state_matches_action_order_rejects_a_permutation():
+    """A permuted state layout must fail at context-build time."""
+    from lerobot.rollout.context import _assert_state_matches_action_order
+
+    dataset_features = {
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": ["b.pos", "a.pos"]},
+    }
+
+    with pytest.raises(ValueError, match="is a permutation of the action dispatch order"):
+        _assert_state_matches_action_order(dataset_features, ["a.pos", "b.pos"])
+
+
+@pytest.mark.parametrize(
+    ("state_names", "ordered_action_keys"),
+    [
+        (["a.pos", "b.pos"], ["a.pos", "b.pos"]),  # aligned
+        (["a.pos", "b.pos", "x.vel"], ["a.pos", "b.pos"]),  # extra state channel
+        (["a.pos"], ["a.pos", "base.vel"]),  # policy commands a base the state omits
+    ],
+)
+def test_assert_state_matches_action_order_allows_non_permutations(state_names, ordered_action_keys):
+    """Differing *sets* are legitimate: extra state channels, an uncommanded base."""
+    from lerobot.rollout.context import _assert_state_matches_action_order
+
+    dataset_features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (len(state_names),),
+            "names": state_names,
+        },
+    }
+
+    _assert_state_matches_action_order(dataset_features, ordered_action_keys)
+
+
+def test_assert_state_matches_action_order_tolerates_missing_state():
+    """A vision-only policy has no state to check."""
+    from lerobot.rollout.context import _assert_state_matches_action_order
+
+    _assert_state_matches_action_order({}, ["a.pos"])
+    _assert_state_matches_action_order({"observation.state": {"names": ["a.pos"]}}, [])
 
 
 def test_estimate_max_episode_seconds_no_video():
@@ -1042,73 +874,645 @@ def test_rollout_context_fields():
     assert field_names == {"runtime", "hardware", "policy", "processors", "data"}
 
 
-def test_temporal_ensemble_underflow_falls_back_to_freshest_chunk():
-    """exp(-m*age) underflows float32 to exactly 0 for m*age > ~104; the ensemble must
-    fall back to the freshest live chunk instead of dividing by zero into NaN."""
-    from lerobot.rollout.inference.temporal_ensemble import (
-        TimestampedActionChunk,
-        temporal_ensemble_action,
+# ---------------------------------------------------------------------------
+# Cadence pacing through the strategies
+#
+# The timer's own contract lives in tests/utils/test_cycle_timer.py; these check
+# how the strategies drive it.  `clock` comes from tests/fixtures/cadence.py.
+# ---------------------------------------------------------------------------
+
+_TIMER_LOGGER = "lerobot.utils.cycle_timer"
+
+
+def _timer_warnings(caplog):
+    return [r for r in caplog.records if r.levelno >= logging.WARNING and r.name == _TIMER_LOGGER]
+
+
+def _info_messages(caplog):
+    """INFO messages from the timer only (i.e. the cadence reports)."""
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and r.name == _TIMER_LOGGER]
+
+
+def test_handle_warmup_paces_then_flushes_and_exempts_the_reprimed_group(caplog, clock):
+    from lerobot.rollout import BaseStrategyConfig
+    from lerobot.rollout.strategies import BaseStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    # Warm-up ticks are paced through the timer, and the flush resets the
+    # interpolator — which then re-primes over two consecutive inference ticks,
+    # exactly like loop start-up.  The group spanning them legitimately exceeds
+    # budget, so `timer.restart()` must re-arm the start-up exemption; without it
+    # every torch.compile run would warn once right after warm-up.
+    fps, multiplier = 20.0, 2  # 25 ms slots, 50 ms cycle budget
+    engine = MagicMock(ready=False, failed=False)
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = engine
+    strategy._interpolator = ActionInterpolator(multiplier=multiplier)
+    timer = CycleTimer(fps, multiplier)
+
+    with caplog.at_level(logging.WARNING, logger=_TIMER_LOGGER):
+        # Two slow warm-up ticks close one over-budget group (80 ms > 50 ms).
+        for _ in range(2):
+            timer.tick(new_cycle=True)
+            clock.advance(0.04)
+            assert strategy._handle_warmup(True, timer) is True
+
+        engine.ready = True
+        timer.tick(new_cycle=True)
+        assert strategy._handle_warmup(True, timer) is False
+
+        # Stale warm-up state is discarded and the engine is put back to work.
+        engine.reset.assert_called_once()
+        engine.resume.assert_called_once()
+        assert strategy._warmup_flushed
+        assert strategy._interpolator.needs_new_action()
+
+        # The two re-priming inference ticks that follow are also over budget.
+        clock.advance(0.04)
+        timer.wait()
+        timer.tick(new_cycle=True)
+        clock.advance(0.04)
+        timer.wait()
+
+    assert not _timer_warnings(caplog), [r.getMessage() for r in _timer_warnings(caplog)]
+
+    # A subsequent over-budget group is still reported — the exemption is armed
+    # once per restart, not switched off.
+    with caplog.at_level(logging.WARNING, logger=_TIMER_LOGGER):
+        for _ in range(2):
+            timer.tick(new_cycle=True)
+            clock.advance(0.04)
+            timer.wait()
+    assert len(_timer_warnings(caplog)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Recording cadence with interpolation
+# ---------------------------------------------------------------------------
+
+
+_LOOP_FEATURES = {
+    "observation.state": {"dtype": "float32", "shape": (1,), "names": ["m.pos"]},
+    "action": {"dtype": "float32", "shape": (1,), "names": ["m.pos"]},
+}
+
+
+def _make_loop_ctx(fps: float, multiplier: int, num_ticks: int, on_tick=None):
+    """Build a mocked RolloutContext-alike for driving a strategy loop.
+
+    The robot's ``get_observation`` sets the shutdown event on the
+    *num_ticks*-th call, so the loop runs exactly *num_ticks* full ticks, and
+    invokes *on_tick* with the 1-based tick index so tests can inject events
+    (keypresses, phase changes) at a chosen tick.
+
+    The engine yields a strictly increasing action per policy call, so an
+    interpolated command (a midpoint, ``x.5``) is distinguishable from the
+    policy's own end-point action (a whole number) in the recorded frames.
+    """
+    shutdown_event = threading.Event()
+    cfg = SimpleNamespace(
+        fps=fps,
+        interpolation_multiplier=multiplier,
+        duration=0.0,
+        dataset=SimpleNamespace(single_task="task"),
+        task="task",
+        play_sounds=False,
+        display_data=False,
+        display_mode="rerun",
+        display_compressed_images=False,
+        display_ip=None,
+        display_port=None,
+        use_torch_compile=False,
+    )
+    robot = MagicMock()
+    calls = {"n": 0}
+
+    def _get_observation():
+        calls["n"] += 1
+        if on_tick is not None:
+            on_tick(calls["n"])
+        if calls["n"] >= num_ticks:
+            shutdown_event.set()
+        return {"m.pos": float(calls["n"])}
+
+    robot.get_observation.side_effect = _get_observation
+    engine = MagicMock()
+    engine.dispatched_task = "task"
+    actions = {"n": 0}
+
+    def _get_action(_obs_frame):
+        actions["n"] += 1
+        return torch.tensor([float(actions["n"])])
+
+    engine.get_action.side_effect = _get_action
+    dataset = MagicMock()
+    dataset.num_episodes = 0
+    # A real (non-existent) path so VideoEncodingManager's image-dir cleanup no-ops.
+    dataset.root = Path("/nonexistent-lerobot-rollout-test")
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(cfg=cfg, shutdown_event=shutdown_event, cadence_report=None),
+        hardware=SimpleNamespace(robot_wrapper=robot, teleop=MagicMock(), initial_position=None),
+        processors=SimpleNamespace(
+            robot_observation_processor=MagicMock(side_effect=lambda obs: obs),
+            robot_action_processor=lambda pair: pair[0],
+            teleop_action_processor=lambda pair: pair[0],
+        ),
+        policy=SimpleNamespace(inference=engine),
+        data=SimpleNamespace(dataset=dataset, dataset_features=_LOOP_FEATURES, ordered_action_keys=["m.pos"]),
+    )
+    return ctx, dataset
+
+
+def _recorded_actions(dataset) -> list[float]:
+    """Action values of the frames handed to ``dataset.add_frame``."""
+    return [call.args[0]["action"][0] for call in dataset.add_frame.call_args_list]
+
+
+def _make_sentry(ctx, multiplier: int):
+    from lerobot.rollout import SentryStrategyConfig
+    from lerobot.rollout.strategies import SentryStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    strategy = SentryStrategy(SentryStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=multiplier)
+    strategy._episode_duration_s = 1e9
+    return strategy
+
+
+def test_sentry_records_once_per_interpolation_cycle():
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8)
+
+    _make_sentry(ctx, 2).run(ctx)
+
+    # 8 ticks at fps × 2 → 4 recorded frames at the base fps cadence, each
+    # carrying the policy's own action rather than an interpolated midpoint.
+    assert dataset.add_frame.call_count == 4
+    assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_sentry_runs_inference_once_per_cycle_and_reuses_processed_observation():
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8)
+
+    _make_sentry(ctx, 2).run(ctx)
+
+    # The interpolator's startup buffer holds one action, so a fresh action is
+    # pulled on ticks 1, 2, 4, 6 and 8 — five policy ticks across eight ticks,
+    # never once per tick.
+    engine = ctx.policy.inference
+    assert engine.get_action.call_count == 5
+    assert engine.notify_observation.call_count == 5
+    # The observation processor is the expensive step gated to policy ticks;
+    # interpolated ticks reuse the cached result.
+    assert ctx.processors.robot_observation_processor.call_count == 5
+    # ...while the raw observation is still refreshed every tick for the
+    # action processors.
+    assert ctx.hardware.robot_wrapper.get_observation.call_count == 8
+
+
+def test_sentry_records_every_tick_at_default_multiplier():
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=1, num_ticks=4)
+
+    _make_sentry(ctx, 1).run(ctx)
+
+    # multiplier=1 (the default): every tick is a full cycle and records.
+    assert dataset.add_frame.call_count == 4
+    assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_highlight_buffers_once_per_interpolation_cycle():
+    from lerobot.rollout import HighlightStrategyConfig
+    from lerobot.rollout.ring_buffer import RolloutRingBuffer
+    from lerobot.rollout.strategies import HighlightStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8)
+    strategy = HighlightStrategy(HighlightStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+    strategy._ring = RolloutRingBuffer(max_seconds=10.0, max_memory_mb=64, fps=200.0)
+
+    strategy.run(ctx)
+
+    # Without a save request every recorded frame lands in the ring buffer,
+    # once per interpolation cycle.
+    assert len(strategy._ring) == 4
+    assert dataset.add_frame.call_count == 0
+
+
+def test_highlight_save_toggle_starts_and_ends_live_recording(caplog):
+    from lerobot.rollout import HighlightStrategyConfig
+    from lerobot.rollout.ring_buffer import RolloutRingBuffer
+    from lerobot.rollout.strategies import HighlightStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    strategy = HighlightStrategy(HighlightStrategyConfig())
+
+    # First keypress lands on tick 2, so the record tick that follows it
+    # (tick 3) flushes the ring and starts live recording; the second lands on
+    # tick 6, so tick 7 closes the episode.
+    def on_tick(n):
+        if n in (2, 6):
+            strategy._save_requested.set()
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8, on_tick=on_tick)
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+    strategy._ring = RolloutRingBuffer(max_seconds=10.0, max_memory_mb=64, fps=200.0)
+
+    with caplog.at_level(logging.INFO, logger=_TIMER_LOGGER):
+        strategy.run(ctx)
+
+    # Record ticks are 1, 3, 5, 7.  Tick 1 buffers into the ring; tick 3 drains
+    # that buffered frame into the dataset — the whole point of the strategy —
+    # and starts live recording, so its own frame follows; tick 5 records live;
+    # tick 7 closes the episode with its frame added exactly once.
+    assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
+    assert dataset.save_episode.call_count == 1
+    assert not strategy._recording_live.is_set()
+    assert len(strategy._ring) == 0
+    # Closing the episode also reports its cadence, and the run block follows.
+    messages = _info_messages(caplog)
+    assert len(messages) == 3
+    assert messages[0].startswith("Cadence (episode 0):")
+    assert messages[1].startswith("Cadence (final episode):")
+    assert messages[2].startswith("Cadence summary — whole run, 2 episodes")
+
+
+def test_episodic_records_once_per_interpolation_cycle():
+    from lerobot.rollout import EpisodicStrategyConfig
+    from lerobot.rollout.strategies import EpisodicStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8)
+    strategy = EpisodicStrategy(EpisodicStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+
+    strategy._policy_loop(
+        ctx=ctx,
+        robot=ctx.hardware.robot_wrapper,
+        events={"exit_early": False},
+        features=_LOOP_FEATURES,
+        timer=CycleTimer(200.0, 2),
+        control_time_s=10.0,
+        dataset=dataset,
     )
 
-    older = torch.full((60, 2), 1.0)
-    newer = torch.full((60, 2), 2.0)
-    # ages 1.60 s and 1.55 s: with ensemble_m=70, m*age is 112 and 108.5 -- both past
-    # the ~103.9 float32 underflow point, so every live weight is exactly zero.
-    action, diagnostics = temporal_ensemble_action(
-        [
-            TimestampedActionChunk(older, observation_time=8.40, chunk_id=1),
-            TimestampedActionChunk(newer, observation_time=8.45, chunk_id=2),
-        ],
-        now=10.0,
-        action_fps=30.0,
-        ensemble_m=70.0,
+    assert dataset.add_frame.call_count == 4
+    assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
+
+
+def test_dagger_continuous_records_once_per_interpolation_cycle():
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8)
+    strategy = DAggerStrategy(DAggerStrategyConfig(record_autonomous=True, num_episodes=1))
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+    strategy._episode_duration_s = 1e9
+
+    strategy._run_continuous(ctx)
+
+    assert dataset.add_frame.call_count == 4
+    assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
+    for call in dataset.add_frame.call_args_list:
+        assert call.args[0]["intervention"].item() is False
+
+
+@pytest.mark.parametrize("correction_ticks", [1, 2, 3])
+def test_dagger_records_policy_actions_after_a_correction_of_any_length(correction_ticks):
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    # Returning to AUTONOMOUS resets the interpolator, restarting its cycle.
+    # The record phase has to restart with it: an odd-length correction
+    # otherwise flips the parity, and every later autonomous frame stores the
+    # interpolated midpoint (x.5) instead of the policy's own action.
+    strategy = DAggerStrategy(
+        DAggerStrategyConfig(record_autonomous=True, num_episodes=1, smooth_handover=False)
+    )
+    first_correcting = 8
+    last_correcting = first_correcting + correction_ticks - 1
+    schedule = {
+        6: "pause_resume",  # -> PAUSED
+        7: "correction",  # -> CORRECTING
+        last_correcting: "correction",  # -> PAUSED
+        last_correcting + 1: "pause_resume",  # -> AUTONOMOUS (interpolator reset)
+    }
+
+    def on_tick(n):
+        if (event := schedule.get(n)) is not None:
+            strategy._events.request_transition(event)
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=last_correcting + 10, on_tick=on_tick)
+    ctx.hardware.teleop.get_action.return_value = {"m.pos": 0.0}
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+    strategy._episode_duration_s = 1e9
+
+    strategy._run_continuous(ctx)
+
+    autonomous = [
+        call.args[0]["action"][0]
+        for call in dataset.add_frame.call_args_list
+        if not call.args[0]["intervention"].item()
+    ]
+    assert autonomous, "expected autonomous frames before and after the correction"
+    assert all(float(a).is_integer() for a in autonomous), autonomous
+
+
+def test_dagger_correction_frames_keep_the_cycle_cadence_and_are_tagged():
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    strategy = DAggerStrategy(
+        DAggerStrategyConfig(record_autonomous=True, num_episodes=1, smooth_handover=False)
     )
 
-    assert torch.isfinite(action).all()
-    assert torch.allclose(action, torch.full((2,), 2.0))  # freshest chunk wins
-    assert [d[0] for d in diagnostics] == [2]
+    # Transitions are consumed at the top of the tick after they are requested,
+    # so the loop is AUTONOMOUS for ticks 1-2, PAUSED on tick 3, then CORRECTING.
+    def on_tick(n):
+        if n == 2:
+            strategy._events.request_transition("pause_resume")
+        elif n == 3:
+            strategy._events.request_transition("correction")
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8, on_tick=on_tick)
+    ctx.hardware.teleop.get_action.return_value = {"m.pos": 42.0}
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+    strategy._episode_duration_s = 1e9
+
+    strategy._run_continuous(ctx)
+
+    # Human-driven frames are recorded on the same one-per-cycle cadence as
+    # autonomous ones, carry the teleop action, and are tagged as interventions.
+    tags = [call.args[0]["intervention"].item() for call in dataset.add_frame.call_args_list]
+    assert tags == [False, True, True, True]
+    assert _recorded_actions(dataset) == [1.0, 42.0, 42.0, 42.0]
 
 
-def test_temporal_ensemble_normal_weights_stay_finite():
-    from lerobot.rollout.inference.temporal_ensemble import (
-        TimestampedActionChunk,
-        temporal_ensemble_action,
+# ---------------------------------------------------------------------------
+# Cadence summaries through the real strategy loops
+# ---------------------------------------------------------------------------
+
+
+def test_base_strategy_reports_the_run_summary_when_the_loop_ends(caplog):
+    from lerobot.rollout import BaseStrategyConfig
+    from lerobot.rollout.strategies import BaseStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    ctx, _ = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8)
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+
+    with caplog.at_level(logging.INFO, logger=_TIMER_LOGGER):
+        strategy.run(ctx)
+
+    (summary,) = _info_messages(caplog)
+    # Base records nothing, so there are no episode boundaries: one block covering
+    # the whole run, and it names the loop-body steps the strategy wrapped.
+    assert summary.startswith("Cadence summary — whole run ·")
+    for step in ("observe", "process_obs", "infer", "send", "telemetry"):
+        assert step in summary, step
+    assert "record" not in summary
+
+
+def test_base_strategy_reports_the_run_summary_even_when_the_loop_raises(caplog):
+    from lerobot.rollout import BaseStrategyConfig
+    from lerobot.rollout.strategies import BaseStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    # The summary lives in a `finally` precisely so a dying camera, a duration
+    # limit and a KeyboardInterrupt all still report what the loop achieved.
+    ctx, _ = _make_loop_ctx(fps=200.0, multiplier=1, num_ticks=8)
+    ctx.hardware.robot_wrapper.get_observation.side_effect = [
+        {"m.pos": 1.0},
+        RuntimeError("camera died"),
+    ]
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=1)
+
+    with caplog.at_level(logging.INFO, logger=_TIMER_LOGGER), pytest.raises(RuntimeError, match="camera"):
+        strategy.run(ctx)
+
+    (summary,) = _info_messages(caplog)
+    assert summary.startswith("Cadence summary —")
+
+
+def test_starved_engine_is_counted_through_the_real_dispatch_path(caplog):
+    from lerobot.rollout import BaseStrategyConfig
+    from lerobot.rollout.strategies import BaseStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    # An async backend with an empty queue yields no action, so the tick commands
+    # nothing and records nothing.  The dataset cannot show that gap — frame
+    # timestamps are synthesised from the frame index — so the count in the
+    # summary is the only signal a user gets.
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=1, num_ticks=4)
+    ctx.policy.inference.get_action.side_effect = lambda _obs_frame: None
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=1)
+
+    with caplog.at_level(logging.INFO, logger=_TIMER_LOGGER):
+        strategy.run(ctx)
+
+    (summary,) = _info_messages(caplog)
+    assert "ticks with no action to send (inference engine starved): 4" in summary
+    assert ctx.hardware.robot_wrapper.send_action.call_count == 0
+    assert dataset.add_frame.call_count == 0
+
+
+def test_episodic_run_reports_a_summary_per_episode_and_for_the_run(caplog, clock):
+    from lerobot.rollout import EpisodicStrategyConfig
+    from lerobot.rollout.strategies import EpisodicStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    # Episodic owns one timer across the whole session (episodes used to get a
+    # fresh one each), so this also covers the `restart()` that keeps a
+    # re-primed interpolator from being reported as a slow episode.
+    # Use the virtual clock so the no-warning assertion below is independent of
+    # scheduler delays on a loaded CI runner.
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8)
+    ctx.runtime.cfg.dataset = SimpleNamespace(
+        single_task="task",
+        episode_time_s=10.0,
+        reset_time_s=0.0,
+        num_episodes=1,
+        push_to_hub=False,
+        tags=None,
+        private=False,
+    )
+    strategy = EpisodicStrategy(EpisodicStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+    strategy._events = {"stop_recording": False, "exit_early": False, "rerecord_episode": False}
+
+    with caplog.at_level(logging.INFO, logger=_TIMER_LOGGER):
+        strategy.run(ctx)
+
+    messages = _info_messages(caplog)
+    assert len(messages) == 2
+    assert messages[0].startswith("Cadence (episode 0):")
+    assert messages[1].startswith("Cadence summary — whole run, 1 episode ·")
+    # Recording still lands once per interpolation cycle over the 8 ticks.
+    assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
+    assert not _timer_warnings(caplog)
+
+
+# ---------------------------------------------------------------------------
+# Sync engine: relative-action anchoring (drift-free chunk execution)
+# ---------------------------------------------------------------------------
+
+_REL_ACTION_NAMES = ["j0.pos", "j1.pos", "j2.pos", "gripper.pos"]
+_REL_ACTION_DIM = len(_REL_ACTION_NAMES)
+
+
+def _relative_pre_post():
+    """Pre/post processors wrapping the real relative (caches anchor) and absolute
+    (relative + cached state) steps, mirroring what the sync engine feeds them."""
+    from lerobot.processor import (
+        AbsoluteActionsProcessorStep,
+        RelativeActionsProcessorStep,
+        TransitionKey,
+        create_transition,
+    )
+    from lerobot.utils.constants import OBS_STATE
+
+    relative_step = RelativeActionsProcessorStep(enabled=True, action_names=list(_REL_ACTION_NAMES))
+    absolute_step = AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)
+
+    class _Pre:
+        steps = [relative_step]
+
+        def __call__(self, observation):
+            # Run the relative step so it caches the anchor, then pass the batch through.
+            transition = create_transition(observation={OBS_STATE: observation[OBS_STATE]})
+            relative_step(transition)
+            return observation
+
+        def reset(self):
+            pass
+
+    class _Post:
+        def __call__(self, action):
+            transition = create_transition(action=action)
+            return absolute_step(transition)[TransitionKey.ACTION]
+
+        def reset(self):
+            pass
+
+    return _Pre(), _Post(), relative_step
+
+
+def _fake_relative_policy(chunk_rel, n_action_steps):
+    """Fake chunking relative-action policy for the sync engine (pi0/fastwam/lingbot/act shape).
+
+    Buffers a chunk and serves it one action per tick, computing a fresh chunk only on refill.
+    ``count_queued_actions()`` mirrors the real ``PreTrainedPolicy`` contract: it reads the same
+    queue ``select_action`` drains, so the bound step sees an accurate depth *before* this
+    tick's call runs.
+    """
+    from collections import deque
+
+    policy = MagicMock()
+    policy.config.use_amp = False
+    policy.config.action_feature_names = list(_REL_ACTION_NAMES)
+    state = {"predict_calls": 0}
+    queue = deque(maxlen=n_action_steps)
+
+    def predict_action_chunk(_batch=None, **_kwargs):
+        state["predict_calls"] += 1
+        return chunk_rel.unsqueeze(0)  # [B=1, n, dim]
+
+    def select_action(_observation):
+        if len(queue) == 0:
+            actions = policy.predict_action_chunk(_observation)
+            queue.extend(actions.transpose(0, 1))  # [n, 1, dim]
+        return queue.popleft()
+
+    policy.predict_action_chunk.side_effect = predict_action_chunk
+    policy.select_action.side_effect = select_action
+    policy.reset.side_effect = queue.clear
+    policy.count_queued_actions.side_effect = lambda: len(queue)
+    policy._predict_state = state
+    return policy
+
+
+def _build_sync_engine(policy, pre, post):
+    """Build the engine the way ``build_rollout_context`` does.
+
+    The engine itself knows nothing about relative actions; the anchor hold lives in
+    ``RelativeActionsProcessorStep`` and is armed once, here, by ``bind_relative_anchor``.
+    """
+    from lerobot.inference import SyncInferenceEngine
+    from lerobot.processor import bind_relative_anchor
+
+    bind_relative_anchor(policy, pre)
+    return SyncInferenceEngine(
+        policy=policy,
+        preprocessor=pre,
+        postprocessor=post,
+        dataset_features={"action": {"names": list(_REL_ACTION_NAMES)}},
+        ordered_action_keys=list(_REL_ACTION_NAMES),
+        task="test",
+        device="cpu",
+        robot_type="mock",
     )
 
-    action, diagnostics = temporal_ensemble_action(
-        [
-            TimestampedActionChunk(torch.full((60, 2), 1.0), observation_time=9.5, chunk_id=1),
-            TimestampedActionChunk(torch.full((60, 2), 2.0), observation_time=9.8, chunk_id=2),
-        ],
-        now=10.0,
-        action_fps=30.0,
-        ensemble_m=0.5,
-    )
-    assert torch.isfinite(action).all()
-    assert len(diagnostics) == 2
+
+def _obs_frame(state_values):
+    import numpy as np
+
+    return {"observation.state": np.asarray(state_values, dtype=np.float32)}
 
 
-def test_build_rollout_context_disconnects_when_resolution_stays_unknown(monkeypatch):
-    """A camera that reports (None, None, 3) both before and after connect must not
-    leave the arm torqued: the still-unresolved raise happens after the early connect
-    but before the assembly cleanup handler."""
-    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+def test_sync_relative_holds_anchor_across_chunk():
+    """Every action popped within a chunk must anchor to the tick-0 state (no drift)."""
+    n = 4
+    # A distinct relative offset per chunk step so a wrong anchor would be visible.
+    chunk_rel = torch.stack([torch.full((_REL_ACTION_DIM,), 0.1 * (i + 1)) for i in range(n)])
+    pre, post, relative_step = _relative_pre_post()
+    policy = _fake_relative_policy(chunk_rel, n_action_steps=n)
+    engine = _build_sync_engine(policy, pre, post)
 
-    robot = MockRobot(MockRobotConfig(n_motors=2))
-    monkeypatch.setattr(
-        MockRobot,
-        "observation_features",
-        property(lambda self: {**self._motors_ft, "cam": (None, None, 3)}),
-    )
-    rollout_context, cfg = _rollout_context_harness(monkeypatch, robot)
-    monkeypatch.setattr(
-        rollout_context,
-        "make_pre_post_processors",
-        lambda **kwargs: (MagicMock(steps=[]), MagicMock(steps=[])),
-    )
-    monkeypatch.setattr(rollout_context, "create_inference_engine", lambda *a, **k: MagicMock())
+    assert relative_step._count_queued_actions == policy.count_queued_actions  # binding wired up
 
-    with pytest.raises(ValueError, match="still unknown after connect"):
-        rollout_context.build_rollout_context(cfg, MagicMock())
+    s0 = [1.0, 2.0, 3.0, 4.0]
+    outputs = []
+    for tick in range(n):
+        # Feed a *different* state each tick; a drifting anchor would use it.
+        state = [v + tick for v in s0]
+        outputs.append(engine.get_action(_obs_frame(state)))
 
-    assert robot.is_connected is False
+    # Exactly one chunk was predicted across the n ticks.
+    assert policy._predict_state["predict_calls"] == 1
+    for tick in range(n):
+        expected = torch.tensor(s0) + chunk_rel[tick]
+        torch.testing.assert_close(outputs[tick], expected)
+
+    # Next tick empties the queue -> fresh chunk -> anchor advances to the new state.
+    s_next = [10.0, 20.0, 30.0, 40.0]
+    out = engine.get_action(_obs_frame(s_next))
+    assert policy._predict_state["predict_calls"] == 2
+    torch.testing.assert_close(out, torch.tensor(s_next) + chunk_rel[0])
+    # The anchor now reflects the fresh-chunk state, not the held one.
+    torch.testing.assert_close(relative_step.get_cached_state(), torch.tensor([s_next]))
+
+
+def test_sync_engine_without_a_relative_step_binds_nothing():
+    """A pipeline with no enabled relative step has nothing to bind, and the engine still runs."""
+    from lerobot.processor import bind_relative_anchor
+
+    policy = MagicMock()
+    policy.config.use_amp = False
+    assert bind_relative_anchor(policy, MagicMock(steps=[])) is None
+    _build_sync_engine(policy, MagicMock(steps=[]), MagicMock())  # must not raise

@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import abc
 import importlib
-import logging
 from dataclasses import dataclass, field, fields
+from enum import Enum
 from typing import Any
 
 import draccus
@@ -127,39 +127,6 @@ class EnvConfig(draccus.ChoiceRegistry, abc.ABC):
     def get_env_processors(self):
         """Return (preprocessor, postprocessor) for this env. Default: identity."""
         return PolicyProcessorPipeline(steps=[]), PolicyProcessorPipeline(steps=[])
-
-    def reconcile_policy_contract(
-        self,
-        policy_cfg: Any,
-        *,
-        explicit_fields: set[str] | None = None,
-    ) -> None:
-        """Adopt generic checkpoint-owned timing before environments are created."""
-        explicit_fields = explicit_fields or set()
-        target_fps = getattr(policy_cfg, "target_fps", None)
-        if target_fps is None:
-            return
-        if "fps" in explicit_fields and float(self.fps) != float(target_fps):
-            raise ValueError(
-                f"Explicit env.fps={self.fps} conflicts with checkpoint target_fps={target_fps}."
-            )
-        previous_fps = self.fps
-        # Checkpoint-owned fps may be fractional; the field stays declared int for the CLI
-        # default while the adopt path deliberately widens it at runtime.
-        self.fps = int(target_fps) if float(target_fps).is_integer() else float(target_fps)  # type: ignore[assignment]
-        if float(previous_fps) != float(self.fps):
-            # For simulators the env fps drives the physics rate (LIBERO maps it straight to
-            # robosuite control_freq), so adopting a checkpoint's target_fps silently changes
-            # the dynamics the policy is scored under. Episodes still run and still produce a
-            # number -- just not one comparable to any reference eval at the default rate.
-            logging.warning(
-                "%s.fps changed %s -> %s to match checkpoint target_fps. For simulated "
-                "environments this changes the physics rate and makes results incomparable "
-                "to evals run at the environment default.",
-                type(self).__name__,
-                previous_fps,
-                self.fps,
-            )
 
 
 @dataclass
@@ -315,7 +282,7 @@ class GripperConfig:
 class ResetConfig:
     """Configuration for environment reset behavior."""
 
-    fixed_reset_joint_positions: Any | None = None
+    fixed_reset_joint_positions: list[float] | None = None
     reset_time_s: float = 5.0
     control_time_s: float = 20.0
     terminate_on_success: bool = True
@@ -358,15 +325,11 @@ class LiberoEnv(EnvConfig):
     task_ids: list[int] | None = None
     fps: int = 20  # Must match robosuite's default control_freq (20 Hz)
     episode_length: int | None = None
-    # No-op simulator steps applied inside reset() so objects settle from the init state.
-    # This wait is free: it steps the underlying env directly and is not charged against
-    # episode_length, unlike idle actions returned from a policy. Reference LIBERO evals use
-    # 50 here; the LeRobot default of 10 is kept so existing runs are unchanged.
-    num_steps_wait: int = 10
     obs_type: str = "pixels_agent_pos"
     render_mode: str = "rgb_array"
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
     init_states: bool = True
+    hard_reset: bool = True
     camera_name_mapping: dict[str, str] | None = None
     observation_height: int = 360
     observation_width: int = 360
@@ -395,6 +358,8 @@ class LiberoEnv(EnvConfig):
     def __post_init__(self):
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
+        if not self.hard_reset and not self.init_states:
+            raise ValueError("hard_reset=False requires init_states=True")
 
         if self.obs_type == "pixels":
             self.features[LIBERO_KEY_PIXELS_AGENTVIEW] = PolicyFeature(
@@ -455,7 +420,7 @@ class LiberoEnv(EnvConfig):
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
             "control_freq": self.fps,
-            "num_steps_wait": self.num_steps_wait,
+            "hard_reset": self.hard_reset,
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
@@ -485,74 +450,6 @@ class LiberoEnv(EnvConfig):
             PolicyProcessorPipeline(steps=[LiberoProcessorStep()]),
             PolicyProcessorPipeline(steps=[]),
         )
-
-    def reconcile_policy_contract(
-        self,
-        policy_cfg: Any,
-        *,
-        explicit_fields: set[str] | None = None,
-    ) -> None:
-        """Apply a strict, package-owned LIBERO geometry without policy branches."""
-        explicit_fields = explicit_fields or set()
-        super().reconcile_policy_contract(policy_cfg, explicit_fields=explicit_fields)
-        if not getattr(policy_cfg, "strict_environment_feature_contract", False):
-            return
-        if not float(self.fps).is_integer():
-            raise ValueError(f"Strict LIBERO checkpoint target_fps must be integral, got {self.fps}.")
-
-        action_dim = int(getattr(policy_cfg, "action_dim", 0))
-        proprio_dim = int(getattr(policy_cfg, "proprio_dim", 0))
-        if (action_dim, proprio_dim) != (7, 8):
-            raise ValueError(
-                "Strict LIBERO checkpoint contract requires action_dim=7 and proprio_dim=8, "
-                f"got action_dim={action_dim}, proprio_dim={proprio_dim}."
-            )
-        image_size = tuple(getattr(policy_cfg, "image_size", ()))
-        if len(image_size) != 2:
-            raise ValueError("Strict LIBERO checkpoint contract requires a two-dimensional image_size.")
-        height, width = (int(image_size[0]), int(image_size[1]))
-        for field_name, expected in (
-            ("observation_height", height),
-            ("observation_width", width),
-        ):
-            actual = int(getattr(self, field_name))
-            if field_name in explicit_fields and actual != expected:
-                raise ValueError(
-                    f"Explicit env.{field_name}={actual} conflicts with checkpoint value {expected}."
-                )
-            setattr(self, field_name, expected)
-
-        raw_cameras = [camera.strip() for camera in self.camera_name.split(",") if camera.strip()]
-        camera_order = list(getattr(policy_cfg, "camera_order", ()))
-        if len(raw_cameras) != len(camera_order):
-            raise ValueError(
-                "Strict LIBERO checkpoint camera count does not match the environment: "
-                f"checkpoint={camera_order}, env={raw_cameras}."
-            )
-        expected_mapping = dict(zip(raw_cameras, camera_order, strict=True))
-        if "camera_name_mapping" in explicit_fields and self.camera_name_mapping != expected_mapping:
-            raise ValueError(
-                "Explicit env.camera_name_mapping conflicts with checkpoint camera order: "
-                f"expected {expected_mapping}."
-            )
-        # camera_name is bound to camera_order positionally, so an explicitly reordered
-        # camera_name silently swaps which physical camera feeds each checkpoint slot. Only
-        # accept an explicit value that already matches the checkpoint's own default order.
-        if "camera_name" in explicit_fields:
-            camera_name_default = type(self).__dataclass_fields__["camera_name"].default
-            if not isinstance(camera_name_default, str):
-                raise TypeError("camera_name must declare a string default.")
-            default_cameras = [camera.strip() for camera in camera_name_default.split(",") if camera.strip()]
-            if raw_cameras != default_cameras:
-                raise ValueError(
-                    f"Explicit env.camera_name={self.camera_name!r} conflicts with the checkpoint "
-                    f"camera order {tuple(camera_order)}; it is bound positionally, so reordering "
-                    f"it would feed the wrong camera into each slot. Expected "
-                    f"{','.join(default_cameras)}."
-                )
-        self.camera_name_mapping = expected_mapping
-        # Refresh feature shapes and mapped names after adopting the package.
-        self.__post_init__()
 
 
 @EnvConfig.register_subclass("metaworld")
@@ -830,6 +727,53 @@ class IsaaclabArenaEnv(HubEnvConfig):
         )
 
 
+class G1EndEffector(str, Enum):
+    """What the G1's arms carry, by hardware name.
+
+    Shared with UnitreeG1Config, which owns the robot-level flag.
+    """
+
+    DUMMY = "dummy"  # bare wrists
+    DEX1 = "dex1"  # parallel grippers
+    DEX3 = "dex3"  # three-finger hands
+
+    @classmethod
+    def _missing_(cls, value: object) -> None:
+        raise ValueError(f"`end_effector` is expected to be in {list(cls)}, but {value} is provided.")
+
+
+@EnvConfig.register_subclass("unitree_g1_mujoco")
+@dataclass
+class UnitreeG1MujocoEnv(HubEnvConfig):
+    """Config for the MuJoCo simulation of the Unitree G1.
+
+    The end effector selects the MuJoCo model, and with it the finger actuators and the
+    wrist cameras that exist: "dummy" for bare wrists, "dex1" for the parallel grippers,
+    "dex3" for the three-finger hands.
+
+    The sim renders either its cameras or its window, never both: the offscreen contexts
+    are bound to the thread that creates them, which is not the one driving the viewer.
+    `onscreen` is therefore resolved from `publish_images` unless it is set explicitly.
+    """
+
+    hub_path: str = "lerobot/unitree-g1-mujoco"
+    end_effector: G1EndEffector = G1EndEffector.DEX1
+    publish_images: bool = True
+    camera_port: int = 5555
+    onscreen: bool | None = None
+
+    def __post_init__(self) -> None:
+        self.end_effector = G1EndEffector(self.end_effector)
+        if self.onscreen is None:
+            self.onscreen = not self.publish_images
+        elif self.onscreen and self.publish_images:
+            raise ValueError(
+                "The G1 sim cannot publish camera images and open its viewer in the same "
+                "process. Set publish_images=False to watch the window, or onscreen=False "
+                "to take the image stream."
+            )
+
+
 @EnvConfig.register_subclass("libero_plus")
 @dataclass
 class LiberoPlusEnv(LiberoEnv):
@@ -966,24 +910,31 @@ class RoboMMEEnv(EnvConfig):
     action_space: str = "joint_angle"  # or "ee_pose" (7-D)
     dataset_split: str = "test"  # "train" | "val" | "test"
     task_ids: list[int] | None = None
+    front_camera_name: str = "camera1"
+    wrist_camera_name: str = "camera2"
     features: dict[str, PolicyFeature] = field(default_factory=dict)
-    features_map: dict[str, str] = field(
-        default_factory=lambda: {
-            ACTION: ACTION,
-            "pixels/image": f"{OBS_IMAGES}.image",
-            "pixels/wrist_image": f"{OBS_IMAGES}.wrist_image",
-            "agent_pos": OBS_STATE,
-        }
-    )
+    features_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         action_dim = 8 if self.action_space == "joint_angle" else 7
+        if self.front_camera_name == self.wrist_camera_name:
+            raise ValueError("RoboMME front and wrist camera names must be distinct.")
+        front_camera_key = f"pixels/{self.front_camera_name}"
+        wrist_camera_key = f"pixels/{self.wrist_camera_name}"
         self.features = {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,)),
-            "pixels/image": PolicyFeature(type=FeatureType.VISUAL, shape=(256, 256, 3)),
-            "pixels/wrist_image": PolicyFeature(type=FeatureType.VISUAL, shape=(256, 256, 3)),
+            front_camera_key: PolicyFeature(type=FeatureType.VISUAL, shape=(256, 256, 3)),
+            wrist_camera_key: PolicyFeature(type=FeatureType.VISUAL, shape=(256, 256, 3)),
             "agent_pos": PolicyFeature(type=FeatureType.STATE, shape=(8,)),
         }
+        default_features_map = {
+            ACTION: ACTION,
+            front_camera_key: f"{OBS_IMAGES}.{self.front_camera_name}",
+            wrist_camera_key: f"{OBS_IMAGES}.{self.wrist_camera_name}",
+            "agent_pos": OBS_STATE,
+        }
+        # Preserve explicit mappings while filling in the RoboMME defaults.
+        self.features_map = {**default_features_map, **self.features_map}
 
     @property
     def gym_kwargs(self) -> dict:
@@ -1000,5 +951,7 @@ class RoboMMEEnv(EnvConfig):
             dataset=self.dataset_split,
             episode_length=self.episode_length,
             task_ids=self.task_ids,
+            front_camera_name=self.front_camera_name,
+            wrist_camera_name=self.wrist_camera_name,
             env_cls=env_cls,
         )

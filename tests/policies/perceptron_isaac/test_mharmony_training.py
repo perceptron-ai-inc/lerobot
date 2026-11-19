@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import sys
+from collections.abc import Iterator
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, TypedDict
 
 import numpy as np
 import pytest
@@ -31,7 +35,39 @@ from lerobot.policies.perceptron_isaac.mharmony_native import (
     build_isaac_mharmony_content_plan,
     build_isaac_training_proprio_contract,
 )
-from lerobot.policies.perceptron_isaac.tensor_stream import TextType, VectorType, VisionType
+from lerobot.policies.perceptron_isaac.tensor_stream import (
+    Event,
+    ModalityType,
+    Stream,
+    TensorStream,
+    TextType,
+    VectorType,
+    VisionType,
+    create_stream,
+    group_streams,
+)
+from lerobot.policies.perceptron_isaac.tensor_stream_utils import (
+    build_action_context_mask,
+    compute_mrope_pos_tensor,
+    compute_tensor_stream_metadata,
+    interleave_partial_mask,
+    set_data,
+)
+
+
+class _RenderInputs(TypedDict):
+    observation_window: list[dict[str, Any]]
+    prompt: str
+    max_num_patches: int
+    device: str
+    dtype: torch.dtype
+    anchor_timestamp_seconds: float
+
+
+class _ActionInputs(TypedDict):
+    action_chunk: np.ndarray
+    action_is_pad: list[bool]
+    fast_processor: Any
 
 
 def _stats():
@@ -85,7 +121,7 @@ def test_joint_plan_places_flow_marker_immediately_before_fast_span():
     assert fast["tags"]["objective_form"] == "FAST"
 
 
-def _footer_rewrite_for(terminal: bool | None) -> bool:
+def _footer_rewrite_for(terminal: bool | None, monkeypatch: pytest.MonkeyPatch) -> bool:
     """Capture the footer decision ``build_training`` hands to the renderer."""
     from lerobot.policies.perceptron_isaac.mharmony_native import IsaacNativeMharmonyRenderer
 
@@ -98,8 +134,8 @@ def _footer_rewrite_for(terminal: bool | None) -> bool:
         captured.update(kwargs)
         return SimpleNamespace(shape=(1, 8))
 
-    renderer._render_plan_to_tensor_stream = fake_render
-    kwargs = {} if terminal is None else {"terminal": terminal}
+    monkeypatch.setattr(renderer, "_render_plan_to_tensor_stream", fake_render)
+    kwargs: dict[str, Any] = {} if terminal is None else {"terminal": terminal}
     renderer.build_training(
         observation_window=[
             {"images": {"image": np.zeros((2, 2, 3), dtype=np.uint8)}, "proprio": np.zeros(2)}
@@ -160,7 +196,7 @@ def test_fast_and_flow_targets_are_clipped_independently():
     assert np.abs(fast_input).max() < 3.0
 
 
-def test_non_terminal_training_chunks_supervise_the_return_footer():
+def test_non_terminal_training_chunks_supervise_the_return_footer(monkeypatch: pytest.MonkeyPatch) -> None:
     """Genesis sets message_stop_token="return" for every chunk short of the terminal step.
 
     ``_action_completion_metadata`` (core/datasets/augment/trajectory.py) attaches the token
@@ -168,12 +204,12 @@ def test_non_terminal_training_chunks_supervise_the_return_footer():
     rendered ``<|end|>`` footer for ``<|return|>``. Genesis's LeRobot-native training builder
     emits a window that never reaches the terminal step, so this is the default.
     """
-    assert _footer_rewrite_for(None) is True
-    assert _footer_rewrite_for(False) is True
+    assert _footer_rewrite_for(None, monkeypatch) is True
+    assert _footer_rewrite_for(False, monkeypatch) is True
 
 
-def test_terminal_training_chunks_keep_the_end_footer():
-    assert _footer_rewrite_for(True) is False
+def test_terminal_training_chunks_keep_the_end_footer(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _footer_rewrite_for(True, monkeypatch) is False
 
 
 def test_joint_plan_exactly_matches_genesis_final_prompt_metadata():
@@ -429,34 +465,160 @@ def test_public_rendered_stream_lowering_rejects_invalid_pixel_shuffle_grid():
         rendered_stream_to_local_tensor_stream(rendered, device="cpu", dtype=torch.float32)
 
 
-def test_public_mharmony_encoding_loader_caches_equivalent_group_configs(monkeypatch):
-    calls = []
-    sentinel = object()
+def test_stream_construction_keeps_render_order_and_owns_event_lists() -> None:
+    late = Event.from_text_tokens(torch.tensor([11]), time=(3.0, 3.0))
+    early = Event.from_text_tokens(torch.tensor([12]), time=(0.0, 0.0), type=TextType.control)
+    last = Event.from_text_tokens(torch.tensor([13]), time=(1.0, 1.0))
+    events = [late, early, last]
+    priority: list[ModalityType] = [TextType.control, TextType.text]
+    stream = create_stream(events, priority)
+    events.clear()
+    assert stream.events == [late, early, last]
+    grouped = group_streams(stream, lambda event: event.type)
+    assert list(grouped) == [TextType.text, TextType.control]
+    assert grouped[TextType.text].events == [late, last]
+    assert grouped[TextType.control].events == [early]
+    assert grouped[TextType.text].priority == priority
+    grouped[TextType.text].events.clear()
+    assert stream.events == [late, early, last]
+    mapped = stream.map(lambda _event: {})
+    assert all(left is right for left, right in zip(mapped.events, stream.events, strict=True))
+    flat = TensorStream([stream]).flat_stream()
+    flat.events.clear()
+    assert stream.events == [late, early, last]
+    short = TensorStream([create_stream([early], priority)])
+    padded = IsaacNativeMharmonyRenderer.collate([TensorStream([stream]), short])
+    assert padded.shape == (2, 3)
+    assert padded.streams[0].events == [late, early, last]
+    assert padded.streams[1].events[0] is early
+    assert padded.streams[1].events[-1].type == TextType.padding
+    torch.testing.assert_close(padded.streams[1].events[-1].data, torch.zeros(2, 1, dtype=torch.long))
+    assert short.streams[0].events == [early]
+
+
+@pytest.mark.parametrize("dtype", [None, torch.float64])
+def test_stream_transfer_preserves_tokens_padding_float_values_and_autograd(
+    dtype: torch.dtype | None,
+) -> None:
+    text_events = [
+        Event.from_text_tokens(torch.tensor([11, 12], dtype=torch.int32), time=(0.0, 0.0), type=kind)
+        for kind in (TextType.text, TextType.control, TextType.timestamp, TextType.padding, TextType.action)
+    ]
+    vector = torch.tensor([[-0.0, 1.5]], requires_grad=True)
+    image = torch.tensor([[2.0, -3.0]], requires_grad=True)
+    float_events = [
+        Event(data=data, time=(0.0, 0.0), type=kind, dims_virtual=[1], dims_real=[1], idx_range=(0, 1))
+        for data, kind in [(vector, VectorType.vector), (image, VisionType.I)]
+    ]
+    stream = TensorStream([Stream(text_events + float_events, [])])
+    assert all(event.data.shape == (2, 1) for event in text_events)
+    assert stream.to("cpu", dtype=dtype, non_blocking=False) is stream
+    for event in text_events:
+        torch.testing.assert_close(event.data, torch.tensor([[11], [12]], dtype=torch.long))
+        assert event.idx_range == (0, 2)
+    for event, expected in zip(float_events, ([[-0.0, 1.5]], [[2.0, -3.0]]), strict=True):
+        torch.testing.assert_close(event.data, torch.tensor(expected, dtype=dtype or torch.float32))
+        assert event.data.requires_grad
+    assert torch.signbit(float_events[0].data[0, 0])
+    (float_events[0].data.sum() + float_events[1].data.sum()).backward()
+    torch.testing.assert_close(vector.grad, torch.ones_like(vector))
+    torch.testing.assert_close(image.grad, torch.ones_like(image))
+
+
+def test_stream_metadata_preserves_partial_tokens_roles_context_and_mrope() -> None:
+    events = [
+        Event.from_text_tokens(
+            torch.tensor(tokens),
+            time=(0.0, 0.0),
+            type=kind,
+            role=role,
+            tags={"source_stream_name": source},
+        )
+        for tokens, kind, role, source in [
+            ([10, 11, 12], TextType.text, "user", "a"),
+            ([99], TextType.control, "user", "a"),
+            ([0], TextType.action_c, "assistant", "a"),
+            ([7], TextType.action, "assistant", "a"),
+            ([6], TextType.text, "user", "b"),
+            ([0], TextType.action_c, "assistant", "b"),
+        ]
+    ]
+    events[0].slice_tokens(1, 3)
+    stream = TensorStream([Stream(events, list(TextType))])
+    metadata = compute_tensor_stream_metadata(stream)
+
+    torch.testing.assert_close(metadata.modality_mask, torch.tensor([[8, 8, 12, 15, 14, 8, 15]]))
+    torch.testing.assert_close(metadata.role_mask, torch.tensor([[1, 1, 1, 0, 0, 1, 0]]))
+    torch.testing.assert_close(
+        interleave_partial_mask(stream, TextType.text, metadata),
+        torch.tensor([False, True, True, True]),
+    )
+    tokens, valid = set_data(stream, (TextType.text, TextType.control), roles=("user",), metadata=metadata)
+    torch.testing.assert_close(tokens, torch.tensor([[11, 12, 99, 0, 0, 6, 0]]))
+    torch.testing.assert_close(valid, torch.tensor([[True, True, True, False, False, True, False]]))
+    context, fallback_count = build_action_context_mask(
+        stream,
+        metadata,
+        action_batch_indices=[0, 0, 0],
+        action_start_indices=[3, 6, 6],
+        action_provenance_keys=[("a", None, None), ("b", None, None), None],
+    )
+    torch.testing.assert_close(
+        context,
+        torch.tensor(
+            [
+                [True, True, True, False, False, False, False],
+                [False, False, False, False, False, True, False],
+                [True, True, True, False, False, True, False],
+            ]
+        ),
+    )
+    assert fallback_count == 1
+    torch.testing.assert_close(
+        compute_mrope_pos_tensor(stream),
+        torch.tensor([[[1, 0, 0], [2, 0, 0], [3, 3, 3], [4, 4, 4], [5, 5, 5], [6, 6, 6], [7, 7, 7]]]),
+    )
+    assert metadata.to("cpu") is metadata
+    moved = metadata.to("meta")
+    assert moved.modality_mask.device.type == "meta"
+    assert moved.role_mask.device.type == "meta"
+    assert moved.partial_mask(TextType.text).device.type == "meta"
+
+
+@pytest.fixture
+def encoding_load_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[list[tuple[str, list[dict[str, Any]] | None]]]:
+    calls: list[tuple[str, list[dict[str, Any]] | None]] = []
 
     class _FakeMharmony:
         @staticmethod
-        def load_harmony_encoding(name, *, reserved_token_groups):
+        def load_harmony_encoding(name: str, *, reserved_token_groups: list[dict[str, Any]] | None) -> object:
             calls.append((name, reserved_token_groups))
-            return sentinel
+            return object()
 
     mharmony_adapter._load_mharmony_encoding_cached.cache_clear()
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     monkeypatch.setattr(mharmony_adapter, "load_mharmony", lambda: _FakeMharmony)
     try:
-        first = load_mharmony_encoding(
-            "QWEN35_HARMONY",
-            reserved_token_groups=[{"size": 2048, "tokenizer": "physical-intelligence/fast"}],
-        )
-        second = load_mharmony_encoding(
-            "QWEN35_HARMONY",
-            reserved_token_groups=[{"tokenizer": "physical-intelligence/fast", "size": 2048}],
-        )
+        yield calls
     finally:
         mharmony_adapter._load_mharmony_encoding_cached.cache_clear()
 
-    assert first is sentinel
-    assert second is sentinel
-    assert calls == [
+
+def test_public_mharmony_encoding_loader_caches_equivalent_group_configs(
+    encoding_load_calls: list[tuple[str, list[dict[str, Any]] | None]],
+) -> None:
+    first = load_mharmony_encoding(
+        "QWEN35_HARMONY",
+        reserved_token_groups=[{"size": 2048, "tokenizer": "physical-intelligence/fast"}],
+    )
+    second = load_mharmony_encoding(
+        "QWEN35_HARMONY",
+        reserved_token_groups=[{"tokenizer": "physical-intelligence/fast", "size": 2048}],
+    )
+    assert first is second
+    assert encoding_load_calls == [
         (
             "QWEN35_HARMONY",
             [{"size": 2048, "tokenizer": "physical-intelligence/fast"}],
@@ -464,31 +626,20 @@ def test_public_mharmony_encoding_loader_caches_equivalent_group_configs(monkeyp
     ]
 
 
-def test_qwen35_encoding_cache_is_scoped_to_resolved_checkpoint_vocab(tmp_path, monkeypatch):
-    calls = []
-
-    class _FakeMharmony:
-        @staticmethod
-        def load_harmony_encoding(name, *, reserved_token_groups):
-            calls.append((name, reserved_token_groups))
-            return object()
-
+def test_qwen35_encoding_cache_is_scoped_to_resolved_checkpoint_vocab(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    encoding_load_calls: list[tuple[str, list[dict[str, Any]] | None]],
+) -> None:
     first_vocab = tmp_path / "first" / "vocab.json"
     second_vocab = tmp_path / "second" / "vocab.json"
-    mharmony_adapter._load_mharmony_encoding_cached.cache_clear()
-    monkeypatch.setattr(mharmony_adapter, "load_mharmony", lambda: _FakeMharmony)
-    try:
-        monkeypatch.setenv("QWEN35_VOCAB_PATH", str(first_vocab.parent / ".." / "first/vocab.json"))
-        first = load_mharmony_encoding("QWEN35_HARMONY")
-        assert load_mharmony_encoding("QWEN35_HARMONY") is first
-
-        monkeypatch.setenv("QWEN35_VOCAB_PATH", str(second_vocab))
-        second = load_mharmony_encoding("QWEN35_HARMONY")
-    finally:
-        mharmony_adapter._load_mharmony_encoding_cached.cache_clear()
-
+    monkeypatch.setenv("QWEN35_VOCAB_PATH", str(first_vocab.parent / ".." / "first/vocab.json"))
+    first = load_mharmony_encoding("QWEN35_HARMONY")
+    assert load_mharmony_encoding("QWEN35_HARMONY") is first
+    monkeypatch.setenv("QWEN35_VOCAB_PATH", str(second_vocab))
+    second = load_mharmony_encoding("QWEN35_HARMONY")
     assert second is not first
-    assert calls == [("QWEN35_HARMONY", None), ("QWEN35_HARMONY", None)]
+    assert encoding_load_calls == [("QWEN35_HARMONY", None), ("QWEN35_HARMONY", None)]
 
 
 def test_public_mharmony_version_must_match_the_pinned_distribution(monkeypatch):
@@ -523,6 +674,33 @@ def test_qwen35_processor_factory_uses_public_root_export(monkeypatch):
 
     assert mharmony_adapter.create_qwen35_image_processor(patch_size=16) is processor
     assert calls == [{"patch_size": 16}]
+
+
+def test_pinned_renderer_serializes_without_mutating_the_final_assistant_message(monkeypatch) -> None:
+    mharmony = pytest.importorskip("mharmony")
+    monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
+    encoding = load_mharmony_encoding("QWEN35_HARMONY")
+    conversation = mharmony.Conversation(
+        messages=[
+            mharmony.Message(
+                author=mharmony.Author(role=mharmony.Role("user")),
+                content=[mharmony.TextContent(text="pick up the block")],
+            ),
+            mharmony.Message(
+                author=mharmony.Author(role=mharmony.Role("assistant")),
+                content=[mharmony.TokensContent(tokens=[0])],
+                channel="final",
+            ),
+        ]
+    )
+    before = conversation.to_json()
+    rendered = encoding.render_conversation_multimodal_with_processors(conversation)
+    assert conversation.to_json() == before
+    footer = rendered["stream"]["events"][-1]
+    assert footer["role"] == "assistant"
+    assert footer["channel"] == "final"
+    assert footer["modality"] == "special_token"
+    assert footer["data"]["Tokens"] == encoding.encode("<|end|>", allowed_special={"<|end|>"})
 
 
 def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch):
@@ -661,14 +839,36 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
     assert stream.streams[0].events[0].role == "agent"
 
 
+def test_cached_renderer_does_not_skip_fast_resolver_defects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("mharmony")
+
+    def broken_resolver(*, local_files_only: bool) -> Path:
+        assert local_files_only
+        raise ValueError("FAST resolver defect")
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "resolve_pinned_fast_processor_snapshot",
+        broken_resolver,
+    )
+    with pytest.raises(ValueError, match="FAST resolver defect"):
+        try:
+            test_real_cached_fast_and_mharmony_render_joint_training_stream(tmp_path, monkeypatch)
+        except pytest.skip.Exception as exc:
+            pytest.fail(f"A resolver defect must fail, not skip: {exc}")
+
+
 def test_real_cached_fast_and_mharmony_render_joint_training_stream(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-):
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pytest.importorskip("mharmony")
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     try:
         source = resolve_pinned_fast_processor_snapshot(local_files_only=True)
-    except Exception as exc:  # pragma: no cover - cache is host-specific
+    except FileNotFoundError as exc:  # pragma: no cover - cache is host-specific
         pytest.skip(f"pinned FAST processor is not cached: {exc}")
     artifact = materialize_pinned_fast_processor_snapshot(source, tmp_path / "fast_processor")
     identity_before = fast_processor_tree_identity(artifact.path)
@@ -698,22 +898,25 @@ def test_real_cached_fast_and_mharmony_render_joint_training_stream(
     )
     renderer = IsaacNativeMharmonyRenderer(metadata=metadata, stats=stats)
 
-    stream = renderer.build_training(
-        observation_window=[
+    common_inputs: _RenderInputs = {
+        "observation_window": [
             {
                 "images": {"image": np.zeros((256, 256, 3), dtype=np.uint8)},
                 "proprio": np.zeros(2, dtype=np.float32),
             }
         ],
-        prompt="pick up the block",
-        action_chunk=np.asarray([[0.25, -0.5], [0.75, 1.0]], dtype=np.float32),
-        action_is_pad=[False, True],
-        fast_processor=processor,
-        max_num_patches=256,
-        device="cpu",
-        dtype=torch.float32,
-        anchor_timestamp_seconds=0.0,
-    )
+        "prompt": "pick up the block",
+        "max_num_patches": 256,
+        "device": "cpu",
+        "dtype": torch.float32,
+        "anchor_timestamp_seconds": 0.0,
+    }
+    action_inputs: _ActionInputs = {
+        "action_chunk": np.asarray([[0.25, -0.5], [0.75, 1.0]], dtype=np.float32),
+        "action_is_pad": [False, True],
+        "fast_processor": processor,
+    }
+    stream = renderer.build_training(**common_inputs, **action_inputs)
 
     events = stream.streams[0].events
     flow = [event for event in events if event.type == TextType.action_c]
@@ -745,36 +948,8 @@ def test_real_cached_fast_and_mharmony_render_joint_training_stream(
     # <|return|>. Only an explicitly terminal chunk keeps <|end|>.
     assert final_control_id(stream) == return_id
 
-    terminal_stream = renderer.build_training(
-        observation_window=[
-            {
-                "images": {"image": np.zeros((256, 256, 3), dtype=np.uint8)},
-                "proprio": np.zeros(2, dtype=np.float32),
-            }
-        ],
-        prompt="pick up the block",
-        action_chunk=np.asarray([[0.25, -0.5], [0.75, 1.0]], dtype=np.float32),
-        action_is_pad=[False, True],
-        fast_processor=processor,
-        max_num_patches=256,
-        device="cpu",
-        dtype=torch.float32,
-        anchor_timestamp_seconds=0.0,
-        terminal=True,
-    )
+    terminal_stream = renderer.build_training(**common_inputs, **action_inputs, terminal=True)
     assert final_control_id(terminal_stream) == end_id
 
-    inference_stream = renderer.build(
-        observation_window=[
-            {
-                "images": {"image": np.zeros((256, 256, 3), dtype=np.uint8)},
-                "proprio": np.zeros(2, dtype=np.float32),
-            }
-        ],
-        prompt="pick up the block",
-        max_num_patches=256,
-        device="cpu",
-        dtype=torch.float32,
-        anchor_timestamp_seconds=0.0,
-    )
+    inference_stream = renderer.build(**common_inputs)
     assert final_control_id(inference_stream) == return_id

@@ -17,14 +17,14 @@
 import re
 import sys
 from collections.abc import Generator
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.encoding_utils import encode_sign_magnitude
 from lerobot.motors.feetech import MODEL_NUMBER, MODEL_NUMBER_TABLE, FeetechMotorsBus
-from lerobot.motors.feetech.tables import STS_SMS_SERIES_CONTROL_TABLE
+from lerobot.motors.feetech.tables import STS_SMS_SERIES_CONTROL_TABLE, STS_SMS_SERIES_ENCODINGS_TABLE
 
 try:
     import scservo_sdk as scs
@@ -274,6 +274,25 @@ def test__write_comm(raise_on_error, mock_motors, dummy_motors):
     assert mock_motors.stubs[stub].called
 
 
+def test_read_write_acceleration_multiplier_by_name(mock_motors, dummy_motors):
+    """Register 86 can be read and written by its name `Acceleration_Multiplier`."""
+    motor_name, motor = next(iter(dummy_motors.items()))
+    read_stub = mock_motors.build_read_stub(86, 1, motor.id, 7)
+    write_stub = mock_motors.build_write_stub(86, 1, motor.id, 9)
+    bus = FeetechMotorsBus(
+        port=mock_motors.port,
+        motors=dummy_motors,
+    )
+    bus.connect(handshake=False)
+
+    read_value = bus.read("Acceleration_Multiplier", motor_name)
+    bus.write("Acceleration_Multiplier", motor_name, 9)
+
+    assert read_value == 7
+    assert mock_motors.stubs[read_stub].called
+    assert mock_motors.stubs[write_stub].wait_called()
+
+
 @pytest.mark.parametrize(
     "addr, length, ids_values",
     [
@@ -342,24 +361,6 @@ def test__sync_write(addr, length, ids_values, mock_motors, dummy_motors):
 
     assert mock_motors.stubs[stub].wait_called()
     assert comm == scs.COMM_SUCCESS
-
-
-@pytest.mark.parametrize(
-    "method_name, expected_torque, expected_lock",
-    [("enable_torque", 1, 1), ("disable_torque", 0, 0)],
-)
-def test_torque_writes_retry_transient_status_loss_by_default(
-    method_name, expected_torque, expected_lock, mock_motors, dummy_motors
-):
-    bus = FeetechMotorsBus(port="/dev/null", motors=dummy_motors)
-    bus.write = MagicMock()
-
-    getattr(bus, method_name)("dummy_1")
-
-    assert bus.write.call_args_list == [
-        call("Torque_Enable", "dummy_1", expected_torque, num_retry=3),
-        call("Lock", "dummy_1", expected_lock, num_retry=3),
-    ]
 
 
 def test_is_calibrated(mock_motors, dummy_motors, dummy_calibration):
@@ -458,6 +459,26 @@ def test_set_half_turn_homings(mock_motors, dummy_motors):
     bus.reset_calibration.assert_called_once()
     assert mock_motors.stubs[read_pos_stub].called
     assert all(mock_motors.stubs[stub].wait_called() for stub in write_homing_stubs)
+
+
+@pytest.mark.parametrize(
+    "position, expected_homing",
+    [
+        (0, -2047),
+        (2047, 0),
+        (4094, 2047),
+        # 4095 - 2047 = 2048 does not fit an 11-bit sign-magnitude register: clamp to 2047.
+        (4095, 2047),
+    ],
+)
+def test_half_turn_homings_fit_the_sign_magnitude_register(position, expected_homing, dummy_motors):
+    bus = FeetechMotorsBus(port="/dev/dummy-port", motors=dummy_motors)
+    motor = next(iter(dummy_motors))
+
+    homing = bus._get_half_turn_homings({motor: position})[motor]
+
+    assert homing == expected_homing
+    encode_sign_magnitude(homing, STS_SMS_SERIES_ENCODINGS_TABLE["Homing_Offset"])  # must not raise
 
 
 @pytest.mark.parametrize(

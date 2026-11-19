@@ -8,13 +8,23 @@ geometry is available solely for explicitly marked CPU test fixtures.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Never
+
+from .checkpoint_integrity import load_json_object
+from .rtc import (
+    DIT_CONTEXT_CONDITIONING_FIELDS,
+    ActionExpertConditioning,
+    SharedFinalContext,
+    validate_action_context,
+    validate_dit_action_metadata,
+)
 
 MK1_MODEL_TYPE = "qwen3_5_moe"
 MK1_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
@@ -87,11 +97,44 @@ _ROPE_KEYS = {
     "rope_theta",
     "rope_type",
 }
-_ARTIFACT_IDENTITY_KEYS = {"schema_version", "artifact_kind", "trained_steps"}
+_ARTIFACT_IDENTITY_KEYS = {"schema_version", "artifact_kind"}
 
 
 class Mk1CheckpointContractError(ValueError):
     """The checkpoint cannot be interpreted as the allowlisted MK1 VLA ABI."""
+
+
+def validate_checkpoint_action_expert_semantics(raw: Mapping[str, Any]) -> None:
+    """Validate both native copies or the migrated envelope before eager or lazy construction."""
+    text = _object_field(raw, "text_config")
+    depth = _integer(text, "num_hidden_layers", "text_config")
+    for path, block in (
+        ("isaac05_vla.action_expert", raw.get("isaac05_vla")),
+        ("action_expert", raw),
+        ("genesis_vla.action_expert", raw.get("genesis_vla")),
+    ):
+        if isinstance(block, Mapping):
+            action = block.get("action_expert")
+            if isinstance(action, Mapping):
+                if action.get("type") == "dit":
+                    _validate_native_action_metadata(action, path=path, backbone_num_layers=depth)
+                else:
+                    schema = block.get("schema_version")
+                    try:
+                        validate_action_context(action, schema_version=schema, backbone_num_layers=depth)
+                    except ValueError as exc:
+                        _fail(str(exc))
+                    expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
+                    _require_exact_keys(action, expected, path)
+    if raw.get("model_type") == "isaac_0_5":
+        vla = _object_field(raw, "isaac05_vla")
+        if _integer(vla, "schema_version", "isaac05_vla") != 1:
+            _fail(
+                "isaac05_vla.schema_version must remain 1; the native action_expert owns its schema_version"
+            )
+        nested = _object_field(vla, "action_expert")
+        if _object_field(raw, "action_expert") != nested:
+            _fail("root and isaac05_vla action_expert blocks must be identical")
 
 
 @dataclass(frozen=True)
@@ -171,6 +214,8 @@ class Mk1ActionExpertContract:
     mlp_ratio: float
     timestep_embed_dim: int
     ffn_multiple_of: int
+    native_metadata: tuple[tuple[str, Any], ...] = ()
+    conditioning: ActionExpertConditioning = SharedFinalContext()
 
     @property
     def intermediate_size(self) -> int:
@@ -193,7 +238,14 @@ class Mk1MtpContract:
 class Mk1ArtifactContract:
     schema_version: int
     artifact_kind: str
-    trained_steps: int
+
+
+@dataclass(frozen=True)
+class TensorMetadata:
+    """Shape and storage dtype, independent of any filesystem inventory."""
+
+    shape: tuple[int, ...]
+    dtype: str
 
 
 @dataclass(frozen=True)
@@ -277,6 +329,12 @@ class Mk1CheckpointContract:
         therefore never accept a tiny checkpoint accidentally.
         """
         root = _object(raw_config, "config")
+        validate_checkpoint_action_expert_semantics(root)
+        native_format = root.get("model_type") == "isaac_0_5"
+        if native_format:
+            root = _normalize_isaac05(root)
+        elif _object_field(_object_field(root, "genesis_vla"), "action_expert").get("type") == "dit":
+            _fail("legacy MK1 requires the molmoact action ABI")
         test_marker = root.get(MK1_TEST_GEOMETRY_MARKER, False)
         if test_marker is not False and test_marker is not True:
             _fail(f"{MK1_TEST_GEOMETRY_MARKER} must be a boolean")
@@ -313,7 +371,7 @@ class Mk1CheckpointContract:
         special_tokens = _parse_special_tokens(root, text_raw, text=text, test_geometry=test_geometry)
         coord = _parse_coord(_object_field(root, "genesis_coord_tokens"), text, test_geometry=test_geometry)
         vector, action = _parse_vla(
-            _object_field(root, "genesis_vla"), text=text, mtp=mtp, test_geometry=test_geometry
+            _object_field(root, "genesis_vla"), text=text, test_geometry=test_geometry
         )
 
         return cls(
@@ -411,8 +469,24 @@ class Mk1CheckpointContract:
         allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
     ) -> None:
         """Require exact key, shape, and explicitly allowed dtype coverage before allocation."""
+        self.validate_tensor_metadata(inventory.tensors, allowed_storage_dtypes=allowed_storage_dtypes)
+
+    def validate_tensor_metadata(
+        self,
+        tensors: Mapping[str, TensorMetadata | TensorHeader],
+        *,
+        allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
+        runtime_only: bool = False,
+    ) -> None:
+        """Validate headers or gathered tensors; only runtime saves may omit source-only MTP."""
         expected = self.expected_tensor_shapes()
-        actual_keys = set(inventory.tensors)
+        if runtime_only:
+            expected = {
+                key: shape
+                for key, shape in expected.items()
+                if not key.startswith(self.excluded_runtime_prefixes)
+            }
+        actual_keys = set(tensors)
         missing = sorted(set(expected) - actual_keys)
         unexpected = sorted(actual_keys - set(expected))
         if missing or unexpected:
@@ -422,20 +496,18 @@ class Mk1CheckpointContract:
                 f"unexpected={len(unexpected)} (first={unexpected[:8]})"
             )
         bad_shapes = [
-            (key, inventory.tensors[key].shape, shape)
-            for key, shape in expected.items()
-            if inventory.tensors[key].shape != shape
+            (key, tensors[key].shape, shape) for key, shape in expected.items() if tensors[key].shape != shape
         ]
         if bad_shapes:
             key, actual, wanted = bad_shapes[0]
             _fail(f"tensor {key!r} has shape {actual}, expected {wanted}")
         bad_dtypes = sorted(
-            key for key, header in inventory.tensors.items() if header.dtype not in allowed_storage_dtypes
+            key for key, header in tensors.items() if header.dtype not in allowed_storage_dtypes
         )
         if bad_dtypes:
             first = bad_dtypes[0]
-            expected = "/".join(sorted(allowed_storage_dtypes))
-            _fail(f"tensor {first!r} has dtype {inventory.tensors[first].dtype}, expected {expected}")
+            expected_dtype = "/".join(sorted(allowed_storage_dtypes))
+            _fail(f"tensor {first!r} has dtype {tensors[first].dtype}, expected {expected_dtype}")
 
     def validate_coord_reserved_token_groups(self, groups: Any) -> None:
         """Cross-check the checkpoint coordinate range against mHarmony metadata.
@@ -507,6 +579,13 @@ def read_mk1_config_data(
         raw,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
+    if raw.get("model_type") == "isaac_0_5":
+        artifact = _object_field(raw, "isaac05_artifact")
+        shapes = contract.expected_tensor_shapes()
+        expected_bytes = sum(math.prod(shape) * 4 for shape in shapes.values())
+        if artifact.get("tensor_count") != len(shapes) or artifact.get("tensor_bytes") != expected_bytes:
+            _fail("isaac05_artifact tensor count/bytes disagree with F32 geometry")
+        raw = _normalize_isaac05(raw)
     return raw, contract
 
 
@@ -741,9 +820,15 @@ def finalize_mk1_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     root = Path(model_dir)
     config_path = root / "config.json"
     raw = _read_json_object(config_path)
-    genesis_vla = raw.get("genesis_vla")
+    # A raw Isaac-0.5 export stores the VLA block under ``isaac05_vla``; ``_normalize_isaac05``
+    # renames it to ``genesis_vla``, but only in the dict it returns, so both spellings are
+    # valid on disk. Read whichever the saved config actually uses.
+    vla = next(
+        (raw[name] for name in ("genesis_vla", "isaac05_vla") if isinstance(raw.get(name), dict)),
+        None,
+    )
     text_config = raw.get("text_config")
-    mtp = genesis_vla.get("mtp") if isinstance(genesis_vla, dict) else None
+    mtp = vla.get("mtp") if isinstance(vla, dict) else None
     if not isinstance(mtp, dict) or not isinstance(text_config, dict):
         _fail("MK1 runtime checkpoint config is missing its MTP contract")
     if mtp.get("present") is True:
@@ -791,6 +876,101 @@ def finalize_mk1_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     temporary_index.replace(index_path)
 
 
+# Isaac05 schema-1 semantics remain pinned; retired RTC recipe values are provenance only.
+_ISAAC05_ACTION_VALUES = {
+    "type": "dit",
+    "schema_version": 1,
+    "num_inference_steps": 10,
+    "timestep_sampling_alpha": 1.5,
+    "timestep_sampling_beta": 1.0,
+    "timestep_sampling_scale": 0.999,
+    "timestep_sampling_offset": 0.001,
+    "train_samples_per_chunk": 8,
+    "mask_padded_action_rows": True,
+    "drop_action_dim_overflow": False,
+    "k_batched_cross_attn": True,
+    "k_batched_cross_attn_backend": "flash_gqa",
+}
+
+
+def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate native metadata before constructing the shared in-tree backbone config."""
+    root = copy.deepcopy(dict(raw))
+    _require_values(
+        root,
+        {
+            "architectures": ["Isaac05ForConditionalGeneration"],
+            "storage_dtype": "float32",
+            "runtime_dtype": "bfloat16",
+            "dtype": "bfloat16",
+        },
+        "isaac05",
+    )
+    text = _object_field(root, "text_config")
+    for name in ("artifact", "coord_tokens", "moe", "vla", "test_only_reduced_geometry"):
+        destination = f"genesis_{name}"
+        if destination in root:
+            _fail(f"isaac05 must not mix legacy field {destination}")
+        source = f"isaac05_{name}"
+        if source not in root:
+            _fail(f"isaac05 missing {source}")
+        root[destination] = root.pop(source)
+    if "genesis_moe" in text:
+        _fail("isaac05 text must not mix legacy genesis_moe")
+    moe = _object_field(root, "genesis_moe")
+    if moe != _object_field(text, "isaac05_moe"):
+        _fail("root and text_config isaac05_moe blocks must be identical")
+    _require_exact_keys(
+        moe, _CUSTOM_MOE_KEYS - {"null_expert_semantics", "shared_expert_mode"}, "isaac05_moe"
+    )
+    normalized_moe = dict(
+        moe,
+        null_expert_semantics="skip_compute_renormalize_real_routes",
+        shared_expert_mode="sigmoid_gated_additive",
+    )
+    root["genesis_moe"] = normalized_moe
+    root["text_config"] = dict(text)
+    root["text_config"].pop("isaac05_moe")
+    root["text_config"]["genesis_moe"] = copy.deepcopy(normalized_moe)
+    vla = _object_field(root, "genesis_vla")
+    _require_exact_keys(vla, _VLA_KEYS - {"backbone_family"}, "isaac05_vla")
+    nested_action = _object_field(vla, "action_expert")
+    root_action = _object_field(root, "action_expert")
+    # Validate both copies before equality, which aliases booleans with numeric RTC values.
+    _validate_native_action_metadata(nested_action, path="isaac05_vla.action_expert")
+    _validate_native_action_metadata(root_action, path="action_expert")
+    if root_action != nested_action:
+        _fail("root and isaac05_vla action_expert blocks must be identical")
+    vector = _object_field(vla, "vector_encoder")
+    if _integer(root, "vector_max_states") != _integer(vector, "max_states"):
+        _fail("isaac05 vector_max_states disagrees with vector_encoder")
+    if _integer(root, "max_sequence_length") <= 0:
+        _fail("isaac05 max_sequence_length must be positive")
+    _require_values(root, {"vision_token": "<|image_pad|>", "vision_rescale_factor": 1 / 255}, "isaac05")
+    fast = _object_field(root, "isaac05_fast_tokens")
+    _require_exact_keys(fast, {"enabled", "offset", "size", "tokenizer"}, "isaac05_fast_tokens")
+    _require_values(fast, {"enabled": True, "tokenizer": MK1_FAST_TOKENIZER}, "isaac05_fast_tokens")
+    offset, size = _integer(fast, "offset"), _integer(fast, "size")
+    if offset < 0 or size <= 0 or offset + size > _integer(text, "vocab_size"):
+        _fail("isaac05 FAST token range is outside the vocabulary")
+    if root[MK1_TEST_GEOMETRY_MARKER] is False and (offset, size) != (
+        MK1_FAST_TOKEN_OFFSET,
+        MK1_FAST_TOKEN_SIZE,
+    ):
+        _fail("production isaac05 FAST token range differs from the native contract")
+    root["genesis_vla"] = dict(vla, backbone_family=MK1_BACKBONE_FAMILY)
+    artifact = dict(_object_field(root, "genesis_artifact"))
+    for key in ("tensor_count", "tensor_bytes"):
+        if key in artifact:
+            if _integer(artifact, key, "isaac05_artifact") <= 0:
+                _fail(f"isaac05_artifact.{key} must be positive")
+            artifact.pop(key)
+    root["genesis_artifact"] = artifact
+    root["model_type"] = MK1_MODEL_TYPE
+    root["architectures"] = [MK1_ARCHITECTURE]
+    return root
+
+
 def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> Mk1MoeContract:
     _require_exact_keys(raw, _CUSTOM_MOE_KEYS, "genesis_moe")
     real = _integer(raw, "num_real_experts")
@@ -827,10 +1007,10 @@ def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> Mk1MoeContract
 
 
 def _parse_artifact(raw: Mapping[str, Any]) -> Mk1ArtifactContract:
-    """Parse the exporter-owned training-state identity.
+    """Parse the exporter-owned artifact identity, not trainer progress.
 
     Neutral Step-0 exports may carry additional hash/provenance fields. Those
-    fields are inert metadata; the three versioned identity fields below are
+    fields are inert metadata; the two versioned identity fields below are
     the complete behavior and deployment authority contract.
     """
     missing = _ARTIFACT_IDENTITY_KEYS - set(raw)
@@ -842,19 +1022,14 @@ def _parse_artifact(raw: Mapping[str, Any]) -> Mk1ArtifactContract:
     artifact_kind = raw.get("artifact_kind")
     if artifact_kind not in {"trained_policy", "neutral_debug"}:
         _fail("genesis_artifact.artifact_kind must be 'trained_policy' or 'neutral_debug'")
-    trained_steps = _integer(raw, "trained_steps", "genesis_artifact")
-    if artifact_kind == "trained_policy" and trained_steps <= 0:
-        _fail("genesis_artifact trained_policy requires positive trained_steps")
-    if artifact_kind == "neutral_debug" and trained_steps != 0:
-        _fail("genesis_artifact neutral_debug requires trained_steps=0")
-    if artifact_kind == "trained_policy" and set(raw) != _ARTIFACT_IDENTITY_KEYS:
+    if artifact_kind == "trained_policy" and set(raw) - {"trained_steps"} != _ARTIFACT_IDENTITY_KEYS:
         _fail("trained genesis_artifact fields do not match schema version 1")
-    return Mk1ArtifactContract(schema_version, artifact_kind, trained_steps)
+    return Mk1ArtifactContract(schema_version, artifact_kind)
 
 
 def _validate_standard_runtime_fields(raw: Mapping[str, Any], *, path: str) -> None:
     """Pin optional Transformers flags whose defaults can change execution."""
-    common = {
+    common: dict[str, Any] = {
         "output_attentions": False,
         "output_hidden_states": False,
         "return_dict": True,
@@ -1131,28 +1306,46 @@ def _parse_special_tokens(
     return Mk1SpecialTokenContract(**values)
 
 
+def _validate_native_action_metadata(
+    action_raw: Mapping[str, Any], *, path: str, backbone_num_layers: int | None = None
+) -> ActionExpertConditioning:
+    """Validate versioned native action semantics and typed RTC provenance without rewriting metadata."""
+    try:
+        conditioning = validate_dit_action_metadata(action_raw, backbone_num_layers=backbone_num_layers)
+    except ValueError as exc:
+        _fail(f"{path} fields are invalid: {exc}")
+    pinned = {key: value for key, value in _ISAAC05_ACTION_VALUES.items() if key != "schema_version"}
+    _require_values(action_raw, pinned, path)
+    if _integer(action_raw, "rtc_max_delay_steps", path) < 0:
+        _fail(f"{path}.rtc_max_delay_steps must be nonnegative source metadata")
+    probability = action_raw["rtc_probability"]
+    if probability is not None and not 0 <= _number(action_raw, "rtc_probability", path) <= 1:
+        _fail(f"{path}.rtc_probability must be None or in [0, 1]")
+    if action_raw["rtc_max_delay_steps"] == 0 and probability not in (None, 0.0):
+        _fail(f"{path}.rtc_probability > 0 requires rtc_max_delay_steps > 0")
+    if action_raw["rtc_delay_sampling"] not in ("uniform", "exponential", "poisson"):
+        _fail(f"{path}.rtc_delay_sampling has unsupported source metadata")
+    if _number(action_raw, "rtc_poisson_mean", path) <= 0:
+        _fail(f"{path}.rtc_poisson_mean must be positive source metadata")
+    return conditioning
+
+
 def _parse_vla(
-    raw: Mapping[str, Any], *, text: Mk1TextContract, mtp: Mk1MtpContract, test_geometry: bool
+    raw: Mapping[str, Any], *, text: Mk1TextContract, test_geometry: bool
 ) -> tuple[Mk1VectorEncoderContract, Mk1ActionExpertContract]:
     _require_exact_keys(raw, _VLA_KEYS, "genesis_vla")
+    schema = _integer(raw, "schema_version", "genesis_vla")
+    if schema not in (1, 2):
+        _fail("genesis_vla.schema_version must be 1 or 2")
     _require_values(
         raw,
         {
-            "schema_version": MK1_VLA_SCHEMA_VERSION,
             "backbone_family": MK1_BACKBONE_FAMILY,
             "state_dict_schema": MK1_STATE_DICT_SCHEMA,
             "rmsnorm_weight_convention": MK1_RMSNORM_CONVENTION,
         },
         "genesis_vla",
     )
-    if _object_field(raw, "mtp", "genesis_vla") != {
-        "present": mtp.present,
-        "physical_layers": mtp.physical_layers,
-        "rollout_steps": mtp.rollout_steps,
-        "action_runtime": "exclude",
-    }:
-        _fail("genesis_vla.mtp changed while parsing")  # pragma: no cover - defensive
-
     vector_raw = _object_field(raw, "vector_encoder", "genesis_vla")
     _require_exact_keys(vector_raw, _VECTOR_KEYS, "genesis_vla.vector_encoder")
     _require_values(
@@ -1172,6 +1365,28 @@ def _parse_vla(
     vector = Mk1VectorEncoderContract(max_states, hidden_dim, output_dim)
 
     action_raw = _object_field(raw, "action_expert", "genesis_vla")
+    native = action_raw.get("type") == "dit"
+    metadata = tuple(sorted(action_raw.items())) if native else ()
+    if native:
+        if schema != 1:
+            _fail(
+                "isaac05_vla.schema_version must remain 1; the native action_expert owns its schema_version"
+            )
+        conditioning = _validate_native_action_metadata(
+            action_raw, path="isaac05_vla.action_expert", backbone_num_layers=text.num_hidden_layers
+        )
+        action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
+        action_raw = dict(action_raw, type="molmoact", clean_at_0=False)
+    else:
+        try:
+            conditioning = validate_action_context(
+                action_raw, schema_version=schema, backbone_num_layers=text.num_hidden_layers
+            )
+        except ValueError as exc:
+            _fail(f"genesis_vla.action_expert: {exc}")
+        expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
+        _require_exact_keys(action_raw, expected, "genesis_vla.action_expert")
+        action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
     _require_exact_keys(action_raw, _ACTION_KEYS, "genesis_vla.action_expert")
     _require_values(
         action_raw,
@@ -1214,6 +1429,7 @@ def _parse_vla(
         _fail("action expert hidden_dim must be divisible by num_heads")
     if not test_geometry and action != Mk1ActionExpertContract(64, 64, 36, 768, 8, 4.0, 256, 256):
         _fail("production MK1 action expert geometry does not match the 36-layer MolmoAct contract")
+    action = replace(action, native_metadata=metadata, conditioning=conditioning)
     return vector, action
 
 
@@ -1326,21 +1542,10 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if size > _MAX_JSON_FILE_BYTES:
         _fail(f"JSON object {path} exceeds the {_MAX_JSON_FILE_BYTES}-byte safety limit")
 
-    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                _fail(f"duplicate JSON key {key!r} in {path}")
-            result[key] = value
-        return result
-
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates)
-    except Mk1CheckpointContractError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        _fail(f"could not read JSON object {path}: {exc}")
-    return dict(_object(value, str(path)))
+        return load_json_object(path)
+    except ValueError as exc:
+        raise Mk1CheckpointContractError(f"could not read JSON object {path}: {exc}") from exc
 
 
 def _local_file(root: Path, name: str) -> Path:
@@ -1513,5 +1718,5 @@ def _same_json_value(actual: Any, expected: Any) -> bool:
     return type(actual) is type(expected) and actual == expected
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> Never:
     raise Mk1CheckpointContractError(message)

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hmac
 import json
-import shutil
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from .checkpoint_integrity import (
     canonical_json_sha256,
@@ -16,18 +16,21 @@ from .checkpoint_integrity import (
     load_json_object,
     require_sha256,
 )
+from .mk1_checkpoint_contract import SafetensorsInventory, read_and_validate_safetensors_index
+
+if TYPE_CHECKING:
+    from .configuration_perceptron_isaac import PerceptronIsaacConfig
 
 TRAINED_PACKAGE_INERT_HUB_METADATA = frozenset({".gitattributes", "README.md"})
-QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME = "qwen35_trained_package_manifest.json"
-QWEN35_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_qwen35_trained_package_manifest_v1"
-QWEN35_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD = "qwen35_trained_package_manifest_sha256"
 MK1_TRAINED_PACKAGE_MANIFEST_FILENAME = "mk1_trained_package_manifest.json"
 MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_trained_package_manifest_v1"
 MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD = "mk1_trained_package_manifest_sha256"
-MK1_TRAINED_PACKAGE_INERT_HUB_METADATA = TRAINED_PACKAGE_INERT_HUB_METADATA
-MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_canonical_trained_package_manifest_v2"
+MK1_MODEL_IMPORT_FILENAME = "mk1_model_import.json"
+MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2 = (
+    "perceptron_isaac_mk1_canonical_trained_package_manifest_v2"
+)
+MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_canonical_trained_package_manifest_v3"
 CANONICAL_INNER_MODEL_STORAGE = "canonical_inner"
-AUTHENTICATED_IMPORT_MODEL_STORAGE = "authenticated_import"
 
 PackageFilePredicate = Callable[[Path, Path], bool]
 
@@ -40,6 +43,89 @@ PROCESSOR_PACKAGE_PATHS = {
 }
 
 
+def parse_trained_tensor_storage_dtypes(metadata: object) -> frozenset[str]:
+    """Read the exact v3 storage declaration, never infer a missing declaration."""
+    if not isinstance(metadata, dict) or set(metadata) != {"tensor_storage_dtypes"}:
+        raise RuntimeError(
+            "MK1 trained storage declaration metadata must contain only tensor_storage_dtypes."
+        )
+    values = metadata["tensor_storage_dtypes"]
+    if (
+        not isinstance(values, list)
+        or not values
+        or any(not isinstance(value, str) or value not in {"BF16", "F32"} for value in values)
+        or values != sorted(set(values))
+    ):
+        raise RuntimeError("MK1 tensor_storage_dtypes must be a sorted distinct nonempty BF16/F32 list.")
+    return frozenset(values)
+
+
+@dataclass(frozen=True)
+class VerifiedTrainedTensorStorage:
+    """Storage and source generation authenticated by the complete outer checkpoint.
+
+    Inner descriptors retain producer lineage; a trained hf_model is not a standalone ABI.
+    Precise shard identities avoid a second payload-hash pass; second-resolution
+    sources are rehashed before lazy materialization.
+    """
+
+    model_root: Path
+    dtypes: frozenset[str]
+    source_inventory: SafetensorsInventory
+    metadata_digests: Mapping[Path, str]
+    coarse_shard_digests: Mapping[Path, str]
+
+    def _verify_shards_unchanged(self) -> None:
+        for shard in self.source_inventory.shards:
+            self.source_inventory.verify_shard_identity(shard)
+
+    def for_model(self, model_root: Path) -> frozenset[str]:
+        if model_root.resolve(strict=True) != self.model_root:
+            raise RuntimeError("Verified MK1 tensor storage belongs to a different model directory.")
+        self.verify_source_unchanged()
+        return self.dtypes
+
+    def verify_source_unchanged(self) -> None:
+        """Check the authenticated generation without rereading weight payloads."""
+        self._verify_shards_unchanged()
+        # These small files are read again by the loader; sidecar snapshots do not
+        # authorize a changed config, tokenizer, or index at the weight-backed root.
+        for path, expected in self.metadata_digests.items():
+            try:
+                actual = file_sha256(path)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Authenticated MK1 model metadata changed: {path.name}") from exc
+            if not hmac.compare_digest(actual, expected):
+                raise RuntimeError(f"Authenticated MK1 model metadata changed: {path.name}")
+
+    def verify_for_materialization(self) -> None:
+        """Rehash second-resolution shards; their timestamps can hide same-second writes.
+
+        Precise identities keep the no-extra-payload-read path. Coarse sources incur
+        one extra authenticated weight read, without copying or casting tensors.
+        """
+        self.verify_source_unchanged()
+        for shard, expected in self.coarse_shard_digests.items():
+            try:
+                actual = file_sha256(shard)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"Authenticated MK1 shard changed: {shard.name}") from exc
+            if not hmac.compare_digest(actual, expected):
+                raise RuntimeError(f"Authenticated MK1 shard digest mismatch: {shard.name}")
+        if self.coarse_shard_digests:
+            # Metadata must remain bound through the potentially long payload read.
+            self.verify_source_unchanged()
+
+    def require_header_dtypes(self, inventory: SafetensorsInventory) -> None:
+        self._verify_shards_unchanged()
+        actual = frozenset(header.dtype for header in inventory.tensors.values())
+        if actual != self.dtypes:
+            raise RuntimeError(
+                "MK1 trained storage declaration disagrees with tensor header dtype set: "
+                f"declared={sorted(self.dtypes)}, headers={sorted(actual)}."
+            )
+
+
 def _processor_configs(root: Path) -> list[Path]:
     return [
         path
@@ -48,131 +134,6 @@ def _processor_configs(root: Path) -> list[Path]:
         and path.name.startswith(("policy_preprocessor", "policy_postprocessor"))
         and path.suffix == ".json"
     ]
-
-
-def _processor_path_values(value: Any, found: dict[str, set[str]]) -> None:
-    if isinstance(value, list):
-        for item in value:
-            _processor_path_values(item, found)
-        return
-    if not isinstance(value, dict):
-        return
-    for key, item in value.items():
-        if key in PROCESSOR_PACKAGE_PATHS and isinstance(item, str) and item.strip():
-            found[key].add(item)
-        _processor_path_values(item, found)
-
-
-def stage_trained_processor_assets(package_root: str | Path, config: Any) -> None:
-    """Materialize the runtime sidecars declared by a saved PEFT processor pair.
-
-    PEFT saves only adapter tensors. Unlike a dense policy save, it therefore does
-    not copy the base package before the processor JSON is finalized. Copy the
-    small processor-owned runtime assets from their retained source first so the
-    adapter remains portable while its (potentially remote) base stays a pinned
-    Hub reference.
-    """
-    root = Path(package_root).resolve()
-    declared = {key: set() for key in PROCESSOR_PACKAGE_PATHS}
-    for config_path in _processor_configs(root):
-        try:
-            _processor_path_values(load_json_object(config_path), declared)
-        except ValueError as exc:
-            raise RuntimeError(f"Cannot stage serialized processor assets: {exc}") from exc
-
-    retained_records = dict(getattr(config, "_checkpoint_relative_paths", {}))
-    trusted_paths: dict[str, str] = {}
-    for key in PROCESSOR_PACKAGE_PATHS:
-        record = retained_records.get(key)
-        configured = getattr(config, key, None)
-        if (
-            not isinstance(record, dict)
-            or not isinstance(record.get("absolute"), str)
-            or record["absolute"] != str(configured or "")
-            or not isinstance(record.get("root"), str)
-            or not isinstance(record.get("relative"), str)
-        ):
-            continue
-        relative_path = Path(record["relative"])
-        record_root = Path(record["root"])
-        if (
-            relative_path.is_absolute()
-            or not relative_path.parts
-            or ".." in relative_path.parts
-            or str(record_root / relative_path) != record["absolute"]
-        ):
-            continue
-        trusted_paths[key] = record["absolute"]
-
-    for key, values in declared.items():
-        for raw in values:
-            path = Path(raw)
-            if ".." in path.parts:
-                raise RuntimeError(f"Serialized processor path {key} escapes its package: {raw}.")
-            if path.is_absolute() and raw != trusted_paths.get(key):
-                raise RuntimeError(f"Serialized processor path {key} is an untrusted absolute path: {raw}.")
-
-    source_roots = [
-        Path(str(value)).resolve()
-        for value in (
-            getattr(config, "_pretrained_processor_root", None),
-            getattr(config, "_checkpoint_source_root", None),
-        )
-        if value and Path(str(value)).is_dir()
-    ]
-
-    def resolve_source(raw: str, *, is_directory: bool) -> Path | None:
-        path = Path(raw)
-        candidates = [path] if path.is_absolute() else [source / path for source in source_roots]
-        for candidate in candidates:
-            if candidate.is_dir() if is_directory else candidate.is_file():
-                return candidate.resolve()
-        return None
-
-    for key, (relative, is_directory) in PROCESSOR_PACKAGE_PATHS.items():
-        destination = root / relative
-        if destination.exists():
-            if destination.is_symlink() or destination.is_dir() != is_directory:
-                expected = "directory" if is_directory else "file"
-                raise RuntimeError(f"PEFT processor asset {relative} must be a regular {expected}.")
-            continue
-
-        candidates = []
-        configured = getattr(config, key, None)
-        if trusted_paths.get(key) == str(configured or ""):
-            candidates.append(str(configured))
-        candidates.extend(raw for raw in sorted(declared[key]) if not Path(raw).is_absolute())
-        source = next(
-            (
-                resolved
-                for raw in candidates
-                if (resolved := resolve_source(raw, is_directory=is_directory)) is not None
-            ),
-            None,
-        )
-        if source is None:
-            if declared[key] or configured:
-                raise RuntimeError(
-                    f"Cannot stage PEFT processor asset {relative}; no verified retained source exists."
-                )
-            continue
-        if is_directory:
-            shutil.copytree(source, destination)
-        else:
-            shutil.copyfile(source, destination)
-
-    normalization_destination = root / "policy_normalization.json"
-    if not normalization_destination.exists():
-        normalization_source = next(
-            (
-                source / normalization_destination.name
-                for source in source_roots
-                if (source / normalization_destination.name).is_file()
-            ),
-            None,
-        )
-        if normalization_source is not None:
-            shutil.copyfile(normalization_source, normalization_destination)
 
 
 def rewrite_trained_processor_paths(package_root: str | Path) -> None:
@@ -288,7 +249,6 @@ def write_trained_package_manifest(
     identity: Mapping[str, Any],
     metadata: Mapping[str, Any] | None = None,
     delegated_directory: str | None = "hf_model",
-    precomputed_files_sha256: Mapping[str, str] | None = None,
 ) -> str:
     """Write an exhaustive outer-package manifest and return its raw digest."""
     root = Path(package_root).resolve(strict=True)
@@ -317,20 +277,7 @@ def write_trained_package_manifest(
         delegated_directory=delegated_directory,
         label=label,
     )
-    precomputed = dict(precomputed_files_sha256 or {})
-    if unknown := set(precomputed) - set(files):
-        raise RuntimeError(f"{label} precomputed digests contain unknown files: {sorted(unknown)}.")
-    try:
-        files_sha256 = {
-            relative: (
-                require_sha256(precomputed[relative], context=f"{label} precomputed digest for {relative}")
-                if relative in precomputed
-                else file_sha256(path)
-            )
-            for relative, path in files.items()
-        }
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
+    files_sha256 = {relative: file_sha256(path) for relative, path in files.items()}
     manifest = {
         "schema": manifest_schema,
         **identity,
@@ -392,6 +339,10 @@ def verify_trained_package_manifest(
 
     metadata = metadata or {}
     expected_keys = {"schema", *identity, *metadata, "config_sha256", "files_sha256"}
+    # Historical ISAAC manifests retain the retired count in both authenticated JSONs.
+    # It is not runtime identity, and is never removed before hashing either document.
+    if "trained_steps" in manifest:
+        expected_keys.add("trained_steps")
     if set(manifest) != expected_keys or manifest.get("schema") != manifest_schema:
         raise RuntimeError(f"{label} manifest fields do not match its schema.")
     if any(manifest.get(key) != value or raw_config.get(key) != value for key, value in identity.items()):
@@ -464,90 +415,50 @@ def verify_trained_package_manifest(
     return manifest
 
 
-def finalize_trained_package_config(
-    config: Any,
+def finalize_canonical_trained_package(
+    config: PerceptronIsaacConfig,
     package_root: str | Path,
     *,
-    label: str,
-    manifest_filename: str,
-    manifest_schema: str,
-    digest_field: str,
-    identity: Mapping[str, Any],
-    metadata: Mapping[str, Any] | None = None,
-    delegated_directory: str | None = "hf_model",
-    precomputed_files_sha256: Mapping[str, str] | None = None,
+    mk1_source_model_import_sha256: str | None,
 ) -> str:
-    """Save a canonical config, write its manifest once, then close the digest cycle."""
+    """Bind native inner weights to their source identity and close the config digest cycle."""
+    if not mk1_source_model_import_sha256:
+        raise RuntimeError("Cannot finalize an MK1 package without source model-import identity.")
     root = Path(package_root).resolve(strict=True)
-    setattr(config, digest_field, None)
+    inventory = read_and_validate_safetensors_index(root / "hf_model")
+    storage_metadata = {"tensor_storage_dtypes": sorted({h.dtype for h in inventory.tensors.values()})}
+    parse_trained_tensor_storage_dtypes(storage_metadata)
+    config.mk1_trained_package_manifest_sha256 = None
     config._save_pretrained(root)
     digest = write_trained_package_manifest(
         root,
-        label=label,
-        manifest_filename=manifest_filename,
-        manifest_schema=manifest_schema,
-        digest_field=digest_field,
-        identity=identity,
-        metadata=metadata,
-        delegated_directory=delegated_directory,
-        precomputed_files_sha256=precomputed_files_sha256,
+        label="MK1 canonical trained package",
+        manifest_filename=MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
+        manifest_schema=MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+        digest_field=MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
+        identity={
+            "artifact_kind": config.artifact_kind,
+            "mk1_source_model_import_sha256": mk1_source_model_import_sha256,
+        },
+        metadata={"model_storage": CANONICAL_INNER_MODEL_STORAGE, "metadata": storage_metadata},
+        delegated_directory=None,
     )
-    setattr(config, digest_field, digest)
+    config.mk1_trained_package_manifest_sha256 = digest
     config._save_pretrained(root)
 
     try:
         raw_config = load_json_object(root / "config.json")
-        manifest = load_json_object(root / manifest_filename)
+        manifest = load_json_object(root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME)
     except ValueError as exc:
-        raise RuntimeError(f"Cannot re-read finalized {label}: {exc}") from exc
+        raise RuntimeError(f"Cannot re-read finalized MK1 canonical trained package: {exc}") from exc
     canonical_config = dict(raw_config)
-    canonical_config[digest_field] = None
+    canonical_config[MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD] = None
     if (
-        raw_config.get(digest_field) != digest
-        or file_sha256(root / manifest_filename) != digest
+        raw_config.get(MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD) != digest
+        or file_sha256(root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME) != digest
         or manifest.get("config_sha256") != canonical_json_sha256(canonical_config)
     ):
-        raise RuntimeError(f"{label} config/manifest binding changed before publication.")
+        raise RuntimeError(
+            "MK1 canonical trained package config/manifest binding changed before publication."
+        )
     return digest
-
-
-def finalize_canonical_trained_package(
-    config: Any,
-    package_root: str | Path,
-    *,
-    family: Literal["mk1", "qwen35"],
-    mk1_source_model_import_sha256: str | None = None,
-    precomputed_files_sha256: Mapping[str, str] | None = None,
-) -> str:
-    """Finalize one canonical inner-weight package using its family-owned manifest contract."""
-    identity = {
-        "artifact_kind": config.artifact_kind,
-        "trained_steps": config.trained_steps,
-    }
-    if family == "mk1":
-        if not mk1_source_model_import_sha256:
-            raise RuntimeError("Cannot finalize an MK1 package without source model-import identity.")
-        identity["mk1_source_model_import_sha256"] = mk1_source_model_import_sha256
-        label = "MK1 canonical trained package"
-        manifest_filename = MK1_TRAINED_PACKAGE_MANIFEST_FILENAME
-        manifest_schema = MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA
-        digest_field = MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD
-    elif family == "qwen35":
-        label = "Qwen3.5 canonical trained package"
-        manifest_filename = QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME
-        manifest_schema = QWEN35_TRAINED_PACKAGE_MANIFEST_SCHEMA
-        digest_field = QWEN35_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD
-    else:
-        raise ValueError(f"Unsupported Perceptron ISAAC checkpoint family: {family!r}.")
-    return finalize_trained_package_config(
-        config,
-        package_root,
-        label=label,
-        manifest_filename=manifest_filename,
-        manifest_schema=manifest_schema,
-        digest_field=digest_field,
-        identity=identity,
-        metadata={"model_storage": CANONICAL_INNER_MODEL_STORAGE},
-        delegated_directory=None,
-        precomputed_files_sha256=precomputed_files_sha256,
-    )

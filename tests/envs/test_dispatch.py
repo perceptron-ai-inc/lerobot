@@ -10,11 +10,11 @@ import pytest
 import torch
 from gymnasium.envs.registration import register, registry as gym_registry
 
-from lerobot.configs.types import PolicyFeature
+from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.envs.configs import EnvConfig, LiberoEnv
 from lerobot.envs.factory import make_env, make_env_config, make_env_pre_post_processors
 from lerobot.processor import LiberoProcessorStep
-from lerobot.utils.constants import OBS_PREFIX, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_PREFIX, OBS_STATE
 
 logger = logging.getLogger(__name__)
 
@@ -44,89 +44,6 @@ def test_libero_fps_controls_simulator_frequency():
 def test_libero_rejects_nonpositive_fps():
     with pytest.raises(ValueError, match="fps must be positive"):
         LiberoEnv(fps=0)
-
-
-def test_libero_adopts_strict_checkpoint_timing_geometry_and_camera_order():
-    policy = type(
-        "PolicyContract",
-        (),
-        {
-            "target_fps": 30.0,
-            "strict_environment_feature_contract": True,
-            "action_dim": 7,
-            "proprio_dim": 8,
-            "image_size": (256, 256),
-            "camera_order": ("image", "wrist_image"),
-        },
-    )()
-    cfg = LiberoEnv()
-
-    cfg.reconcile_policy_contract(policy)
-
-    assert cfg.fps == 30
-    assert (cfg.observation_height, cfg.observation_width) == (256, 256)
-    assert cfg.camera_name_mapping == {
-        "agentview_image": "image",
-        "robot0_eye_in_hand_image": "wrist_image",
-    }
-    assert cfg.features_map["pixels/robot0_eye_in_hand_image"] == "observation.images.wrist_image"
-    assert cfg.gym_kwargs["control_freq"] == 30
-
-
-def test_libero_rejects_explicit_checkpoint_contract_mismatch():
-    policy = type(
-        "PolicyContract",
-        (),
-        {
-            "target_fps": 30.0,
-            "strict_environment_feature_contract": True,
-            "action_dim": 7,
-            "proprio_dim": 8,
-            "image_size": (256, 256),
-            "camera_order": ("image", "wrist_image"),
-        },
-    )()
-
-    with pytest.raises(ValueError, match="Explicit env.fps"):
-        LiberoEnv(fps=20).reconcile_policy_contract(policy, explicit_fields={"fps"})
-
-
-def test_eval_override_names_include_nested_yaml_parent():
-    from lerobot.configs.parser import get_override_field_names
-
-    assert get_override_field_names(["--camera_name_mapping.agentview_image=image"]) == {
-        "camera_name_mapping",
-        "camera_name_mapping.agentview_image",
-    }
-
-
-def test_train_reconciles_strict_libero_checkpoint_contract(tmp_path, monkeypatch):
-    from lerobot.configs.default import DatasetConfig
-    from lerobot.configs.train import TrainPipelineConfig
-    from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import (
-        PerceptronIsaacConfig,
-    )
-
-    monkeypatch.setattr("sys.argv", ["pytest"])
-    policy = PerceptronIsaacConfig(repo_id="synthetic/libero")
-    policy.strict_environment_feature_contract = True
-    policy.image_size = (256, 256)
-    policy.target_fps = 20.0
-    policy.camera_order = ("image", "wrist_image")
-    policy.action_dim = 7
-    policy.proprio_dim = 8
-    config = TrainPipelineConfig(
-        dataset=DatasetConfig(repo_id="synthetic/train"),
-        env=LiberoEnv(),
-        policy=policy,
-        output_dir=tmp_path / "train",
-    )
-
-    config.validate()
-
-    assert config.env is not None
-    assert (config.env.observation_height, config.env.observation_width) == (256, 256)
-    assert config.env.fps == 20
 
 
 def test_identity_processors():
@@ -164,6 +81,29 @@ def test_libero_processors_are_policy_agnostic():
 
     assert isinstance(pre.steps[0], LiberoProcessorStep)
     assert len(post.steps) == 0
+
+
+def test_libero_processor_transform_features_replaces_state_components():
+    step = LiberoProcessorStep()
+    image = PolicyFeature(type=FeatureType.VISUAL, shape=(256, 256, 3))
+    action = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
+    features = {
+        PipelineFeatureType.OBSERVATION: {
+            f"{OBS_IMAGES}.image": image,
+            f"{OBS_STATE}.eef_pos": PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+            f"{OBS_STATE}.gripper_qpos": PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        },
+        PipelineFeatureType.ACTION: action,
+    }
+
+    out = step.transform_features(features)
+
+    assert set(out) == {PipelineFeatureType.OBSERVATION, PipelineFeatureType.ACTION}
+    assert out[PipelineFeatureType.OBSERVATION] == {
+        f"{OBS_IMAGES}.image": image,
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,)),
+    }
+    assert out[PipelineFeatureType.ACTION] == action
 
 
 def test_libero_processor_flattens_state_to_raw_8_dim():

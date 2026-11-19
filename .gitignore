@@ -55,7 +55,6 @@ lib64/
 __pycache__/
 *.py[cod]
 *$py.class
-*.orig
 *.so
 *.sage.py
 .cache/
@@ -160,16 +159,8 @@ sbatch*.sh
 # W&B
 wandb/
 
-# Local development artifacts
+# Dev scripts
 .dev/
-/.worktrees/
-/scripts/sbatch/
-/reports/
-/logbook.md
-
-# Bench-local operator applications live in their own deployment repositories.
-/apps/isaac0p5_so100_dashboard/
-/apps/isaac0p5_yam_dashboard/
 
 # Data folders
 data/
@@ -185,13 +176,3 @@ outputs/
 *.urdf
 *.xml
 *.part
-
-# Perceptron Isaac local deploy build artifact (hf_model symlink + generated sidecars)
-deploy/
-
-# Local model/data artifacts. Keep checkpoint contracts and test fixtures in
-# dedicated tracked locations; this tree contains hundreds of GB of weights.
-/checkpoint/
-
-# Raw diagnosis payloads remain in local workspaces and source-snapshot branches.
-/experiments/isaac_yam_diagnosis/

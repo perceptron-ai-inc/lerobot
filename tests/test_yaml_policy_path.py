@@ -2,17 +2,16 @@
 
 import json
 import sys
+import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 import yaml
 
 from lerobot.configs import parser
 from lerobot.configs.parser import (
-    _config_explicit_fields,
     _config_path_args,
+    _config_yaml_overrides,
     _flatten_to_cli_args,
     extract_path_fields_from_config,
     get_path_arg,
@@ -20,36 +19,19 @@ from lerobot.configs.parser import (
 )
 
 
-@pytest.fixture(autouse=True)
-def clear_parser_override_registries():
-    parser._clear_config_overrides()
-    yield
-    parser._clear_config_overrides()
-
-
-def _write_config(tmp_path: Path, config: dict | str, suffix: str = ".yaml") -> Path:
-    config_path = tmp_path / f"config{suffix}"
-    if suffix in (".yaml", ".yml"):
-        content = yaml.safe_dump(config)
-    elif suffix == ".json":
-        content = json.dumps(config)
-    elif isinstance(config, str):
-        content = config
-    else:
-        raise ValueError(f"Unsupported config suffix: {suffix}")
-    config_path.write_text(content)
-    return config_path
-
-
-def test_extract_path_fields_from_yaml(tmp_path):
+def test_extract_path_fields_from_yaml():
     """Test that policy.path is extracted from a YAML config and the policy block
     is removed entirely (siblings are captured separately as cli_overrides)."""
     config = {
         "dataset": {"repo_id": "lerobot/pusht"},
         "policy": {"type": "smolvla", "path": "lerobot/smolvla_base", "push_to_hub": False},
     }
-    config_path = _write_config(tmp_path, config)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(config, f)
+        config_path = f.name
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
     cleaned_path = extract_path_fields_from_config(config_path, ["policy"])
 
     # Path should be extracted and stored
@@ -69,15 +51,22 @@ def test_extract_path_fields_from_yaml(tmp_path):
     overrides = get_yaml_overrides("policy")
     assert any("push_to_hub=false" in o for o in overrides)
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
 
-def test_extract_path_fields_from_json(tmp_path):
+
+def test_extract_path_fields_from_json():
     """Test that policy.path is extracted from a JSON config and the policy
     block is removed entirely."""
     config = {
         "policy": {"type": "act", "path": "some/local/path"},
     }
-    config_path = _write_config(tmp_path, config, ".json")
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(config, f)
+        config_path = f.name
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
     cleaned_path = extract_path_fields_from_config(config_path, ["policy"])
 
     assert _config_path_args["policy"] == "some/local/path"
@@ -86,43 +75,40 @@ def test_extract_path_fields_from_json(tmp_path):
         cleaned = json.load(f)
     assert "policy" not in cleaned
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
 
-def test_extract_no_path_returns_original(tmp_path):
+
+def test_extract_no_path_returns_original():
     """Test that configs without path fields are returned unchanged."""
     config = {
         "dataset": {"repo_id": "lerobot/pusht"},
         "policy": {"type": "smolvla"},
     }
-    config_path = _write_config(tmp_path, config)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(config, f)
+        config_path = f.name
 
+    _config_path_args.clear()
     result = extract_path_fields_from_config(config_path, ["policy"])
 
     assert result == config_path
     assert "policy" not in _config_path_args
 
-
-def test_extract_toml_returns_original(tmp_path):
-    """TOML is not rewritten by the YAML/JSON path extractor."""
-    config_path = _write_config(
-        tmp_path,
-        'policy = { path = "lerobot/smolvla_base" }',
-        ".toml",
-    )
-
-    result = extract_path_fields_from_config(config_path, ["policy"])
-
-    assert result == config_path
-    assert "policy" not in _config_path_args
+    _config_path_args.clear()
 
 
-def test_extract_removes_empty_field(tmp_path):
+def test_extract_removes_empty_field():
     """Test that the field dict is removed entirely if path was the only key."""
     config = {
         "dataset": {"repo_id": "lerobot/pusht"},
         "policy": {"path": "lerobot/smolvla_base"},
     }
-    config_path = _write_config(tmp_path, config)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(config, f)
+        config_path = f.name
 
+    _config_path_args.clear()
     cleaned_path = extract_path_fields_from_config(config_path, ["policy"])
 
     assert _config_path_args["policy"] == "lerobot/smolvla_base"
@@ -131,45 +117,64 @@ def test_extract_removes_empty_field(tmp_path):
         cleaned = yaml.safe_load(f)
     assert "policy" not in cleaned
 
+    _config_path_args.clear()
+
 
 def test_get_path_arg_fallback():
     """Test that get_path_arg falls back to _config_path_args when CLI has no path."""
+    _config_path_args.clear()
     _config_path_args["policy"] = "lerobot/smolvla_base"
 
     # No CLI args with --policy.path
     result = get_path_arg("policy", args=[])
     assert result == "lerobot/smolvla_base"
 
+    _config_path_args.clear()
+
 
 def test_get_path_arg_cli_takes_precedence():
     """Test that CLI --policy.path takes precedence over YAML config path."""
+    _config_path_args.clear()
     _config_path_args["policy"] = "yaml/path"
 
     result = get_path_arg("policy", args=["--policy.path=cli/path"])
     assert result == "cli/path"
 
+    _config_path_args.clear()
 
-def test_yaml_overrides_captured(tmp_path):
+
+def test_yaml_overrides_captured():
     """Test that non-path policy fields are captured as CLI-style overrides."""
     config = {
         "policy": {"path": "lerobot/smolvla_base", "lr": 1e-4, "batch_size": 32},
     }
-    config_path = _write_config(tmp_path, config)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(config, f)
+        config_path = f.name
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
     extract_path_fields_from_config(config_path, ["policy"])
 
     overrides = get_yaml_overrides("policy")
     assert "--lr=0.0001" in overrides or any("lr=" in o for o in overrides)
     assert any("batch_size=32" in o for o in overrides)
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
 
-def test_yaml_overrides_excludes_type_and_path(tmp_path):
+
+def test_yaml_overrides_excludes_type_and_path():
     """Test that type and path fields are not included in YAML overrides."""
     config = {
         "policy": {"path": "lerobot/smolvla_base", "type": "smolvla", "lr": 5e-5},
     }
-    config_path = _write_config(tmp_path, config)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(config, f)
+        config_path = f.name
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
     extract_path_fields_from_config(config_path, ["policy"])
 
     overrides = get_yaml_overrides("policy")
@@ -177,17 +182,27 @@ def test_yaml_overrides_excludes_type_and_path(tmp_path):
     assert not any("type=" in o for o in overrides)
     assert any("lr=" in o for o in overrides)
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
 
-def test_get_yaml_overrides_empty_when_path_only(tmp_path):
+
+def test_get_yaml_overrides_empty_when_path_only():
     """Test that get_yaml_overrides returns [] when policy had only a path field."""
     config = {
         "policy": {"path": "lerobot/smolvla_base"},
     }
-    config_path = _write_config(tmp_path, config)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(config, f)
+        config_path = f.name
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
     extract_path_fields_from_config(config_path, ["policy"])
 
     assert get_yaml_overrides("policy") == []
+
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
 
 
 def test_flatten_bool_values():
@@ -217,7 +232,7 @@ def test_flatten_nested_with_bools():
     assert "--optimizer.lr=0.01" in args
 
 
-def test_extract_removes_field_with_siblings_and_no_type(tmp_path):
+def test_extract_removes_field_with_siblings_and_no_type():
     """Regression: when policy.path has siblings but no type:, the entire policy
     block must still be removed from the cleaned config. Otherwise draccus tries
     to decode the leftover dict as PreTrainedConfig and crashes on the missing
@@ -231,8 +246,12 @@ def test_extract_removes_field_with_siblings_and_no_type(tmp_path):
             "dtype": "bfloat16",
         },
     }
-    config_path = _write_config(tmp_path, config)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(config, f)
+        config_path = f.name
 
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
     cleaned_path = extract_path_fields_from_config(config_path, ["policy"])
 
     with open(cleaned_path) as f:
@@ -243,6 +262,9 @@ def test_extract_removes_field_with_siblings_and_no_type(tmp_path):
     overrides = get_yaml_overrides("policy")
     assert any("n_action_steps=10" in o for o in overrides)
     assert any("dtype=bfloat16" in o for o in overrides)
+
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
 
 
 @dataclass
@@ -260,7 +282,7 @@ class _DummyConfig:
         return ["nested"]
 
 
-def test_wrap_uses_cleaned_config_for_draccus_parse(tmp_path):
+def test_wrap_uses_cleaned_config_for_draccus_parse():
     """Regression: wrap() updates config_path_cli to point at the cleaned temp
     file but must propagate that to the draccus.parse fallback branch. Without
     the fix, cli_args still contains --config_path=<original> and draccus reads
@@ -270,7 +292,12 @@ def test_wrap_uses_cleaned_config_for_draccus_parse(tmp_path):
         "nested": {"path": "some/checkpoint", "foo": 42},
         "other": "set-via-yaml",
     }
-    config_path = _write_config(tmp_path, config)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump(config, f)
+        config_path = f.name
+
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()
 
     captured: dict = {}
 
@@ -289,97 +316,5 @@ def test_wrap_uses_cleaned_config_for_draccus_parse(tmp_path):
     # the captured yaml_overrides via from_pretrained()).
     assert captured["cfg"].nested.foo == 0
 
-
-@dataclass
-class _ExplicitNested:
-    fps: int = 10
-    task_ids: list[int] | None = None
-
-
-@dataclass
-class _ExplicitConfig:
-    env: _ExplicitNested = field(default_factory=_ExplicitNested)
-    steps: int = 5
-
-    @classmethod
-    def __get_path_fields__(cls):
-        return ["policy"]
-
-
-def test_config_file_defaults_are_not_explicit_overrides(tmp_path):
-    """A config file dumped by a previous run serializes every default; those must not
-    count as deliberate user choices, or checkpoint-owned adoption paths hard-error on
-    fields nobody set."""
-    config = {"env": {"fps": 10, "task_ids": None}, "steps": 5}
-    config_path = _write_config(tmp_path, config)
-
-    extract_path_fields_from_config(config_path, ["policy"], _ExplicitConfig)
-
-    assert parser.get_explicit_override_fields("env") == set()
-    assert "steps" not in _config_explicit_fields
-
-
-def test_config_file_non_defaults_are_explicit_including_lists(tmp_path):
-    """Non-default config-file values are explicit — including list-valued fields, which
-    the CLI-flattening path used to drop silently."""
-    config = {"env": {"fps": 99, "task_ids": [1, 2]}}
-    config_path = _write_config(tmp_path, config)
-
-    extract_path_fields_from_config(config_path, ["policy"], _ExplicitConfig)
-
-    assert {"fps", "task_ids"} <= parser.get_explicit_override_fields("env")
-
-
-def test_wrap_second_parse_starts_clean(tmp_path):
-    """A second wrapped parse in the same process — even one passing no --config_path —
-    must not inherit the first parse's path args or explicit-override registries."""
-    config = {
-        "nested": {"path": "run1/checkpoint"},
-        "other": "set-via-yaml",
-    }
-    config_path = _write_config(tmp_path, config)
-
-    @parser.wrap()
-    def main(cfg: _DummyConfig) -> _DummyConfig:
-        return cfg
-
-    with patch.object(sys, "argv", ["prog", f"--config_path={config_path}"]):
-        main()
-    assert get_path_arg("nested") == "run1/checkpoint"
-    assert "other" in parser.get_explicit_override_fields("other")
-
-    with patch.object(sys, "argv", ["prog", "--other=run2"]):
-        cfg2 = main()
-    assert cfg2.other == "run2"
-    assert get_path_arg("nested") is None
-    assert parser.get_explicit_override_fields("other") == set()
-
-
-def test_wrap_clears_stale_registries_for_presupplied_config():
-    """A programmatically built config must not inherit a previous CLI parse's
-    registry entries: the pre-supplied-cfg branch performs no parse, so before the
-    fix a stale explicit env.fps override could hard-fail reconcile_policy_contract
-    on a config that never mentioned fps."""
-    from dataclasses import dataclass
-
-    from lerobot.configs import parser
-
-    @dataclass
-    class _TinyConfig:
-        x: int = 0
-
-    # Pollute the registries as an earlier --config_path parse would.
-    _config_explicit_fields["env"] = {"fps"}
-    parser._config_path_args["policy"] = "lerobot/some_policy"
-    parser._config_yaml_overrides["env"] = {"fps": 25}
-
-    @parser.wrap()
-    def main(cfg: _TinyConfig):
-        return (
-            parser.get_explicit_override_fields("env"),
-            parser.get_path_arg("policy"),
-        )
-
-    explicit, path_arg = main(_TinyConfig())
-    assert explicit == set()
-    assert path_arg is None
+    _config_path_args.clear()
+    _config_yaml_overrides.clear()

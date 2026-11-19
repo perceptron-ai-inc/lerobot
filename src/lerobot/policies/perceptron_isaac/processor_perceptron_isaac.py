@@ -8,9 +8,11 @@ policy device, and normalized actions are unnormalized on the way back to CPU.
 import json
 import logging
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
 import torch
@@ -18,13 +20,6 @@ from torch import Tensor
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.lerobot_types import EnvTransition, TransitionKey
-from lerobot.policies.processor_utils import (
-    RETAINED_SAMPLE_INDICES_KEY,
-    coerce_batch_text,
-    coerce_rgb_uint8,
-    flatten_feature_names,
-    to_numpy as _to_numpy,
-)
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -45,13 +40,20 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-from .configuration_perceptron_isaac import PerceptronIsaacConfig
+from .checkpoint_integrity import canonical_json_sha256
+from .configuration_perceptron_isaac import (
+    PerceptronIsaacConfig,
+    is_portable_isaac05_repository,
+    reject_legacy_action_conditioning,
+)
 from .fast_processor import load_fast_action_processor
 from .isaac_stats import (
+    IsaacNormalizationProfile,
     IsaacNormalizationStats,
     IsaacStatsBlock,
     apply_gripper_passthrough,
     isaac_stats_from_state_dict,
+    isaac_stats_to_dict,
     isaac_stats_to_state_dict,
     isaac_stats_value_differences,
     load_isaac_stats,
@@ -66,12 +68,23 @@ from .mharmony_native import (
     IsaacMharmonyRenderMetadata,
     IsaacNativeMharmonyRenderer,
     hydrate_isaac_training_proprio_contract,
+    load_native_render_metadata,
 )
+from .processor_utils import (
+    RETAINED_SAMPLE_INDICES_KEY,
+    coerce_batch_text,
+    coerce_rgb_uint8,
+    flatten_feature_names,
+    letterbox_resize_image,
+    to_numpy as _to_numpy,
+)
+
+if TYPE_CHECKING:
+    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 
 PERCEPTRON_ISAAC_STREAM_KEY = "perceptron_isaac_stream"
 PERCEPTRON_ISAAC_RENDER_META_KEY = "perceptron_isaac_render_meta"
 PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY = "perceptron_isaac_anchor_timestamp_seconds"
-PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY = "perceptron_isaac_previous_actions"
 # Backward-compatible policy-specific alias for the shared filtered-batch protocol.
 PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY = RETAINED_SAMPLE_INDICES_KEY
 # When online single-step serving skips rendering (the anchor arrives only after
@@ -80,6 +93,7 @@ PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY = RETAINED_SAMPLE_INDICES_KEY
 # with the checkpoint's serialized stats instead of independently path-loading
 # config.native_stats_path (which, for PEFT finetunes, points at the base package).
 PERCEPTRON_ISAAC_SERVING_STATS_KEY = "perceptron_isaac_serving_stats"
+LIBERO_SERVING_STATS_FILENAME = "libero_serving_stats.json"
 
 _TASK_TRAILING_SENTENCE_PUNCTUATION = ".,!?;:,\u2026"
 _TASK_TRAILING_CLOSERS = "\"'\u201d\u2019)]}"
@@ -99,22 +113,16 @@ _PACK_CONFIG_METADATA = {"pack_config": True}
 _LIST_CONFIG_FIELD_NAMES = frozenset({"camera_order", "image_size", "image_keys"})
 
 
-def _adopt_dataset_state_feature_names(config: PerceptronIsaacConfig, dataset_meta: Any | None) -> None:
-    """Capture non-strict dataset state layout so gripper masks can be derived and saved."""
+def _adopt_dataset_state_feature_names(
+    config: PerceptronIsaacConfig, dataset_meta: "LeRobotDatasetMetadata | None"
+) -> None:
+    """Capture non-strict state names for masks; make_policy validates strict joint order."""
     if dataset_meta is None or config.strict_hardware_feature_contract:
         return
-    features = getattr(dataset_meta, "features", None)
-    if not isinstance(features, dict):
-        return
-    state_feature = features.get(OBS_STATE)
+    state_feature = dataset_meta.features.get(OBS_STATE)
     if state_feature is None:
         return
-    raw_names = (
-        state_feature.get("names")
-        if isinstance(state_feature, dict)
-        else getattr(state_feature, "names", None)
-    )
-    names = flatten_feature_names(raw_names, empty_as_none=True)
+    names = flatten_feature_names(state_feature.get("names"), empty_as_none=True)
     if names is None:
         return
     if len(names) != int(config.proprio_dim):
@@ -125,7 +133,13 @@ def _adopt_dataset_state_feature_names(config: PerceptronIsaacConfig, dataset_me
     config.state_feature_names = names
 
 
-def _dataset_stats_to_isaac_stats(dataset_stats, config, *, dataset_fps):
+def _dataset_stats_to_isaac_stats(
+    dataset_stats,
+    config: PerceptronIsaacConfig,
+    *,
+    dataset_fps: float | None,
+    source_profile: IsaacNormalizationProfile | None = None,
+) -> IsaacNormalizationStats:
     """Convert LeRobot dataset quantiles into native Isaac normalization stats."""
     action_raw = dataset_stats.get("action")
     proprio_raw = dataset_stats.get("observation.state") or dataset_stats.get("state")
@@ -169,6 +183,8 @@ def _dataset_stats_to_isaac_stats(dataset_stats, config, *, dataset_fps):
     # only trustworthy comparison (isaac_stats_value_differences), but the label should
     # not collide on top of that.
     base_profile_id = config.normalization_profile_id
+    if base_profile_id is None and source_profile is not None:
+        base_profile_id = source_profile.profile_id
     if base_profile_id and not str(base_profile_id).endswith("#finetune_dataset"):
         profile_id = f"{base_profile_id}#finetune_dataset"
     else:
@@ -201,6 +217,26 @@ def _dataset_stats_to_isaac_stats(dataset_stats, config, *, dataset_fps):
             action_feature_names=list(config.action_feature_names or []),
             state_feature_names=list(config.state_feature_names or []),
         )
+    if source_profile is not None:
+        assert profile_id is not None
+        serialized = isaac_stats_to_dict(stats)
+        action_stats_sha256 = canonical_json_sha256(serialized["action"])
+        proprio_stats_sha256 = canonical_json_sha256(serialized["proprio"])
+        profile_data = {
+            "profile_id": profile_id,
+            "action_stats_sha256": action_stats_sha256,
+            "proprio_stats_sha256": proprio_stats_sha256,
+            "clip_normalized_proprio": source_profile.clip_normalized_proprio,
+            "proprio_clip_normalized_max": source_profile.proprio_clip_normalized_max,
+        }
+        profile = replace(
+            source_profile,
+            profile_id=profile_id,
+            profile_sha256=canonical_json_sha256(profile_data),
+            action_stats_sha256=action_stats_sha256,
+            proprio_stats_sha256=proprio_stats_sha256,
+        )
+        stats = replace(stats, profile=profile)
     return stats
 
 
@@ -216,7 +252,7 @@ def _sync_normalization_labels(step: Any, stats: IsaacNormalizationStats) -> Non
     step.normalization_validation_status = stats.validation_status
 
 
-def _install_dataset_stats(preprocessor, postprocessor, stats):
+def _install_normalization_stats(preprocessor, postprocessor, stats):
     for step in preprocessor.steps:
         if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep):
             step._stats = stats
@@ -226,6 +262,35 @@ def _install_dataset_stats(preprocessor, postprocessor, stats):
         if isinstance(step, PerceptronIsaacActionUnnormalizeProcessorStep):
             step._stats = stats
             _sync_normalization_labels(step, stats)
+
+
+def _install_finetune_dataset_stats(
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+    config: PerceptronIsaacConfig,
+    dataset_stats: dict[str, dict[str, torch.Tensor]],
+    *,
+    dataset_fps: float | None,
+) -> None:
+    base_stats = next(
+        (
+            step._stats
+            for step in preprocessor.steps
+            if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep) and step._stats is not None
+        ),
+        None,
+    )
+    if base_stats is None:
+        path = config.resolve_native_stats_path()
+        if path is not None and Path(path).is_file():
+            base_stats = load_isaac_stats(path)
+    stats = _dataset_stats_to_isaac_stats(
+        dataset_stats,
+        config,
+        dataset_fps=dataset_fps,
+        source_profile=base_stats.profile if base_stats is not None else None,
+    )
+    _install_normalization_stats(preprocessor, postprocessor, stats)
 
 
 def _record_config_stats_export(config: PerceptronIsaacConfig, preprocessor) -> None:
@@ -384,6 +449,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
     action_conditioning_role: str = field(default="user", metadata=_PACK_CONFIG_METADATA)
     mistake_conditioning: bool = field(default=False, metadata=_PACK_CONFIG_METADATA)
     render_metadata: dict[str, Any] | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
+    inference_clip_normalized_proprio: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     train_clip_normalized_actions: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     clip_normalized_max: float = field(default=10.0, metadata=_PACK_CONFIG_METADATA)
     # FAST tokenizer input cap; Genesis lowers FAST and Flow with independent caps.
@@ -397,6 +463,11 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
     state_feature_names: list[str] | None = field(default=None, metadata=_PACK_CONFIG_METADATA)
 
     def __post_init__(self) -> None:
+        reject_legacy_action_conditioning(self.action_conditioning)
+        if not isinstance(self.inference_clip_normalized_proprio, bool):
+            raise ValueError("inference_clip_normalized_proprio must be a boolean.")
+        if self.render_metadata is not None:
+            IsaacMharmonyRenderMetadata(**self.render_metadata)
         self.mharmony_version = normalize_mharmony_version_marker(self.mharmony_version)
         require_closed_loop_safe_isaac_profile(
             profile_id=self.normalization_profile_id,
@@ -415,14 +486,16 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 "Perceptron Isaac image_preprocessing must be 'stretch' or 'letterbox'; "
                 f"got {self.image_preprocessing!r}."
             )
-        self._stream_builder = None
-        self._stats = None
-        self._fast_processor = None
-        self._suite_stats = None
-        self._suite_by_task_index = None
+        self._stream_builder: IsaacNativeMharmonyRenderer | None = None
+        self._stats: IsaacNormalizationStats | None = None
+        self._fast_processor: Callable[[np.ndarray], list[list[int]]] | None = None
+        self._suite_stats: dict[str, IsaacNormalizationStats] | None = None
+        self._suite_by_task_index: dict[int, str] | None = None
         # Run-local, factory-injected: the training dataset's declared fps, used to
         # cross-check the checkpoint-owned clock in _frame_index_anchors. Never serialized.
-        self._dataset_declared_fps = None
+        self._dataset_declared_fps: float | None = None
+        # Run-local episode endpoints, never serialized into a portable policy.
+        self._dataset_metadata: LeRobotDatasetMetadata | None = None
         self._warned_dataset_fps_mismatch = False
 
     def reset(self) -> None:
@@ -432,6 +505,10 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         config: dict[str, Any] = {}
         for config_field in dataclass_fields(self):
             name = config_field.name
+            # Preserve legacy processor JSON exactly; only the explicit deployment
+            # override needs a new wire field. Missing still means source clipping.
+            if name == "inference_clip_normalized_proprio" and self.inference_clip_normalized_proprio:
+                continue
             if not self._serialize_pack_fields and config_field.metadata.get("pack_config"):
                 continue
             value = getattr(self, name)
@@ -491,15 +568,12 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         if action is not None:
             return int(action.shape[0]) if action.ndim > 1 else 1
         state = observation.get(OBS_STATE)
-        if torch.is_tensor(state) or isinstance(state, np.ndarray):
-            ndim = getattr(state, "ndim", 0)
-            if ndim >= 2:
-                return int(state.shape[0])
-            return 1
+        if isinstance(state, (Tensor, np.ndarray)):
+            return int(state.shape[0]) if state.ndim >= 2 else 1
         for key in self._resolve_image_keys(observation):
             value = observation[key]
-            if torch.is_tensor(value) or isinstance(value, np.ndarray):
-                return int(value.shape[0]) if getattr(value, "ndim", 0) >= 4 else 1
+            if isinstance(value, (Tensor, np.ndarray)):
+                return int(value.shape[0]) if value.ndim >= 4 else 1
         return 1
 
     def _extract_image_tensor(self, observation: dict[str, Any], batch_size: int) -> np.ndarray:
@@ -555,8 +629,6 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         from torchvision.transforms import InterpolationMode
         from torchvision.transforms.v2 import functional as tvf
 
-        from lerobot.transforms import letterbox_resize_image
-
         tensor = torch.from_numpy(np.ascontiguousarray(images))
         if not channels_first:
             tensor = tensor.movedim(-1, -3)
@@ -604,9 +676,9 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             return state[None, None, :]
         raise ValueError(f"Unsupported Isaac state shape {state.shape}.")
 
-    def _ensure_renderer(self) -> None:
+    def _ensure_renderer(self) -> IsaacNativeMharmonyRenderer:
         if self._stream_builder is not None:
-            return
+            return self._stream_builder
         if self.inference_backend != "native_mharmony":
             raise ValueError(
                 "Perceptron Isaac pack only supports inference_backend='native_mharmony', "
@@ -648,7 +720,14 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 mharmony_version=self.mharmony_version,
             )
         self._validate_target_fps(metadata.target_fps, artifact="render metadata")
+        # Inlined/sidecar metadata is authoritative on restored pipelines as well.
+        self.patch_size = metadata.patch_size
+        self.pixel_shuffle_scale = metadata.pixel_shuffle_scale
+        self.temporal_patch_size = metadata.temporal_patch_size
+        self.max_num_patches = metadata.max_num_patches
+        self.min_num_patches = metadata.min_num_patches
         self._stream_builder = IsaacNativeMharmonyRenderer(metadata=metadata, stats=self._stats)
+        return self._stream_builder
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         if not self.enabled:
@@ -756,6 +835,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 for scope, block in load_isaac_suite_stats(self.suite_stats_path).items()
             }
             self._require_suite_geometry_matches_contract(suite_stats)
+            assert self.suite_by_task_index_path is not None  # Validated together in __post_init__.
             raw = json.loads(Path(self.suite_by_task_index_path).read_text())
             suite_by_task_index = {int(k): str(v) for k, v in raw.items()}
             missing = sorted(set(suite_by_task_index.values()) - set(suite_stats))
@@ -819,6 +899,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         """Per-sample normalization stats, or None when per-suite routing is off."""
         if not self._ensure_suite_stats():
             return None
+        assert self._suite_stats is not None and self._suite_by_task_index is not None
         task_indices = self._anchor_numeric_values(
             complementary.get("task_index"), batch_size, field_name="task_index"
         )
@@ -884,7 +965,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 )
         return [float(frame) / fps for frame in frames]
 
-    def _anchor_timestamps(self, complementary: dict[str, Any], batch_size: int) -> list[float | None]:
+    def _anchor_timestamps(self, complementary: dict[str, Any], batch_size: int) -> list[float] | list[None]:
         explicit_anchors = self._anchor_numeric_values(
             complementary.get(PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY),
             batch_size,
@@ -924,15 +1005,18 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
         tasks: list[str],
         actions: Tensor | None,
         complementary: dict[str, Any],
-        anchors: list[float | None],
+        anchors: Sequence[float | None],
     ):
-        self._ensure_renderer()
+        renderer = self._ensure_renderer()
         if actions is not None:
-            if any(anchor is None for anchor in anchors):
+            training_anchors = [anchor for anchor in anchors if anchor is not None]
+            if len(training_anchors) != len(anchors):
                 raise ValueError(
                     "ISAAC training requires an explicit episode-relative dataset timestamp; "
                     "the stateless processor never synthesizes model time."
                 )
+            if not bool(torch.isfinite(actions).all()):
+                raise ValueError("ISAAC training actions must contain only finite values before filtering.")
             if actions.ndim != 3:
                 raise ValueError(
                     f"ISAAC training actions must be shaped [B, H, D], got {tuple(actions.shape)}."
@@ -943,6 +1027,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                 )
             fast_processor = self._ensure_fast_processor()
             pad_rows = self._action_padding_rows(complementary, len(windows))
+            terminals = self._training_terminal_rows(complementary, pad_rows)
             suite_stats = self._suite_stats_for(complementary, len(windows))
             streams = []
             kept_indices = []
@@ -955,13 +1040,14 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             unchecked_length = 2**31 - 1
 
             def render_sample(index: int, *, skip_outlier_threshold: float, max_sequence_length: int):
-                return self._stream_builder.build_training(
+                return renderer.build_training(
                     stats=None if suite_stats is None else suite_stats[index],
                     observation_window=windows[index],
                     prompt=tasks[index],
                     action_chunk=actions[index].detach().cpu().numpy(),
                     fast_processor=fast_processor,
                     action_is_pad=pad_rows[index],
+                    terminal=terminals[index],
                     clip_normalized_actions=bool(self.train_clip_normalized_actions),
                     clip_normalized_max=float(self.clip_normalized_max),
                     fast_clip_normalized_max=float(self.fast_clip_normalized_max),
@@ -974,7 +1060,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                     min_num_patches=self.min_num_patches,
                     pixel_shuffle_scale=self.pixel_shuffle_scale,
                     temporal_patch_size=self.temporal_patch_size,
-                    anchor_timestamp_seconds=float(anchors[index]),
+                    anchor_timestamp_seconds=float(training_anchors[index]),
                 )
 
             # In a distributed run a data-dependent raise on one rank aborts it alone while
@@ -1002,59 +1088,63 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
                     continue
                 streams.append(stream)
                 kept_indices.append(index)
-            if distributed and not self._all_distributed_ranks_have_usable_samples(bool(streams)):
-                # Every rank participates in this validation collective before any rank can enter
-                # denominator/model collectives. Fail together instead of keeping an outlier with
-                # the threshold disabled or letting one rank raise alone and hang its peers.
-                raise IsaacActionOutlierError(
-                    "At least one distributed rank has no usable samples after ISAAC outlier and "
-                    f"max_sequence_length={max_sequence_length} filtering. Aborting this update on "
-                    "every rank before loss collectives; verify normalization stats, suite routing, "
-                    "and the sequence-length budget."
-                )
-            if not streams:
-                # No collectives to keep in lockstep: an all-outlier microbatch means the
-                # normalization stats do not match the data, and training on it clipped
-                # would only converge to a silently wrong policy.
-                raise IsaacActionOutlierError(
-                    "Every ISAAC training sample in this microbatch exceeded "
-                    f"train_skip_outlier_threshold={self.train_skip_outlier_threshold}. This "
-                    "usually means the normalization stats do not match the dataset (wrong "
-                    "stats file or wrong per-suite routing)."
-                )
             complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] = kept_indices
-            return self._stream_builder.collate(streams)
-        if len(windows) != 1:
-            raise NotImplementedError("Perceptron Isaac eval rendering currently supports batch_size=1.")
+            if not streams:
+                # Window-level counts decide global eligibility. Do not duplicate rejected
+                # samples to make a rank participate in model/loss collectives.
+                from .tensor_stream import TensorStream
+
+                return TensorStream.collective_dummy()
+            return renderer.collate(streams)
         dtype = _dtype_from_name(self.dtype)
-        fast_processor = (
-            self._ensure_fast_processor() if self._stream_builder.metadata.action_conditioning else None
-        )
-        stream = self._stream_builder.build(
-            observation_window=windows[0],
-            prompt=tasks[0],
-            fast_processor=fast_processor,
-            device=self.device,
-            dtype=dtype,
-            patch_size=self.patch_size,
-            max_num_patches=self.max_num_patches,
-            min_num_patches=self.min_num_patches,
-            pixel_shuffle_scale=self.pixel_shuffle_scale,
-            temporal_patch_size=self.temporal_patch_size,
-            scene_events=None,
-            anchor_timestamp_seconds=anchors[0],
-        )
-        if stream.shape[1] > int(self.train_max_sequence_length):
-            raise ValueError(
-                f"ISAAC inference stream uses {stream.shape[1]} tokens, exceeding the "
-                f"checkpoint-trained max_sequence_length={self.train_max_sequence_length}."
+        streams = []
+        for window, task, anchor in zip(windows, tasks, anchors, strict=True):
+            stream = renderer.build(
+                observation_window=window,
+                prompt=task,
+                device=self.device,
+                dtype=dtype,
+                patch_size=self.patch_size,
+                max_num_patches=self.max_num_patches,
+                min_num_patches=self.min_num_patches,
+                pixel_shuffle_scale=self.pixel_shuffle_scale,
+                temporal_patch_size=self.temporal_patch_size,
+                scene_events=None,
+                inference_clip_normalized_proprio=self.inference_clip_normalized_proprio,
+                anchor_timestamp_seconds=anchor,
             )
-        return stream
+            if stream.shape[1] > int(self.train_max_sequence_length):
+                raise ValueError(
+                    f"ISAAC inference stream uses {stream.shape[1]} tokens, exceeding the "
+                    f"checkpoint-trained max_sequence_length={self.train_max_sequence_length}."
+                )
+            streams.append(stream)
+        # Keep the B=1 stream unchanged; only vector batches need right-padding.
+        return streams[0] if len(streams) == 1 else renderer.collate(streams)
+
+    def _batch_validity_collective_device(self) -> torch.device:
+        """Device the batch-validity all_reduce must use for the active process group.
+
+        `self.device` cannot decide this: it is a DATA-placement field defaulting to "cpu",
+        and NCCL registers no backend for CPU tensors, so reducing one raises
+        "No backend type associated with device type cpu" and no distributed run of this
+        policy can start. Any group with a NCCL component therefore reduces on the
+        accelerator this rank already owns, while gloo/mpi/ucc-only groups stay on CPU so a
+        CPU-only run is never forced to create a CUDA context.
+        """
+        backend = str(torch.distributed.get_backend()).lower()
+        if "nccl" not in backend:
+            return torch.device("cpu")
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "The ISAAC batch-validity collective needs a CUDA device because the process "
+                f"group backend is {backend!r}, but torch.cuda.is_available() is False."
+            )
+        return torch.device("cuda", torch.cuda.current_device())
 
     def _all_distributed_ranks_have_usable_samples(self, locally_usable: bool) -> bool:
         """Collectively decide batch validity on a backend-compatible device."""
-        backend = str(torch.distributed.get_backend()).lower()
-        status_device = torch.device(self.device) if "nccl" in backend else torch.device("cpu")
+        status_device = self._batch_validity_collective_device()
         status = torch.tensor(int(locally_usable), device=status_device, dtype=torch.int32)
         torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN)
         return bool(status.item())
@@ -1071,6 +1161,72 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             )
         self._fast_processor = load_fast_action_processor(path, expected_tree_sha256=tree_sha256)
         return self._fast_processor
+
+    @staticmethod
+    def _episode_index_values(raw: Any, batch_size: int, *, name: str) -> list[int] | None:
+        """Read exact dataset indices without the clock helper's float32 rounding/broadcast."""
+        if raw is None:
+            return None
+        values = _to_numpy(raw)
+        if values.size != batch_size or not np.issubdtype(values.dtype, np.integer):
+            raise ValueError(f"ISAAC terminal routing requires one integer {name} per sample.")
+        indices = [int(value) for value in values.reshape(-1).tolist()]
+        if any(value < 0 for value in indices):
+            raise ValueError(f"ISAAC terminal routing requires nonnegative {name}.")
+        return indices
+
+    def _training_terminal_rows(
+        self, complementary: dict[str, Any], pad_rows: list[list[bool]]
+    ) -> list[bool]:
+        """Match MDS last-real-action completion using authoritative episode endpoints.
+
+        Current observation DONE/TRUNCATED is not an episode-wide terminal index.
+        Both explicit truncation and implicit last-step termination count in frozen MDS.
+        """
+        batch_size = len(pad_rows)
+        metadata = self._dataset_metadata
+        if metadata is None or "episode_index" not in metadata.features:
+            return [False] * batch_size
+        episodes = metadata.episodes
+        if episodes is None:
+            return [False] * batch_size
+        episode_indices = self._episode_index_values(
+            complementary.get("episode_index"), batch_size, name="episode_index"
+        )
+        frame_indices = self._episode_index_values(
+            complementary.get("frame_index"), batch_size, name="frame_index"
+        )
+        if episode_indices is None or frame_indices is None:
+            return [False] * batch_size
+        absolute_indices = self._episode_index_values(complementary.get("index"), batch_size, name="index")
+        terminals = []
+        for sample, (episode_index, frame, padding) in enumerate(
+            zip(episode_indices, frame_indices, pad_rows, strict=True)
+        ):
+            if episode_index >= len(episodes):
+                raise ValueError(f"ISAAC terminal routing has no metadata for episode {episode_index}.")
+            episode = episodes[episode_index]
+            start, end = int(episode["dataset_from_index"]), int(episode["dataset_to_index"])
+            if (
+                int(episode["episode_index"]) != episode_index
+                or start < 0
+                or end <= start
+                or frame >= end - start
+            ):
+                raise ValueError("ISAAC terminal routing episode bounds or frame index are inconsistent.")
+            anchor = start + frame
+            if absolute_indices is not None and absolute_indices[sample] != anchor:
+                raise ValueError(
+                    "ISAAC terminal routing absolute index disagrees with episode/frame metadata."
+                )
+            positions = [anchor + delta for delta in range(len(padding))]
+            if padding != [position >= end for position in positions]:
+                raise ValueError("ISAAC terminal routing action padding disagrees with episode bounds.")
+            real_positions = [
+                position for position, padded in zip(positions, padding, strict=True) if not padded
+            ]
+            terminals.append(bool(real_positions) and real_positions[-1] == end - 1)
+        return terminals
 
     def _action_padding_rows(self, complementary: dict[str, Any], batch_size: int) -> list[list[bool]]:
         raw = complementary.get("action_is_pad")
@@ -1106,10 +1262,6 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             )
 
         batch_size = self._infer_batch_size(observation, action)
-        if action is None and batch_size != 1:
-            raise NotImplementedError(
-                f"Perceptron Isaac eval/serving currently supports batch_size=1; got batch_size={batch_size}."
-            )
         images = self._extract_image_tensor(observation, batch_size)
         states = self._extract_state_tensor(observation, batch_size)
         if images.shape[:2] != states.shape[:2]:
@@ -1155,19 +1307,6 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
             build_perceptron_isaac_observation_window(images[idx], states[idx], tuple(self.camera_order))
             for idx in range(batch_size)
         ]
-        previous_action_batches = complementary.get(PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY)
-        if previous_action_batches is not None:
-            if not isinstance(previous_action_batches, list) or len(previous_action_batches) != batch_size:
-                raise ValueError(
-                    f"{PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY} must contain one history per batch item."
-                )
-            for window, previous_actions in zip(windows, previous_action_batches, strict=True):
-                if not isinstance(previous_actions, list) or len(previous_actions) != len(window):
-                    raise ValueError(
-                        f"{PERCEPTRON_ISAAC_PREVIOUS_ACTIONS_KEY} histories must align with observation windows."
-                    )
-                for frame, previous_action in zip(window, previous_actions, strict=True):
-                    frame["previous_action"] = previous_action
         anchors = self._anchor_timestamps(complementary, batch_size)
         complementary[self.stream_key] = self._render_streams(
             windows=windows,
@@ -1203,6 +1342,76 @@ class PerceptronIsaacMharmonyPackProcessorStep(PerceptronIsaacRenderProcessorSte
 
     _serialize_pack_fields: ClassVar[bool] = True
 
+    @classmethod
+    def from_config(
+        cls,
+        config: PerceptronIsaacConfig,
+        *,
+        native_stats_path: str | None,
+        device: str,
+        suite_stats_path: str | None = None,
+        suite_by_task_index_path: str | None = None,
+    ) -> "PerceptronIsaacMharmonyPackProcessorStep":
+        """Apply the shared render contract with caller-owned path, device and suite routing."""
+        metadata = None
+        if config.native_render_metadata_path or config.resolve_native_recipe_path() is not None:
+            metadata = load_native_render_metadata(config, stats_fps=config.target_fps)
+        return cls(
+            enabled=True,
+            inference_backend=str(config.inference_backend),
+            config_toml_path=config.config_toml_path,
+            stats_path=config.stats_path,
+            native_render_metadata_path=config.native_render_metadata_path,
+            native_stats_path=native_stats_path,
+            fast_processor_path=config.fast_processor_path,
+            fast_processor_tree_sha256=config.fast_processor_tree_sha256,
+            mharmony_version=config.mharmony_version,
+            action_dim=int(config.action_dim),
+            proprio_dim=int(config.proprio_dim),
+            vector_max_states=int(config.vector_max_states),
+            dataset_name=str(config.dataset_name),
+            robot_type=str(config.robot_type),
+            target_fps=config.target_fps,
+            action_conditioning=bool(config.action_conditioning),
+            action_conditioning_role=str(config.action_conditioning_role),
+            mistake_conditioning=bool(config.mistake_conditioning),
+            camera_order=list(config.camera_order),
+            image_size=config.image_size,
+            image_preprocessing=str(config.image_preprocessing),
+            image_keys=[f"observation.images.{cam}" for cam in config.camera_order],
+            allow_image_key_fallback=bool(config.allow_image_key_fallback),
+            normalize_language=bool(config.normalize_task_text),
+            n_obs_steps=int(config.n_obs_steps),
+            chunk_size=int(config.chunk_size),
+            objective=str(config.objective),
+            patch_size=int(config.render_patch_size) if metadata is None else metadata.patch_size,
+            max_num_patches=config.render_max_num_patches if metadata is None else metadata.max_num_patches,
+            min_num_patches=config.render_min_num_patches if metadata is None else metadata.min_num_patches,
+            pixel_shuffle_scale=(
+                int(config.render_pixel_shuffle_scale) if metadata is None else metadata.pixel_shuffle_scale
+            ),
+            temporal_patch_size=(
+                int(config.render_temporal_patch_size) if metadata is None else metadata.temporal_patch_size
+            ),
+            device=device,
+            dtype="bfloat16",
+            normalization_profile_id=config.normalization_profile_id,
+            normalization_profile_scope=config.normalization_profile_scope,
+            normalization_validation_status=config.normalization_validation_status,
+            render_metadata=None if metadata is None else metadata.to_json_dict(),
+            inference_clip_normalized_proprio=config.inference_clip_normalized_proprio,
+            train_clip_normalized_actions=bool(config.train_clip_normalized_actions),
+            clip_normalized_max=float(config.clip_normalized_max),
+            fast_clip_normalized_max=float(config.fast_clip_normalized_max),
+            train_skip_outlier_threshold=float(config.train_skip_outlier_threshold),
+            train_max_sequence_length=int(config.train_max_sequence_length),
+            normalize_gripper=bool(config.normalize_gripper),
+            action_feature_names=list(config.action_feature_names or []) or None,
+            state_feature_names=list(config.state_feature_names or []) or None,
+            suite_stats_path=suite_stats_path,
+            suite_by_task_index_path=suite_by_task_index_path,
+        )
+
 
 @ProcessorStepRegistry.register(name="perceptron_isaac_action_unnormalize")
 @dataclass
@@ -1228,7 +1437,7 @@ class PerceptronIsaacActionUnnormalizeProcessorStep(ProcessorStep):
             profile_scope=self.normalization_profile_scope,
             validation_status=self.normalization_validation_status,
         )
-        self._stats = None
+        self._stats: IsaacNormalizationStats | None = None
 
     def get_config(self) -> dict[str, Any]:
         return {
@@ -1316,7 +1525,7 @@ class _PerceptronIsaacJointFrameTransformStep(ProcessorStep):
     joint_signs: list[float] | None = None
     joint_offsets: list[float] | None = None
 
-    _container_key: ClassVar[TransitionKey | None] = None
+    _container_key: ClassVar[Literal["observation"] | None] = None
     _value_key: ClassVar[str] = TransitionKey.ACTION
     _inverse: ClassVar[bool] = False
 
@@ -1334,7 +1543,7 @@ class _PerceptronIsaacJointFrameTransformStep(ProcessorStep):
 
         out = transition.copy()
         if self._container_key is not None:
-            container = container.copy()
+            container = dict(container)
             out[self._container_key] = container
         else:
             container = out
@@ -1369,7 +1578,7 @@ class PerceptronIsaacStateFrameTransformStep(_PerceptronIsaacJointFrameTransform
     No-op when both fields are None. See PerceptronIsaacConfig.joint_signs/joint_offsets.
     """
 
-    _container_key: ClassVar[TransitionKey | None] = TransitionKey.OBSERVATION
+    _container_key: ClassVar[Literal["observation"] | None] = TransitionKey.OBSERVATION
     _value_key: ClassVar[str] = OBS_STATE
 
 
@@ -1406,7 +1615,7 @@ class PerceptronIsaacActionFrameTransformStep(_PerceptronIsaacJointFrameTransfor
 def make_perceptron_isaac_pre_post_processors(
     config: PerceptronIsaacConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-    dataset_meta: Any | None = None,
+    dataset_meta: "LeRobotDatasetMetadata | None" = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
@@ -1422,66 +1631,15 @@ def make_perceptron_isaac_pre_post_processors(
     cams = config.camera_order
     if len(cams) >= 2 and cams[1] != "image2":
         rename_map["observation.images.image2"] = f"observation.images.{cams[1]}"
-    render_step_class: type[PerceptronIsaacRenderProcessorStep] = PerceptronIsaacMharmonyPackProcessorStep
-    render_step_kwargs = {
-        "native_render_metadata_path": config.native_render_metadata_path,
-        "native_stats_path": config.native_stats_path,
-        "fast_processor_path": config.fast_processor_path,
-        "fast_processor_tree_sha256": config.fast_processor_tree_sha256,
-        "mharmony_version": config.mharmony_version,
-        "action_dim": int(config.action_dim),
-        "proprio_dim": int(config.proprio_dim),
-        "vector_max_states": int(config.vector_max_states),
-        "dataset_name": str(config.dataset_name),
-        "robot_type": str(config.robot_type),
-        "target_fps": config.target_fps,
-        "action_conditioning": bool(config.action_conditioning),
-        "action_conditioning_role": str(config.action_conditioning_role),
-        "mistake_conditioning": bool(config.mistake_conditioning),
-        "normalization_profile_id": config.normalization_profile_id,
-        "normalization_profile_scope": config.normalization_profile_scope,
-        "normalization_validation_status": config.normalization_validation_status,
-        "render_metadata": (
-            IsaacMharmonyRenderMetadata.from_json_file(config.native_render_metadata_path).to_json_dict()
-            if config.native_render_metadata_path and Path(config.native_render_metadata_path).is_file()
-            else None
-        ),
-        "train_clip_normalized_actions": bool(config.train_clip_normalized_actions),
-        "clip_normalized_max": float(config.clip_normalized_max),
-        "fast_clip_normalized_max": float(config.fast_clip_normalized_max),
-        "train_skip_outlier_threshold": float(config.train_skip_outlier_threshold),
-        "train_max_sequence_length": int(config.train_max_sequence_length),
-        "normalize_gripper": bool(config.normalize_gripper),
-        "action_feature_names": list(config.action_feature_names or []) or None,
-        "state_feature_names": list(config.state_feature_names or []) or None,
-    }
-    render_enabled = True
-    render_step = render_step_class(
-        enabled=render_enabled,
-        inference_backend=str(config.inference_backend),
-        config_toml_path=config.config_toml_path,
-        stats_path=config.stats_path,
-        camera_order=list(config.camera_order),
-        image_size=tuple(config.image_size),
-        image_preprocessing=str(config.image_preprocessing),
-        image_keys=[f"observation.images.{cam}" for cam in config.camera_order],
-        allow_image_key_fallback=bool(config.allow_image_key_fallback),
-        normalize_language=bool(config.normalize_task_text),
-        n_obs_steps=int(config.n_obs_steps),
-        chunk_size=int(config.chunk_size),
-        objective=str(config.objective),
-        patch_size=int(config.render_patch_size),
-        max_num_patches=config.render_max_num_patches,
-        min_num_patches=config.render_min_num_patches,
-        pixel_shuffle_scale=int(config.render_pixel_shuffle_scale),
-        temporal_patch_size=int(config.render_temporal_patch_size),
+    render_step = PerceptronIsaacMharmonyPackProcessorStep.from_config(
+        config,
+        native_stats_path=config.resolve_native_stats_path(),
         device=str(config.device),
-        dtype="bfloat16",
         suite_stats_path=config.suite_stats_path,
         suite_by_task_index_path=config.suite_by_task_index_path,
-        **render_step_kwargs,
     )
-    declared_fps = getattr(dataset_meta, "fps", None)
+    render_step._dataset_metadata = dataset_meta
+    declared_fps = dataset_meta.fps if dataset_meta is not None else None
     if declared_fps is not None:
         # Hand the anchor derivation the training dataset's declared clock so a genuine
         # rate mismatch with the checkpoint's target_fps fails loudly instead of silently
@@ -1503,7 +1661,7 @@ def make_perceptron_isaac_pre_post_processors(
             joint_signs=config.joint_signs, joint_offsets=config.joint_offsets
         ),
         render_step,
-        DeviceProcessorStep(device=config.device),
+        DeviceProcessorStep(device=str(config.device)),
     ]
     output_steps: list[ProcessorStep] = []
     output_steps.append(
@@ -1539,12 +1697,12 @@ def make_perceptron_isaac_pre_post_processors(
         to_output=transition_to_policy_action,
     )
     if dataset_stats is not None:
-        _install_dataset_stats(
+        _install_finetune_dataset_stats(
             preprocessor,
             postprocessor,
-            _dataset_stats_to_isaac_stats(
-                dataset_stats, config, dataset_fps=getattr(dataset_meta, "fps", None)
-            ),
+            config,
+            dataset_stats,
+            dataset_fps=declared_fps,
         )
     _record_config_stats_export(config, preprocessor)
     return preprocessor, postprocessor
@@ -1596,7 +1754,7 @@ def _require_restored_stats_match_config_paths(
                 f"{name_a} and {name_b} serialized different stats values: {'; '.join(diffs)}."
             )
 
-    stats_path = config.native_stats_path or config.stats_path
+    stats_path = config.resolve_native_stats_path()
     if not stats_path:
         return
     path = Path(str(stats_path))
@@ -1716,14 +1874,67 @@ def _reconcile_training_action_frame_step(
             "ISAAC preprocessor must contain exactly one mharmony pack step before the "
             "training action-frame transform can be reconciled."
         )
-    preprocessor.steps.insert(
+    steps = list(preprocessor.steps)
+    steps.insert(
         pack_indices[0],
         PerceptronIsaacTrainingActionFrameTransformStep(
             joint_signs=config.joint_signs,
             joint_offsets=config.joint_offsets,
         ),
     )
+    preprocessor.steps = steps
     logging.info("Installed ISAAC v2 training action-frame transform before mharmony normalization.")
+
+
+def _resolve_retained_processor_path(raw: str, configured: str | None, record: Any, asset_root: Path) -> Path:
+    """Bind only the matching package-relative declaration to its retained owner.
+
+    Containment is checked against ``asset_root`` (the export root for a raw Isaac-0.5
+    layout, the package directory otherwise), the same bound the caller already applied,
+    and the record's stored absolute is compared in resolved form because the loader
+    records the resolved target of a sibling-relative declaration. For a non-portable
+    package ``asset_root`` is the package directory, so a sibling or outside target is
+    still refused.
+    """
+    if (
+        not isinstance(record, dict)
+        or not isinstance(record.get("absolute"), str)
+        or not isinstance(record.get("root"), str)
+        or not isinstance(record.get("relative"), str)
+        or record["absolute"] != configured
+        or record["relative"] != raw
+    ):
+        raise RuntimeError(f"Invalid retained processor path record for {raw!r}.")
+    relative = Path(raw)
+    root = Path(record["root"])
+    candidate = root / relative
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or not root.is_absolute()
+        or not candidate.exists()
+        or candidate.resolve() != Path(record["absolute"]).resolve()
+        or not candidate.resolve().is_relative_to(asset_root.resolve())
+    ):
+        raise RuntimeError(f"Retained processor path escapes or mismatches its package: {raw!r}.")
+    return candidate
+
+
+def _package_asset_root(pretrained_path: str | Path) -> Path:
+    """Return the directory that actually holds a loaded package's assets.
+
+    A raw Isaac-0.5 export stores ``fast_processor_pinned/``,  ``isaac_stats.json``
+    and ``policy_normalization.json`` beside ``lerobot_policy/``, which is why its
+    serialized processor paths are sibling-relative. Resolution therefore uses the
+    export root for that layout and the package directory for every other one; the
+    containment check below is applied to whichever root is in force, so paths that
+    leave it are still refused.
+    """
+    package_root = Path(pretrained_path)
+    export_root = package_root.parent
+    if is_portable_isaac05_repository(export_root):
+        return export_root
+    return package_root
 
 
 def make_perceptron_isaac_pre_post_processors_from_pretrained(
@@ -1732,7 +1943,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     *,
     revision: str | None = None,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
-    dataset_meta: Any | None = None,
+    dataset_meta: "LeRobotDatasetMetadata | None" = None,
     preprocessor_overrides: dict[str, Any] | None = None,
     postprocessor_overrides: dict[str, Any] | None = None,
     preprocessor_config_filename: str = f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
@@ -1746,7 +1957,17 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     Imported packages inline normalization into processor safetensors and
     render metadata into the pack-step config. Relative paths are retained as
     a compatibility fallback for older serialized pipelines only.
+
+    When the policy loader has retained a verified snapshot of the processor assets it
+    records the snapshot root on the config, and the pipelines are restored from that
+    immutable local directory (so no Hub revision applies) instead of the caller's source.
     """
+    # Deliberate getattr: a runtime attribute the policy loader sets, not a config field, so a
+    # config read straight from config.json does not carry it.
+    retained_processor_root = getattr(config, "_pretrained_processor_root", None)
+    if retained_processor_root:
+        pretrained_path = str(retained_processor_root)
+        revision = None
     _adopt_dataset_state_feature_names(config, dataset_meta)
     # Mirror the fresh-construction path, where the pack step's __post_init__ raises for
     # a half-configured pair; without this the loaded-package path silently disables
@@ -1777,6 +1998,15 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     _reconcile_training_action_frame_step(preprocessor, config)
     _reconcile_normalization_recipe(preprocessor, postprocessor, config)
     package_root = Path(pretrained_path)
+    asset_root = _package_asset_root(package_root)
+    # Retention records are runtime-only config metadata, not dataclass fields.
+    retained_paths = getattr(config, "_checkpoint_relative_paths", {})
+    configured_paths = {
+        "native_render_metadata_path": config.native_render_metadata_path,
+        "native_stats_path": config.native_stats_path,
+        "stats_path": config.stats_path,
+        "fast_processor_path": config.fast_processor_path,
+    }
     if package_root.is_dir():
         for step in (*preprocessor.steps, *postprocessor.steps):
             for attribute in (
@@ -1789,9 +2019,15 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                 if not raw or Path(str(raw)).is_absolute():
                     continue
                 candidate = package_root / str(raw)
+                if not candidate.resolve().is_relative_to(asset_root.resolve()):
+                    raise RuntimeError(f"Serialized processor path {attribute} escapes its package: {raw}.")
+                if attribute in retained_paths:
+                    candidate = _resolve_retained_processor_path(
+                        str(raw), configured_paths[attribute], retained_paths[attribute], asset_root
+                    )
                 if candidate.exists():
                     setattr(step, attribute, str(candidate))
-        normalization_path = package_root / "policy_normalization.json"
+        normalization_path = asset_root / "policy_normalization.json"
         for step in preprocessor.steps:
             if (
                 not isinstance(step, PerceptronIsaacMharmonyPackProcessorStep)
@@ -1811,10 +2047,20 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
             )
             step.render_metadata = metadata.to_json_dict()
             step._stream_builder = None
-    declared_fps = getattr(dataset_meta, "fps", None)
+    declared_fps = dataset_meta.fps if dataset_meta is not None else None
     for step in preprocessor.steps:
         if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep):
             step.device = str(config.device)
+            step._dataset_metadata = dataset_meta
+            if step.render_metadata is not None:
+                IsaacMharmonyRenderMetadata(**step.render_metadata).validate_image_preprocess_for_config(
+                    config
+                )
+            elif config.native_render_metadata_path or config.resolve_native_recipe_path() is not None:
+                step.render_metadata = load_native_render_metadata(
+                    config, stats_fps=config.target_fps
+                ).to_json_dict()
+                step._stream_builder = None
             if declared_fps is not None:
                 # Hand the anchor derivation the training dataset's declared clock so a
                 # genuine rate mismatch with the checkpoint's target_fps fails loudly
@@ -1846,12 +2092,12 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                     config.suite_stats_path,
                 )
     if dataset_stats is not None:
-        _install_dataset_stats(
+        _install_finetune_dataset_stats(
             preprocessor,
             postprocessor,
-            _dataset_stats_to_isaac_stats(
-                dataset_stats, config, dataset_fps=getattr(dataset_meta, "fps", None)
-            ),
+            config,
+            dataset_stats,
+            dataset_fps=declared_fps,
         )
     elif dataset_meta is None:
         # Serving/eval load: the package must not be split-brained between its
@@ -1863,5 +2109,26 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
         # native_stats_path (the base package's, for every pre-export finetune) --
         # running the check would fail every healthy finetune resume.
         _require_restored_stats_match_config_paths(preprocessor, postprocessor, config)
+        if config.libero_suite is not None:
+            stats_path = package_root / LIBERO_SERVING_STATS_FILENAME
+            if not stats_path.is_file():
+                raise ValueError(f"Checkpoint does not provide LIBERO suite profiles at {stats_path}.")
+            suite_stats = load_isaac_suite_stats(stats_path)
+            if config.libero_suite not in suite_stats:
+                raise ValueError(
+                    f"Unknown LIBERO suite {config.libero_suite!r}. Choose from {sorted(suite_stats)}."
+                )
+            stats = suite_stats[config.libero_suite]
+            if (
+                stats.profile_scope != config.libero_suite
+                or stats.action_dim != config.action_dim
+                or stats.proprio_dim != config.proprio_dim
+                or stats.action_horizon != config.chunk_size
+                or stats.target_fps != config.target_fps
+            ):
+                raise ValueError(f"LIBERO stats for {config.libero_suite!r} disagree with the policy contract.")
+            stats = _maybe_passthrough_grippers(config, stats)
+            require_closed_loop_safe_isaac_stats(stats)
+            _install_normalization_stats(preprocessor, postprocessor, stats)
     _record_config_stats_export(config, preprocessor)
     return preprocessor, postprocessor

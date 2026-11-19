@@ -1,15 +1,8 @@
 # ruff: noqa
-"""Local HF model definition for the Isaac Qwen3.5-VL flow-matching VLA.
+"""Shared VLA stream shell, vector encoder and flow-matching action expert.
 
-This wraps the native transformers ``Qwen3_5Model`` by composition and adds the
-Isaac proprio encoder plus MolmoAct2 flow-matching action expert. The model
-loads converted HF checkpoints with keys for ``lm_head``, ``model.language_model``,
-``model.visual``, ``model.vector_embedding``, and ``model.action_expert``.
-
-``sample_action(tensor_stream)`` runs the VLM once over a local TensorStream,
-conditions the action expert on pre-action context, and integrates the flow
-expert into a normalized ``[B, H, action_dim]`` chunk. TensorStream, MRoPE, and
-mask utilities are vendored locally for the LeRobot native eval path.
+Native MK1 borrows the stream embedding, mRoPE, training and sampling methods.
+Checkpoint validation and loading live in the native MK1 loader, not this module.
 """
 
 from __future__ import annotations
@@ -17,34 +10,34 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Optional
+from numbers import Real
+from typing import Any, Literal, Optional, TypeAlias
 from collections.abc import Sequence
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.distributed.fsdp import FSDPModule
+
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5PreTrainedModel, Qwen3_5RMSNorm
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5PreTrainedModel
+
+from lerobot.utils.random_utils import deserialize_rng_state, serialize_rng_state
 
 # --- Genesis TensorStream layout / mrope / context-mask utilities ---
-from .checkpoint_integrity import load_json_object
-from .qwen35_checkpoint import (
-    QWEN35_CONVERSION_PROVENANCE_FILE,
-    QWEN35_IMPORT_PROVENANCE_FILE,
-    QWEN35_PACKAGED_SOURCE_FILENAMES,
-    QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
-    QWEN35_WEIGHT_CONVENTION_FILE,
-    _snapshot_verified_qwen35_imported_package,
-    _snapshot_verified_qwen35_trained_package,
-    _VerifiedQwen35Package,
-    _verified_qwen35_model_path,
-    safetensors_checkpoint_layout,
-    verify_qwen35_weight_convention,
+from .rtc import (
+    DIT_ACTION_EXPERT_CONFIG_V1_FIELDS,
+    ActionExpertConditioning,
+    ActionExpertStepModulation,
+    LayerHiddenContext,
+    reject_rtc_prefix,
+    validate_action_context,
+    validate_dit_action_metadata,
 )
-from .tensor_stream import TensorStream, TextType, VisionType, group_streams
+from .tensor_stream import ModalityType, TensorStream, TextType, VectorType, VisionType, group_streams
 from .tensor_stream_utils import (
     build_action_context_mask,
     compute_mrope_pos_tensor,
@@ -56,6 +49,19 @@ from .tensor_stream_utils import (
 # The continuous-action marker type that delimits where the action chunk begins. Genesis sets
 # FLOW_ACTION_TEXT_TYPE = TextType.action_c (value 15); the expert never attends to action tokens.
 FLOW_ACTION_TEXT_TYPE = TextType.action_c
+
+
+def _ordered_modality_input(payload: torch.Tensor, preceding: torch.Tensor) -> torch.Tensor:
+    """Keep exact input bytes while ordering encoder backward through one unused element."""
+    if not preceding.requires_grad:
+        return payload
+    # The unselected scalar retains a zero-gradient edge without a whole-tensor sum,
+    # arithmetic on real input bytes (including signed zero), or detached active math.
+    return torch.where(
+        torch.ones((), dtype=torch.bool, device=payload.device),
+        payload,
+        preceding.reshape(-1)[0].to(device=payload.device, dtype=payload.dtype),
+    )
 
 
 def normalize_vector_tokens(vector_tokens: torch.Tensor, max_states: int | None) -> torch.Tensor:
@@ -82,14 +88,30 @@ def normalize_vector_tokens(vector_tokens: torch.Tensor, max_states: int | None)
     return vector_tokens
 
 
-class ModelOutput:
-    """Minimal local training-output container retained for API compatibility."""
+FlowMatchingContext: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 
-    def __init__(self, final_activations, final_embedding, additional_info=None, flow_matching_expert=None):
+
+class ModelOutput:
+    """Keep final text activations separate from the expert's declared Flow context."""
+
+    def __init__(
+        self,
+        final_activations: torch.Tensor,
+        final_embedding: nn.Module,
+        additional_info: dict[str, Any] | None = None,
+        flow_matching_expert: nn.Module | None = None,
+        *,
+        flow_matching_context: FlowMatchingContext | None = None,
+    ) -> None:
         self.final_activations = final_activations
         self.final_embedding = final_embedding
         self.additional_info = additional_info if additional_info is not None else {}
         self.flow_matching_expert = flow_matching_expert
+        # Existing schema-1 outputs share the final tensor. A layerwise expert still
+        # rejects that form unless its producer supplies the actual selected layers.
+        self.flow_matching_context: FlowMatchingContext = (
+            final_activations if flow_matching_context is None else flow_matching_context
+        )
         self._logits = None
 
     @property
@@ -140,26 +162,6 @@ def build_vector_encoder(vector_max_states: int, hidden: int) -> nn.Module:
     )
 
 
-@torch.no_grad()
-def apply_qwen35_offset_norm_correction(language_model: nn.Module) -> int:
-    """Convert genesis (standard) RMSNorm weights to the native Qwen3.5 unit-offset convention.
-
-    Native ``Qwen3_5RMSNorm`` computes ``x_normed * (1 + weight)`` (weight init = 0), whereas genesis
-    trains a standard ``Qwen2RMSNorm`` (``x_normed * weight``, weight ~ 1). ``convert_genesis_qwen35_to_hf``
-    writes the genesis weights verbatim, so native would apply ``(1 + w)`` instead of ``w`` — a per-channel
-    direction change that compounds across layers into a garbage final state. Subtracting
-    1.0 makes native compute ``(1 + (w - 1)) = w``. Only ``Qwen3_5RMSNorm`` modules are touched — the gated
-    ``Qwen3_5RMSNormGated`` (a different class, standard convention) and the vision LayerNorms are untouched.
-    Idempotency is the caller's responsibility (apply exactly once, right after loading raw genesis weights).
-    """
-    corrected = 0
-    for module in language_model.modules():
-        if isinstance(module, Qwen3_5RMSNorm):
-            module.weight.sub_(1.0)
-            corrected += 1
-    return corrected
-
-
 # === Action expert (vendored MolmoAct2 DiT + pluggable head) ===
 @dataclass
 class MolmoAct2ActionExpertConfig:
@@ -182,8 +184,21 @@ class MolmoAct2ActionExpertConfig:
     causal_attn: bool = False
 
 
+def _broadcast_action_condition(condition: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    if condition.dim() == actions.dim() - 1:
+        return condition.unsqueeze(1)
+    if condition.dim() == actions.dim():
+        return condition
+    raise ValueError(
+        f"Action conditioning must be [B,D] or [B,H,D]; got {tuple(condition.shape)} "
+        f"for actions {tuple(actions.shape)}."
+    )
+
+
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    shift = _broadcast_action_condition(shift, x)
+    scale = _broadcast_action_condition(scale, x)
+    return x * (1 + scale) + shift
 
 
 def _round_up_multiple(value: int, multiple_of: int) -> int:
@@ -211,13 +226,6 @@ class ActionExpertContext:
     self_mask: torch.Tensor | None
     valid_action: torch.Tensor | None
     rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None
-
-
-@dataclass
-class ActionExpertStepModulation:
-    conditioning: torch.Tensor
-    block_modulations: Sequence[tuple[torch.Tensor, ...]]
-    final_modulation: tuple[torch.Tensor, torch.Tensor]
 
 
 class ActionExpertRMSNorm(nn.Module):
@@ -538,7 +546,7 @@ class ActionExpertBlock(nn.Module):
         rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if modulation is None:
-            modulation = self.modulation(conditioning).chunk(9, dim=1)
+            modulation = self.modulation(conditioning).chunk(9, dim=-1)
         (
             shift_msa,
             scale_msa,
@@ -550,19 +558,21 @@ class ActionExpertBlock(nn.Module):
             scale_mlp,
             gate_mlp,
         ) = modulation
-        x = x + gate_msa.unsqueeze(1) * self.self_attn(
+        x = x + _broadcast_action_condition(gate_msa, x) * self.self_attn(
             _modulate(self.self_norm(x), shift_msa, scale_msa),
             attn_mask=self_attn_mask,
             is_causal=is_causal,
             rope_cache=rope_cache,
         )
-        x = x + gate_mca.unsqueeze(1) * self.cross_attn(
+        x = x + _broadcast_action_condition(gate_mca, x) * self.cross_attn(
             _modulate(self.cross_norm(x), shift_mca, scale_mca),
             kv_k=cross_kv[0],
             kv_v=cross_kv[1],
             attn_mask=attn_mask,
         )
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(_modulate(self.ff_norm(x), shift_mlp, scale_mlp))
+        x = x + _broadcast_action_condition(gate_mlp, x) * self.mlp(
+            _modulate(self.ff_norm(x), shift_mlp, scale_mlp)
+        )
         return x
 
 
@@ -581,7 +591,7 @@ class ActionExpertFinalLayer(nn.Module):
         modulation: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if modulation is None:
-            modulation = self.modulation(conditioning).chunk(2, dim=1)
+            modulation = self.modulation(conditioning).chunk(2, dim=-1)
         shift, scale = modulation
         return self.linear(_modulate(self.norm(x), shift, scale))
 
@@ -592,8 +602,8 @@ class SinusoidalTimeEmbedding(nn.Module):
         self.dim = dim
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        if timesteps.dim() > 1:
-            timesteps = timesteps.view(timesteps.shape[0], -1)[:, 0]
+        timestep_shape = timesteps.shape
+        timesteps = timesteps.reshape(-1)
         half_dim = self.dim // 2
         freq = torch.exp(
             torch.arange(half_dim, device=timesteps.device, dtype=timesteps.dtype)
@@ -603,7 +613,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
-        return emb
+        return emb.reshape(*timestep_shape, self.dim)
 
 
 class ActionExpert(nn.Module):
@@ -722,7 +732,7 @@ class ActionExpert(nn.Module):
                 f"Expected {len(self.blocks)} KV layers for per-layer conditioning, got {len(encoder_kv_states)}."
             )
         kv_contexts = []
-        for block, (k_in, v_in) in zip(self.blocks, encoder_kv_states, strict=False):
+        for block, (k_in, v_in) in zip(self.blocks, encoder_kv_states, strict=True):
             k_ctx = self._project_kv_tensor(k_in, self.context_k_proj)
             v_ctx = self._project_kv_tensor(v_in, self.context_v_proj)
             k_norm = block.cross_attn.k_norm
@@ -811,8 +821,8 @@ class ActionExpert(nn.Module):
             conditioning = self._time_conditioning(step_t)
             block_modulations = []
             for block in self.blocks:
-                block_modulations.append(tuple(block.modulation(conditioning).chunk(9, dim=1)))
-            final_modulation = tuple(self.final_layer.modulation(conditioning).chunk(2, dim=1))
+                block_modulations.append(tuple(block.modulation(conditioning).chunk(9, dim=-1)))
+            final_modulation = tuple(self.final_layer.modulation(conditioning).chunk(2, dim=-1))
             cache.append(
                 ActionExpertStepModulation(
                     conditioning=conditioning,
@@ -850,19 +860,24 @@ class ActionExpert(nn.Module):
             raise ValueError(
                 f"Action sequence length {seq_len} exceeds configured max_action_horizon={self.config.max_action_horizon}"
             )
+        block_modulations: Sequence[tuple[torch.Tensor, ...] | None]
+        if timesteps.shape != (bsz,):
+            raise ValueError("RTC/per-row time conditioning is unsupported; timesteps must have shape [B].")
         if modulation is None:
             conditioning = self._time_conditioning(timesteps)
-            block_modulations: Sequence[tuple[torch.Tensor, ...] | None] = [None] * len(self.blocks)
+            block_modulations = [None] * len(self.blocks)
             final_modulation = None
         else:
             conditioning = modulation.conditioning
             block_modulations = modulation.block_modulations
             final_modulation = modulation.final_modulation
+        if len(context.kv_contexts) != len(self.blocks) or len(block_modulations) != len(self.blocks):
+            raise ValueError("action expert context and modulation counts must match the expert block count.")
         x = self.action_embed(actions)
         if context.valid_action is not None:
             x = x * context.valid_action
         for _idx, (block, kv_context, block_modulation) in enumerate(
-            zip(self.blocks, context.kv_contexts, block_modulations, strict=False)
+            zip(self.blocks, context.kv_contexts, block_modulations, strict=True)
         ):
             x = block(
                 x,
@@ -876,7 +891,11 @@ class ActionExpert(nn.Module):
             )
             if context.valid_action is not None:
                 x = x * context.valid_action
-        out = self.final_layer(x, conditioning, modulation=final_modulation)
+        out = self.final_layer(
+            x,
+            conditioning,
+            modulation=final_modulation,
+        )
         if context.valid_action is not None:
             out = out * context.valid_action
         return out
@@ -907,8 +926,8 @@ class ActionExpert(nn.Module):
 
 # ---------------------------------------------------------------------------
 # Pluggable action-expert head. The vendored ActionExpert (above) is driven from
-# the backbone's FINAL-layer activations as a single shared cross-attention
-# context (clean-at-1), ported from genesis MolmoActFlowExpert. Geometry comes
+# schema-1 FINAL-layer activations as a shared context or schema-2 ordered
+# post-residual layer contexts (clean-at-1), ported from genesis MolmoActFlowExpert. Geometry comes
 # from IsaacConfig.action_expert; weights nest as action_expert.action_expert.*
 # (mirrors genesis flow_matching_expert.action_expert.* -> pure converter prefix swap).
 # ---------------------------------------------------------------------------
@@ -950,15 +969,12 @@ class MolmoActExpertTrainArgs:
     timestep_sampling_scale: float = 0.999
     timestep_sampling_offset: float = 0.001
     train_samples_per_chunk: int = 1
-    dual_timestep_ratio: float = 0.0
-    rtc_max_delay_steps: int = 0
-    rtc_delay_sampling: str = "uniform"
     mask_padded_action_rows: bool = False
     drop_action_dim_overflow: bool = False
 
 
 class MolmoActExpertHead(ActionExpertHead):
-    """Vendored MolmoAct2 ActionExpert wired to a single shared final-layer context.
+    """Vendored MolmoAct2 ActionExpert with shared-final or ordered layerwise context.
 
     Ported from genesis ``MolmoActFlowExpert``: context_k/v_proj project vlm_dim->hidden
     (the genesis-wired projections ARE the trained weights), every other weight loads
@@ -967,18 +983,29 @@ class MolmoActExpertHead(ActionExpertHead):
 
     expert_type = "molmoact"
 
-    def __init__(self, action_expert_cfg: dict, vlm_dim: int) -> None:
+    def __init__(
+        self,
+        action_expert_cfg: dict[str, Any],
+        vlm_dim: int,
+        *,
+        conditioning: ActionExpertConditioning | None = None,
+    ) -> None:
         super().__init__()
         c = dict(action_expert_cfg)
+        if c.get("type") == "dit":
+            declared = validate_dit_action_metadata(c)
+        else:
+            declared = validate_action_context(
+                c, schema_version=2 if isinstance(conditioning, LayerHiddenContext) else 1
+            )
+        if conditioning is not None and conditioning != declared:
+            raise ValueError("action expert context conditioning disagrees with its metadata.")
+        self.conditioning = declared
         self.vlm_dim = int(vlm_dim)
         self.action_dim = int(c["action_dim"])
         self.action_horizon = int(c["action_horizon"])
         self.num_inference_steps = int(c.get("num_inference_steps", 10))
         self.clean_at_0 = bool(c.get("clean_at_0", False))
-        # RTC capability declared by the checkpoint contract (genesis rtc_max_delay_steps):
-        # the maximum pinned-prefix length the expert was trained to inpaint. 0 = not
-        # RTC-trained; sample() rejects any action prefix beyond this budget.
-        self.rtc_max_delay_steps = int(c.get("rtc_max_delay_steps", 0) or 0)
         cfg = MolmoAct2ActionExpertConfig(
             hidden_size=int(c["hidden_dim"]),
             num_layers=int(c["num_layers"]),
@@ -996,15 +1023,15 @@ class MolmoActExpertHead(ActionExpertHead):
             context_layer_norm=bool(c.get("context_layer_norm", True)),
             causal_attn=bool(c.get("causal_attn", False)),
         )
-        # llm_kv_dim=vlm_dim => context_k/v_proj are vlm_dim->hidden; one shared context fed
-        # to all blocks, so llm_num_layers is nominal (satisfies the one-block-per-layer assert).
+        # llm_kv_dim=vlm_dim keeps the same shared projections for either context form;
+        # llm_num_layers counts expert context slots, not the full backbone depth.
         self.action_expert = ActionExpert(
             cfg, llm_dim=vlm_dim, llm_kv_dim=vlm_dim, llm_num_layers=cfg.num_layers
         )
         self.hidden_dim = int(c["hidden_dim"])
         # Training-time args duck-typing genesis MolmoActFlowExpertArgs (read by the genesis flow
         # loss). setup_qwen35_vla_for_training overrides the train-only knobs; inference ignores it.
-        self.args = MolmoActExpertTrainArgs(
+        self.args: MolmoActExpertTrainArgs | DiTActionExpertArgs = MolmoActExpertTrainArgs(
             action_dim=self.action_dim,
             action_horizon=self.action_horizon,
             hidden_dim=self.hidden_dim,
@@ -1015,14 +1042,97 @@ class MolmoActExpertHead(ActionExpertHead):
         # Genesis tau is the noise level (1=noise); MolmoAct2 is clean-at-1, so feed 1-tau.
         return tau if self.clean_at_0 else (1.0 - tau)
 
+    def _context_tensors(
+        self, vlm_activations: torch.Tensor | Sequence[torch.Tensor]
+    ) -> tuple[torch.Tensor, ...]:
+        """Validate context form and geometry before projection, attention or sampling RNG draws."""
+        if isinstance(self.conditioning, LayerHiddenContext):
+            if isinstance(vlm_activations, torch.Tensor) or not isinstance(vlm_activations, Sequence):
+                raise ValueError(
+                    "layerwise context requires a sequence of Tensor layers, not a final Tensor."
+                )
+            tensors = tuple(vlm_activations)
+            if len(tensors) != len(self.action_expert.blocks):
+                raise ValueError("layerwise context count must equal the expert block count.")
+        else:
+            if not isinstance(vlm_activations, torch.Tensor):
+                raise ValueError("shared final context requires a Tensor, not a layer sequence.")
+            tensors = (vlm_activations,)
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 3:
+                raise ValueError("action expert context must contain rank-3 Tensor layers [B,L,D].")
+            if tensor.shape[-1] != self.vlm_dim or min(tensor.shape[:2]) < 1:
+                raise ValueError(
+                    "action expert context shape must have nonempty batch/tokens and backbone width."
+                )
+            if not tensor.is_floating_point():
+                raise ValueError("action expert context dtype must be floating point.")
+        first = tensors[0]
+        for tensor in tensors[1:]:
+            if tensor.shape != first.shape:
+                raise ValueError("action expert context layer shapes must match [B,L,D].")
+            if tensor.dtype != first.dtype or tensor.device != first.device:
+                raise ValueError("action expert context layer dtype and device must match.")
+        return tensors
+
+    def select_backbone_context(
+        self, output: BaseModelOutputWithPast, *, final_norm: nn.Module, backbone_num_layers: int
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Map decoder i to HF boundary i+1; the final slot already has its learned final norm."""
+        if not isinstance(self.conditioning, LayerHiddenContext):
+            return output.last_hidden_state
+        hidden_states = output.hidden_states
+        if hidden_states is None or len(hidden_states) != backbone_num_layers + 1:
+            raise ValueError("layerwise context requires every post-residual backbone hidden-state boundary.")
+        selected = []
+        for index in self.conditioning.context_layers:
+            if index >= backbone_num_layers:
+                raise ValueError("context_layers index is outside the backbone decoder bounds.")
+            if index == backbone_num_layers - 1:
+                if self.conditioning.context_hidden_norm != "final_norm":
+                    raise ValueError("context_hidden_norm='none' cannot use the unexposed raw last layer.")
+                selected.append(output.last_hidden_state)
+            else:
+                raw = hidden_states[index + 1]
+                selected.append(
+                    final_norm(raw) if self.conditioning.context_hidden_norm == "final_norm" else raw
+                )
+        return tuple(selected)
+
     def _build_single_context(
-        self, vlm_activations, vlm_mask, action_mask, *, seq_len, batch_size, device, dtype
-    ):
+        self,
+        vlm_activations: torch.Tensor | Sequence[torch.Tensor],
+        vlm_mask: torch.Tensor | None,
+        action_mask: torch.Tensor | None,
+        *,
+        seq_len: int,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> ActionExpertContext:
+        tensors = self._context_tensors(vlm_activations)
+        first = tensors[0]
+        if first.shape[0] != batch_size or first.device != device or first.dtype != dtype:
+            raise ValueError("action expert context batch, device and dtype must match the action input.")
+        if vlm_mask is not None and vlm_mask.shape != first.shape[:2]:
+            raise ValueError("action expert context mask shape must match [B,L].")
+        if action_mask is not None and action_mask.shape != (batch_size, seq_len):
+            raise ValueError("action expert context action mask shape must match [B,H].")
         ae = self.action_expert
         encoder_attention_mask = None if vlm_mask is None else vlm_mask.to(device=device, dtype=dtype)
         action_attention_mask = None if action_mask is None else action_mask.to(device=device)
-        k_base = ae._project_kv_tensor(vlm_activations, ae.context_k_proj)  # noqa: SLF001
-        v_ctx = ae._project_kv_tensor(vlm_activations, ae.context_v_proj)  # noqa: SLF001
+        if isinstance(self.conditioning, LayerHiddenContext):
+            return ae.prepare_context(
+                encoder_kv_states=[(tensor, tensor) for tensor in tensors],
+                encoder_attention_mask=encoder_attention_mask,
+                action_attention_mask=action_attention_mask,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+            )
+        k_base = ae._project_kv_tensor(first, ae.context_k_proj)  # noqa: SLF001
+        v_ctx = ae._project_kv_tensor(first, ae.context_v_proj)  # noqa: SLF001
         kv_contexts = []
         for block in ae.blocks:
             k_ctx = k_base
@@ -1056,22 +1166,9 @@ class MolmoActExpertHead(ActionExpertHead):
         tau = beta * a.timestep_sampling_scale + a.timestep_sampling_offset
         return tau.to(device=device, dtype=dtype)
 
-    # -- horizon embedding unused (MolmoAct2 positions come from RoPE); zeros placeholder --
-    def horizon_embeddings(
-        self,
-        horizons: int | Sequence[int],
-        *,
-        h_max: int | None = None,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        real = [horizons] if isinstance(horizons, int) else list(horizons)
-        h = max(real) if h_max is None else h_max
-        return torch.zeros(len(real), h, self.hidden_dim, device=device, dtype=dtype)
-
     def forward(
         self,
-        vlm_activations: torch.Tensor,
+        vlm_activations: torch.Tensor | Sequence[torch.Tensor],
         vlm_mask: torch.Tensor | None,
         x_tau: torch.Tensor,
         tau: torch.Tensor,
@@ -1079,7 +1176,7 @@ class MolmoActExpertHead(ActionExpertHead):
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Differentiable single-step velocity prediction (training). Mirrors genesis
-        ``MolmoActFlowExpert.forward``: build the shared final-layer context once, run the expert at the
+        ``MolmoActFlowExpert.forward``: build the declared contexts once, run the expert at the
         clean-at-1 flow time. ``x_tau`` is ``[B,H,D]`` or ``[K,B,H,D]`` (K MC samples looped against the
         shared context to bound memory). ``horizon_emb`` is ignored (positions come from RoPE)."""
         del horizon_emb
@@ -1118,15 +1215,17 @@ class MolmoActExpertHead(ActionExpertHead):
         prefix_length=None,
         num_flow_samples: int = 1,
     ):
+        reject_rtc_prefix(action_prefix, prefix_length)
         num_steps = num_steps or self.num_inference_steps
         horizon = num_action_steps or self.action_horizon
         full_dim = self.action_dim
         out_dim = full_dim if action_dim is None else int(action_dim)
         if out_dim > full_dim:
             raise ValueError(f"action_dim={out_dim} exceeds expert action_dim={full_dim}")
-        batch_size = vlm_activations.shape[0]
-        device = vlm_activations.device
-        model_dtype = vlm_activations.dtype
+        first = self._context_tensors(vlm_activations)[0]
+        batch_size = first.shape[0]
+        device = first.device
+        model_dtype = first.dtype
         state_dtype = torch.float32
 
         context = self._build_single_context(
@@ -1144,41 +1243,6 @@ class MolmoActExpertHead(ActionExpertHead):
             dim_mask = torch.zeros(1, 1, full_dim, dtype=state_dtype, device=device)
             dim_mask[:, :, :out_dim] = 1.0
 
-        prefix_tensor = None
-        prefix_mask = None
-        if action_prefix is not None:
-            if prefix_length is None:
-                lengths = torch.full((batch_size,), action_prefix.shape[1], device=device, dtype=torch.long)
-            elif isinstance(prefix_length, int):
-                lengths = torch.full((batch_size,), prefix_length, device=device, dtype=torch.long)
-            else:
-                lengths = prefix_length.to(device=device, dtype=torch.long)
-            prefix_source_dim = action_prefix.shape[-1]
-            max_prefix = int(lengths.max().item())
-            # Capability gate mirroring genesis's serve-time RTC guard: a pinned prefix
-            # is inpainting the expert must have been trained for. Without this, any
-            # caller could pin rows on a non-RTC expert and get silently wrong chunks.
-            if max_prefix > self.rtc_max_delay_steps:
-                raise ValueError(
-                    f"action_prefix pins {max_prefix} rows, but this expert's checkpoint "
-                    f"contract declares rtc_max_delay_steps={self.rtc_max_delay_steps}; "
-                    "it was not trained to inpaint a prefix of that length."
-                )
-            prefix_tensor = torch.zeros(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
-            prefix_tensor[:, :max_prefix, :prefix_source_dim] = action_prefix[:, :max_prefix].to(
-                device=device, dtype=state_dtype
-            )
-            if dim_mask is not None:
-                prefix_tensor = prefix_tensor * dim_mask
-            prefix_mask = torch.arange(horizon, device=device).view(1, horizon, 1) < lengths.view(
-                batch_size, 1, 1
-            )
-
-        def _apply_prefix(state):
-            if prefix_mask is None or prefix_tensor is None:
-                return state
-            return torch.where(prefix_mask, prefix_tensor, state)
-
         clean_at_0 = self.clean_at_0
         dt = -1.0 / num_steps if clean_at_0 else 1.0 / num_steps
 
@@ -1186,7 +1250,6 @@ class MolmoActExpertHead(ActionExpertHead):
             x = torch.randn(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
             if dim_mask is not None:
                 x = x * dim_mask
-            x = _apply_prefix(x)
             for step in range(num_steps):
                 tau_value = 1.0 - step / num_steps  # noise level, 1 -> 1/N
                 flow_time = tau_value if clean_at_0 else (1.0 - tau_value)
@@ -1196,12 +1259,9 @@ class MolmoActExpertHead(ActionExpertHead):
                 )
                 if dim_mask is not None:
                     v = v * dim_mask
-                if prefix_mask is not None:
-                    v = torch.where(prefix_mask, torch.zeros_like(v), v)
                 x = x + dt * v
                 if dim_mask is not None:
                     x = x * dim_mask
-                x = _apply_prefix(x)
             return x
 
         sample_count = max(1, int(num_flow_samples or 1))
@@ -1210,116 +1270,311 @@ class MolmoActExpertHead(ActionExpertHead):
         return torch.stack([_sample_once() for _ in range(sample_count)], dim=0).mean(dim=0)
 
 
+@dataclass
+class DiTActionExpertArgs:
+    """Configuration for the sole Isaac05 continuous-action DiT expert.
+
+    Architecture defaults mirror the released MolmoAct2 ActionExpert. Isaac05 uses a
+    catalog-wide action width and can extend the horizon without changing checkpoint
+    parameter shapes. The objective is always MolmoAct2's clean-at-1 flow convention.
+    """
+
+    action_dim: int = 64
+    action_horizon: int = 30
+    num_layers: int = 36
+    hidden_dim: int = 768
+    num_heads: int = 8
+    mlp_ratio: float = 4.0
+    num_inference_steps: int = 10
+    timestep_sampling_alpha: float = 1.5
+    timestep_sampling_beta: float = 1.0
+    timestep_sampling_scale: float = 0.999
+    timestep_sampling_offset: float = 0.001
+    train_samples_per_chunk: int = 1
+    timestep_embed_dim: int = 256
+    rtc_max_delay_steps: int = 0
+    rtc_probability: float | None = None
+    rtc_delay_sampling: Literal["uniform", "exponential", "poisson"] = "uniform"
+    rtc_poisson_mean: float = 5.0
+    mask_padded_action_rows: bool = False
+    # action_dim=64 spans the catalog (max 54), so no chunk overflows. Keep the
+    # loud-fail safety net (no silent drops). The upstream pretrained 32 dims
+    # load into the first 32; dims 32..63 are fresh-init and learned during adaptation.
+    drop_action_dim_overflow: bool = False
+    ffn_multiple_of: int = 256
+    qk_norm: bool = True
+    qk_norm_eps: float = 1e-6
+    rope: bool = True
+    context_layer_norm: bool = True
+    causal_attn: bool = False
+    # WS4: batch the K flow samples in one pass by folding K into
+    # cross-attention QUERY heads (GQA), keeping the VLM context K/V at batch B (not K*B). Removes the
+    # serial per-sample loop. K=1 is unchanged either way. Default True (validated in the 4B VLA run).
+    k_batched_cross_attn: bool = True
+    # "flash_gqa" (default): FA3 GQA over FA3-varlen ("CrossVarLen") — context K/V stays flat with K (the memory
+    #   win), the production path; bf16/fp16 only, so it transparently falls back to sdpa_gqa for fp32/CPU (see
+    #   ActionExpertCrossAttention.forward). "sdpa_gqa": SDPA(enable_gqa) — mask-correct fp32/CPU reference that
+    #   materializes K/V (memory grows with K). Both are proven equal to the serial loop (see the k-batched tests).
+    k_batched_cross_attn_backend: str = "flash_gqa"
+
+    @property
+    def clean_at_0(self) -> bool:
+        """Native DiT always predicts action minus noise on the clean-at-one clock."""
+        return False
+
+    def __post_init__(self) -> None:
+        integer_fields = (
+            ("action_dim", self.action_dim),
+            ("action_horizon", self.action_horizon),
+            ("num_layers", self.num_layers),
+            ("hidden_dim", self.hidden_dim),
+            ("num_heads", self.num_heads),
+            ("num_inference_steps", self.num_inference_steps),
+            ("train_samples_per_chunk", self.train_samples_per_chunk),
+            ("timestep_embed_dim", self.timestep_embed_dim),
+            ("rtc_max_delay_steps", self.rtc_max_delay_steps),
+            ("ffn_multiple_of", self.ffn_multiple_of),
+        )
+        for field_name, value in integer_fields:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{field_name} must be an int.")
+        boolean_fields = (
+            ("mask_padded_action_rows", self.mask_padded_action_rows),
+            ("drop_action_dim_overflow", self.drop_action_dim_overflow),
+            ("qk_norm", self.qk_norm),
+            ("rope", self.rope),
+            ("context_layer_norm", self.context_layer_norm),
+            ("causal_attn", self.causal_attn),
+            ("k_batched_cross_attn", self.k_batched_cross_attn),
+        )
+        for field_name, value in boolean_fields:
+            if not isinstance(value, bool):
+                raise ValueError(f"{field_name} must be a bool.")
+        numeric_fields = (
+            ("mlp_ratio", self.mlp_ratio),
+            ("qk_norm_eps", self.qk_norm_eps),
+            ("timestep_sampling_alpha", self.timestep_sampling_alpha),
+            ("timestep_sampling_beta", self.timestep_sampling_beta),
+            ("timestep_sampling_scale", self.timestep_sampling_scale),
+            ("timestep_sampling_offset", self.timestep_sampling_offset),
+            ("rtc_poisson_mean", self.rtc_poisson_mean),
+        )
+        for field_name, numeric_value in numeric_fields:
+            if (
+                not isinstance(numeric_value, Real)
+                or isinstance(numeric_value, bool)
+                or not math.isfinite(float(numeric_value))
+            ):
+                raise ValueError(f"{field_name} must be a finite number.")
+        if self.rtc_probability is not None and (
+            not isinstance(self.rtc_probability, Real)
+            or isinstance(self.rtc_probability, bool)
+            or not math.isfinite(float(self.rtc_probability))
+        ):
+            raise ValueError("rtc_probability must be None or a finite number in [0, 1].")
+        if self.hidden_dim < 1 or self.num_heads < 1 or self.timestep_embed_dim < 1:
+            raise ValueError("hidden_dim, num_heads, and timestep_embed_dim must be >= 1.")
+        if self.hidden_dim % self.num_heads != 0:
+            raise ValueError(
+                f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})."
+            )
+        if self.action_dim < 1 or self.action_horizon < 1:
+            raise ValueError("action_dim and action_horizon must be >= 1.")
+        if self.num_layers < 1 or self.num_inference_steps < 1:
+            raise ValueError("num_layers and num_inference_steps must be >= 1.")
+        if self.timestep_sampling_alpha <= 0 or self.timestep_sampling_beta <= 0:
+            raise ValueError("Beta distribution parameters must be positive.")
+        if self.mlp_ratio <= 0 or self.qk_norm_eps <= 0:
+            raise ValueError("mlp_ratio and qk_norm_eps must be positive.")
+        if self.timestep_sampling_scale <= 0 or self.timestep_sampling_offset < 0:
+            raise ValueError("timestep sampling scale must be positive and offset must be non-negative.")
+        if self.timestep_sampling_offset + self.timestep_sampling_scale > 1:
+            raise ValueError("timestep_sampling_offset + timestep_sampling_scale must be <= 1.")
+        if self.train_samples_per_chunk < 1:
+            raise ValueError("train_samples_per_chunk must be >= 1.")
+        if self.rtc_max_delay_steps < 0:
+            raise ValueError("rtc_max_delay_steps must be >= 0.")
+        if self.rtc_probability is not None and not 0.0 <= self.rtc_probability <= 1.0:
+            raise ValueError("rtc_probability must be None or in [0, 1].")
+        if self.rtc_max_delay_steps == 0 and self.rtc_probability not in (None, 0.0):
+            raise ValueError("rtc_probability > 0 requires rtc_max_delay_steps > 0.")
+        if self.rtc_delay_sampling not in ("uniform", "exponential", "poisson"):
+            raise ValueError("rtc_delay_sampling must be 'uniform', 'exponential', or 'poisson'.")
+        if not math.isfinite(self.rtc_poisson_mean) or self.rtc_poisson_mean <= 0:
+            raise ValueError("rtc_poisson_mean must be finite and > 0.")
+        if self.ffn_multiple_of < 1:
+            raise ValueError("ffn_multiple_of must be >= 1.")
+        if self.k_batched_cross_attn_backend not in ("flash_gqa", "sdpa_gqa"):
+            raise ValueError("k_batched_cross_attn_backend must be 'flash_gqa' or 'sdpa_gqa'.")
+
+
+def _validate_action_expert_contract(action_expert_cfg: dict[str, Any]) -> DiTActionExpertArgs:
+    validate_dit_action_metadata(action_expert_cfg)
+    values = {key: action_expert_cfg[key] for key in DIT_ACTION_EXPERT_CONFIG_V1_FIELDS}
+    try:
+        return DiTActionExpertArgs(**values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid action_expert metadata: {exc}") from exc
+
+
+class DiTActionExpertHead(MolmoActExpertHead):
+    """Isaac05 clean-at-one DiT with source-compatible weights and metadata, without RTC execution."""
+
+    expert_type = "dit"
+    args: DiTActionExpertArgs
+
+    def __init__(
+        self,
+        action_expert_cfg: dict[str, Any],
+        vlm_dim: int,
+        *,
+        conditioning: ActionExpertConditioning | None = None,
+    ) -> None:
+        args = _validate_action_expert_contract(action_expert_cfg)
+        super().__init__(action_expert_cfg, vlm_dim, conditioning=conditioning)
+        self.args = args
+
+    @torch.no_grad()
+    def sample(
+        self,
+        vlm_activations: torch.Tensor | Sequence[torch.Tensor],
+        vlm_mask: torch.Tensor | None = None,
+        num_steps: int | None = None,
+        num_action_steps: int | None = None,
+        action_dim: int | None = None,
+        action_prefix: torch.Tensor | None = None,
+        prefix_length: int | Sequence[int] | torch.Tensor | None = None,
+        num_flow_samples: int = 1,
+        allow_ood_rtc_prefix: bool = False,
+        noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Batch candidate integration while preserving the historical client's per-candidate RNG draws.
+
+        Optional noise is [H,Dfull] (broadcast) or [K*B,H,Dfull] in sample-major order.
+        Supplied noise consumes no sampling RNG and is never modified in place.
+        """
+        reject_rtc_prefix(action_prefix, prefix_length)
+        num_steps = self.num_inference_steps if num_steps is None else int(num_steps)
+        horizon = self.action_horizon if num_action_steps is None else int(num_action_steps)
+        if num_steps < 1:
+            raise ValueError(f"num_steps must be >= 1; got {num_steps}.")
+        if horizon < 1 or horizon > self.action_horizon:
+            raise ValueError(f"num_action_steps must be in [1, {self.action_horizon}]; got {horizon}.")
+        full_dim = self.action_dim
+        first = self._context_tensors(vlm_activations)[0]
+        batch_size = first.shape[0]
+        device = first.device
+        model_dtype = first.dtype
+        state_dtype = torch.float32
+
+        out_dim = full_dim if action_dim is None else int(action_dim)
+        if not 1 <= out_dim <= full_dim:
+            raise ValueError(f"action_dim must be in [1, {full_dim}]; got {out_dim}.")
+        if vlm_mask is not None and vlm_mask.shape != first.shape[:2]:
+            raise ValueError("action expert context mask shape must match [B,L].")
+
+        sample_count = max(1, int(num_flow_samples or 1))
+        sample_batch_size = sample_count * batch_size
+
+        def expand_candidates(tensor: torch.Tensor) -> torch.Tensor:
+            expanded = tensor.unsqueeze(0).expand(sample_count, *tensor.shape)
+            return expanded.reshape(sample_batch_size, *tensor.shape[1:])
+
+        # Expand raw contexts before projection, as the serving batch-eight path does.
+        # For B=1, expand keeps the raw context as a zero-stride view instead of copying it K times.
+        if sample_count > 1:
+            if isinstance(vlm_activations, torch.Tensor):
+                vlm_activations = expand_candidates(vlm_activations)
+            else:
+                vlm_activations = tuple(expand_candidates(layer) for layer in vlm_activations)
+            if vlm_mask is not None:
+                vlm_mask = expand_candidates(vlm_mask)
+        context = self._build_single_context(
+            vlm_activations,
+            vlm_mask,
+            action_mask=None,
+            seq_len=horizon,
+            batch_size=sample_batch_size,
+            device=device,
+            dtype=model_dtype,
+        )
+
+        dim_mask = None
+        if out_dim < full_dim:
+            dim_mask = torch.zeros(1, 1, full_dim, dtype=state_dtype, device=device)
+            dim_mask[:, :, :out_dim] = 1.0
+
+        if noise is None:
+            # Benchmark 102799's client drew K tensors separately, not one randn(K*B,H,D).
+            # CUDA draw geometry matters even when the scalar seed and element count agree.
+            draws = [
+                torch.randn(batch_size, horizon, full_dim, dtype=state_dtype, device=device)
+                for _ in range(sample_count)
+            ]
+            x = torch.stack(draws).reshape(sample_batch_size, horizon, full_dim)
+        else:
+            expected_shape = (sample_batch_size, horizon, full_dim)
+            if noise.ndim == 2 and noise.shape == (horizon, full_dim):
+                noise = noise.unsqueeze(0).expand(sample_batch_size, -1, -1)
+            elif noise.shape != expected_shape:
+                raise ValueError(
+                    f"noise shape must be {(horizon, full_dim)} or {expected_shape}; got {tuple(noise.shape)}."
+                )
+            x = noise.to(device=device, dtype=state_dtype).contiguous()
+        if dim_mask is not None:
+            x = x * dim_mask
+        dt = 1.0 / num_steps
+        for step in range(num_steps):
+            t_tensor = torch.full((sample_batch_size,), step / num_steps, dtype=model_dtype, device=device)
+            velocity = self.action_expert.forward_with_context(
+                x.to(model_dtype), t_tensor, context=context
+            ).to(state_dtype)
+            if dim_mask is not None:
+                velocity = velocity * dim_mask
+            x = x + dt * velocity
+            if dim_mask is not None:
+                x = x * dim_mask
+        if sample_count == 1:
+            return x
+        return x.reshape(sample_count, batch_size, horizon, full_dim).mean(dim=0)
+
+
 ACTION_EXPERT_HEADS = {
     MolmoActExpertHead.expert_type: MolmoActExpertHead,
+    DiTActionExpertHead.expert_type: DiTActionExpertHead,
 }
 
-# Genesis DiT action-expert contract (genesis/core/rtc.py). Genesis #3402 renamed
-# MolmoActExpertHead -> DiTActionExpertHead and stamps exported checkpoints with
-# type="dit", schema_version=1, and these 27 payload fields. The vendored expert core
-# here is byte-identical to genesis pre-#3402 and samples bit-identically when fed the
-# genesis-stamped contract, so 'dit' is aliased onto the vendored head after strict
-# validation instead of being rejected (or, worse, silently replaced by a default).
-GENESIS_DIT_ACTION_EXPERT_SCHEMA_VERSION = 1
-GENESIS_DIT_ACTION_EXPERT_V1_FIELDS = (
-    "action_dim",
-    "action_horizon",
-    "num_layers",
-    "hidden_dim",
-    "num_heads",
-    "mlp_ratio",
-    "num_inference_steps",
-    "timestep_sampling_alpha",
-    "timestep_sampling_beta",
-    "timestep_sampling_scale",
-    "timestep_sampling_offset",
-    "train_samples_per_chunk",
-    "timestep_embed_dim",
-    "rtc_max_delay_steps",
-    "rtc_probability",
-    "rtc_delay_sampling",
-    "rtc_poisson_mean",
-    "mask_padded_action_rows",
-    "drop_action_dim_overflow",
-    "ffn_multiple_of",
-    "qk_norm",
-    "qk_norm_eps",
-    "rope",
-    "context_layer_norm",
-    "causal_attn",
-    "k_batched_cross_attn",
-    "k_batched_cross_attn_backend",
-)
 
-
-def _normalize_genesis_dit_expert_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Validate a genesis-stamped DiT contract and map it onto the vendored head.
-
-    Fail-loud by design: an unknown schema version or unknown fields are rejected
-    instead of guessed at, and the rtc_* capability fields are honored rather than
-    dropped -- a contract declaring RTC training support is REJECTED, because the
-    vendored sampler conditions every row at a single flow time while genesis's RTC
-    serving conditions prefix rows at clean flow time; accepting a within-budget
-    prefix here would silently run a mathematically different inpainting regime.
-    Training-only fields (timestep sampling, k-batching backend, padded-row masking)
-    are carried through and ignored by the sampling path, which is value-safe:
-    vendored vs genesis heads sample bit-identically on this contract (no prefix).
-    """
-    schema_version = cfg.get("schema_version")
-    if schema_version != GENESIS_DIT_ACTION_EXPERT_SCHEMA_VERSION:
-        raise ValueError(
-            "action_expert type 'dit' requires "
-            f"schema_version={GENESIS_DIT_ACTION_EXPERT_SCHEMA_VERSION}; got "
-            f"{schema_version!r}. The genesis contract moved past what this runtime "
-            "implements."
-        )
-    known = set(GENESIS_DIT_ACTION_EXPERT_V1_FIELDS) | {"schema_version", "type"}
-    unexpected = sorted(set(cfg) - known)
-    if unexpected:
-        raise ValueError(
-            f"action_expert 'dit' contract carries unknown fields {unexpected}; "
-            "refusing to silently ignore contract drift."
-        )
-    rtc_budget = int(cfg.get("rtc_max_delay_steps") or 0)
-    rtc_probability = cfg.get("rtc_probability")
-    if rtc_budget > 0 or rtc_probability not in (None, 0, 0.0):
-        raise ValueError(
-            "action_expert 'dit' contract declares RTC training support "
-            f"(rtc_max_delay_steps={rtc_budget}, rtc_probability={rtc_probability!r}), "
-            "which this runtime cannot faithfully execute: the vendored expert "
-            "conditions all rows at a single flow time, unlike genesis's per-row "
-            "clean-tau RTC conditioning. Refusing to serve a different regime "
-            "silently; use genesis serving for RTC-trained checkpoints."
-        )
-    resolved = dict(cfg)
-    resolved["type"] = MolmoActExpertHead.expert_type
-    # Genesis DiT has no clean_at_0 knob; its convention matches the vendored
-    # clean-at-1 default (clean_at_0=False), verified by bit-identical sampling.
-    resolved.setdefault("clean_at_0", False)
-    return resolved
-
-
-def build_action_expert_head(action_expert_cfg, vlm_dim):
+def build_action_expert_head(
+    action_expert_cfg: dict[str, Any] | None,
+    vlm_dim: int,
+    *,
+    context_schema_version: int = 1,
+    backbone_num_layers: int | None = None,
+) -> MolmoActExpertHead | None:
     """Construct the action-expert head selected by ``action_expert_cfg['type']``.
 
-    A genesis-stamped ``type="dit"`` contract (post-#3402 exports) is validated and
-    aliased onto the vendored MolmoAct head, which is weight- and sample-compatible.
+    DiT schemas 1 and 2 share the native clean-at-one head and weight ABI.
+    Migrated MolmoAct conditioning is versioned by its VLA envelope, not the action block.
     """
     if action_expert_cfg is None:
         return None
     cfg = dict(action_expert_cfg)
     head_type = cfg.get("type", "molmoact")
-    if head_type == "dit":
-        cfg = _normalize_genesis_dit_expert_cfg(cfg)
-        head_type = cfg["type"]
-    elif "schema_version" in cfg:
+    if head_type != "dit" and "schema_version" in cfg:
         raise ValueError(
             f"action_expert type {head_type!r} does not define a schema_version "
             f"contract; got schema_version={cfg['schema_version']!r}."
         )
     if head_type not in ACTION_EXPERT_HEADS:
         raise ValueError(f"unknown action_expert type {head_type!r}; known: {sorted(ACTION_EXPERT_HEADS)}")
-    return ACTION_EXPERT_HEADS[head_type](cfg, vlm_dim=vlm_dim)
+    if head_type == "dit":
+        conditioning = validate_dit_action_metadata(cfg, backbone_num_layers=backbone_num_layers)
+    else:
+        conditioning = validate_action_context(
+            cfg, schema_version=context_schema_version, backbone_num_layers=backbone_num_layers
+        )
+    return ACTION_EXPERT_HEADS[head_type](cfg, vlm_dim=vlm_dim, conditioning=conditioning)
 
 
 # === Config ===
@@ -1350,28 +1605,6 @@ class Qwen35VLAConfig(Qwen3_5Config):
         self.action_expert = action_expert
 
 
-# The molmoact flavor (qwen3_5_2b_moevit_ps16_vla_fm_molmoact) expert geometry — matches the converted
-# checkpoint's model.action_expert.action_expert.* shapes. clean_at_0=False => clean-at-1 (feed 1-tau).
-DEFAULT_MOLMOACT_EXPERT_CFG: dict[str, Any] = {
-    "type": "molmoact",
-    "action_dim": 64,
-    "action_horizon": 30,
-    "num_layers": 36,
-    "hidden_dim": 768,
-    "num_heads": 8,
-    "mlp_ratio": 4.0,
-    "num_inference_steps": 10,
-    "timestep_embed_dim": 256,
-    "clean_at_0": False,
-    "ffn_multiple_of": 256,
-    "qk_norm": True,
-    "qk_norm_eps": 1e-6,
-    "rope": True,
-    "context_layer_norm": True,
-    "causal_attn": False,
-}
-
-
 # === Inner model: native Qwen3.5-VL + proprio encoder + action expert ===
 
 
@@ -1388,7 +1621,9 @@ class Qwen35VLAModel(Qwen3_5Model):
         super().__init__(config)
         hidden = config.text_config.hidden_size
         self.vector_embedding = build_vector_encoder(config.vector_max_states, hidden)
-        self.action_expert = build_action_expert_head(config.action_expert, vlm_dim=hidden)
+        self.action_expert = build_action_expert_head(
+            config.action_expert, vlm_dim=hidden, backbone_num_layers=config.text_config.num_hidden_layers
+        )
 
     # -- per-modality embedders --
 
@@ -1421,6 +1656,76 @@ class Qwen35VLAModel(Qwen3_5Model):
         feats = self.get_image_features(patches, image_grid_thw=grid_thw)
         return torch.cat(list(feats.pooler_output), dim=0)
 
+    def _embed_sharded_modalities(
+        self,
+        tensor_stream: TensorStream,
+        payloads: dict[ModalityType, torch.Tensor],
+        grids: dict[Any, list[list[int]]],
+    ) -> tuple[dict[ModalityType, torch.Tensor], torch.Tensor]:
+        """Run the same encoder schedule on every training rank, without adding stream events."""
+        conditional_types = (VectorType.vector, VisionType.I, VisionType.P)
+        presence = torch.tensor(
+            [int(kind in payloads) for kind in conditional_types],
+            device=tensor_stream.device,
+            dtype=torch.int64,
+        )
+        dist.all_reduce(presence, op=dist.ReduceOp.MAX)
+
+        token_types = [kind for kind in payloads if not isinstance(kind, (VectorType, VisionType))]
+        token_payload = (
+            torch.cat([payloads[kind] for kind in token_types])
+            if token_types
+            else torch.zeros((1, 1), device=tensor_stream.device, dtype=torch.long)
+        )
+        rng = serialize_rng_state() if not token_types else None
+        try:
+            tokens = self._embed_text(token_payload)
+        finally:
+            if rng is not None:
+                deserialize_rng_state(rng)
+        # Token lookup is row-independent; one call can be split back into the original types.
+        embedded = (
+            dict(
+                zip(token_types, tokens.split([payloads[kind].shape[0] for kind in token_types]), strict=True)
+            )
+            if token_types
+            else {}
+        )
+        preceding = tokens
+        vcfg = self.config.vision_config
+        merge = vcfg.spatial_merge_size
+        for kind, present in zip(conditional_types, presence.tolist(), strict=True):
+            if not present:
+                continue
+            missing = kind not in payloads
+            encoder = self.vector_embedding if kind == VectorType.vector else self.visual
+            if not missing:
+                payload = payloads[kind]
+            elif kind == VectorType.vector:
+                payload = tokens.new_zeros(1, self.config.vector_max_states)
+            else:
+                patch_width = vcfg.in_channels * vcfg.temporal_patch_size * vcfg.patch_size**2
+                payload = tokens.new_zeros(merge**2, patch_width)
+            # Do not turn a frozen encoder into an input-gradient/backbone backward path.
+            if payload.requires_grad or any(parameter.requires_grad for parameter in encoder.parameters()):
+                payload = _ordered_modality_input(payload, preceding)
+            rng = serialize_rng_state() if missing else None
+            try:
+                if kind == VectorType.vector:
+                    result = self._embed_vector(payload)
+                else:
+                    grid = [[1, merge, merge]] if missing else grids[kind]
+                    grid_thw = torch.tensor(grid, dtype=torch.long, device=tensor_stream.device)
+                    result = self._embed_vision(payload, grid_thw)
+            finally:
+                if rng is not None:
+                    deserialize_rng_state(rng)
+            if not missing:
+                embedded[kind] = result
+            if result.requires_grad:
+                preceding = result
+        return embedded, preceding
+
     def embed_stream(self, tensor_stream: TensorStream) -> torch.Tensor:
         """Embed each modality in place and compact -> ``[B, T, D]`` interleaved embeddings.
 
@@ -1429,7 +1734,7 @@ class Qwen35VLAModel(Qwen3_5Model):
         are stored in sequence order, so the concat IS the interleave).
         """
         flat_stream = tensor_stream.flat_stream()
-        per_modality_stream = group_streams(flat_stream, group_fn=lambda ev: ev.type, schedule=False)
+        per_modality_stream = group_streams(flat_stream, group_fn=lambda ev: ev.type)
         per_modality_compact = {k: v.compact() for k, v in per_modality_stream.items()}
 
         # Per-event spatial grids for vision events: dims(virtual=False) == [T, H, W].
@@ -1438,22 +1743,38 @@ class Qwen35VLAModel(Qwen3_5Model):
             for event in stream:
                 grids[event.type].append(event.dims(virtual=False))
 
-        embedded: dict[Any, torch.Tensor] = {}
-        for stype, payload in per_modality_compact.items():
-            mod_name = stype.modality.__name__
-            if mod_name == "VisionType":
-                grid_thw = torch.tensor(grids[stype], dtype=torch.long, device=tensor_stream.device)
-                embedded[stype] = self._embed_vision(payload, grid_thw)
-            elif mod_name == "VectorType":
-                embedded[stype] = self._embed_vector(payload)
-            else:
-                embedded[stype] = self._embed_text(payload)
+        # Serving and ordinary local calls keep their original encoder/RNG semantics.
+        sharded_training = (
+            self.training
+            and torch.is_grad_enabled()
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and any(isinstance(module, FSDPModule) for module in self.modules())
+        )
+        preceding = None
+        embedded: dict[Any, torch.Tensor]
+        if sharded_training:
+            embedded, preceding = self._embed_sharded_modalities(tensor_stream, per_modality_compact, grids)
+        else:
+            embedded = {}
+            for stype, payload in per_modality_compact.items():
+                mod_name = stype.modality.__name__
+                if mod_name == "VisionType":
+                    grid_thw = torch.tensor(grids[stype], dtype=torch.long, device=tensor_stream.device)
+                    embedded[stype] = self._embed_vision(payload, grid_thw)
+                elif mod_name == "VectorType":
+                    embedded[stype] = self._embed_vector(payload)
+                else:
+                    embedded[stype] = self._embed_text(payload)
 
         embedded_ts = reconstruct_tensor_stream_from_compact_dict(tensor_stream, embedded)
-        return embedded_ts.compact()  # [B, T, D]
+        compact = embedded_ts.compact()  # [B, T, D]
+        # Even a text-only rank must backward through the last scheduled encoder first.
+        return compact if preceding is None else _ordered_modality_input(compact, preceding)
 
-    def forward(self, tensor_stream: TensorStream, **kwargs: Any) -> BaseModelOutputWithPast:  # type: ignore[override]
-        """Run the VLM over the rendered stream and return post-final-norm activations.
+    def forward(self, tensor_stream: TensorStream, **kwargs: Any) -> BaseModelOutputWithPast:
+        """Run one VLM pass, retaining hidden-state boundaries only for layerwise conditioning.
 
         Replicates genesis ``PerceptronTransformer.forward``: interleave -> MRoPE positions ->
         next-token-prediction truncation ``[:, :-1]`` -> native hybrid decoder -> final norm.
@@ -1481,13 +1802,31 @@ class Qwen35VLAModel(Qwen3_5Model):
         # padding so this is all-ones (identical to the prior behavior). Truncate `mod` to L_model to
         # match the [:, :-1] NTP shift.
         attention_mask = (mod != TextType.padding.value).to(torch.long)[:, :-1]
+        router_output_kwargs = {}
+        if kwargs.get("output_router_auxiliaries", False):
+            router_output_kwargs["output_router_auxiliaries"] = True
+        if self.action_expert is not None and isinstance(self.action_expert.conditioning, LayerHiddenContext):
+            router_output_kwargs["output_hidden_states"] = True
         out = self.language_model(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
             use_cache=False,
+            **router_output_kwargs,
         )
-        return BaseModelOutputWithPast(last_hidden_state=out.last_hidden_state)
+        if kwargs.get("output_flow_context", False):
+            # Select while the owning VLA forward still holds its FSDP parameters.
+            # Inference keeps its existing selector call and does no extra norm work.
+            out["flow_matching_context"] = (
+                out.last_hidden_state
+                if self.action_expert is None
+                else self.action_expert.select_backbone_context(
+                    out,
+                    final_norm=self.language_model.norm,
+                    backbone_num_layers=len(self.language_model.layers),
+                )
+            )
+        return out
 
 
 # === Top-level model: inner VLA model + lm_head + sample_action ===
@@ -1527,14 +1866,16 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
         action_prefix: torch.Tensor | None = None,
         prefix_length: int | None = None,
         num_flow_samples: int = 1,
+        flow_noise: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Integrate the flow expert into a ``[B, num_action_steps or H, action_dim]`` chunk.
 
         Numerically mirrors genesis ``PerceptronTransformer.sample_action``: one VLM forward over the
-        stream, take the post-norm final activations (already ``[:, :-1]``-truncated by ``forward``),
+        stream, select the declared context (already ``[:, :-1]``-truncated by ``forward``),
         build the pre-action context mask (excludes action-marker positions), and run the expert's
         clean-at-1 Euler ODE. Output is in normalized action space (caller unnormalizes).
         """
+        reject_rtc_prefix(action_prefix, prefix_length)
         expert = self.model.action_expert
         if expert is None:
             raise RuntimeError(
@@ -1555,8 +1896,18 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
             l_model=l_model,
             device=device,
         )
+        context = expert.select_backbone_context(
+            output,
+            final_norm=self.model.language_model.norm,
+            backbone_num_layers=len(self.model.language_model.layers),
+        )
+        noise_kwargs: dict[str, Any] = {}
+        if flow_noise is not None:
+            if not isinstance(expert, DiTActionExpertHead):
+                raise ValueError("flow_noise requires the native DiT action expert.")
+            noise_kwargs["noise"] = flow_noise
         actions = expert.sample(
-            vlm_activations=final,
+            vlm_activations=context,
             vlm_mask=vlm_mask,
             num_steps=num_steps,
             num_action_steps=num_action_steps,
@@ -1564,336 +1915,25 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
             action_prefix=action_prefix,
             prefix_length=prefix_length,
             num_flow_samples=num_flow_samples,
+            **noise_kwargs,
         )
         if action_dim is not None and action_dim < expert.action_dim:
             actions = actions[:, :, :action_dim].contiguous()
         return actions
 
-    def train_forward(self, tensor_stream: TensorStream) -> Any:
-        """Differentiable training forward retained for future native training.
+    def train_forward(self, tensor_stream: TensorStream) -> ModelOutput:
+        """Return differentiable native activations and heads for the policy's joint training loss.
 
-        The LeRobot eval policy does not call this path. It returns a local
-        ``ModelOutput``-compatible container for callers that explicitly wire a
-        native training objective later.
+        Evaluation uses ``sample_action``; training consumes this output through
+        ``perceptron_isaac_training_loss`` without a separate backbone implementation.
         """
-        out = self.model(tensor_stream)
+        out = self.model(tensor_stream, output_flow_context=True)
         return ModelOutput(
             final_activations=out.last_hidden_state,
             final_embedding=self.lm_head,
             flow_matching_expert=self.model.action_expert,
+            flow_matching_context=out["flow_matching_context"],
         )
-
-
-# === Loader for the convert_genesis_qwen35_to_hf.py output ===
-
-
-def load_sharded_safetensors_into_model(
-    model: nn.Module,
-    checkpoint_dir: str | Path,
-    *,
-    strict: bool = True,
-) -> tuple[list[str], list[str]]:
-    """Load a safetensors checkpoint while retaining at most one shard.
-
-    When an index exists it is authoritative: every advertised key must be in
-    its advertised shard and no unindexed tensor may be present. This catches
-    partial or accidentally mixed checkpoint directories before inference.
-    """
-    from safetensors.torch import load_file
-
-    root = Path(checkpoint_dir)
-    shard_paths, advertised_by_shard = safetensors_checkpoint_layout(root)
-
-    expected_keys = set(model.state_dict())
-    loaded_keys: set[str] = set()
-    unexpected_keys: set[str] = set()
-    for shard_path in shard_paths:
-        if not shard_path.is_file():
-            raise FileNotFoundError(f"Safetensors index references missing shard {shard_path}.")
-        shard = load_file(str(shard_path))
-        shard_keys = set(shard)
-        if advertised_by_shard is not None:
-            advertised = advertised_by_shard[shard_path.name]
-            missing_from_shard = advertised - shard_keys
-            unindexed_in_shard = shard_keys - advertised
-            if missing_from_shard or unindexed_in_shard:
-                raise ValueError(
-                    f"Safetensors index mismatch for {shard_path.name}: "
-                    f"missing={sorted(missing_from_shard)} unindexed={sorted(unindexed_in_shard)}."
-                )
-        duplicates = loaded_keys.intersection(shard_keys)
-        if duplicates:
-            raise ValueError(
-                f"Duplicate tensor keys across safetensors shards; first: {sorted(duplicates)[:10]}."
-            )
-        _, shard_unexpected = model.load_state_dict(shard, strict=False)
-        unexpected_keys.update(shard_unexpected)
-        loaded_keys.update(shard_keys)
-        del shard
-
-    missing_keys = sorted(expected_keys - loaded_keys)
-    unexpected = sorted(unexpected_keys | (loaded_keys - expected_keys))
-    if strict and (missing_keys or unexpected):
-        raise RuntimeError(
-            "ISAAC checkpoint key coverage mismatch: "
-            f"missing={len(missing_keys)} (first={missing_keys[:10]}), "
-            f"unexpected={len(unexpected)} (first={unexpected[:10]})."
-        )
-    return missing_keys, unexpected
-
-
-def _assert_offset_norm_matches_marker(hf_path: Path, *, apply_offset_norm: bool) -> None:
-    """Cross-check the offset-norm flag against checkpoint-owned convention markers.
-
-    ``rmsnorm_conversion.json`` is written only into directories whose RMSNorm weights have
-    already been converted to the native unit-offset convention. Canonical trained checkpoints
-    archive that import record and carry an explicit weight-convention marker. Subtracting one
-    again turns every language-model norm gain into ``w - 1 ~ 0``, which produces garbage
-    activations with no error, so refuse the load instead.
-    """
-    convention_marker = hf_path / QWEN35_WEIGHT_CONVENTION_FILE
-    if convention_marker.exists() or convention_marker.is_symlink():
-        verify_qwen35_weight_convention(hf_path)
-    markers = (
-        hf_path / QWEN35_CONVERSION_PROVENANCE_FILE,
-        hf_path / QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
-        convention_marker,
-    )
-    already_converted = any(marker.exists() or marker.is_symlink() for marker in markers)
-    if already_converted and apply_offset_norm:
-        marker_names = ", ".join(marker.name for marker in markers if marker.exists() or marker.is_symlink())
-        raise RuntimeError(
-            f"{hf_path} carries {marker_names}, so its RMSNorm weights are already in the native "
-            "unit-offset convention. Loading with apply_offset_norm=True would subtract one "
-            "twice and corrupt every language-model norm; pass apply_offset_norm=False."
-        )
-
-
-def resolve_action_expert_config(
-    file_expert_cfg: dict[str, Any] | None,
-    *,
-    action_expert: dict[str, Any] | None = None,
-    action_expert_overrides: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Resolve the effective action-expert config for a checkpoint load.
-
-    Precedence: a checkpoint-stamped block (``file_expert_cfg``, genesis post-#3402
-    exports) is authoritative and may not be wholesale-replaced; an explicit
-    ``action_expert`` dict is accepted only for checkpoints without one; otherwise
-    ``DEFAULT_MOLMOACT_EXPERT_CFG`` applies. ``action_expert_overrides`` carries
-    serving knobs (action_horizon / num_inference_steps) merged on top -- except that
-    a horizon contradicting a checkpoint-stamped contract fails loudly, because that
-    means the policy config and checkpoint disagree on trained geometry.
-    """
-    if action_expert is not None:
-        if file_expert_cfg is not None:
-            raise ValueError(
-                "The checkpoint's config.json carries an authoritative action_expert "
-                "contract; refusing to override it wholesale. Pass "
-                "action_expert_overrides for serving knobs instead."
-            )
-        resolved = dict(action_expert)
-    elif file_expert_cfg is not None:
-        resolved = dict(file_expert_cfg)
-    else:
-        resolved = dict(DEFAULT_MOLMOACT_EXPERT_CFG)
-    if action_expert_overrides:
-        file_horizon = resolved.get("action_horizon")
-        wanted_horizon = action_expert_overrides.get("action_horizon")
-        if (
-            file_expert_cfg is not None
-            and wanted_horizon is not None
-            and file_horizon is not None
-            and int(wanted_horizon) != int(file_horizon)
-        ):
-            raise ValueError(
-                f"Policy config implies action_horizon={wanted_horizon}, but the "
-                f"checkpoint's action_expert contract declares {file_horizon}; the "
-                "policy config and checkpoint disagree on trained geometry."
-            )
-        resolved = {**resolved, **action_expert_overrides}
-    return resolved
-
-
-def load_qwen35_vla_from_hf(
-    hf_dir: str | Path,
-    *,
-    vector_max_states: int = 128,
-    action_expert: dict[str, Any] | None = None,
-    action_expert_overrides: dict[str, Any] | None = None,
-    dtype: torch.dtype = torch.float32,
-    device: str = "cpu",
-    strict: bool = True,
-    apply_offset_norm: bool = True,
-) -> tuple[Qwen35VLAForActionGeneration, Qwen35VLAConfig]:
-    """Load raw upstream HF weights or a stable, fully verified imported package snapshot."""
-    hf_path = Path(hf_dir)
-    package_root = hf_path.parent
-    load_options = {
-        "vector_max_states": vector_max_states,
-        "action_expert": action_expert,
-        "action_expert_overrides": action_expert_overrides,
-        "dtype": dtype,
-        "device": device,
-        "strict": strict,
-        "apply_offset_norm": apply_offset_norm,
-    }
-
-    from .trained_package import QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME
-
-    if (package_root / QWEN35_TRAINED_PACKAGE_MANIFEST_FILENAME).is_file():
-
-        def verify_trained_snapshot(snapshot_root: Path) -> tuple[str | Path, bool]:
-            from lerobot.configs import PreTrainedConfig
-
-            from .modeling_perceptron_isaac import PerceptronIsaacPolicy
-
-            saved_config = PreTrainedConfig.from_pretrained(snapshot_root)
-            PerceptronIsaacPolicy._resolve_checkpoint_local_paths(saved_config, snapshot_root)
-            PerceptronIsaacPolicy._verify_qwen35_trained_package_manifest(saved_config, snapshot_root)
-            return saved_config.hf_model_path, bool(saved_config.apply_offset_norm)
-
-        verified = _snapshot_verified_qwen35_trained_package(
-            package_root,
-            hf_model_dir=hf_path,
-            verify_snapshot=verify_trained_snapshot,
-        )
-        return _load_qwen35_vla_from_verified_package(verified, **load_options)
-
-    has_import_provenance = (package_root / QWEN35_IMPORT_PROVENANCE_FILE).is_file()
-    has_conversion_marker = (hf_path / QWEN35_CONVERSION_PROVENANCE_FILE).is_file()
-    parent_config_path = package_root / "config.json"
-    has_policy_config = False
-    if parent_config_path.is_file():
-        try:
-            has_policy_config = load_json_object(parent_config_path).get("type") == "perceptron_isaac"
-        except ValueError as exc:
-            raise RuntimeError(f"Cannot inspect parent policy config: {exc}") from exc
-    has_package_identity = (package_root / "isaac_deployment_adapter.json").is_file() or any(
-        (package_root / filename).is_file() for filename in QWEN35_PACKAGED_SOURCE_FILENAMES
-    )
-    if has_import_provenance or has_conversion_marker or has_package_identity or has_policy_config:
-        verified = _snapshot_verified_qwen35_imported_package(
-            package_root,
-            hf_model_dir=hf_path,
-        )
-        return _load_qwen35_vla_from_verified_package(verified, **load_options)
-    detached_markers = [
-        name
-        for name in (
-            QWEN35_SOURCE_CONVERSION_PROVENANCE_FILE,
-            QWEN35_WEIGHT_CONVENTION_FILE,
-        )
-        if (hf_path / name).exists() or (hf_path / name).is_symlink()
-    ]
-    if detached_markers:
-        if QWEN35_WEIGHT_CONVENTION_FILE in detached_markers:
-            verify_qwen35_weight_convention(hf_path)
-        raise RuntimeError(
-            "Detached canonical Qwen3.5 hf_model cannot be loaded without its authenticated "
-            f"outer trained package; found markers={detached_markers}. Load the package root instead."
-        )
-    return _load_qwen35_vla_from_hf(hf_path, **load_options)
-
-
-def _load_qwen35_vla_from_verified_package(
-    verified: _VerifiedQwen35Package,
-    *,
-    vector_max_states: int,
-    action_expert: dict[str, Any] | None,
-    action_expert_overrides: dict[str, Any] | None,
-    dtype: torch.dtype,
-    device: str,
-    strict: bool,
-    apply_offset_norm: bool,
-) -> tuple[Qwen35VLAForActionGeneration, Qwen35VLAConfig]:
-    """Consume one exact-root verified snapshot and release it after model materialization."""
-    try:
-        hf_model_path = _verified_qwen35_model_path(verified)
-        if verified.apply_offset_norm != apply_offset_norm:
-            raise RuntimeError(
-                "Verified Qwen3.5 package apply_offset_norm disagrees with the loader request."
-            )
-        return _load_qwen35_vla_from_hf(
-            hf_model_path,
-            vector_max_states=vector_max_states,
-            action_expert=action_expert,
-            action_expert_overrides=action_expert_overrides,
-            dtype=dtype,
-            device=device,
-            strict=strict,
-            apply_offset_norm=apply_offset_norm,
-        )
-    finally:
-        verified.cleanup()
-
-
-def _load_qwen35_vla_from_hf(
-    hf_dir: str | Path,
-    *,
-    vector_max_states: int,
-    action_expert: dict[str, Any] | None,
-    action_expert_overrides: dict[str, Any] | None,
-    dtype: torch.dtype,
-    device: str,
-    strict: bool,
-    apply_offset_norm: bool,
-) -> tuple[Qwen35VLAForActionGeneration, Qwen35VLAConfig]:
-    """Instantiate ``Qwen35VLAForActionGeneration`` and load the converter's safetensors shards.
-
-    Historical converters write a *native* ``Qwen3_5Config`` (model_type ``qwen3_5``, no
-    action_expert block), for which ``DEFAULT_MOLMOACT_EXPERT_CFG`` supplies the expert
-    geometry. Genesis post-#3402 exports stamp an authoritative ``action_expert`` block
-    (type "dit" + schema_version) into config.json; that block is honored, never
-    silently replaced. ``action_expert_overrides`` carries serving knobs
-    (action_horizon / num_inference_steps) applied on top of whichever base wins.
-    Weights load with ``strict=False`` (the VLM/expert/proprio keys must all match; we
-    assert nothing is missing).
-    """
-    hf_path = Path(hf_dir).resolve()
-    # Load WITHOUT an action_expert kwarg so a checkpoint-stamped block survives as
-    # the authoritative contract (an HF from_pretrained kwarg would wholesale-replace
-    # it -- exactly the silent-discard failure this loader used to have).
-    config = Qwen35VLAConfig.from_pretrained(
-        hf_path,
-        vector_max_states=vector_max_states,
-        tie_word_embeddings=False,
-    )
-    config.action_expert = resolve_action_expert_config(
-        getattr(config, "action_expert", None),
-        action_expert=action_expert,
-        action_expert_overrides=action_expert_overrides,
-    )
-
-    # Construct parameters directly in their requested storage dtype. This
-    # avoids a second full fp32 model allocation during inference and matches
-    # the validated Accelerate loader's cast-before-RMSNorm-correction order.
-    original_default_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        model = Qwen35VLAForActionGeneration(config)
-    finally:
-        torch.set_default_dtype(original_default_dtype)
-    if model.lm_head.weight.data_ptr() == model.get_input_embeddings().weight.data_ptr():
-        raise RuntimeError("Qwen35VLA checkpoint load requires untied lm_head and input embeddings.")
-
-    load_sharded_safetensors_into_model(model, hf_path, strict=strict)
-
-    # convert_genesis_qwen35_to_hf writes standard (genesis) RMSNorm weights; native Qwen3.5 applies
-    # the unit-offset (1 + weight) convention, so correct the language-model norms once here. A
-    # finetuned-and-resaved checkpoint is ALREADY in native convention — load it with
-    # apply_offset_norm=False (re-applying the -1 would corrupt every language-model norm).
-    #
-    # The importer drops rmsnorm_conversion.json next to converted shards precisely so this is
-    # detectable: the correction is not idempotent, so honor the marker over the flag rather
-    # than silently subtracting one twice.
-    _assert_offset_norm_matches_marker(Path(hf_path), apply_offset_norm=apply_offset_norm)
-    if apply_offset_norm:
-        apply_qwen35_offset_norm_correction(model.model.language_model)
-
-    model = model.to(device=device, dtype=dtype)
-    model.eval()
-    return model, config
 
 
 def setup_qwen35_vla_for_training(
@@ -1915,12 +1955,17 @@ def setup_qwen35_vla_for_training(
 
     Does NOT touch the offset-norm correction (applied once at load).
     """
+    if rtc_max_delay_steps != 0 or dual_timestep_ratio != 0:
+        raise ValueError("RTC delay and dual-timestep training are unsupported.")
+    from .modeling_qwen36_moe import GenesisQwen36TextRotaryEmbedding
+
+    # BF16-source training retains its serving load path; rederive before distributed preparation too.
+    for module in model.modules():
+        if isinstance(module, GenesisQwen36TextRotaryEmbedding):
+            module.prepare_for_training()
     expert = model.model.action_expert
-    if expert is not None and hasattr(expert, "args"):
+    if expert is not None:
         expert.args.train_samples_per_chunk = int(train_samples_per_chunk)
-        expert.args.rtc_max_delay_steps = int(rtc_max_delay_steps)
-        expert.args.rtc_delay_sampling = str(rtc_delay_sampling)
-        expert.args.dual_timestep_ratio = float(dual_timestep_ratio)
         expert.args.mask_padded_action_rows = bool(mask_padded_action_rows)
     model.train()
     if train_expert_only:

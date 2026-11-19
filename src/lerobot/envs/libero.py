@@ -128,10 +128,13 @@ class LiberoEnv(gym.Env):
         control_freq: int = 20,
         control_mode: str = "relative",
         is_libero_plus: bool = False,
+        hard_reset: bool = True,
     ):
         super().__init__()
         if control_freq <= 0:
             raise ValueError(f"control_freq must be positive, got {control_freq}")
+        if not hard_reset and not init_states:
+            raise ValueError("hard_reset=False requires init_states=True")
         self.task_id = task_id
         self.is_libero_plus = is_libero_plus
         self.obs_type = obs_type
@@ -158,6 +161,7 @@ class LiberoEnv(gym.Env):
         self.camera_name_mapping = camera_name_mapping
         self.num_steps_wait = num_steps_wait
         self.control_freq = control_freq
+        self.hard_reset = hard_reset
         self.episode_index = episode_index
         self.episode_length = episode_length
         # Load once and keep
@@ -265,6 +269,9 @@ class LiberoEnv(gym.Env):
             camera_heights=self.observation_height,
             camera_widths=self.observation_width,
             control_freq=self.control_freq,
+            # Soft resets skip LIBERO's model and renderer rebuild. They are opt-in
+            # because settle steps can make their observations differ from hard resets.
+            hard_reset=self.hard_reset,
         )
         env.reset()
         self._env = env
@@ -273,21 +280,14 @@ class LiberoEnv(gym.Env):
         self._ensure_env()
         raw_obs = self._env.env._get_observations()
         pixels = self._format_raw_obs(raw_obs)["pixels"]
-        # _format_raw_obs hands back the raw bottom-up MuJoCo render; flip for human viewing.
-        return next(iter(pixels.values()))[::-1, ::-1]
+        image = next(iter(pixels.values()))
+        image = image[::-1, ::-1]  # flip both H and W for visualization
+        return image
 
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         assert self._env is not None, "_format_raw_obs called before _ensure_env()"
         images = {}
         for camera_name in self.camera_name:
-            # Do NOT rotate here. MuJoCo does render bottom-up, but LiberoProcessorStep -- the
-            # env preprocessor every policy runs through -- already applies the 180-degree flip
-            # (processor/env_processor.py). Correcting it a second time composes to the identity
-            # and hands the policy the raw upside-down frame.
-            #
-            # This is not hypothetical: with both flips in place, Genesis's own 91% LIBERO
-            # checkpoint scored 14% through this harness, and probe_policy_input_image.py
-            # measured the served frames at MSE 6012 against the dataset versus 326 once rotated.
             image = raw_obs[camera_name]
             images[self.camera_name_mapping[camera_name]] = image
 

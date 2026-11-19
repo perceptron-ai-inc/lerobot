@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
 import logging
 import shutil
@@ -17,7 +16,7 @@ import torch
 # install it (see .github/workflows/fast_tests.yml).
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
-import lerobot.policies.perceptron_isaac.mharmony_native as mharmony_native
+import lerobot.policies.perceptron_isaac.modeling_perceptron_isaac as policy_module
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.lerobot_types import TransitionKey
 from lerobot.policies import get_policy_class, make_policy_config, make_pre_post_processors
@@ -46,9 +45,9 @@ from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import Perceptr
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
     MolmoActExpertHead,
     Qwen35VLAConfig,
-    load_sharded_safetensors_into_model,
 )
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
+    LIBERO_SERVING_STATS_FILENAME,
     PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY,
     PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY,
     PERCEPTRON_ISAAC_RENDER_META_KEY,
@@ -63,6 +62,7 @@ from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     make_perceptron_isaac_pre_post_processors_from_pretrained,
     normalize_perceptron_isaac_task_text,
 )
+from lerobot.policies.perceptron_isaac.rtc import SharedFinalContext
 from lerobot.processor import PolicyProcessorPipeline, batch_to_transition, transition_to_batch
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -71,7 +71,7 @@ class FakeTensorStream:
     def __init__(self, payload, sequence_length: int = 1):
         self.payload = payload
         self.sequence_length = sequence_length
-        self.to_calls = []
+        self.to_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     @property
     def shape(self):
@@ -80,6 +80,23 @@ class FakeTensorStream:
     def to(self, *args, **kwargs):
         self.to_calls.append((args, kwargs))
         return self
+
+
+def _saved_processor_config(root: Path, *, normalize_task_text: bool = True) -> PerceptronIsaacConfig:
+    stats_path = root / "source_stats.json"
+    _write_native_stats(stats_path)
+    config = PerceptronIsaacConfig(
+        device="cpu",
+        n_obs_steps=1,
+        normalize_task_text=normalize_task_text,
+        native_stats_path=str(stats_path),
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+    preprocessor, postprocessor = make_pre_post_processors(config)
+    preprocessor.save_pretrained(root)
+    postprocessor.save_pretrained(root)
+    return config
 
 
 def test_perceptron_isaac_uses_v06_convention_based_factories(tmp_path):
@@ -113,48 +130,6 @@ def test_perceptron_isaac_uses_v06_convention_based_factories(tmp_path):
     )
 
 
-def test_peft_retained_processor_root_survives_adapter_source_replacement(tmp_path):
-    adapter = tmp_path / "adapter"
-    adapter.mkdir()
-    stats_path = adapter / "isaac_stats.json"
-    _write_native_stats(stats_path)
-    cfg = make_policy_config(
-        "perceptron_isaac",
-        device="cpu",
-        n_obs_steps=1,
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    preprocessor, postprocessor = make_pre_post_processors(cfg)
-    preprocessor.save_pretrained(adapter)
-    postprocessor.save_pretrained(adapter)
-    assert list(adapter.glob("*.safetensors"))
-
-    # Match the path records installed by policy loading: config sidecars belong
-    # to the adapter even though the processor JSON currently contains absolutes.
-    cfg.native_stats_path = "isaac_stats.json"
-    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(cfg, adapter)
-    policy = PerceptronIsaacPolicy(cfg)
-    policy.retain_pretrained_processor_assets(adapter)
-    retained_root = Path(cfg._pretrained_processor_root)
-
-    adapter.rename(tmp_path / "retired-adapter")
-    loaded_preprocessor, loaded_postprocessor = make_pre_post_processors(
-        cfg,
-        pretrained_path=str(adapter),
-    )
-
-    assert retained_root.is_dir()
-    assert list(retained_root.glob("*.safetensors"))
-    assert any(
-        isinstance(step, PerceptronIsaacMharmonyPackProcessorStep) for step in loaded_preprocessor.steps
-    )
-    assert any(
-        isinstance(step, PerceptronIsaacActionUnnormalizeProcessorStep) for step in loaded_postprocessor.steps
-    )
-
-
 def test_per_suite_normalization_survives_loading_from_a_package(tmp_path):
     """--policy.suite_stats_path must reach the loaded step, not just the policy config.
 
@@ -164,25 +139,12 @@ def test_per_suite_normalization_survives_loading_from_a_package(tmp_path):
     into the package. A multi-suite run then trained entirely in one suite's frame and scored well
     on that suite alone -- indistinguishable from a policy that simply failed to learn the others.
     """
-    stats_path = tmp_path / "source_stats.json"
-    _write_native_stats(stats_path)
-
     suite_stats = tmp_path / "suite_stats.json"
     suite_map = tmp_path / "suite_by_task_index.json"
     suite_stats.write_text(json.dumps({"suite_a": {}, "suite_b": {}}))
     suite_map.write_text(json.dumps({"0": "suite_a", "1": "suite_b"}))
 
-    base = make_policy_config(
-        "perceptron_isaac",
-        device="cpu",
-        n_obs_steps=1,
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    preprocessor, postprocessor = make_pre_post_processors(base)
-    preprocessor.save_pretrained(tmp_path)
-    postprocessor.save_pretrained(tmp_path)
+    base = _saved_processor_config(tmp_path)
 
     # The saved package carries no suite fields -- that is the condition being guarded.
     saved = json.loads((tmp_path / "policy_preprocessor.json").read_text())
@@ -196,6 +158,85 @@ def test_per_suite_normalization_survives_loading_from_a_package(tmp_path):
     pack = next(s for s in loaded.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
     assert pack.suite_stats_path == str(suite_stats)
     assert pack.suite_by_task_index_path == str(suite_map)
+
+
+@pytest.mark.parametrize(("cap", "restore_from_package"), [(1.0, True), (10.0, False)])
+def test_finetune_keeps_proprio_clip_with_new_stats_through_save_and_reload(tmp_path, cap, restore_from_package):
+    config = _saved_processor_config(tmp_path)
+    source = Path(config.native_stats_path)
+    payload = json.loads(source.read_text())
+    payload["profile_id"] = "base"
+    payload["_profile"] = {
+        "profile_id": "base",
+        "profile_sha256": "a" * 64,
+        "action_stats_sha256": "b" * 64,
+        "proprio_stats_sha256": "c" * 64,
+        "clip_normalized_proprio": True,
+        "proprio_clip_normalized_max": cap,
+    }
+    source.write_text(json.dumps(payload))
+    pre, post = make_pre_post_processors(config)
+    pre.save_pretrained(tmp_path)
+    post.save_pretrained(tmp_path)
+    dataset_stats = {
+        ACTION: {"q01": torch.full((7,), -0.4), "q99": torch.full((7,), 0.4)},
+        OBS_STATE: {"q01": torch.full((8,), -0.25), "q99": torch.full((8,), 0.25)},
+    }
+
+    pre, post = make_pre_post_processors(
+        config,
+        pretrained_path=str(tmp_path) if restore_from_package else None,
+        dataset_stats=dataset_stats,
+    )
+    output = tmp_path / "finetuned"
+    pre.save_pretrained(output)
+    post.save_pretrained(output)
+    config._save_pretrained(output)
+
+    saved_stats_path = output / "isaac_stats.json"
+    saved_stats = load_isaac_stats(saved_stats_path)
+    assert saved_stats.profile_id == "base#finetune_dataset"
+    assert saved_stats.profile is not None
+    assert saved_stats.profile.profile_sha256 != payload["_profile"]["profile_sha256"]
+    assert saved_stats.profile.action_stats_sha256 != payload["_profile"]["action_stats_sha256"]
+    assert saved_stats.profile.proprio_stats_sha256 != payload["_profile"]["proprio_stats_sha256"]
+    assert saved_stats.profile.proprio_clip_normalized_max == cap
+    np.testing.assert_allclose(saved_stats.action.q99, 0.4)
+    np.testing.assert_allclose(saved_stats.proprio.q99, 0.25)
+
+    loaded_cfg = PerceptronIsaacConfig.from_pretrained(output)
+    loaded_cfg.native_stats_path = str(saved_stats_path)
+    loaded_pre, _ = make_pre_post_processors(loaded_cfg, pretrained_path=str(output))
+    packed = next(step for step in loaded_pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
+    assert packed._stats.profile == saved_stats.profile
+    normed = normalize_isaac_proprio(np.full(8, 20.0), packed._stats.proprio, profile=packed._stats.profile)
+    np.testing.assert_allclose(normed, cap)
+
+
+def test_libero_serving_switches_both_processors_without_changing_the_package(tmp_path):
+    config = _saved_processor_config(tmp_path)
+    config.target_fps = 20.0
+    table = {}
+    for suite, lower in (("libero_10", -0.9), ("libero_spatial", -0.3)):
+        path = tmp_path / f"{suite}.json"
+        _write_native_stats(path, action_q01=lower, profile_scope=suite)
+        table[suite] = json.loads(path.read_text())
+    (tmp_path / LIBERO_SERVING_STATS_FILENAME).write_text(json.dumps(table))
+
+    for suite, data in table.items():
+        config.libero_suite = suite
+        pre, post = make_pre_post_processors(config, pretrained_path=str(tmp_path))
+        pack = next(step for step in pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
+        unnormalize = next(
+            step for step in post.steps if isinstance(step, PerceptronIsaacActionUnnormalizeProcessorStep)
+        )
+        assert pack._stats is unnormalize._stats
+        assert pack._stats.profile_scope == suite
+        np.testing.assert_allclose(pack._stats.action.q01, data["action"]["q01"])
+
+    config.libero_suite = "invalid"
+    with pytest.raises(ValueError, match="Unknown LIBERO suite"):
+        make_pre_post_processors(config, pretrained_path=str(tmp_path))
 
 
 def test_from_pretrained_factory_rejects_half_configured_suite_normalization(tmp_path):
@@ -221,25 +262,13 @@ def test_from_pretrained_factory_rejects_half_configured_suite_normalization(tmp
 
 
 def test_dataset_declared_fps_reaches_pack_step_on_both_factory_paths(tmp_path):
-    stats_path = tmp_path / "source_stats.json"
-    _write_native_stats(stats_path)
-    cfg = make_policy_config(
-        "perceptron_isaac",
-        device="cpu",
-        n_obs_steps=1,
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    meta = SimpleNamespace(fps=30)
+    cfg = _saved_processor_config(tmp_path)
+    meta = SimpleNamespace(fps=30, features={})
 
     fresh, _ = make_pre_post_processors(cfg, dataset_meta=meta)
     pack = next(s for s in fresh.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
     assert pack._dataset_declared_fps == 30.0
 
-    preprocessor, postprocessor = make_pre_post_processors(cfg)
-    preprocessor.save_pretrained(tmp_path)
-    postprocessor.save_pretrained(tmp_path)
     loaded, _ = make_pre_post_processors(cfg, pretrained_path=str(tmp_path), dataset_meta=meta)
     pack = next(s for s in loaded.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
     assert pack._dataset_declared_fps == 30.0
@@ -250,71 +279,130 @@ def test_dataset_declared_fps_reaches_pack_step_on_both_factory_paths(tmp_path):
     assert pack._dataset_declared_fps is None
 
 
-def test_task_normalization_config_reaches_loaded_pack_step(tmp_path):
-    stats_path = tmp_path / "source_stats.json"
-    _write_native_stats(stats_path)
-    cfg = make_policy_config(
-        "perceptron_isaac",
+@pytest.mark.parametrize("route", ["fresh", "finetune", "resume"])
+@pytest.mark.parametrize("scenario", ["gripper_names", "wrong_fps", "libero_clock"])
+def test_trainer_forwards_metadata_to_actual_processor_factories(
+    tmp_path, monkeypatch, caplog, route, scenario
+):
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig
+    from lerobot.scripts import lerobot_train
+
+    config = PerceptronIsaacConfig(
         device="cpu",
         n_obs_steps=1,
-        normalize_task_text=False,
-        native_stats_path=str(stats_path),
-        input_features=_features(),
+        chunk_size=30,
+        n_action_steps=30,
+        action_dim=7,
+        proprio_dim=7,
+        dataset_name="libero" if scenario == "libero_clock" else "custom_robot",
+        normalize_gripper=scenario != "gripper_names",
+        action_feature_names=list(_ARM_NAMES),
+        input_features={
+            "observation.images.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(7,)),
+        },
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
-    preprocessor, postprocessor = make_pre_post_processors(cfg)
-    preprocessor.save_pretrained(tmp_path)
-    postprocessor.save_pretrained(tmp_path)
+    checkpoint = tmp_path / "checkpoint"
+    pretrained = checkpoint / "pretrained_model"
+    if route != "fresh":
+        config.state_feature_names = list(_ARM_NAMES)
+        pre, post = make_pre_post_processors(config, dataset_stats=_dummy_dataset_stats())
+        pre.save_pretrained(pretrained)
+        post.save_pretrained(pretrained)
+        config.pretrained_path = pretrained
+        config.state_feature_names = None
+    dataset_stats = _dummy_dataset_stats()
+    # A resume must retain serialized quantiles, not replace them with these new values.
+    dataset_stats[ACTION]["q01"] = torch.full((7,), -9.0)
+    metadata = SimpleNamespace(
+        fps=10.0 if scenario == "libero_clock" else 30.0 if scenario == "wrong_fps" else 20.0,
+        stats=dataset_stats,
+        features={OBS_STATE: {"names": {"motors": list(_ARM_NAMES)}}},
+    )
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="local/metadata-test"),
+        policy=config,
+        resume=route == "resume",
+        seed=None,
+    )
+    cfg.checkpoint_path = checkpoint if cfg.resume else None
+    monkeypatch.setattr(cfg, "validate", lambda: None)
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        num_processes=1,
+        process_index=0,
+        gradient_accumulation_steps=cfg.accelerator.gradient_accumulation.steps,
+        gather=lambda value: value,
+        wait_for_everyone=lambda: None,
+    )
+    monkeypatch.setattr(lerobot_train, "make_accelerator", lambda cfg: accelerator)
+    monkeypatch.setattr(lerobot_train, "init_logging", lambda **kwargs: None)
+    monkeypatch.setattr(lerobot_train, "is_main_process", lambda: False)
+    monkeypatch.setattr(
+        lerobot_train, "make_train_eval_datasets", lambda cfg: (SimpleNamespace(meta=metadata), None)
+    )
+    monkeypatch.setattr(lerobot_train, "make_policy", lambda **kwargs: PerceptronIsaacPolicy(config))
+    # Restore global backend settings when the actual trainer prefix exits.
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", torch.backends.cudnn.deterministic)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", torch.backends.cudnn.benchmark)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", torch.backends.cuda.matmul.allow_tf32)
+    pipelines = []
+
+    def capture_processors(*args, **kwargs):
+        assert kwargs.get("dataset_meta") is metadata, "trainer dropped dataset metadata"
+        assert ("dataset_stats" in kwargs) is (route != "resume")
+        result = make_pre_post_processors(*args, **kwargs)
+        pipelines.append(result)
+        return result
+
+    class ProcessorsReadyError(Exception):
+        pass
+
+    def stop_before_training(*args):
+        raise ProcessorsReadyError
+
+    monkeypatch.setattr(lerobot_train, "make_pre_post_processors", capture_processors)
+    monkeypatch.setattr(lerobot_train, "_make_image_augmentation", stop_before_training)
+    with pytest.raises(ProcessorsReadyError):
+        lerobot_train.train(cfg)
+
+    pre, post = pipelines[0]
+    pack = next(step for step in pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
+    assert pack._dataset_declared_fps == metadata.fps
+    assert config.state_feature_names == _ARM_NAMES
+    assert pack._stats is not None
+    expected_stats = _dummy_dataset_stats() if route == "resume" else dataset_stats
+    np.testing.assert_array_equal(pack._stats.action.q01, expected_stats[ACTION]["q01"])
+    if scenario == "gripper_names":
+        assert _serialized_masks(("pre", pre), ("post", post)) == {
+            "pre:action.mask": [6],
+            "pre:proprio.mask": [6],
+            "post:action.mask": [6],
+            "post:proprio.mask": [6],
+        }
+    else:
+        _install_fake_native_renderer(pack, monkeypatch)
+        complementary = {"frame_index": torch.tensor([4])}
+        if scenario == "wrong_fps":
+            with pytest.raises(ValueError, match="scaled episode clock"):
+                pack._frame_index_anchors(complementary, batch_size=1)
+        else:
+            with caplog.at_level(logging.WARNING):
+                assert pack._frame_index_anchors(complementary, batch_size=1) == pytest.approx([4 / 20])
+                assert pack._frame_index_anchors(complementary, batch_size=1) == pytest.approx([4 / 20])
+            assert sum("misdeclare" in record.getMessage() for record in caplog.records) == 1
+
+
+def test_task_normalization_config_reaches_loaded_pack_step(tmp_path):
+    cfg = _saved_processor_config(tmp_path, normalize_task_text=False)
 
     cfg.normalize_task_text = True
     loaded, _ = make_pre_post_processors(cfg, pretrained_path=str(tmp_path))
     pack = next(step for step in loaded.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
 
     assert pack.normalize_language is True
-
-
-def test_sharded_loader_streams_and_validates_index(tmp_path):
-    from safetensors.torch import save_file
-
-    model = torch.nn.Sequential(torch.nn.Linear(2, 3), torch.nn.Linear(3, 1))
-    expected = {key: tensor.detach().clone() + 1 for key, tensor in model.state_dict().items()}
-    keys = sorted(expected)
-    shard_names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
-    save_file({key: expected[key] for key in keys[:2]}, tmp_path / shard_names[0])
-    save_file({key: expected[key] for key in keys[2:]}, tmp_path / shard_names[1])
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": sum(t.numel() * t.element_size() for t in expected.values())},
-                "weight_map": {key: shard_names[0] if key in keys[:2] else shard_names[1] for key in keys},
-            }
-        )
-    )
-
-    missing, unexpected = load_sharded_safetensors_into_model(model, tmp_path)
-
-    assert missing == []
-    assert unexpected == []
-    for key, tensor in model.state_dict().items():
-        torch.testing.assert_close(tensor, expected[key])
-
-
-def test_sharded_loader_rejects_index_mismatch(tmp_path):
-    from safetensors.torch import save_file
-
-    model = torch.nn.Linear(2, 1)
-    save_file(model.state_dict(), tmp_path / "model-00001-of-00001.safetensors")
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {},
-                "weight_map": {"weight": "model-00001-of-00001.safetensors"},
-            }
-        )
-    )
-
-    with pytest.raises(ValueError, match="index mismatch"):
-        load_sharded_safetensors_into_model(model, tmp_path)
 
 
 class FakeNativeRenderer:
@@ -343,6 +431,8 @@ class FakeNativeRenderer:
 
 
 class FakePackedStream:
+    shape = (1, 1)
+
     def __init__(self):
         self.to_calls = []
 
@@ -357,7 +447,7 @@ class FakeIsaacModel:
             vision_config=SimpleNamespace(patch_size=16, spatial_merge_size=2, temporal_patch_size=2)
         )
         self.value = value
-        self.sample_calls = []
+        self.sample_calls: list[dict[str, object]] = []
 
     def sample_action(self, stream, **kwargs):
         self.sample_calls.append({"stream": stream, **kwargs})
@@ -410,6 +500,33 @@ class ZeroVelocityActionExpert:
         return torch.zeros_like(x)
 
 
+def _tiny_policy(
+    root: Path,
+    model: FakeIsaacModel | FakeMixedPrecisionIsaacModel | None = None,
+    *,
+    action_q01: float = -1.0,
+    action_q99: float = 1.0,
+    train_storage_fp32: bool = True,
+    num_flow_samples: int = 4,
+    flow_seed_base: int | None = None,
+) -> PerceptronIsaacPolicy:
+    stats_path = root / "stats.json"
+    _write_native_stats(stats_path, action_q01=action_q01, action_q99=action_q99)
+    config = PerceptronIsaacConfig(
+        device="cpu",
+        native_stats_path=str(stats_path),
+        train_storage_fp32=train_storage_fp32,
+        num_flow_samples=num_flow_samples,
+        flow_seed_base=flow_seed_base,
+        input_features=_features(),
+        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+    )
+    policy = PerceptronIsaacPolicy(config)
+    # Processor tests intentionally inject a narrow fake backend, not a complete VLA.
+    policy._isaac_model = model  # type: ignore[assignment]
+    return policy
+
+
 def _features():
     return {
         "observation.images.image": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 256, 256)),
@@ -418,9 +535,12 @@ def _features():
     }
 
 
-def _install_fake_native_renderer(step: PerceptronIsaacRenderProcessorStep) -> FakeNativeRenderer:
+def _install_fake_native_renderer(
+    step: PerceptronIsaacRenderProcessorStep, monkeypatch: pytest.MonkeyPatch
+) -> FakeNativeRenderer:
     renderer = FakeNativeRenderer()
-    step._stream_builder = renderer
+    # Test-double injection: production currently infers this field as None.
+    monkeypatch.setattr(step, "_stream_builder", renderer)
     return renderer
 
 
@@ -466,6 +586,9 @@ def _write_native_stats(
 def test_molmoact_expert_averages_flow_samples_with_one_context_build():
     head = MolmoActExpertHead.__new__(MolmoActExpertHead)
     torch.nn.Module.__init__(head)
+    # This narrow sampler fixture bypasses __init__, so supply its required context contract.
+    head.conditioning = SharedFinalContext()
+    head.vlm_dim = 4
     head.num_inference_steps = 1
     head.action_dim = 1
     head.action_horizon = 1
@@ -623,15 +746,17 @@ def test_render_registry_configs_round_trip_without_schema_drift(tmp_path):
 
 def test_native_backend_factory_uses_mharmony_pack_step(tmp_path):
     stats_path = tmp_path / "native_stats.json"
+    metadata_path = tmp_path / "native_render.json"
     _write_native_stats(stats_path)
     cfg = PerceptronIsaacConfig(
         device="cpu",
-        native_render_metadata_path="/tmp/native_render.json",
+        native_render_metadata_path=str(metadata_path),
         native_stats_path=str(stats_path),
         mharmony_version=SUPPORTED_MHARMONY_VERSION,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
+    metadata_path.write_text(json.dumps(IsaacMharmonyRenderMetadata.from_config(cfg).to_json_dict()))
     preprocessor, postprocessor = make_perceptron_isaac_pre_post_processors(cfg)
 
     native_step = next(
@@ -645,7 +770,7 @@ def test_native_backend_factory_uses_mharmony_pack_step(tmp_path):
 
     assert native_step.enabled is True
     assert native_step.inference_backend == "native_mharmony"
-    assert native_step.native_render_metadata_path == "/tmp/native_render.json"
+    assert native_step.native_render_metadata_path == str(metadata_path)
     assert native_step.native_stats_path == str(stats_path)
     assert native_step.mharmony_version == SUPPORTED_MHARMONY_VERSION
     assert action_step.stats_path == str(stats_path)
@@ -780,7 +905,7 @@ def test_saved_processors_are_portable_without_source_stats(tmp_path):
     assert action_step._stats.proprio_dim == 8
 
 
-def test_preprocessor_returns_rendered_stream_as_policy_batch_key():
+def test_preprocessor_returns_rendered_stream_as_policy_batch_key(monkeypatch):
     cfg = PerceptronIsaacConfig(
         device="cpu",
         native_stats_path="/tmp/stats.json",
@@ -791,7 +916,7 @@ def test_preprocessor_returns_rendered_stream_as_policy_batch_key():
     render_step = next(
         step for step in preprocessor.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep)
     )
-    fake_renderer = _install_fake_native_renderer(render_step)
+    fake_renderer = _install_fake_native_renderer(render_step, monkeypatch)
 
     batch = {
         "observation.images.image": torch.zeros(3, 256, 256),
@@ -826,7 +951,7 @@ def test_batch_to_transition_passes_frame_index_and_timestamp():
     assert float(complementary["timestamp"]) == pytest.approx(0.2)
 
 
-def test_native_pack_anchor_uses_frame_index_over_misdeclared_dataset_timestamp():
+def test_native_pack_anchor_uses_frame_index_over_misdeclared_dataset_timestamp(monkeypatch):
     """A dataset that misdeclares its fps must not shift training-time model time.
 
     ``allenai/MolmoAct2-LIBERO-Dataset`` and ``lerobot/libero_spatial_image`` both declare
@@ -842,7 +967,7 @@ def test_native_pack_anchor_uses_frame_index_over_misdeclared_dataset_timestamp(
         device="cpu",
         dtype="float32",
     )
-    fake_renderer = _install_fake_native_renderer(step)
+    fake_renderer = _install_fake_native_renderer(step, monkeypatch)
     assert fake_renderer.metadata.target_fps == 20.0
 
     transition = {
@@ -872,7 +997,7 @@ def test_native_pack_anchor_uses_frame_index_over_misdeclared_dataset_timestamp(
     np.testing.assert_allclose([fake_renderer.build_calls[-1]["anchor_timestamp_seconds"]], [0.2])
 
 
-def test_native_pack_build_path_passes_external_timestamp_from_explicit_window():
+def test_native_pack_build_path_passes_external_timestamp_from_explicit_window(monkeypatch):
     step = PerceptronIsaacMharmonyPackProcessorStep(
         enabled=True,
         camera_order=["image", "wrist_image"],
@@ -881,7 +1006,7 @@ def test_native_pack_build_path_passes_external_timestamp_from_explicit_window()
         device="cpu",
         dtype="float32",
     )
-    fake_renderer = _install_fake_native_renderer(step)
+    fake_renderer = _install_fake_native_renderer(step, monkeypatch)
 
     transition = {
         TransitionKey.OBSERVATION: {
@@ -922,7 +1047,7 @@ def test_native_pack_build_path_passes_external_timestamp_from_explicit_window()
     assert not hasattr(step, "_state_queue")
 
 
-def test_native_pack_skips_live_single_step_without_anchor():
+def test_native_pack_skips_live_single_step_without_anchor(monkeypatch):
     step = PerceptronIsaacMharmonyPackProcessorStep(
         enabled=True,
         camera_order=["image", "wrist_image"],
@@ -931,7 +1056,7 @@ def test_native_pack_skips_live_single_step_without_anchor():
         device="cpu",
         dtype="float32",
     )
-    fake_renderer = _install_fake_native_renderer(step)
+    fake_renderer = _install_fake_native_renderer(step, monkeypatch)
 
     out = step(
         {
@@ -957,7 +1082,7 @@ def test_native_pack_skips_live_single_step_without_anchor():
     assert fake_renderer.build_calls == []
 
 
-def test_native_pack_rejects_multi_environment_batch():
+def test_native_pack_defers_multi_environment_live_batch(monkeypatch):
     step = PerceptronIsaacMharmonyPackProcessorStep(
         enabled=True,
         camera_order=["image", "wrist_image"],
@@ -966,7 +1091,7 @@ def test_native_pack_rejects_multi_environment_batch():
         device="cpu",
         dtype="float32",
     )
-    _install_fake_native_renderer(step)
+    _install_fake_native_renderer(step, monkeypatch)
 
     transition = {
         TransitionKey.OBSERVATION: {
@@ -982,11 +1107,14 @@ def test_native_pack_rejects_multi_environment_batch():
         TransitionKey.COMPLEMENTARY_DATA: {"task": ["Pick up the mug", "Open the drawer"]},
     }
 
-    with pytest.raises(NotImplementedError, match="batch_size=1.*batch_size=2"):
-        step(transition)
+    output = step(transition)
+    complementary = output[TransitionKey.COMPLEMENTARY_DATA]
+    assert PERCEPTRON_ISAAC_STREAM_KEY not in complementary
+    assert complementary[PERCEPTRON_ISAAC_RENDER_META_KEY]["render_skipped"] is True
+    assert complementary["task"] == ["pick up the mug", "open the drawer"]
 
 
-def test_native_policy_online_rollout_uses_policy_clock(tmp_path):
+def test_native_policy_online_rollout_uses_policy_clock(monkeypatch, tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
 
@@ -1012,7 +1140,7 @@ def test_native_policy_online_rollout_uses_policy_clock(tmp_path):
 
     policy = PerceptronIsaacPolicy(_cfg(num_settle_steps=0))
     policy._isaac_model = FakeIsaacModel()
-    fake_renderer = _install_fake_native_renderer(policy._ensure_online_render_step())
+    fake_renderer = _install_fake_native_renderer(policy._ensure_online_render_step(), monkeypatch)
 
     policy.select_action(_batch(0))
     # Genesis floors the anchor at (k-1)/fps so the k rendered observation timestamps stay
@@ -1038,7 +1166,7 @@ def test_native_policy_online_rollout_uses_policy_clock(tmp_path):
 
     settled_policy = PerceptronIsaacPolicy(_cfg(num_settle_steps=10))
     settled_policy._isaac_model = FakeIsaacModel()
-    settled_renderer = _install_fake_native_renderer(settled_policy._ensure_online_render_step())
+    settled_renderer = _install_fake_native_renderer(settled_policy._ensure_online_render_step(), monkeypatch)
     for idx in range(11):
         settled_policy.select_action(_batch(idx))
 
@@ -1053,13 +1181,13 @@ def test_native_policy_online_rollout_uses_policy_clock(tmp_path):
     assert settled_policy._frame_index == 0
 
 
-def test_online_renderer_inherits_conditioning_contract(tmp_path):
+def test_online_renderer_preserves_mistake_conditioning_without_action_history(tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     config = PerceptronIsaacConfig(
         device="cpu",
         native_stats_path=str(stats_path),
-        action_conditioning=True,
+        action_conditioning=False,
         action_conditioning_role="user",
         mistake_conditioning=True,
         input_features=_features(),
@@ -1068,16 +1196,16 @@ def test_online_renderer_inherits_conditioning_contract(tmp_path):
 
     step = PerceptronIsaacPolicy(config)._ensure_online_render_step()
 
-    assert step.action_conditioning is True
+    assert step.action_conditioning is False
     assert step.action_conditioning_role == "user"
     assert step.mistake_conditioning is True
     step._ensure_renderer()
-    assert step._stream_builder.metadata.action_conditioning is True
+    assert step._stream_builder.metadata.action_conditioning is False
     assert step._stream_builder.metadata.action_conditioning_role == "user"
     assert step._stream_builder.metadata.mistake_conditioning is True
 
 
-def test_native_policy_requires_and_resets_executed_action_history(tmp_path):
+def test_native_policy_needs_no_executed_actions_between_observations(monkeypatch, tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     config = PerceptronIsaacConfig(
@@ -1086,7 +1214,7 @@ def test_native_policy_requires_and_resets_executed_action_history(tmp_path):
         n_obs_steps=3,
         n_action_steps=1,
         chunk_size=30,
-        action_conditioning=True,
+        action_conditioning=False,
         clip_normalized_max=10.0,
         fast_clip_normalized_max=1.0,
         input_features=_features(),
@@ -1104,45 +1232,25 @@ def test_native_policy_requires_and_resets_executed_action_history(tmp_path):
     policy = PerceptronIsaacPolicy(config)
     policy._isaac_model = FakeIsaacModel()
     render_step = policy._ensure_online_render_step()
-    renderer = _install_fake_native_renderer(render_step)
-    renderer.metadata.action_conditioning = True
-    render_step._fast_processor = object()
-
+    renderer = _install_fake_native_renderer(render_step, monkeypatch)
     policy.select_action(batch(0))
-    assert [frame.get("previous_action") for frame in renderer.build_calls[-1]["observation_window"]] == [
-        None,
-        None,
-        None,
-    ]
-
-    with pytest.raises(RuntimeError, match="record_executed_action"):
-        policy.select_action(batch(1))
-    assert policy._frame_index == 0
-
-    with pytest.raises(ValueError, match="finite"):
-        policy.record_executed_action(np.full(7, np.nan, dtype=np.float32))
-
-    executed_action = np.full(7, 2.0, dtype=np.float32)
-    policy.record_executed_action(executed_action)
     policy.select_action(batch(1))
-    expected = normalize_isaac_actions(executed_action[None, :], load_isaac_stats(stats_path).action)[0]
-    expected = np.clip(expected, -config.fast_clip_normalized_max, config.fast_clip_normalized_max)
-    np.testing.assert_allclose(
-        renderer.build_calls[-1]["observation_window"][-1]["previous_action"],
-        expected,
-    )
+    assert policy._frame_index == 1
+    window = renderer.build_calls[-1]["observation_window"]
+    assert [float(frame["proprio"][0]) for frame in window] == [0.0, 0.0, 1.0]
+    assert all("previous_action" not in frame for frame in window)
 
     policy.reset()
-    assert list(policy._online_action_queue) == []
-    assert policy._pending_executed_action is None
     first_step = policy._ensure_online_render_step()
-    first_renderer = _install_fake_native_renderer(first_step)
-    first_renderer.metadata.action_conditioning = True
-    first_step._fast_processor = object()
+    first_renderer = _install_fake_native_renderer(first_step, monkeypatch)
     policy.select_action(batch(0))
+    assert policy._frame_index == 0
+    assert all(
+        float(frame["proprio"][0]) == 0.0 for frame in first_renderer.build_calls[-1]["observation_window"]
+    )
 
 
-def test_native_policy_external_timestamp_is_monotonic_and_resettable(tmp_path):
+def test_native_policy_external_timestamp_is_monotonic_and_resettable(monkeypatch, tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     cfg = PerceptronIsaacConfig(
@@ -1157,7 +1265,7 @@ def test_native_policy_external_timestamp_is_monotonic_and_resettable(tmp_path):
     )
     policy = PerceptronIsaacPolicy(cfg)
     policy._isaac_model = FakeIsaacModel()
-    fake_renderer = _install_fake_native_renderer(policy._ensure_online_render_step())
+    fake_renderer = _install_fake_native_renderer(policy._ensure_online_render_step(), monkeypatch)
 
     first = {
         "observation.images.image": torch.zeros(3, 256, 256),
@@ -1174,12 +1282,12 @@ def test_native_policy_external_timestamp_is_monotonic_and_resettable(tmp_path):
 
     policy.reset()
     policy._isaac_model = FakeIsaacModel()
-    reset_renderer = _install_fake_native_renderer(policy._ensure_online_render_step())
+    reset_renderer = _install_fake_native_renderer(policy._ensure_online_render_step(), monkeypatch)
     policy.select_action({**first, "timestamp_seconds": torch.tensor(0.0)})
     assert reset_renderer.build_calls[-1]["anchor_timestamp_seconds"] == pytest.approx(0.0)
 
 
-def test_native_pack_accepts_policy_owned_explicit_anchor():
+def test_native_pack_accepts_policy_owned_explicit_anchor(monkeypatch):
     step = PerceptronIsaacMharmonyPackProcessorStep(
         enabled=True,
         camera_order=["image", "wrist_image"],
@@ -1188,7 +1296,7 @@ def test_native_pack_accepts_policy_owned_explicit_anchor():
         device="cpu",
         dtype="float32",
     )
-    fake_renderer = _install_fake_native_renderer(step)
+    fake_renderer = _install_fake_native_renderer(step, monkeypatch)
     transition = {
         TransitionKey.OBSERVATION: {
             "observation.images.image": torch.zeros(1, 3, 3, 16, 16),
@@ -1329,7 +1437,7 @@ def test_joint_frame_config_rejects_noninvertible_signs():
         )
 
 
-def test_native_pack_renders_batched_training_actions_with_explicit_dataset_time():
+def test_native_pack_renders_batched_training_actions_with_explicit_dataset_time(monkeypatch):
     step = PerceptronIsaacMharmonyPackProcessorStep(
         enabled=True,
         camera_order=["image", "wrist_image"],
@@ -1340,7 +1448,7 @@ def test_native_pack_renders_batched_training_actions_with_explicit_dataset_time
         device="cpu",
         dtype="float32",
     )
-    renderer = _install_fake_native_renderer(step)
+    renderer = _install_fake_native_renderer(step, monkeypatch)
     step._fast_processor = object()
     action = torch.arange(2 * 30 * 7, dtype=torch.float32).reshape(2, 30, 7)
     action[0, 0, 0] = -999.0
@@ -1377,87 +1485,7 @@ def test_native_pack_renders_batched_training_actions_with_explicit_dataset_time
     assert len(renderer.collate_calls[0]) == 1
 
 
-def test_real_preprocessor_promotes_retained_indices_to_weighted_trainer():
-    """The filtered-row protocol must survive the real pipeline conversion boundary."""
-    pytest.importorskip("accelerate", reason="accelerate is required for the trainer boundary")
-    pytest.importorskip("datasets", reason="datasets is required to import lerobot_train")
-
-    from accelerate import Accelerator
-
-    from lerobot.scripts.lerobot_train import update_policy
-
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        n_obs_steps=3,
-        native_stats_path="/tmp/stats.json",
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    preprocessor, _ = make_perceptron_isaac_pre_post_processors(cfg)
-    render_step = next(
-        step for step in preprocessor.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep)
-    )
-    _install_fake_native_renderer(render_step)
-    render_step._fast_processor = object()
-
-    action = torch.zeros(3, 30, 7)
-    action[0, 0, 0] = -999.0
-    processed = preprocessor(
-        {
-            "observation.images.image": torch.zeros(3, 3, 3, 256, 256),
-            "observation.images.image2": torch.ones(3, 3, 3, 256, 256),
-            OBS_STATE: torch.zeros(3, 3, 8),
-            ACTION: action,
-            "task": ["drop", "keep one", "keep two"],
-            "timestamp": torch.tensor([0.0, 0.05, 0.1]),
-        }
-    )
-
-    # transition_to_batch promotes complementary data back to policy-batch keys.
-    assert processed[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == [1, 2]
-
-    class BoundaryPolicy(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.tensor(0.0))
-
-        def forward(self, batch, reduction="mean"):
-            assert batch[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == [1, 2]
-            per_sample = (self.weight - self.weight.new_tensor([1.0, 3.0])).square()
-            loss = per_sample if reduction == "none" else per_sample.mean()
-            return loss, {"boundary_loss": per_sample.mean().detach()}
-
-    class OriginalBatchWeighter:
-        @staticmethod
-        def compute_batch_weights(_batch):
-            return torch.tensor([1000.0, 1.0, 3.0]), {}
-
-    class Tracker:
-        @staticmethod
-        def update_metrics(_metrics):
-            return None
-
-    accelerator = Accelerator(cpu=True)
-    policy = BoundaryPolicy()
-    optimizer = torch.optim.SGD(policy.parameters(), lr=0.1)
-    policy, optimizer = accelerator.prepare(policy, optimizer)
-
-    update_policy(
-        Tracker(),
-        policy,
-        processed,
-        optimizer,
-        10.0,
-        accelerator,
-        sample_weighter=OriginalBatchWeighter(),
-    )
-
-    # Rows 1 and 2 survive. Their weighted gradient is
-    # (1 * -2 + 3 * -6) / 4 = -5, so SGD(lr=.1) moves the weight to .5.
-    assert accelerator.unwrap_model(policy).weight.item() == pytest.approx(0.5)
-
-
-def test_native_pack_training_requires_explicit_dataset_timestamp():
+def test_native_pack_training_requires_explicit_dataset_timestamp(monkeypatch):
     step = PerceptronIsaacMharmonyPackProcessorStep(
         enabled=True,
         camera_order=["image", "wrist_image"],
@@ -1468,7 +1496,7 @@ def test_native_pack_training_requires_explicit_dataset_timestamp():
         device="cpu",
         dtype="float32",
     )
-    _install_fake_native_renderer(step)
+    _install_fake_native_renderer(step, monkeypatch)
     step._fast_processor = object()
     transition = {
         TransitionKey.OBSERVATION: {
@@ -1541,10 +1569,10 @@ def _training_transition(action, tasks, **complementary):
     }
 
 
-def test_frame_index_anchor_rejects_genuine_dataset_fps_mismatch():
+def test_frame_index_anchor_rejects_genuine_dataset_fps_mismatch(monkeypatch):
     """A correctly-declared 30 Hz dataset under a 20 Hz contract must not silently dilate."""
     step = _training_step(dataset_name="molmoact2_so100_101")
-    _install_fake_native_renderer(step)  # contract target_fps=20
+    _install_fake_native_renderer(step, monkeypatch)  # contract target_fps=20
     step._dataset_declared_fps = 30.0
 
     transition = _training_transition(torch.zeros(1, 30, 7), ["pick"], frame_index=torch.tensor([4]))
@@ -1552,10 +1580,10 @@ def test_frame_index_anchor_rejects_genuine_dataset_fps_mismatch():
         step(transition)
 
 
-def test_frame_index_anchor_warns_once_for_misdeclared_libero_fps(caplog):
+def test_frame_index_anchor_warns_once_for_misdeclared_libero_fps(monkeypatch, caplog):
     """LIBERO conversions misdeclare fps; the contract clock wins, but loudly."""
     step = _training_step(dataset_name="libero")
-    renderer = _install_fake_native_renderer(step)  # contract target_fps=20
+    renderer = _install_fake_native_renderer(step, monkeypatch)  # contract target_fps=20
     step._dataset_declared_fps = 10.0
 
     transition = _training_transition(torch.zeros(1, 30, 7), ["pick"], frame_index=torch.tensor([4]))
@@ -1568,9 +1596,9 @@ def test_frame_index_anchor_warns_once_for_misdeclared_libero_fps(caplog):
     assert len(warnings) == 1
 
 
-def test_frame_index_anchor_accepts_matching_dataset_fps():
+def test_frame_index_anchor_accepts_matching_dataset_fps(monkeypatch):
     step = _training_step(dataset_name="molmoact2_so100_101")
-    renderer = _install_fake_native_renderer(step)  # contract target_fps=20
+    renderer = _install_fake_native_renderer(step, monkeypatch)  # contract target_fps=20
     step._dataset_declared_fps = 20.0
 
     step(_training_transition(torch.zeros(1, 30, 7), ["pick"], frame_index=torch.tensor([4])))
@@ -1578,15 +1606,17 @@ def test_frame_index_anchor_accepts_matching_dataset_fps():
     np.testing.assert_allclose([renderer.build_training_calls[0]["anchor_timestamp_seconds"]], [4 / 20])
 
 
-def test_all_outlier_microbatch_fails_loud_single_process():
-    """Without collectives to keep in lockstep, an all-outlier microbatch must abort."""
+def test_all_outlier_microbatch_defers_empty_objective_check_to_window(monkeypatch):
+    """An empty microbatch may have usable peers or a later usable input in its window."""
     step = _training_step()
-    renderer = _install_fake_native_renderer(step)
+    renderer = _install_fake_native_renderer(step, monkeypatch)
     action = torch.zeros(1, 30, 7)
     action[0, 0, 0] = -999.0
 
-    with pytest.raises(IsaacActionOutlierError, match="normalization stats"):
-        step(_training_transition(action, ["pick"], timestamp=torch.tensor([0.0])))
+    out = step(_training_transition(action, ["pick"], timestamp=torch.tensor([0.0])))
+    complementary = out[TransitionKey.COMPLEMENTARY_DATA]
+    assert complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == []
+    assert complementary[PERCEPTRON_ISAAC_STREAM_KEY].collective_only
 
     # Single-process keeps the renderer's own fail-loud over-length check.
     assert renderer.build_training_calls[0]["max_sequence_length"] == 4096
@@ -1603,7 +1633,7 @@ def _mock_distributed_batch_validation(monkeypatch, *, peer_has_no_usable_sample
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
 
 
-def test_all_outlier_microbatch_fails_collectively_distributed(monkeypatch):
+def test_all_outlier_microbatch_prepares_collective_only_input_distributed(monkeypatch):
     _mock_distributed_batch_validation(monkeypatch)
     step = _training_step()
     renderer = ThresholdAwareFakeNativeRenderer()
@@ -1611,8 +1641,10 @@ def test_all_outlier_microbatch_fails_collectively_distributed(monkeypatch):
     action = torch.zeros(2, 30, 7)
     action[:, 0, 0] = -999.0
 
-    with pytest.raises(IsaacActionOutlierError, match="distributed rank has no usable samples"):
-        step(_training_transition(action, ["pick", "place"], timestamp=torch.tensor([0.0, 0.05])))
+    out = step(_training_transition(action, ["pick", "place"], timestamp=torch.tensor([0.0, 0.05])))
+    complementary = out[TransitionKey.COMPLEMENTARY_DATA]
+    assert complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == []
+    assert complementary[PERCEPTRON_ISAAC_STREAM_KEY].collective_only
 
     # The threshold is never disabled just to keep collectives alive.
     assert all(call["skip_outlier_threshold"] > 0.0 for call in renderer.build_training_calls)
@@ -1636,38 +1668,40 @@ def test_distributed_over_length_sample_is_skipped_not_fatal(monkeypatch):
     assert renderer.build_training_calls[0]["max_sequence_length"] == 2**31 - 1
 
 
-def test_distributed_all_over_length_microbatch_fails_collectively(monkeypatch):
+def test_distributed_all_over_length_microbatch_prepares_collective_only_input(monkeypatch):
     _mock_distributed_batch_validation(monkeypatch)
     step = _training_step(train_max_sequence_length=5)
     renderer = ThresholdAwareFakeNativeRenderer(lengths_by_prompt={"pick": 10, "place": 11})
     step._stream_builder = renderer
 
-    with pytest.raises(IsaacActionOutlierError, match="distributed rank has no usable samples"):
-        step(
-            _training_transition(
-                torch.zeros(2, 30, 7),
-                ["pick", "place"],
-                timestamp=torch.tensor([0.0, 0.05]),
-            )
+    out = step(
+        _training_transition(
+            torch.zeros(2, 30, 7),
+            ["pick", "place"],
+            timestamp=torch.tensor([0.0, 0.05]),
         )
+    )
+    complementary = out[TransitionKey.COMPLEMENTARY_DATA]
+    assert complementary[PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == []
+    assert complementary[PERCEPTRON_ISAAC_STREAM_KEY].collective_only
 
 
-def test_distributed_valid_rank_fails_before_loss_collectives_when_peer_is_invalid(monkeypatch):
+def test_distributed_valid_rank_keeps_real_input_when_peer_is_empty(monkeypatch):
     _mock_distributed_batch_validation(monkeypatch, peer_has_no_usable_samples=True)
     step = _training_step()
     renderer = ThresholdAwareFakeNativeRenderer()
     step._stream_builder = renderer
 
-    with pytest.raises(IsaacActionOutlierError, match="distributed rank has no usable samples"):
-        step(
-            _training_transition(
-                torch.zeros(1, 30, 7),
-                ["pick"],
-                timestamp=torch.tensor([0.0]),
-            )
+    out = step(
+        _training_transition(
+            torch.zeros(1, 30, 7),
+            ["pick"],
+            timestamp=torch.tensor([0.0]),
         )
+    )
 
-    assert renderer.collate_calls == []
+    assert out[TransitionKey.COMPLEMENTARY_DATA][PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY] == [0]
+    assert len(renderer.collate_calls) == 1
 
 
 def test_render_processor_conforms_resolution_and_rejects_undecidable_layouts():
@@ -1793,16 +1827,7 @@ def test_isaac_stats_state_dict_round_trips_empty_string_labels():
 
 
 def test_policy_reset_clears_flow_seed_index_and_has_no_policy_side_renderer(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeIsaacModel()
+    policy = _tiny_policy(tmp_path, FakeIsaacModel())
     policy._flow_seed_index = 12
     policy._frame_index = 3
     policy._last_external_timestamp_seconds = 0.15
@@ -1825,16 +1850,7 @@ def test_policy_reset_clears_flow_seed_index_and_has_no_policy_side_renderer(tmp
 
 
 def test_native_policy_without_stream_requires_raw_online_observation(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeIsaacModel()
+    policy = _tiny_policy(tmp_path, FakeIsaacModel())
 
     with pytest.raises(ValueError, match="at least one image observation"):
         policy.predict_action_chunk({"task": "pick up the mug"})
@@ -1885,18 +1901,21 @@ def test_saved_pipelines_reload_with_trainer_supplied_normalizer_overrides(tmp_p
     assert not any("Normalizer" in name for name in step_names)
 
 
-def test_native_policy_loads_backbone_with_policy_chunk_size(tmp_path, monkeypatch):
+def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    calls = []
+    calls: list[dict[str, object]] = []
+    model = FakeIsaacModel()
 
-    import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as qwen35_vla
+    def fake_load_mk1_vla_from_hf(
+        model_dir: Path, **kwargs: object
+    ) -> tuple[FakeIsaacModel, SimpleNamespace, SimpleNamespace]:
+        calls.append({"model_dir": model_dir, **kwargs})
+        return model, SimpleNamespace(), contract
 
-    def fake_load_qwen35_vla_from_hf(hf_dir, **kwargs):
-        calls.append({"hf_dir": hf_dir, **kwargs})
-        return FakeIsaacModel(), SimpleNamespace()
-
-    monkeypatch.setattr(qwen35_vla, "load_qwen35_vla_from_hf", fake_load_qwen35_vla_from_hf)
+    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
     cfg = PerceptronIsaacConfig(
         device="cpu",
         hf_model_path=str(tmp_path / "hf"),
@@ -1904,6 +1923,9 @@ def test_native_policy_loads_backbone_with_policy_chunk_size(tmp_path, monkeypat
         chunk_size=50,
         n_action_steps=30,
         num_inference_steps=12,
+        num_flow_samples=4,
+        apply_offset_norm=False,
+        mk1_model_import_sha256="0" * 64,
         # fp32 storage defers the load, so pin bf16 storage to exercise the eager path.
         train_storage_fp32=False,
         input_features=_features(),
@@ -1914,17 +1936,32 @@ def test_native_policy_loads_backbone_with_policy_chunk_size(tmp_path, monkeypat
 
     assert policy._isaac_model is not None
     assert len(calls) == 1
-    # Serving knobs travel as overrides; the full expert dict is resolved inside
-    # load_qwen35_vla_from_hf so a checkpoint-stamped contract stays authoritative.
+    # Native geometry stays checkpoint-owned; serving knobs belong to sampling only.
     assert "action_expert" not in calls[0]
-    overrides = calls[0]["action_expert_overrides"]
-    assert overrides["action_horizon"] == 50
-    assert overrides["num_inference_steps"] == 12
+    assert "action_expert_overrides" not in calls[0]
+    assert "action_horizon" not in calls[0]
+    assert "num_inference_steps" not in calls[0]
+    assert contract.action_expert.action_horizon == 64
+
+    stream = FakePackedStream()
+    actions = policy.predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: stream})
+
+    assert tuple(actions.shape) == (1, 50, 7)
+    assert model.sample_calls == [
+        {
+            "stream": stream,
+            "num_steps": 12,
+            "action_dim": 7,
+            "num_action_steps": 50,
+            "num_flow_samples": 4,
+        }
+    ]
+    assert len(calls) == 1
 
 
 def _patch_mk1_checkpoint_load(monkeypatch, loader):
     contract = SimpleNamespace(
-        artifact=SimpleNamespace(artifact_kind="trained_policy", trained_steps=1),
+        artifact=SimpleNamespace(artifact_kind="trained_policy"),
         vector_encoder=SimpleNamespace(max_states=128),
         action_expert=SimpleNamespace(action_dim=64, action_horizon=64),
         validate_coord_reserved_token_groups=lambda groups: None,
@@ -1974,9 +2011,13 @@ def test_native_policy_mk1_loader_is_checkpoint_driven(tmp_path, monkeypatch):
             "model_dir": hf_dir,
             "dtype": torch.bfloat16,
             "device": "cpu",
+            "runtime_device": "cpu",
             "allow_test_only_reduced_geometry": False,
             "attention_backend": "torch_sdpa_v1",
             "route_reduction": "stable_token_segment_sum_v1",
+            "allowed_storage_dtypes": frozenset({"BF16"}),
+            "load_intent": "inference",
+            "verified_tensor_storage": None,
         }
     ]
 
@@ -1988,7 +2029,6 @@ def test_neutral_debug_package_loads_but_cannot_emit_actions(tmp_path):
         device="cpu",
         native_stats_path=str(stats_path),
         artifact_kind="neutral_debug",
-        trained_steps=0,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
@@ -2000,35 +2040,13 @@ def test_neutral_debug_package_loads_but_cannot_emit_actions(tmp_path):
         policy.select_action({})
 
 
-@pytest.mark.parametrize("trained_steps", [None, 1, -1, True, 1.5])
-def test_neutral_debug_config_requires_exact_zero_training_steps(trained_steps):
-    with pytest.raises(ValueError, match="trained_steps"):
-        PerceptronIsaacConfig(
-            artifact_kind="neutral_debug",
-            trained_steps=trained_steps,
-            input_features=_features(),
-            output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-        )
+@pytest.mark.parametrize("artifact_kind", ["trained_policy", "neutral_debug"])
+def test_artifact_kind_requires_no_model_count(artifact_kind):
+    config = PerceptronIsaacConfig(artifact_kind=artifact_kind, device="cpu")
+    assert "trained_steps" not in config.to_dict()
 
 
-@pytest.mark.parametrize("trained_steps", [None, 0, -1, True, 1.5])
-def test_trained_policy_config_requires_positive_training_steps(trained_steps):
-    with pytest.raises(ValueError, match="trained_steps"):
-        PerceptronIsaacConfig(
-            artifact_kind="trained_policy",
-            trained_steps=trained_steps,
-            input_features=_features(),
-            output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-        )
-
-
-@pytest.mark.parametrize(
-    ("artifact_kind", "trained_steps"),
-    [("trained_policy", 2), ("neutral_debug", 0)],
-)
-def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(
-    tmp_path, monkeypatch, artifact_kind, trained_steps
-):
+def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     load_calls = []
@@ -2040,8 +2058,7 @@ def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(
                 device="cpu",
                 hf_model_path=str(tmp_path / "hf"),
                 native_stats_path=str(stats_path),
-                artifact_kind=artifact_kind,
-                trained_steps=trained_steps,
+                artifact_kind="neutral_debug",
                 mk1_model_import_sha256="0" * 64,
                 train_storage_fp32=False,
                 input_features=_features(),
@@ -2096,7 +2113,19 @@ def test_native_policy_mk1_rejects_outer_contract_drift_before_load(
     assert not load_calls
 
 
-def test_training_parameter_freeze_is_applied_once(tmp_path, monkeypatch):
+@pytest.fixture
+def mock_fsdp2_topology(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model the live FSDP2 gate without starting a distributed process group."""
+    topology = policy_module.FullShardTopology(
+        world_size=2, fsdp_version=2, sharding_strategy="reshard_after_forward=True"
+    )
+    monkeypatch.setattr(policy_module, "detect_full_shard_topology", lambda: topology)
+    monkeypatch.setattr(policy_module, "read_accelerate_mixed_precision", lambda: "bf16")
+
+
+def test_training_parameter_freeze_is_applied_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mock_fsdp2_topology: None
+) -> None:
     """Freezing must not re-apply per step: FSDP parameters are not leaf tensors.
 
     ``forward`` calls ``_configure_training_parameters`` on every training step. Once FSDP
@@ -2106,50 +2135,81 @@ def test_training_parameter_freeze_is_applied_once(tmp_path, monkeypatch):
     """
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    calls = []
+    calls: list[str] = []
+    load_calls: list[dict[str, object]] = []
 
     import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as qwen35_vla
 
-    monkeypatch.setattr(
-        qwen35_vla, "load_qwen35_vla_from_hf", lambda hf_dir, **kw: (MagicMock(), SimpleNamespace())
-    )
+    def fake_load_mk1_vla_from_hf(
+        model_dir: Path, **kwargs: object
+    ) -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
+        load_calls.append({"model_dir": model_dir, **kwargs})
+        return MagicMock(), SimpleNamespace(), contract
+
+    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
     monkeypatch.setattr(qwen35_vla, "setup_qwen35_vla_for_training", lambda *a, **k: calls.append("setup"))
     cfg = PerceptronIsaacConfig(
         device="cpu",
         hf_model_path=str(tmp_path / "hf"),
         native_stats_path=str(stats_path),
+        apply_offset_norm=False,
+        mk1_model_import_sha256="0" * 64,
         freeze_input_embeddings=False,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
     policy = PerceptronIsaacPolicy(cfg)
+    assert policy._isaac_model is None
+    assert load_calls == []
     policy._load_backbone(training=True)
+    assert len(load_calls) == 1
     assert calls == ["setup"]
 
     # Every later call (one per training step) must be a no-op.
     policy._configure_training_parameters()
     policy._configure_training_parameters()
     assert calls == ["setup"]
+    assert len(load_calls) == 1
 
 
-def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(tmp_path, monkeypatch):
-    """Genesis finetunes with fp32 parameter storage; never materialize bf16 weights first."""
+@pytest.mark.parametrize(
+    ("native_f32_source", "expected_dtype", "expected_load_intent"),
+    [(True, torch.float32, "training"), (False, torch.bfloat16, "inference")],
+)
+def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_fsdp2_topology: None,
+    native_f32_source: bool,
+    expected_dtype: torch.dtype,
+    expected_load_intent: str,
+) -> None:
+    """FSDP2 preserves native F32 sources; legacy BF16 sources keep the BF16 load path."""
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    calls = []
+    hf_dir = tmp_path / "hf"
+    if native_f32_source:
+        hf_dir.mkdir()
+        (hf_dir / "config.json").write_text(json.dumps({"model_type": "isaac_0_5"}))
+    calls: list[dict[str, object]] = []
 
     import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as qwen35_vla
 
-    def fake_load_qwen35_vla_from_hf(hf_dir, **kwargs):
-        calls.append({"hf_dir": hf_dir, **kwargs})
-        return MagicMock(), SimpleNamespace()
+    def fake_load_mk1_vla_from_hf(
+        model_dir: Path, **kwargs: object
+    ) -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
+        calls.append({"model_dir": model_dir, **kwargs})
+        return MagicMock(), SimpleNamespace(), contract
 
-    monkeypatch.setattr(qwen35_vla, "load_qwen35_vla_from_hf", fake_load_qwen35_vla_from_hf)
+    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
     monkeypatch.setattr(qwen35_vla, "setup_qwen35_vla_for_training", lambda *a, **k: None)
     cfg = PerceptronIsaacConfig(
         device="cpu",
-        hf_model_path=str(tmp_path / "hf"),
+        hf_model_path=str(hf_dir),
         native_stats_path=str(stats_path),
+        apply_offset_norm=False,
+        mk1_model_import_sha256="0" * 64,
+        freeze_input_embeddings=False,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
@@ -2161,10 +2221,14 @@ def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(tmp_path, 
 
     policy._load_backbone(training=True)
     assert len(calls) == 1
-    assert calls[0]["dtype"] is torch.float32
+    assert calls[0]["dtype"] is expected_dtype
+    assert calls[0]["load_intent"] == expected_load_intent
+    assert calls[0]["allowed_storage_dtypes"] == frozenset({"F32" if native_f32_source else "BF16"})
+    assert calls[0]["device"] == "cpu"
+    assert calls[0]["runtime_device"] == "cpu"
 
 
-def test_native_mk1_training_is_rejected_before_checkpoint_or_model_allocation(tmp_path, monkeypatch):
+def test_native_mk1_dense_training_is_rejected_before_checkpoint_or_model_allocation(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     hf_dir = tmp_path / "hf"
@@ -2185,78 +2249,97 @@ def test_native_mk1_training_is_rejected_before_checkpoint_or_model_allocation(t
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
     assert cfg.train_storage_fp32 is True
+    assert not cfg.train_expert_only and not cfg.use_peft
 
     policy = PerceptronIsaacPolicy(cfg)
     assert policy._isaac_model is None
     assert calls == []
 
-    with pytest.raises(RuntimeError, match="FP32 parameter storage.*grouped_mm.*BF16"):
+    with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
         policy._load_backbone(training=True)
     assert calls == []
 
     policy._isaac_model = MagicMock()
-    with pytest.raises(RuntimeError, match="inference-only"):
+    with pytest.raises(RuntimeError, match="dense full-parameter training is unsupported"):
         policy.forward({})
 
 
-def test_expert_only_training_keeps_frozen_base_bf16_and_promotes_trainables(tmp_path, monkeypatch):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    model = torch.nn.Module()
-    model.vlm = torch.nn.Linear(2, 2)
-    model.action_expert = torch.nn.Linear(2, 2)
-    calls = []
+@pytest.mark.parametrize(("train_expert_only", "use_peft"), [(True, False), (False, True)])
+def test_native_mk1_bounded_training_config_is_rejected_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, train_expert_only: bool, use_peft: bool
+) -> None:
+    """Deferred training modes must fail before checkpoint validation or model allocation."""
+    preflight = MagicMock(side_effect=AssertionError("checkpoint validation must not run"))
+    loader = MagicMock(side_effect=AssertionError("checkpoint allocation must not run"))
+    monkeypatch.setattr(
+        "lerobot.policies.perceptron_isaac.mk1_checkpoint_contract.validate_mk1_checkpoint", preflight
+    )
+    monkeypatch.setattr("lerobot.policies.perceptron_isaac.modeling_mk1_vla.load_mk1_vla_from_hf", loader)
 
-    import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as qwen35_vla
+    with pytest.raises(ValueError, match="PEFT and expert-only training are unsupported"):
+        PerceptronIsaacPolicy(
+            PerceptronIsaacConfig(
+                device="cpu",
+                hf_model_path=str(tmp_path / "hf"),
+                apply_offset_norm=False,
+                mk1_model_import_sha256="0" * 64,
+                train_expert_only=train_expert_only,
+                use_peft=use_peft,
+                input_features=_features(),
+                output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
+            )
+        )
 
-    def fake_load_qwen35_vla_from_hf(hf_dir, **kwargs):
-        calls.append({"hf_dir": hf_dir, **kwargs})
-        model.to(dtype=kwargs["dtype"])
-        return model, SimpleNamespace()
+    preflight.assert_not_called()
+    loader.assert_not_called()
 
-    def fake_setup(loaded_model, **kwargs):
-        for name, parameter in loaded_model.named_parameters():
-            parameter.requires_grad_("action_expert" in name)
 
-    monkeypatch.setattr(qwen35_vla, "load_qwen35_vla_from_hf", fake_load_qwen35_vla_from_hf)
-    monkeypatch.setattr(qwen35_vla, "setup_qwen35_vla_for_training", fake_setup)
+@pytest.mark.parametrize(("train_expert_only", "use_peft"), [(True, False), (False, True)])
+def test_native_mk1_bounded_training_is_rejected_at_training_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, train_expert_only: bool, use_peft: bool
+) -> None:
+    """Reject post-construction flag changes too, before loading or using an injected model."""
+    preflight = MagicMock(side_effect=AssertionError("checkpoint validation must not run"))
+    loader = MagicMock(side_effect=AssertionError("checkpoint allocation must not run"))
+    monkeypatch.setattr(
+        "lerobot.policies.perceptron_isaac.mk1_checkpoint_contract.validate_mk1_checkpoint", preflight
+    )
+    monkeypatch.setattr("lerobot.policies.perceptron_isaac.modeling_mk1_vla.load_mk1_vla_from_hf", loader)
     cfg = PerceptronIsaacConfig(
         device="cpu",
         hf_model_path=str(tmp_path / "hf"),
-        native_stats_path=str(stats_path),
-        train_expert_only=True,
-        freeze_input_embeddings=False,
+        apply_offset_norm=False,
+        mk1_model_import_sha256="0" * 64,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
-
     policy = PerceptronIsaacPolicy(cfg)
-    policy._load_backbone(training=True)
+    assert policy._isaac_model is None
+    cfg.train_expert_only = train_expert_only
+    cfg.use_peft = use_peft
 
-    assert calls[0]["dtype"] is torch.bfloat16
-    assert model.vlm.weight.requires_grad is False
-    assert model.vlm.weight.dtype is torch.bfloat16
-    assert model.action_expert.weight.requires_grad is True
-    assert model.action_expert.weight.dtype is torch.float32
+    with pytest.raises(RuntimeError, match="PEFT and expert-only training are unsupported"):
+        policy._load_backbone(training=True)
+    assert policy._isaac_model is None
+
+    injected_model = MagicMock()
+    policy._isaac_model = injected_model
+    with pytest.raises(RuntimeError, match="PEFT and expert-only training are unsupported"):
+        policy.forward({})
+
+    preflight.assert_not_called()
+    loader.assert_not_called()
+    assert injected_model.mock_calls == []
 
 
 def test_isaac_compute_dtype_is_explicitly_bfloat16():
-    assert PerceptronIsaacConfig().dtype == "bfloat16"
-    with pytest.raises(ValueError, match="require dtype='bfloat16'"):
-        PerceptronIsaacConfig(dtype="float32")
+    assert PerceptronIsaacConfig().dtype is torch.bfloat16
+    with pytest.raises(ValueError, match="require dtype=torch.bfloat16"):
+        PerceptronIsaacConfig(dtype=torch.float32)
 
 
 def test_native_policy_consumes_processor_stream_and_returns_normalized_actions(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path, action_q01=0.0, action_q99=2.0)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeIsaacModel(value=0.0)
+    policy = _tiny_policy(tmp_path, FakeIsaacModel(value=0.0), action_q01=0.0, action_q99=2.0)
     stream = FakePackedStream()
 
     actions = policy.predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: stream, "task": "pick up the mug"})
@@ -2269,16 +2352,7 @@ def test_native_policy_consumes_processor_stream_and_returns_normalized_actions(
 
 
 def test_native_policy_rejects_non_finite_normalized_actions(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeIsaacModel(value=float("nan"))
+    policy = _tiny_policy(tmp_path, FakeIsaacModel(value=float("nan")))
 
     with pytest.raises(RuntimeError, match="non-finite normalized actions"):
         policy.predict_action_chunk(
@@ -2287,17 +2361,7 @@ def test_native_policy_rejects_non_finite_normalized_actions(tmp_path):
 
 
 def test_native_policy_autocasts_bf16_compute_with_fp32_master_weights(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        train_storage_fp32=True,
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeMixedPrecisionIsaacModel()
+    policy = _tiny_policy(tmp_path, FakeMixedPrecisionIsaacModel(), train_storage_fp32=True)
 
     actions = policy.predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
 
@@ -2307,17 +2371,7 @@ def test_native_policy_autocasts_bf16_compute_with_fp32_master_weights(tmp_path)
 
 
 def test_native_policy_requests_model_side_flow_sample_averaging(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        num_flow_samples=3,
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
-    policy._isaac_model = FakeFlowAveragingIsaacModel()
+    policy = _tiny_policy(tmp_path, FakeFlowAveragingIsaacModel(), num_flow_samples=3)
 
     actions = policy.predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
 
@@ -2327,25 +2381,15 @@ def test_native_policy_requests_model_side_flow_sample_averaging(tmp_path):
 
 
 def test_native_policy_uses_configured_flow_seed_base_without_environment(monkeypatch, tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-
-    def _policy():
-        cfg = PerceptronIsaacConfig(
-            device="cpu",
-            native_stats_path=str(stats_path),
-            num_flow_samples=4,
-            flow_seed_base=1234,
-            input_features=_features(),
-            output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-        )
-        policy = PerceptronIsaacPolicy(cfg)
-        policy._isaac_model = FakeRandomFlowIsaacModel()
-        return policy
-
     monkeypatch.delenv("ISAAC_FLOW_SEED_BASE", raising=False)
-    first = _policy().predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
-    second = _policy().predict_action_chunk({PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"})
+    first_policy = _tiny_policy(tmp_path, FakeRandomFlowIsaacModel(), flow_seed_base=1234)
+    second_policy = _tiny_policy(tmp_path, FakeRandomFlowIsaacModel(), flow_seed_base=1234)
+    first = first_policy.predict_action_chunk(
+        {PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"}
+    )
+    second = second_policy.predict_action_chunk(
+        {PERCEPTRON_ISAAC_STREAM_KEY: FakePackedStream(), "task": "pick"}
+    )
 
     torch.testing.assert_close(first, second)
 
@@ -2437,15 +2481,7 @@ def test_native_settle_action_is_normalized_for_postprocessor(tmp_path):
 
 
 def test_policy_training_requires_rendered_stream_and_checkpoint(tmp_path):
-    stats_path = tmp_path / "stats.json"
-    _write_native_stats(stats_path)
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        native_stats_path=str(stats_path),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
-    policy = PerceptronIsaacPolicy(cfg)
+    policy = _tiny_policy(tmp_path)
 
     with pytest.raises(ValueError, match="requires the native preprocessor output"):
         policy.forward({})
@@ -2517,44 +2553,20 @@ def test_checkpoint_local_model_directory_rejects_symlink_escape(tmp_path):
         PerceptronIsaacPolicy._resolve_checkpoint_local_paths(cfg, tmp_path)
 
 
-def test_from_pretrained_resolves_hub_snapshot_and_loads_weights(tmp_path, monkeypatch):
-    from safetensors.torch import save_file
+def test_from_pretrained_resolves_hub_snapshot_and_loads_native_inner_weights(tmp_path, monkeypatch):
+    from tests.policies.perceptron_isaac.test_portable_model_repo import _native_portable_package
 
-    snapshot = tmp_path / "snapshot"
-    snapshot.mkdir()
-    (snapshot / "hf_model").mkdir()
-    (snapshot / "stats.json").write_text("{}")
-    adapter = snapshot / "isaac_deployment_adapter.json"
-    adapter.write_text("{}")
-    save_file({"_isaac_model.weight": torch.full((1, 1), 7.0)}, snapshot / "model.safetensors")
-
+    snapshot, config, source_value = _native_portable_package(tmp_path)
     snapshot_calls = []
 
     def _snapshot_download(**kwargs):
         snapshot_calls.append(kwargs)
         return str(snapshot)
 
-    def _load_backbone(policy, *, training=False):
-        # A dense finetune resume must materialize FP32 trainable storage before
-        # applying the saved outer state; BF16-first loading loses master-weight bits.
-        assert training is True
-        policy._isaac_model = torch.nn.Linear(1, 1, bias=False)
-
     monkeypatch.setattr("huggingface_hub.snapshot_download", _snapshot_download)
-    monkeypatch.setattr(PerceptronIsaacPolicy, "_load_backbone", _load_backbone)
-    monkeypatch.setattr(PerceptronIsaacPolicy, "_verify_packaged_contract_digests", lambda *_args: None)
-
-    cfg = PerceptronIsaacConfig(
-        device="cpu",
-        hf_model_path="hf_model",
-        native_stats_path="stats.json",
-        deployment_adapter_sha256=hashlib.sha256(adapter.read_bytes()).hexdigest(),
-        input_features=_features(),
-        output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
-    )
     policy = PerceptronIsaacPolicy.from_pretrained(
         "perceptron/example",
-        config=cfg,
+        config=config,
         revision="test-revision",
         local_files_only=True,
     )
@@ -2569,9 +2581,12 @@ def test_from_pretrained_resolves_hub_snapshot_and_loads_weights(tmp_path, monke
             "local_files_only": True,
         }
     ]
-    assert cfg.hf_model_path == str(snapshot / "hf_model")
-    assert cfg.native_stats_path == str(snapshot / "stats.json")
-    torch.testing.assert_close(policy._isaac_model.weight, torch.full((1, 1), 7.0))
+    assert config.hf_model_path == str(snapshot.parent)
+    assert policy._isaac_model is not None
+    assert all(
+        torch.equal(parameter, source_value.bfloat16().expand_as(parameter))
+        for parameter in policy._isaac_model.parameters()
+    )
 
 
 def test_deprecated_bridge_config_fields_are_ignored_and_stats_promoted():
@@ -2625,7 +2640,7 @@ def test_native_mharmony_metadata_rejects_package_fps_mismatch():
         metadata.validate_for_config(cfg)
 
 
-def test_inference_render_rejects_stream_over_checkpoint_token_budget():
+def test_inference_render_rejects_stream_over_checkpoint_token_budget(monkeypatch):
     step = PerceptronIsaacMharmonyPackProcessorStep(
         image_size=(16, 16),
         n_obs_steps=1,
@@ -2633,7 +2648,7 @@ def test_inference_render_rejects_stream_over_checkpoint_token_budget():
         dtype="float32",
         train_max_sequence_length=4,
     )
-    fake_renderer = _install_fake_native_renderer(step)
+    fake_renderer = _install_fake_native_renderer(step, monkeypatch)
     fake_renderer.sequence_length = 5
 
     with pytest.raises(ValueError, match="checkpoint-trained max_sequence_length=4"):
@@ -2745,65 +2760,26 @@ def _libero_content_plan_window() -> list[dict[str, object]]:
     ]
 
 
-def test_native_mharmony_places_historical_fast_actions_before_next_observation(tmp_path):
+def test_native_mharmony_rejects_historical_fast_action_conditioning():
+    with pytest.raises(ValueError, match="action_conditioning must be false"):
+        IsaacMharmonyRenderMetadata(action_conditioning=True)
+
+
+def test_native_mharmony_ignores_unused_previous_action_values(tmp_path):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    plan = build_isaac_mharmony_content_plan(
-        observation_window=_libero_content_plan_window(),
-        prompt="pick up the mug",
-        metadata=IsaacMharmonyRenderMetadata(action_conditioning=True),
-        stats=load_isaac_stats(stats_path),
-        anchor_timestamp_seconds=0.1,
-        historical_fast_action_tokens=[None, [17, 18], [19]],
-    )
-
-    kinds = [item["kind"] for item in plan.user_content]
-    assert kinds == [
-        "text",
-        "timestamp",
-        "image",
-        "image",
-        "tokens",
-        "timestamp",
-        "image",
-        "image",
-        "tokens",
-        "timestamp",
-        "image",
-        "image",
-        "vector",
-    ]
-    action_items = [item for item in plan.user_content if item["kind"] == "tokens"]
-    assert [item["tokens"] for item in action_items] == [[17, 18], [19]]
-    assert [item["tags"]["action_conditioning_observation_window"] for item in action_items] == [
-        [0, 1],
-        [1, 2],
-    ]
-    assert all(item["tags"]["token_group"] == "fast_action" for item in action_items)
-
-
-def test_native_mharmony_encodes_normalized_executed_actions_as_fast_history():
-    class RecordingFastProcessor:
-        def __init__(self):
-            self.actions = []
-
-        def __call__(self, actions):
-            self.actions.append(np.asarray(actions))
-            return [[23, 24]]
-
-    processor = RecordingFastProcessor()
     window = _libero_content_plan_window()
     window[1]["previous_action"] = np.arange(7, dtype=np.float32)
-
-    tokens = mharmony_native.encode_isaac_historical_fast_actions(
+    plan = build_isaac_mharmony_content_plan(
         observation_window=window,
-        metadata=IsaacMharmonyRenderMetadata(action_conditioning=True),
-        fast_processor=processor,
+        prompt="pick up the mug",
+        metadata=IsaacMharmonyRenderMetadata(),
+        stats=load_isaac_stats(stats_path),
+        anchor_timestamp_seconds=0.1,
     )
-
-    assert tokens == [None, [23, 24], None]
-    assert len(processor.actions) == 1
-    np.testing.assert_allclose(processor.actions[0], np.arange(7, dtype=np.float32).reshape(1, 1, 7))
+    assert not any(item["kind"] == "tokens" for item in plan.user_content)
+    assert len([item for item in plan.user_content if item["kind"] == "image"]) == 6
+    assert len([item for item in plan.user_content if item["kind"] == "vector"]) == 1
 
 
 def test_native_mharmony_renders_mistake_false_when_checkpoint_trained_with_support(tmp_path):
@@ -2899,7 +2875,7 @@ def _suite_stats_block(*, proprio_q01: float, proprio_q99: float) -> dict:
     }
 
 
-def test_training_normalization_is_routed_per_libero_suite(tmp_path):
+def test_training_normalization_is_routed_per_libero_suite(monkeypatch, tmp_path):
     """Each sample must be normalized by its own suite's quantiles, keyed on task_index.
 
     LIBERO suites are not interchangeable: end-effector height spans [0.916, 1.286] in
@@ -2930,7 +2906,7 @@ def test_training_normalization_is_routed_per_libero_suite(tmp_path):
         suite_stats_path=str(stats_path),
         suite_by_task_index_path=str(map_path),
     )
-    renderer = _install_fake_native_renderer(step)
+    renderer = _install_fake_native_renderer(step, monkeypatch)
     step._fast_processor = object()
 
     def _obs(n):
@@ -3035,7 +3011,7 @@ def test_per_suite_table_must_agree_with_the_checkpoint_geometry(tmp_path):
         step._ensure_suite_stats()
 
 
-def test_per_suite_normalization_rejects_unmapped_task_index(tmp_path):
+def test_per_suite_normalization_rejects_unmapped_task_index(monkeypatch, tmp_path):
     stats_path = tmp_path / "suite_stats.json"
     stats_path.write_text(
         json.dumps({"libero_spatial": _suite_stats_block(proprio_q01=0.9, proprio_q99=1.3)})
@@ -3054,7 +3030,7 @@ def test_per_suite_normalization_rejects_unmapped_task_index(tmp_path):
         suite_stats_path=str(stats_path),
         suite_by_task_index_path=str(map_path),
     )
-    _install_fake_native_renderer(step)
+    _install_fake_native_renderer(step, monkeypatch)
     step._fast_processor = object()
 
     # An unmapped suite must fail loudly rather than silently borrow the wrong quantiles.
@@ -3082,7 +3058,7 @@ def test_per_suite_normalization_rejects_unmapped_task_index(tmp_path):
 
 def test_letterbox_geometry_conform_matches_camera_primitive():
     """Off-size frames conform via the shared letterbox primitive, both memory layouts."""
-    from lerobot.transforms import letterbox_resize_image
+    from lerobot.policies.perceptron_isaac.processor_utils import letterbox_resize_image
 
     step = PerceptronIsaacMharmonyPackProcessorStep(
         camera_order=["image"],
@@ -3400,3 +3376,63 @@ def test_dataset_state_feature_names_reach_gripper_masks(tmp_path, load_saved_pr
         "post:action.mask": [6],
         "post:proprio.mask": [6],
     }
+
+
+# --- The batch-validity collective must reduce on a device the process-group backend owns.
+# PerceptronIsaacRenderProcessorStep.device is a DATA-placement field defaulting to "cpu";
+# handing that CPU tensor to a NCCL group raises
+# "No backend type associated with device type cpu", which is what blocks distributed
+# training for this policy. These tests pin the device the collective actually uses.
+
+
+class _RecordingAllReduce:
+    """Stand-in for torch.distributed.all_reduce that records the reduced tensor's device."""
+
+    def __init__(self, peer_value: int) -> None:
+        self.peer_value = peer_value
+        self.devices: list[torch.device] = []
+
+    def __call__(self, tensor, op=None, group=None, async_op: bool = False) -> None:
+        self.devices.append(tensor.device)
+        tensor.fill_(min(int(tensor.item()), self.peer_value))
+
+
+def _patch_batch_validity_collective(monkeypatch, backend: str, recorder: _RecordingAllReduce) -> None:
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group=None: backend)
+    monkeypatch.setattr(torch.distributed, "all_reduce", recorder)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a NCCL process group needs a CUDA device")
+@pytest.mark.parametrize("backend", ["nccl", "cpu:gloo,cuda:nccl"])
+def test_batch_validity_collective_runs_on_the_accelerator_under_nccl(monkeypatch, backend):
+    recorder = _RecordingAllReduce(peer_value=1)
+    _patch_batch_validity_collective(monkeypatch, backend, recorder)
+    step = PerceptronIsaacRenderProcessorStep(enabled=True)
+    assert step.device == "cpu", "data placement stays on CPU; only the collective device changes"
+
+    assert step._all_distributed_ranks_have_usable_samples(True) is True
+
+    assert [device.type for device in recorder.devices] == ["cuda"]
+    assert recorder.devices[0].index == torch.cuda.current_device()
+
+
+@pytest.mark.parametrize("backend", ["gloo", "mpi", "ucc"])
+def test_batch_validity_collective_stays_on_cpu_without_nccl(monkeypatch, backend):
+    recorder = _RecordingAllReduce(peer_value=1)
+    _patch_batch_validity_collective(monkeypatch, backend, recorder)
+    step = PerceptronIsaacRenderProcessorStep(enabled=True)
+
+    assert step._all_distributed_ranks_have_usable_samples(True) is True
+
+    assert [device.type for device in recorder.devices] == ["cpu"]
+
+
+@pytest.mark.parametrize("backend", ["gloo", "nccl"])
+def test_batch_validity_collective_keeps_min_semantics(monkeypatch, backend):
+    if backend == "nccl" and not torch.cuda.is_available():
+        pytest.skip("a NCCL process group needs a CUDA device")
+    recorder = _RecordingAllReduce(peer_value=0)
+    _patch_batch_validity_collective(monkeypatch, backend, recorder)
+    step = PerceptronIsaacRenderProcessorStep(enabled=True)
+
+    assert step._all_distributed_ranks_have_usable_samples(True) is False

@@ -13,54 +13,21 @@
 # limitations under the License.
 
 import builtins
-import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, TypeVar
 
 from huggingface_hub import HfApi
-from huggingface_hub.utils import validate_hf_hub_args, validate_repo_id
+from huggingface_hub.utils import validate_hf_hub_args
 
 from .constants import CHECKPOINTS_DIR
 
 T = TypeVar("T", bound="HubMixin")
 
-_HUB_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
-
-def resolve_hub_snapshot(
-    reference: str | Path,
-    *,
-    allow_file: bool = False,
-    expand_user: bool = False,
-    force_remote: bool = False,
-    **kwargs: Any,
-) -> Path:
-    """Resolve a local path or download a model repository snapshot."""
-    if force_remote:
-        validate_repo_id(str(reference))
-        from huggingface_hub import snapshot_download
-
-        return Path(snapshot_download(repo_id=str(reference), **kwargs))
-    local_path = Path(reference)
-    local_path = local_path.expanduser() if expand_user else local_path
-    if local_path.is_dir() or (allow_file and local_path.exists()):
-        return local_path
-    from huggingface_hub import snapshot_download
-
-    return Path(snapshot_download(repo_id=str(reference), **kwargs))
-
-
-def hub_snapshot_revision(snapshot: str | Path) -> str:
-    """Return the immutable commit revision encoded by a Hub cache snapshot path."""
-    snapshot_path = Path(snapshot).resolve(strict=True)
-    if snapshot_path.parent.name != "snapshots" or _HUB_COMMIT_PATTERN.fullmatch(snapshot_path.name) is None:
-        raise ValueError(
-            f"Resolved Hub snapshot does not encode an immutable commit revision: {snapshot_path}."
-        )
-    return snapshot_path.name
-
-
+# Sharded-training resume artifacts (torch DCP shard dirs + shard files). Published model repos
+# carry safetensors only, so publishing uploads exclude these — checkpoint pushes (which exist
+# for resume, not distribution) deliberately do not.
 def find_latest_hub_checkpoint(
     repo_id: str,
     *,
@@ -72,6 +39,16 @@ def find_latest_hub_checkpoint(
     Training runs push checkpoints to ``checkpoints/<step>/`` (see
     ``push_checkpoint_to_hub``). This lists those step dirs and returns
     ``checkpoints/<highest-step>``, or ``None`` if the repo has no checkpoints.
+
+    Args:
+        repo_id (str): The Hub model repo to inspect.
+        token (str | bool | None): Hub authentication token. Defaults to None (the token
+            cached by `huggingface-cli login`).
+        revision (str | None): Repo revision to list. Defaults to None (the default branch).
+
+    Returns:
+        str | None: The repo-relative path `checkpoints/<highest-step>`, or None if the repo
+            has no checkpoints.
     """
     files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model", revision=revision, token=token)
     prefix = f"{CHECKPOINTS_DIR}/"
@@ -99,6 +76,7 @@ class HubMixin:
         *,
         repo_id: str | None = None,
         push_to_hub: bool = False,
+        finalize_package: bool = True,
         card_kwargs: dict[str, Any] | None = None,
         **push_to_hub_kwargs,
     ) -> str | None:
@@ -110,6 +88,10 @@ class HubMixin:
                 Path to directory in which the object will be saved.
             push_to_hub (`bool`, *optional*, defaults to `False`):
                 Whether or not to push your object to the Huggingface Hub after saving it.
+            finalize_package (`bool`, *optional*, defaults to `True`):
+                Finalize package metadata after saving. Set to `False` when a checkpoint writer
+                must add sidecars before calling `finalize_pretrained_package`. Cannot be `False`
+                when `push_to_hub=True`.
             repo_id (`str`, *optional*):
                 ID of your repository on the Hub. Used only if `push_to_hub=True`. Will default to the folder name if
                 not provided.
@@ -120,11 +102,21 @@ class HubMixin:
         Returns:
             `str` or `None`: url of the commit on the Hub if `push_to_hub=True`, `None` otherwise.
         """
+        if push_to_hub and not finalize_package:
+            raise ValueError("Cannot push to the Hub with finalize_package=False.")
+
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
 
         # save object (weights, files, etc.)
         self._save_pretrained(save_directory)
+
+        if finalize_package:
+            # Keep collective saves on every rank, but package metadata writes main-process-only.
+            from lerobot.distributed.utils import is_main_process
+
+            if is_main_process():
+                self.finalize_pretrained_package(save_directory)
 
         # push to the Hub if required
         if push_to_hub:
@@ -132,6 +124,17 @@ class HubMixin:
                 repo_id = save_directory.name  # Defaults to `save_directory` name
             return self.push_to_hub(repo_id=repo_id, card_kwargs=card_kwargs, **push_to_hub_kwargs)
         return None
+
+    def finalize_pretrained_package(self, save_directory: Path) -> None:
+        """Finalize model-owned metadata after every checkpoint writer has finished.
+
+        Standalone saves call this on the main process after serialization. Checkpoint writers
+        defer it until weights, configs and processors are saved. Objects without additional
+        package metadata inherit a no-op.
+
+        Args:
+            save_directory (Path): The completed pretrained-model directory.
+        """
 
     def _save_pretrained(self, save_directory: Path) -> None:
         """
@@ -200,13 +203,17 @@ class HubMixin:
         ignore_patterns: list[str] | str | None = None,
         delete_patterns: list[str] | str | None = None,
         card_kwargs: dict[str, Any] | None = None,
-    ) -> str:
+    ) -> str | None:
         """
         Upload model checkpoint to the Hub.
 
         Use `allow_patterns` and `ignore_patterns` to precisely filter which files should be pushed to the hub. Use
         `delete_patterns` to delete existing remote files in the same commit. See [`upload_folder`] reference for more
         details.
+
+        Distributed contract: call on EVERY rank. `save_pretrained` runs on all ranks — for
+        sharded objects it can contain a collective gather (rank-gating it would deadlock) —
+        while repo creation and the upload happen on the main process only.
 
         Args:
             repo_id (`str`):
@@ -233,11 +240,17 @@ class HubMixin:
                 Additional arguments passed to the card template to customize the card.
 
         Returns:
-            The url of the commit of your object in the given repository.
+            `str` or `None`: The url of the commit of your object in the given repository, or
+            `None` on non-main ranks of a distributed run (only the main process uploads).
         """
-        api = HfApi(token=token)
-        repo_id = api.create_repo(repo_id=repo_id, private=private, exist_ok=True).repo_id
+        # Lazy import: hub code must not import the distributed package at module load
+        # (configs -> hub is on the import path of lerobot.distributed itself).
+        from lerobot.distributed.utils import is_main_process
 
+        # Distributed contract: `save_pretrained` runs on EVERY rank — for sharded policies it
+        # contains a collective gather (rank-gating it would deadlock) and it writes into this
+        # rank's private tmpdir only on the main process. Repo creation and upload are then
+        # main-process-only.
         if commit_message is None:
             if "Policy" in self.__class__.__name__:
                 commit_message = "Upload policy"
@@ -246,10 +259,13 @@ class HubMixin:
             else:
                 commit_message = f"Upload {self.__class__.__name__}"
 
-        # Push the files to the repo in a single commit
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             saved_path = Path(tmp) / repo_id
             self.save_pretrained(saved_path, card_kwargs=card_kwargs)
+            if not is_main_process():
+                return None
+            api = HfApi(token=token)
+            repo_id = api.create_repo(repo_id=repo_id, private=private, exist_ok=True).repo_id
             return api.upload_folder(
                 repo_id=repo_id,
                 repo_type="model",

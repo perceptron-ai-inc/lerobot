@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import copy
+from unittest.mock import patch
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+pytest.importorskip("transformers")
+
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen35_modeling
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
@@ -17,6 +22,7 @@ from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import (
     GenesisNullSparseMoeBlock,
     GenesisNullTopKRouter,
     GenesisQwen36Attention,
+    GenesisQwen36AttentionTrace,
     GenesisQwen36DecoderLayer,
     GenesisQwen36GatedDeltaNet,
     GenesisQwen36Model,
@@ -155,9 +161,8 @@ def test_deterministic_route_reducer_is_bitwise_stable_and_preserves_ordered_sum
 
 def test_null_moe_defaults_to_qualified_stable_route_reduction() -> None:
     config = _text_config()
-    block = GenesisNullSparseMoeBlock(config)
+    GenesisNullSparseMoeBlock(config)
 
-    assert block.deterministic_route_reduction is True
     config._mk1_route_reduction = "repeated_index_add"
     with pytest.raises(ValueError, match="Unsupported MK1 route reduction"):
         GenesisNullSparseMoeBlock(config)
@@ -178,7 +183,6 @@ def test_deterministic_null_moe_block_is_bitwise_stable_on_cuda() -> None:
         for parameter in block.parameters():
             parameter.uniform_(-0.02, 0.02)
         block.gate.weight.zero_()
-    block.deterministic_route_reduction = True
     block.eval()
     x = torch.linspace(-1.0, 1.0, steps=5 * 24, device="cuda", dtype=torch.bfloat16).reshape(1, 5, 24)
 
@@ -310,8 +314,9 @@ def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> 
             scale=attention.scaling,
             is_causal=True,
         )
-        expected = expected.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-        expected = attention.o_proj(expected * torch.sigmoid(gate))
+        expected_raw_output = expected
+        expected_transposed = expected.transpose(1, 2).contiguous()
+        expected = attention.o_proj(expected_transposed.reshape(*input_shape, -1) * torch.sigmoid(gate))
 
     calls = []
     original_sdpa = torch.nn.functional.scaled_dot_product_attention
@@ -321,7 +326,7 @@ def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> 
         return original_sdpa(query, key, value, **kwargs)
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", recording_sdpa)
-    traces = []
+    traces: list[GenesisQwen36AttentionTrace] = []
     attention.trace_observer = traces.append
     with torch.no_grad():
         actual, weights = attention(hidden_states, position_embeddings, None)
@@ -342,6 +347,14 @@ def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> 
     assert trace.rotary_query.shape == (1, 4, 2, 12)
     assert trace.sdpa_query.shape == trace.repeated_key.shape == (1, 2, 4, 12)
     assert trace.repeated_value.shape == (1, 2, 4, 12)
+    assert trace.repeated_key.stride() == key.stride()
+    assert trace.repeated_value.stride() == value.stride()
+    assert trace.raw_sdpa_output.stride() == expected_raw_output.stride()
+    assert trace.post_transpose_output.is_contiguous()
+    torch.testing.assert_close(trace.repeated_key, key, rtol=0, atol=0)
+    torch.testing.assert_close(trace.repeated_value, value, rtol=0, atol=0)
+    torch.testing.assert_close(trace.raw_sdpa_output, expected_raw_output, rtol=0, atol=0)
+    torch.testing.assert_close(trace.post_transpose_output, expected_transposed, rtol=0, atol=0)
     torch.testing.assert_close(trace.token_mixer, actual, rtol=0, atol=0)
 
 
@@ -473,7 +486,6 @@ def test_multimodal_model_installs_explicit_sdpa_for_text_and_vision() -> None:
     assert isinstance(model.language_model.layers[0].self_attn, GenesisQwen36Attention)
     assert isinstance(model.visual, GenesisQwen36VisionModel)
     assert all(isinstance(block.attn, GenesisQwen36VisionAttention) for block in model.visual.blocks)
-    assert all(layer.mlp.deterministic_route_reduction for layer in model.language_model.layers)
     assert DETERMINISTIC_ROUTE_REDUCTION == "stable_token_segment_sum_v1"
 
 
@@ -714,17 +726,16 @@ def test_compact_routes_match_genesis_two_stage_real_renormalization() -> None:
     torch.testing.assert_close(routes.offsets, expected_offsets)
 
 
+def _cuda_grouped_moe() -> GenesisNullSparseMoeBlock:
+    return GenesisNullSparseMoeBlock(
+        _text_config(num_real_experts=8, num_null_experts=8, top_k=4, moe_intermediate_size=8)
+    ).to(device="cuda", dtype=torch.bfloat16)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA grouped_mm parity requires a GPU")
 def test_grouped_mm_compact_dispatch_matches_eager_oracle() -> None:
     torch.manual_seed(23)
-    block = GenesisNullSparseMoeBlock(
-        _text_config(
-            num_real_experts=8,
-            num_null_experts=8,
-            top_k=4,
-            moe_intermediate_size=8,
-        )
-    ).to(device="cuda", dtype=torch.bfloat16)
+    block = _cuda_grouped_moe()
     with torch.no_grad():
         for parameter in block.parameters():
             parameter.normal_(std=0.05)
@@ -749,14 +760,7 @@ def test_grouped_mm_compact_dispatch_matches_eager_oracle() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA all-null dispatch requires a GPU")
 def test_grouped_backend_all_null_routes_never_reads_nan_experts() -> None:
-    block = GenesisNullSparseMoeBlock(
-        _text_config(
-            num_real_experts=8,
-            num_null_experts=8,
-            top_k=4,
-            moe_intermediate_size=8,
-        )
-    ).to(device="cuda", dtype=torch.bfloat16)
+    block = _cuda_grouped_moe()
     with torch.no_grad():
         block.gate.weight.zero_()
         block.gate.weight[8, 0] = 10
@@ -779,14 +783,7 @@ def test_grouped_backend_all_null_routes_never_reads_nan_experts() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA grouped_mm gradients require a GPU")
 def test_grouped_mm_compact_dispatch_backward_is_finite() -> None:
     torch.manual_seed(29)
-    block = GenesisNullSparseMoeBlock(
-        _text_config(
-            num_real_experts=8,
-            num_null_experts=8,
-            top_k=4,
-            moe_intermediate_size=8,
-        )
-    ).to(device="cuda", dtype=torch.bfloat16)
+    block = _cuda_grouped_moe()
     with torch.no_grad():
         for parameter in block.parameters():
             parameter.normal_(std=0.05)
@@ -809,16 +806,205 @@ def test_grouped_mm_compact_dispatch_backward_is_finite() -> None:
     assert all(torch.isfinite(gradient).all() for gradient in gradients if gradient is not None)
 
 
+def _production_dispatch_fixture(
+    activation_dtype: torch.dtype,
+    gate_up_dtype: torch.dtype = torch.float32,
+    down_dtype: torch.dtype = torch.float32,
+    expert_device: str = "cuda:0",
+) -> tuple[GenesisNullSparseMoeBlock, torch.Tensor]:
+    # Allocate only fake CPU tensors, then model CUDA metadata without initializing CUDA.
+    with FakeTensorMode():
+        block = GenesisNullSparseMoeBlock(
+            _text_config(
+                num_real_experts=256,
+                num_null_experts=256,
+                top_k=8,
+                moe_intermediate_size=8,
+            )
+        )
+        block.experts.gate_up_proj = torch.nn.Parameter(block.experts.gate_up_proj.to(gate_up_dtype))
+        block.experts.down_proj = torch.nn.Parameter(block.experts.down_proj.to(down_dtype))
+        hidden_states = torch.empty(1, 24, dtype=activation_dtype)
+    for parameter in block.parameters():
+        assert isinstance(parameter, FakeTensor)
+        parameter.fake_device = torch.device(expert_device)
+    assert isinstance(hidden_states, FakeTensor)
+    hidden_states.fake_device = torch.device("cuda:0")
+    return block, hidden_states
+
+
+@pytest.mark.parametrize("grad_enabled", [True, False], ids=["grad", "no-grad"])
+@pytest.mark.parametrize(
+    "activation_dtype,autocast_enabled",
+    [
+        pytest.param(torch.float32, False, id="fp32"),
+        pytest.param(torch.bfloat16, True, id="bf16"),
+        pytest.param(torch.float32, True, id="fp32-bf16-autocast"),
+    ],
+)
+def test_production_dispatch_fp32_training_uses_eager(
+    activation_dtype: torch.dtype, autocast_enabled: bool, grad_enabled: bool
+) -> None:
+    block, hidden_states = _production_dispatch_fixture(activation_dtype)
+    block.train()
+    with (
+        torch.set_grad_enabled(grad_enabled),
+        patch("torch.cuda.get_device_capability", return_value=(8, 0)),
+        patch("torch.is_autocast_enabled", return_value=autocast_enabled),
+        patch("torch.get_autocast_dtype", return_value=torch.bfloat16),
+    ):
+        assert block.dispatch_backend(hidden_states) == "eager"
+
+
+@pytest.mark.parametrize("grad_enabled", [True, False], ids=["grad", "no-grad"])
+@pytest.mark.parametrize("activation_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_production_dispatch_fp32_eval_stays_closed(
+    activation_dtype: torch.dtype, grad_enabled: bool
+) -> None:
+    block, hidden_states = _production_dispatch_fixture(activation_dtype)
+    block.eval()
+    with (
+        torch.set_grad_enabled(grad_enabled),
+        patch("torch.cuda.get_device_capability", return_value=(8, 0)),
+        patch("torch.is_autocast_enabled", return_value=True),
+        patch("torch.get_autocast_dtype", return_value=torch.bfloat16),
+        pytest.raises(RuntimeError, match="requires BF16 torch grouped_mm"),
+    ):
+        block.dispatch_backend(hidden_states)
+
+
+@pytest.mark.parametrize(
+    "activation_dtype,gate_up_dtype,down_dtype,expert_device,autocast_enabled,autocast_dtype",
+    [
+        pytest.param(
+            torch.float16, torch.float32, torch.float32, "cuda:0", True, torch.float16, id="fp16-input"
+        ),
+        pytest.param(
+            torch.float32, torch.float16, torch.float16, "cuda:0", False, torch.bfloat16, id="fp16-weights"
+        ),
+        pytest.param(
+            torch.float32, torch.bfloat16, torch.float32, "cuda:0", False, torch.bfloat16, id="bf16-gate-up"
+        ),
+        pytest.param(
+            torch.float32, torch.float32, torch.bfloat16, "cuda:0", False, torch.bfloat16, id="bf16-down"
+        ),
+        pytest.param(
+            torch.float32, torch.float32, torch.float32, "cpu", False, torch.bfloat16, id="cpu-weights"
+        ),
+        pytest.param(
+            torch.float32, torch.float32, torch.float32, "cuda:1", False, torch.bfloat16, id="other-device"
+        ),
+        pytest.param(
+            torch.bfloat16, torch.float32, torch.float32, "cuda:0", False, torch.bfloat16, id="no-autocast"
+        ),
+        pytest.param(
+            torch.bfloat16, torch.float32, torch.float32, "cuda:0", True, torch.float16, id="fp16-autocast"
+        ),
+    ],
+)
+def test_production_dispatch_unsupported_training_stays_closed(
+    activation_dtype: torch.dtype,
+    gate_up_dtype: torch.dtype,
+    down_dtype: torch.dtype,
+    expert_device: str,
+    autocast_enabled: bool,
+    autocast_dtype: torch.dtype,
+) -> None:
+    block, hidden_states = _production_dispatch_fixture(
+        activation_dtype, gate_up_dtype, down_dtype, expert_device
+    )
+    block.train()
+    with (
+        patch("torch.cuda.get_device_capability", return_value=(8, 0)),
+        patch("torch.is_autocast_enabled", return_value=autocast_enabled),
+        patch("torch.get_autocast_dtype", return_value=autocast_dtype),
+        pytest.raises(RuntimeError, match="requires BF16 torch grouped_mm"),
+    ):
+        block.dispatch_backend(hidden_states)
+
+
+@pytest.mark.parametrize("training", [True, False], ids=["train", "eval"])
+@pytest.mark.parametrize("capability", [(8, 0), (7, 0)], ids=["sm80", "sm70"])
+def test_production_dispatch_bf16_preserves_grouped_mm(training: bool, capability: tuple[int, int]) -> None:
+    block, hidden_states = _production_dispatch_fixture(torch.bfloat16, torch.bfloat16, torch.bfloat16)
+    block.train(training)
+    with patch("torch.cuda.get_device_capability", return_value=capability):
+        if capability[0] >= 8:
+            assert block.dispatch_backend(hidden_states) == "grouped_mm"
+        else:
+            with pytest.raises(RuntimeError, match="requires BF16 torch grouped_mm"):
+                block.dispatch_backend(hidden_states)
+
+
+@pytest.mark.parametrize("activation_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("real_routes", [2, 1, 0], ids=["real", "mixed", "null"])
+def test_fp32_eager_experts_accept_cpu_bf16_autocast_forward(
+    activation_dtype: torch.dtype, real_routes: int
+) -> None:
+    block = GenesisNullSparseMoeBlock(_text_config()).train()
+    with torch.no_grad():
+        for parameter in block.parameters():
+            parameter.fill_(0.1)
+        block.shared_expert_gate.weight.zero_()
+        if real_routes != 2:
+            block.gate.weight.zero_()
+            block.gate.weight[:, 0] = torch.tensor([2.0, -10.0, 1.0])
+        if real_routes == 0:
+            block.gate.weight[2, 0] = 10
+            block.experts.gate_up_proj.fill_(torch.nan)
+            block.experts.down_proj.fill_(torch.nan)
+    hidden_states = torch.ones(1, 2, 24, dtype=activation_dtype)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        branches = block.forward_with_branches(hidden_states)
+        # The zero shared gate gives exactly sigmoid(0) = 0.5.
+        expected_shared = block.shared_expert(hidden_states) * 0.5
+        if real_routes:
+            # Both real experts have identical weights; only the route score differs.
+            gate, up = torch.nn.functional.linear(hidden_states, block.experts.gate_up_proj[0]).chunk(
+                2, dim=-1
+            )
+            swiglu = block.experts.act_fn(gate) * up
+            weighted_swiglu = (swiglu.float() / real_routes).to(swiglu.dtype)
+            expected_row = torch.nn.functional.linear(weighted_swiglu, block.experts.down_proj[0])
+
+    assert branches.output.dtype is activation_dtype
+    assert branches.routed_output.dtype is activation_dtype
+    assert branches.shared_expert_output.dtype is torch.bfloat16
+    assert torch.isfinite(branches.output).all()
+    assert all(parameter.dtype is torch.float32 for parameter in block.parameters())
+    selected_real = branches.routing.selected_experts < block.contract.num_real_experts
+    assert torch.all(selected_real.sum(dim=-1) == real_routes)
+    expected_weights = selected_real.float() / max(real_routes, 1)
+    torch.testing.assert_close(branches.routing.real_route_weights, expected_weights, rtol=0, atol=0)
+    torch.testing.assert_close(branches.shared_expert_output, expected_shared, rtol=0, atol=0)
+    assert torch.count_nonzero(branches.shared_expert_output) > 0
+    assert branches.output.data_ptr() != branches.shared_expert_output.data_ptr()
+
+    expected_routed = torch.zeros_like(hidden_states)
+    expected_output = expected_shared.to(activation_dtype, copy=True)
+    for _ in range(real_routes):
+        expected_routed = expected_routed + expected_row.to(activation_dtype)
+    expected_output = expected_output + expected_routed
+    torch.testing.assert_close(branches.routed_output, expected_routed, rtol=0, atol=0)
+    torch.testing.assert_close(branches.output, expected_output, rtol=0, atol=0)
+    if real_routes:
+        assert torch.count_nonzero(branches.routed_output) > 0
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="production backend guard requires a GPU")
 def test_production_cuda_dispatch_fails_closed_without_bf16_grouped_mm() -> None:
-    block = GenesisNullSparseMoeBlock(
-        _text_config(
-            num_real_experts=256,
-            num_null_experts=256,
-            top_k=8,
-            moe_intermediate_size=8,
+    block = (
+        GenesisNullSparseMoeBlock(
+            _text_config(
+                num_real_experts=256,
+                num_null_experts=256,
+                top_k=8,
+                moe_intermediate_size=8,
+            )
         )
-    ).cuda()
+        .cuda()
+        .eval()
+    )
 
     with pytest.raises(RuntimeError, match="requires BF16 torch grouped_mm"):
         block.dispatch_backend(torch.zeros(1, 24, device="cuda", dtype=torch.float32))
@@ -946,8 +1132,17 @@ def test_hybrid_attention_is_causal_and_left_padding_preserves_valid_tokens() ->
             use_cache=False,
         ).last_hidden_state
 
-    torch.testing.assert_close(original_output[:, :2], changed_output[:, :2], rtol=0, atol=0)
+    # Future routes change expert GEMM batch sizes, causing FP32 roundoff even
+    # for identical prefix rows. The gradient oracle below tests exact causality.
+    torch.testing.assert_close(original_output[:, :2], changed_output[:, :2], rtol=0, atol=1e-6)
     torch.testing.assert_close(original_output, padded_output[:, -3:], rtol=1e-5, atol=1e-6)
+
+    embeddings = model.embed_tokens(original).detach().requires_grad_()
+    output = model(inputs_embeds=embeddings, use_cache=False).last_hidden_state
+    coefficients = torch.arange(1, 49).reshape(1, 2, 24)
+    gradient = torch.autograd.grad((output[:, :2] * coefficients).sum(), embeddings)[0]
+    assert torch.count_nonzero(gradient[:, :2]) > 0
+    assert torch.count_nonzero(gradient[:, 2:]) == 0
 
 
 def test_hybrid_text_model_constructs_directly_on_meta() -> None:

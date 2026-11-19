@@ -38,19 +38,15 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeTextModel,
     Qwen3_5MoeVisionModel,
 )
+from transformers.utils.output_capturing import OutputRecorder
+
+from .moe_auxiliary_losses import GenesisNullRouterAuxiliary
 
 _NULL_EXPERT_SEMANTICS = "skip_compute_renormalize_real_routes"
 _SIGMOID_GATED_SHARED_EXPERT = "sigmoid_gated_additive"
 _ROUTER_CONTRACT_VERSION = 1
-DETERMINISTIC_ROUTE_REDUCTION = "stable_token_segment_sum_v1"
+DETERMINISTIC_ROUTE_REDUCTION: Literal["stable_token_segment_sum_v1"] = "stable_token_segment_sum_v1"
 GENESIS_ROTARY_PRECISION = "checkpoint_bf16_inv_freq_fp32_phase_v1"
-
-
-class _ExplicitRepeatKvSdpaResult(NamedTuple):
-    output: torch.Tensor
-    repeated_key: torch.Tensor
-    repeated_value: torch.Tensor
-    raw_output: torch.Tensor
 
 
 def _genesis_layout_repeat_kv(hidden_states: torch.Tensor, num_repetitions: int) -> torch.Tensor:
@@ -75,12 +71,12 @@ def _sdpa_with_repeated_kv(
     dropout: float,
     scaling: float | None,
     is_causal: bool | None = None,
-) -> _ExplicitRepeatKvSdpaResult:
+) -> torch.Tensor:
     causal = is_causal if is_causal is not None else bool(getattr(module, "is_causal", True))
     causal = query.shape[2] > 1 and attention_mask is None and causal
     if torch.jit.is_tracing() and isinstance(causal, torch.Tensor):
         causal = bool(causal.item())
-    raw_output = functional.scaled_dot_product_attention(
+    return functional.scaled_dot_product_attention(
         query,
         repeated_key,
         repeated_value,
@@ -88,40 +84,6 @@ def _sdpa_with_repeated_kv(
         dropout_p=dropout,
         scale=scaling,
         is_causal=causal,
-    )
-    return _ExplicitRepeatKvSdpaResult(
-        output=raw_output.transpose(1, 2).contiguous(),
-        repeated_key=repeated_key,
-        repeated_value=repeated_value,
-        raw_output=raw_output,
-    )
-
-
-def _explicit_repeat_kv_sdpa_components(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    *,
-    dropout: float = 0.0,
-    scaling: float | None = None,
-    is_causal: bool | None = None,
-) -> _ExplicitRepeatKvSdpaResult:
-    num_key_value_groups = getattr(module, "num_key_value_groups", None)
-    if not isinstance(num_key_value_groups, int) or num_key_value_groups <= 0:
-        raise ValueError("MK1 SDPA requires a positive integer num_key_value_groups")
-    repeated_key = qwen35_modeling.repeat_kv(key, num_key_value_groups)
-    repeated_value = qwen35_modeling.repeat_kv(value, num_key_value_groups)
-    return _sdpa_with_repeated_kv(
-        module,
-        query,
-        repeated_key=repeated_key,
-        repeated_value=repeated_value,
-        attention_mask=attention_mask,
-        dropout=dropout,
-        scaling=scaling,
-        is_causal=is_causal,
     )
 
 
@@ -137,16 +99,25 @@ def explicit_repeat_kv_sdpa(
     is_causal: bool | None = None,
 ) -> torch.Tensor:
     """Run the qualified MK1 SDPA path after materializing grouped KV heads."""
-    return _explicit_repeat_kv_sdpa_components(
-        module,
-        query,
-        key,
-        value,
-        attention_mask,
-        dropout=dropout,
-        scaling=scaling,
-        is_causal=is_causal,
-    ).output
+    num_key_value_groups = getattr(module, "num_key_value_groups", None)
+    if not isinstance(num_key_value_groups, int) or num_key_value_groups <= 0:
+        raise ValueError("MK1 SDPA requires a positive integer num_key_value_groups")
+    repeated_key = qwen35_modeling.repeat_kv(key, num_key_value_groups)
+    repeated_value = qwen35_modeling.repeat_kv(value, num_key_value_groups)
+    return (
+        _sdpa_with_repeated_kv(
+            module,
+            query,
+            repeated_key=repeated_key,
+            repeated_value=repeated_value,
+            attention_mask=attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            is_causal=is_causal,
+        )
+        .transpose(1, 2)
+        .contiguous()
+    )
 
 
 def deterministic_token_segment_sum(
@@ -411,6 +382,9 @@ class GenesisNullSparseMoeBlock(nn.Module):
         super().__init__()
         self.contract = GenesisNullMoeContract.from_text_config(config)
         self.gate = GenesisNullTopKRouter(config)
+        self.auxiliary = GenesisNullRouterAuxiliary(
+            self.contract.num_real_experts, self.contract.num_null_experts
+        )
         self.experts = Qwen3_5MoeExperts(config)
         self.shared_expert = Qwen3_5MoeMLP(
             config,
@@ -423,9 +397,6 @@ class GenesisNullSparseMoeBlock(nn.Module):
                 f"Unsupported MK1 route reduction {route_reduction!r}; "
                 f"expected {DETERMINISTIC_ROUTE_REDUCTION!r}."
             )
-        # Grouped GEMMs remain unchanged; only repeated-token accumulation uses
-        # the stable segment reducer qualified by the Step-0 parity workflow.
-        self.deterministic_route_reduction = True
         self.dispatch_trace_observer: Callable[[GenesisNullDispatchTrace], None] | None = None
 
     @property
@@ -464,11 +435,29 @@ class GenesisNullSparseMoeBlock(nn.Module):
         return major >= 8
 
     def dispatch_backend(self, hidden_states: torch.Tensor) -> Literal["grouped_mm", "eager"]:
-        """Select the qualified backend and fail closed for production CUDA."""
+        """Keep production inference grouped; allow FP32-storage eager training."""
 
         if self._supports_grouped_mm(hidden_states):
             return "grouped_mm"
         if self._is_production_geometry and hidden_states.device.type == "cuda":
+            # Check module mode, not grad mode: checkpointed training can run under no_grad.
+            # BF16 activations need BF16 autocast for the FP32-weight eager linears.
+            if (
+                self.training
+                and self.experts.gate_up_proj.dtype is torch.float32
+                and self.experts.down_proj.dtype is torch.float32
+                and self.experts.gate_up_proj.device == hidden_states.device
+                and self.experts.down_proj.device == hidden_states.device
+                and (
+                    hidden_states.dtype is torch.float32
+                    or (
+                        hidden_states.dtype is torch.bfloat16
+                        and torch.is_autocast_enabled(hidden_states.device.type)
+                        and torch.get_autocast_dtype(hidden_states.device.type) is torch.bfloat16
+                    )
+                )
+            ):
+                return "eager"
             raise RuntimeError(
                 "Production MK1 null-MoE CUDA inference requires BF16 torch grouped_mm on SM80 or newer; "
                 f"got dtype={hidden_states.dtype}, capability={torch.cuda.get_device_capability(hidden_states.device)}"
@@ -502,16 +491,12 @@ class GenesisNullSparseMoeBlock(nn.Module):
         offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
 
         unscaled_scores = expert_scores / self.contract.route_scale
-        if self.deterministic_route_reduction:
-            selected_unscaled_scores = selected_scores / self.contract.route_scale
-            real_mass = torch.where(
-                real_mask,
-                selected_unscaled_scores,
-                torch.zeros_like(selected_unscaled_scores),
-            ).sum(dim=-1)
-        else:
-            real_mass = unscaled_scores.new_zeros(num_tokens)
-            real_mass.index_add_(0, token_indices, unscaled_scores)
+        selected_unscaled_scores = selected_scores / self.contract.route_scale
+        real_mass = torch.where(
+            real_mask,
+            selected_unscaled_scores,
+            torch.zeros_like(selected_unscaled_scores),
+        ).sum(dim=-1)
         expert_scores = (
             unscaled_scores / real_mass.clamp_min(1e-6)[token_indices]
         ) * self.contract.route_scale
@@ -536,7 +521,8 @@ class GenesisNullSparseMoeBlock(nn.Module):
         shared_output: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         routed_output = torch.zeros_like(hidden_states)
-        combined_output = shared_output.clone()
+        # Autocast may make the shared branch BF16 while route accumulation is FP32.
+        combined_output = shared_output.to(dtype=routed_output.dtype, copy=True)
         start = 0
         deterministic_token_indices: list[torch.Tensor] = []
         deterministic_outputs: list[torch.Tensor] = []
@@ -557,14 +543,8 @@ class GenesisNullSparseMoeBlock(nn.Module):
             weighted_swiglu = (swiglu.float() * expert_scores[:, None]).to(swiglu.dtype)
             current_output = functional.linear(weighted_swiglu, self.experts.down_proj[expert_index])
             current_output = current_output.to(routed_output.dtype)
-            if self.deterministic_route_reduction:
-                deterministic_token_indices.append(token_indices)
-                deterministic_outputs.append(current_output)
-            else:
-                routed_output.index_add_(0, token_indices, current_output)
-                # Genesis scatters route rows directly into the shared-expert base.
-                # Keeping that accumulation order avoids an extra BF16 rounding step.
-                combined_output.index_add_(0, token_indices, current_output)
+            deterministic_token_indices.append(token_indices)
+            deterministic_outputs.append(current_output)
             start = end
         if deterministic_outputs:
             all_token_indices = torch.cat(deterministic_token_indices)
@@ -601,16 +581,10 @@ class GenesisNullSparseMoeBlock(nn.Module):
             self.experts.down_proj.transpose(-2, -1),
             offs=routes.offsets,
         ).to(routed_output.dtype)
-        if self.deterministic_route_reduction:
-            routed_output = deterministic_token_segment_sum(
-                routed_output, routes.token_indices, current_output
-            )
-            combined_output = deterministic_token_segment_sum(
-                combined_output, routes.token_indices, current_output
-            )
-        else:
-            routed_output.index_add_(0, routes.token_indices, current_output)
-            combined_output.index_add_(0, routes.token_indices, current_output)
+        routed_output = deterministic_token_segment_sum(routed_output, routes.token_indices, current_output)
+        combined_output = deterministic_token_segment_sum(
+            combined_output, routes.token_indices, current_output
+        )
         return routed_output, combined_output
 
     def _dispatch_real_experts(
@@ -634,6 +608,7 @@ class GenesisNullSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flattened = hidden_states.reshape(-1, hidden_dim)
         routing = self.gate.route(flattened)
+        self.auxiliary(routing.physical_logits, routing.logical_probabilities, routing.selected_experts)
         shared_output = self._shared_expert_output(flattened)
         routed_output, combined_output = self._dispatch_real_experts(flattened, routing, shared_output)
         output = combined_output.reshape(batch_size, sequence_length, hidden_dim)
@@ -878,7 +853,7 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
                 self.num_key_value_groups,
             ).transpose(1, 2)
 
-        sdpa = _sdpa_with_repeated_kv(
+        raw_sdpa_output = _sdpa_with_repeated_kv(
             self,
             sdpa_query,
             repeated_key,
@@ -887,7 +862,7 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
         )
-        post_transpose_output = sdpa.output
+        post_transpose_output = raw_sdpa_output.transpose(1, 2).contiguous()
         attention_output = post_transpose_output.reshape(*input_shape, -1).contiguous()
         gated_output = attention_output * torch.sigmoid(gate)
         token_mixer = self.o_proj(gated_output)
@@ -903,9 +878,9 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
                     rotary_query=rotary_query,
                     rotary_key=rotary_key,
                     sdpa_query=sdpa_query,
-                    repeated_key=sdpa.repeated_key,
-                    repeated_value=sdpa.repeated_value,
-                    raw_sdpa_output=sdpa.raw_output,
+                    repeated_key=repeated_key,
+                    repeated_value=repeated_value,
+                    raw_sdpa_output=raw_sdpa_output,
                     post_transpose_output=post_transpose_output,
                     gated_output=gated_output,
                     token_mixer=token_mixer,
@@ -915,30 +890,31 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
 
 
 class GenesisQwen36TextRotaryEmbedding(nn.Module):
-    """Genesis mRoPE with model-dtype inverse-frequency quantization.
+    """Genesis mRoPE with intent-specific derived inverse frequencies.
 
-    Genesis registers ``inv_freq`` on the backbone before casting the complete
-    model to its inference dtype. Its phase calculation then promotes that
-    already-quantized table back to FP32. Keeping this derived buffer
-    nonpersistent preserves the HF checkpoint tensor ABI, while the loader
-    places it using the same dtype as the checkpoint parameters.
+    Serving promotes the released BF16 frequency table to F32 for phase math.
+    The training loader instead recomputes the original F32 formula before
+    distributed preparation and optimizer construction. Neither path adds
+    persistent checkpoint tensors or changes parameter ownership.
     """
 
     precision_contract = GENESIS_ROTARY_PRECISION
+    inv_freq: torch.Tensor
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         super().__init__()
         rope_parameters = config.rope_parameters
         if rope_parameters.get("rope_type") != "default":
             raise ValueError("MK1 Genesis rotary precision only supports default RoPE")
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        head_dim = config.head_dim or config.hidden_size // config.num_attention_heads
         rotary_dim = int(head_dim * rope_parameters.get("partial_rotary_factor", 1.0))
         if rotary_dim <= 0 or rotary_dim % 2 != 0:
             raise ValueError(f"MK1 rotary dimension must be positive and even, got {rotary_dim}")
-        theta = float(rope_parameters["rope_theta"])
-        inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
-        # The trained Genesis checkpoint owns this BF16 quantization regardless
-        # of an optional FP32 debug runtime requested by the caller.
+        self.theta = float(rope_parameters["rope_theta"])
+        self.rotary_dim = rotary_dim
+        inv_freq = self._training_inv_freq(None)
+        # Serving, including an F32 debug runtime, retains the released BF16 table.
+        # Explicit training load intent recomputes it after buffer placement.
         self.register_buffer("inv_freq", inv_freq.to(torch.bfloat16), persistent=False)
         self.mrope_section = list(rope_parameters.get("mrope_section", [11, 11, 10]))
         if sum(self.mrope_section) != rotary_dim // 2:
@@ -946,6 +922,16 @@ class GenesisQwen36TextRotaryEmbedding(nn.Module):
                 "MK1 mrope_section must sum to half the rotary dimension: "
                 f"sum={sum(self.mrope_section)}, rotary_dim={rotary_dim}"
             )
+
+    def _training_inv_freq(self, device: torch.device | None) -> torch.Tensor:
+        return 1.0 / (
+            self.theta
+            ** (torch.arange(0, self.rotary_dim, 2, device=device, dtype=torch.float32) / self.rotary_dim)
+        )
+
+    def prepare_for_training(self) -> None:
+        """Recompute derived F32 frequencies; widening the serving BF16 table loses source precision."""
+        self.inv_freq = self._training_inv_freq(self.inv_freq.device)
 
     @torch.no_grad()
     def forward(
@@ -1036,8 +1022,8 @@ class GenesisQwen36VisionModel(Qwen3_5MoeVisionModel):
         grid_ws = [row[2] for row in grid_thw_list]
         device = self.pos_embed.weight.device
 
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
+        idx_list: list[list[int]] = [[] for _ in range(4)]
+        weight_list: list[list[float]] = [[] for _ in range(4)]
         for _t, height, width in grid_thw_list:
             height_indices = torch.linspace(0, self.num_grid_per_side - 1, height)
             width_indices = torch.linspace(0, self.num_grid_per_side - 1, width)
@@ -1130,6 +1116,10 @@ class GenesisQwen36TextModel(Qwen3_5MoeTextModel):
     """Qwen3.6 hybrid text stack constructed directly with null-aware layers."""
 
     _no_split_modules = ["GenesisQwen36DecoderLayer"]
+    _can_record_outputs = {
+        **Qwen3_5MoeTextModel._can_record_outputs,
+        "router_auxiliaries": OutputRecorder(GenesisNullRouterAuxiliary),
+    }
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         Qwen3_5MoePreTrainedModel.__init__(self, config)

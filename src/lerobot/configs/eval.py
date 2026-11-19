@@ -58,33 +58,6 @@ class EvalPipelineConfig:
                 "No pretrained path was provided, evaluated policy will be built from scratch (random weights)."
             )
 
-        # env is optional here -- the job_name branch below explicitly supports env=None.
-        if self.policy is not None and self.env is not None:
-            self.env.reconcile_policy_contract(
-                self.policy,
-                explicit_fields=parser.get_explicit_override_fields("env"),
-            )
-
-        if self.policy is not None and self.policy.max_eval_batch_size is not None:
-            max_batch_size = self.policy.max_eval_batch_size
-            if max_batch_size < 1:
-                raise ValueError(
-                    f"{self.policy.type} declares invalid max_eval_batch_size={max_batch_size}; expected >= 1."
-                )
-            if self.eval.batch_size > max_batch_size:
-                if not self.eval._batch_size_was_auto:
-                    raise ValueError(
-                        f"{self.policy.type} supports eval.batch_size at most {max_batch_size}; "
-                        f"got {self.eval.batch_size}."
-                    )
-                logger.info(
-                    "Capping auto-selected eval.batch_size=%d to %d for policy type '%s'.",
-                    self.eval.batch_size,
-                    max_batch_size,
-                    self.policy.type,
-                )
-                self.eval.batch_size = max_batch_size
-
         if not self.job_name:
             if self.env is None:
                 self.job_name = f"{self.policy.type if self.policy is not None else 'scratch'}"

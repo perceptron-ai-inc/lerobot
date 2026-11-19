@@ -25,11 +25,9 @@ from unittest.mock import MagicMock, patch
 import cv2
 import numpy as np
 import pytest
-import torch
 
 from lerobot.cameras.configs import ColorMode, Cv2Rotation
 from lerobot.cameras.opencv import OpenCVCamera, OpenCVCameraConfig
-from lerobot.transforms import LetterboxResize
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 RealVideoCapture = cv2.VideoCapture
@@ -88,11 +86,6 @@ def test_abc_implementation():
     config = OpenCVCameraConfig(index_or_path=0)
 
     _ = OpenCVCamera(config)
-
-
-def test_startup_timeout_must_be_positive():
-    with pytest.raises(ValueError, match="startup_timeout_s"):
-        OpenCVCameraConfig(index_or_path=0, startup_timeout_s=0)
 
 
 def test_connect():
@@ -218,66 +211,6 @@ def test_color_mode_conversion(index_or_path):
 
     assert rgb.shape == bgr.shape
     np.testing.assert_array_equal(rgb, bgr[..., ::-1])
-
-
-def test_output_resize_is_separate_from_capture_resolution():
-    config = OpenCVCameraConfig(
-        index_or_path=0,
-        output_width=64,
-        output_height=48,
-    )
-    camera = OpenCVCamera(config)
-    camera.capture_width, camera.capture_height = 160, 120
-    raw = np.zeros((120, 160, 3), dtype=np.uint8)
-
-    image = camera._postprocess_image(raw)
-
-    assert (camera.capture_width, camera.capture_height) == (160, 120)
-    assert (camera.width, camera.height) == (64, 48)
-    assert image.shape == (48, 64, 3)
-
-
-def test_output_letterbox_preserves_aspect_ratio():
-    config = OpenCVCameraConfig(
-        index_or_path=0,
-        output_width=256,
-        output_height=256,
-        output_resize_mode="letterbox",
-    )
-    camera = OpenCVCamera(config)
-    camera.capture_width, camera.capture_height = 640, 480
-    raw = np.full((480, 640, 3), 255, dtype=np.uint8)
-
-    image = camera._postprocess_image(raw)
-
-    assert image.shape == (256, 256, 3)
-    assert not image[:32].any() and not image[224:].any()
-    assert (image[32:224] == 255).all()
-
-
-def test_output_letterbox_pixels_match_training_transform():
-    raw = np.arange(480 * 640 * 3, dtype=np.uint8).reshape(480, 640, 3)
-    camera = OpenCVCamera(
-        OpenCVCameraConfig(
-            index_or_path=0,
-            output_width=256,
-            output_height=256,
-            output_resize_mode="letterbox",
-        )
-    )
-    camera.capture_width, camera.capture_height = 640, 480
-
-    deployed = camera._postprocess_image(raw)
-    rgb = np.ascontiguousarray(raw[..., ::-1])
-    trained = LetterboxResize((256, 256))(torch.from_numpy(rgb).permute(2, 0, 1))
-
-    np.testing.assert_array_equal(deployed, trained.permute(1, 2, 0).numpy())
-
-
-def test_output_resize_config_validation(assert_invalid_output_resize_config):
-    assert_invalid_output_resize_config(
-        lambda **kwargs: OpenCVCameraConfig(index_or_path=DEFAULT_PNG_FILE_PATH, **kwargs)
-    )
 
 
 def test_postprocess_invalid_color_mode():

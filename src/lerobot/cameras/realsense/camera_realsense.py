@@ -22,9 +22,9 @@ import time
 from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any
 
-import cv2  # type: ignore  # TODO: add type stubs for OpenCV
-import numpy as np  # type: ignore  # TODO: add type stubs for numpy
-from numpy.typing import NDArray  # type: ignore  # TODO: add type stubs for numpy.typing
+import cv2
+import numpy as np
+from numpy.typing import NDArray
 
 from lerobot.utils.import_utils import _pyrealsense2_available, require_package
 
@@ -38,7 +38,7 @@ from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..camera import Camera
 from ..configs import ColorMode
-from ..utils import get_cv2_rotation, resize_camera_frame
+from ..utils import get_cv2_rotation
 from .configuration_realsense import RealSenseCameraConfig
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,11 @@ class RealSenseCamera(Camera):
         ```
     """
 
+    # Maximum number of warmup attempts made by connect(). A failed attempt is first
+    # retried with a plain pipeline stop/start, which is usually enough to recover the
+    # stream; a USB hardware reset is performed before the final attempt as a last resort.
+    _MAX_CONNECT_ATTEMPTS = 3
+
     def __init__(self, config: RealSenseCameraConfig):
         """
         Initializes the RealSenseCamera instance.
@@ -161,17 +166,87 @@ class RealSenseCamera(Camera):
     def _reset_connection_settings(self) -> None:
         """Restore settings that may have been auto-detected during a failed connection."""
         self.fps = self.config.fps
-        self.capture_width, self.capture_height = self.config.width, self.config.height
-        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-            self.capture_width, self.capture_height = self.config.height, self.config.width
-        self.width = self.config.output_width or self.config.width
-        self.height = self.config.output_height or self.config.height
+        self.width = self.config.width
+        self.height = self.config.height
         self.warmup_s = self.config.warmup_s
+        self.capture_width, self.capture_height = self.width, self.height
+        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
+            self.capture_width, self.capture_height = self.height, self.width
 
     @property
     def is_connected(self) -> bool:
         """Checks if the camera pipeline is started and streams are active."""
         return self.rs_pipeline is not None and self.rs_profile is not None
+
+    def _hardware_reset(self, wait_s: float = 5.0) -> None:
+        """Issue a USB hardware reset to recover an unresponsive device (common on D405)."""
+        context = rs.context()
+        for device in context.query_devices():
+            if device.get_info(rs.camera_info.serial_number) == self.serial_number:
+                logger.info(f"{self} performing hardware reset.")
+                device.hardware_reset()
+                time.sleep(wait_s)
+                return
+        logger.warning(f"{self} device not found for hardware reset, skipping.")
+
+    def _open_pipeline(self) -> None:
+        """Initializes the RealSense pipeline, starts it, and starts the background read thread.
+
+        Raises:
+            ValueError: If the configuration is invalid, a requested sensor option is unsupported,
+                or a requested sensor value is invalid.
+            ConnectionError: If the camera is found but fails to start the pipeline or no RealSense devices are detected at all.
+            RuntimeError: If the pipeline starts but fails to apply requested settings.
+        """
+        rs_pipeline = rs.pipeline()
+        rs_config = rs.config()
+        self._configure_rs_pipeline_config(rs_config)
+
+        try:
+            rs_profile = rs_pipeline.start(rs_config)
+        except RuntimeError as e:
+            raise ConnectionError(
+                f"Failed to open {self}.Run `lerobot-find-cameras realsense` to find available cameras."
+            ) from e
+
+        self.rs_pipeline = rs_pipeline
+        self.rs_profile = rs_profile
+
+        try:
+            self._configure_capture_settings()
+            self._configure_sensor_options()
+            self._start_read_thread()
+        except BaseException:
+            self._release_after_failed_setup()
+            raise
+
+    def _run_warmup(self) -> None:
+        """Blocks until at least one valid frame has been captured by the background thread.
+
+        Raises:
+            ConnectionError: If no frame arrives before ``warmup_s`` elapses.
+        """
+        # NOTE(Steven/Caroline): Enforcing at least one second of warmup as RS cameras need a bit of time before the first read. If we don't wait, the first read from the warmup will raise.
+        self.warmup_s = max(self.warmup_s, 1)
+
+        warmup_read = self.async_read if self.use_rgb else self.async_read_depth
+        start_time = time.time()
+        while time.time() - start_time < self.warmup_s:
+            warmup_read(timeout_ms=self.warmup_s * 1000)
+            time.sleep(0.1)
+        with self.frame_lock:
+            if (self.use_rgb and self.latest_color_frame is None) or (
+                self.use_depth and self.latest_depth_frame is None
+            ):
+                raise ConnectionError(f"{self} failed to capture frames during warmup.")
+
+    def _release_after_failed_setup(self) -> None:
+        """Releases the device handle and restores auto-detected settings after a failed attempt."""
+        try:
+            self._cleanup_resources()
+        except Exception:
+            logger.exception(f"Failed to fully clean up {self} after connect() failed.")
+        self._reset_connection_settings()
 
     @check_if_already_connected
     def connect(self, warmup: bool = True) -> None:
@@ -181,64 +256,53 @@ class RealSenseCamera(Camera):
         Initializes the RealSense pipeline, configures the required streams (color
         and optionally depth), starts the pipeline, and validates the actual stream settings.
 
+        If the pipeline starts but no frames arrive during warmup, retries up to
+        ``_MAX_CONNECT_ATTEMPTS`` times, performing a USB hardware reset before the
+        final attempt.
+
         Args:
             warmup (bool): If True, waits at connect() time until at least one valid frame
                            has been captured by the background thread. Defaults to True.
 
         Raises:
             DeviceAlreadyConnectedError: If the camera is already connected.
-            ValueError: If the configuration is invalid, a requested sensor option is unsupported,
-                or a requested sensor value is invalid.
+            ValueError: If the configuration is invalid (e.g., missing serial/name, name not unique).
             ConnectionError: If the camera is found but fails to start the pipeline or no RealSense devices are detected at all.
             RuntimeError: If the pipeline starts but fails to apply requested settings.
         """
 
-        self.rs_pipeline = rs.pipeline()
-        rs_config = rs.config()
-        self._configure_rs_pipeline_config(rs_config)
+        if not warmup:
+            self._open_pipeline()
+            logger.info(f"{self} connected.")
+            return
 
-        try:
-            self.rs_profile = self.rs_pipeline.start(rs_config)
-        except RuntimeError as e:
-            self.rs_profile = None
-            self.rs_pipeline = None
-            raise ConnectionError(
-                f"Failed to open {self}.Run `lerobot-find-cameras realsense` to find available cameras."
-            ) from e
+        last_error: Exception | None = None
 
-        try:
-            self._configure_capture_settings()
-            self._configure_sensor_options()
-            self._start_read_thread()
+        for attempt in range(1, self._MAX_CONNECT_ATTEMPTS + 1):
+            if attempt == self._MAX_CONNECT_ATTEMPTS:
+                self._hardware_reset()
 
-            # NOTE(Steven/Caroline): Enforcing at least one second of warmup as RS cameras need a bit of time before the first read. If we don't wait, the first read from the warmup will raise.
-            self.warmup_s = max(self.warmup_s, 1)
+            self._open_pipeline()
 
-            warmup_read = self.async_read if self.use_rgb else self.async_read_depth
-            # A D455 can take several seconds to deliver its first frame even
-            # though steady-state reads are fast. Do not tie that startup
-            # allowance to the stabilization duration.
-            warmup_read(timeout_ms=self.config.startup_timeout_s * 1000)
-            # Start the stabilization window only after frames are flowing,
-            # so a slow first frame cannot consume it.
-            start_time = time.time()
-            while time.time() - start_time < self.warmup_s:
-                warmup_read(timeout_ms=self.warmup_s * 1000)
-                time.sleep(0.1)
-            with self.frame_lock:
-                if (self.use_rgb and self.latest_color_frame is None) or (
-                    self.use_depth and self.latest_depth_frame is None
-                ):
-                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
-        except BaseException:
+            connected = False
             try:
-                self._cleanup_resources()
-            except Exception:
-                logger.exception(f"Failed to fully clean up {self} after connect() failed.")
-            self._reset_connection_settings()
-            raise
+                self._run_warmup()
+                connected = True
+            except (TimeoutError, ConnectionError) as e:
+                last_error = e
+            finally:
+                if not connected:
+                    self._release_after_failed_setup()
 
-        logger.info(f"{self} connected.")
+            if connected:
+                logger.info(f"{self} connected.")
+                return
+
+            logger.warning(f"{self} warmup failed (attempt {attempt}/{self._MAX_CONNECT_ATTEMPTS}).")
+
+        raise ConnectionError(
+            f"{self} failed to capture frames after {self._MAX_CONNECT_ATTEMPTS} attempts."
+        ) from last_error
 
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
@@ -316,7 +380,7 @@ class RealSenseCamera(Camera):
         """Creates and configures the RealSense pipeline configuration object."""
         rs.config.enable_device(rs_config, self.serial_number)
 
-        if self.capture_width and self.capture_height and self.fps:
+        if self.width and self.height and self.fps:
             if self.use_rgb:
                 rs_config.enable_stream(
                     rs.stream.color, self.capture_width, self.capture_height, rs.format.rgb8, self.fps
@@ -352,18 +416,15 @@ class RealSenseCamera(Camera):
         if self.fps is None:
             self.fps = stream.fps()
 
-        if self.capture_width is None or self.capture_height is None:
+        if self.width is None or self.height is None:
             actual_width = int(round(stream.width()))
             actual_height = int(round(stream.height()))
-            self.capture_width, self.capture_height = actual_width, actual_height
-        else:
-            actual_width, actual_height = self.capture_width, self.capture_height
-
-        if self.config.output_width is None or self.config.output_height is None:
             if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
                 self.width, self.height = actual_height, actual_width
+                self.capture_width, self.capture_height = actual_width, actual_height
             else:
                 self.width, self.height = actual_width, actual_height
+                self.capture_width, self.capture_height = actual_width, actual_height
 
     def _read(self, read_depth: bool = False) -> NDArray[Any]:
         """Shared helper for :meth:`read`/:meth:`read_depth`: wait for a fresh color or depth frame."""
@@ -601,15 +662,6 @@ class RealSenseCamera(Camera):
         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
             processed_image = cv2.rotate(processed_image, self.rotation)
 
-        if self.width is not None and self.height is not None:
-            processed_image = resize_camera_frame(
-                processed_image,
-                self.width,
-                self.height,
-                is_depth=depth_frame,
-                resize_mode=self.config.output_resize_mode,
-            )
-
         return processed_image
 
     def _read_loop(self) -> None:
@@ -647,6 +699,9 @@ class RealSenseCamera(Camera):
                 capture_time = time.perf_counter()
 
                 with self.frame_lock:
+                    # Under the lock, so a late frame cannot resurrect the buffer _stop_read_thread() cleared.
+                    if stop_event.is_set():
+                        break
                     if self.use_rgb:
                         self.latest_color_frame = processed_color_frame
                     if self.use_depth:
@@ -857,4 +912,5 @@ class RealSenseCamera(Camera):
             )
 
         self._cleanup_resources()
+
         logger.info(f"{self} disconnected.")

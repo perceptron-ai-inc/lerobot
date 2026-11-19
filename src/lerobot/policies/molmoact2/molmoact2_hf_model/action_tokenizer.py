@@ -22,9 +22,30 @@ from tokenizers.trainers import BpeTrainer
 from transformers import PreTrainedTokenizerFast
 from transformers.processing_utils import ProcessorMixin
 
-from ..modeling_molmoact2 import _resolve_molmoact2_location as _resolve_tokenizer_location
+from ..utils_molmoact2 import hf_token
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_tokenizer_location(
+    tokenizer_path: str,
+    *,
+    revision: str | None = None,
+    force_download: bool = False,
+) -> str:
+    local_path = Path(str(tokenizer_path)).expanduser()
+    if local_path.exists():
+        return str(local_path)
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(
+        repo_id=str(tokenizer_path),
+        repo_type="model",
+        revision=revision,
+        force_download=force_download,
+        ignore_patterns=["*.py", "*.pyc", "__pycache__/*"],
+        token=hf_token(),
+    )
 
 
 class UniversalActionProcessor(ProcessorMixin):

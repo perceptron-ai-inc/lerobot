@@ -279,21 +279,22 @@ class FeetechMotorsBus(SerialMotorsBus):
         """
         On Feetech Motors:
         Present_Position = Actual_Position - Homing_Offset
+
+        Homing_Offset is sign-magnitude, so on a 12-bit encoder it spans [-2047, 2047] while
+        `pos - 2047` reaches 2048 at position 4095. That one offset is clamped, which leaves the
+        motor one step off the exact half turn instead of failing the write.
         """
         half_turn_homings: dict[NameOrID, Value] = {}
         for motor, pos in positions.items():
             model = self._get_motor_model(motor)
             max_res = self.model_resolution_table[model] - 1
-            half_turn_homings[motor] = pos - int(max_res / 2)
+            offset = pos - int(max_res / 2)
+            max_magnitude = (1 << self.model_encoding_table[model]["Homing_Offset"]) - 1
+            half_turn_homings[motor] = max(-max_magnitude, min(max_magnitude, offset))
 
         return half_turn_homings
 
     def disable_torque(self, motors: int | str | list[str] | None = None, num_retry: int = 0) -> None:
-        # Default stays 0 so a failed torque write surfaces immediately: retries are silent
-        # (logged at debug only), so a default of 3 would absorb a marginal cable on every
-        # Feetech rig in the repo -- SO-100/101, Koch, LeKiwi, OMX, OpenArm -- and quadruple
-        # time-to-error on a genuinely disconnected arm. Callers on a known-flaky link pass
-        # num_retry explicitly.
         for motor in self._get_motors_list(motors):
             self.write("Torque_Enable", motor, TorqueMode.DISABLED.value, num_retry=num_retry)
             self.write("Lock", motor, 0, num_retry=num_retry)
@@ -305,7 +306,6 @@ class FeetechMotorsBus(SerialMotorsBus):
         self._write(addr, length, motor, 0, num_retry=num_retry)
 
     def enable_torque(self, motors: int | str | list[str] | None = None, num_retry: int = 0) -> None:
-        # Matches disable_torque's fail-fast default; see the note there.
         for motor in self._get_motors_list(motors):
             self.write("Torque_Enable", motor, TorqueMode.ENABLED.value, num_retry=num_retry)
             self.write("Lock", motor, 1, num_retry=num_retry)

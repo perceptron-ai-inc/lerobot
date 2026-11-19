@@ -8,8 +8,9 @@ without depending on RNG consumption order.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,10 @@ from .tensor_stream_utils import (
     resolve_tensor_stream_metadata,
     set_data,
 )
+
+if TYPE_CHECKING:
+    from .modeling_qwen35_vla import FlowMatchingContext, ModelOutput
+
 
 ISAAC_FLOW_TIMESTEPS_KEY = "perceptron_isaac_flow_timesteps"
 ISAAC_FLOW_NOISE_KEY = "perceptron_isaac_flow_noise"
@@ -52,7 +57,6 @@ class _FlowBatch:
     targets: Tensor
     full_mask: Tensor
     horizon_mask: Tensor
-    real_elements: Tensor
     batch_indices: list[int]
     action_start_indices: list[int]
     provenance_keys: list[tuple[object, ...] | None]
@@ -73,7 +77,7 @@ def _valid_next_token_labels(tokens: Tensor, valid: Tensor) -> tuple[Tensor, Ten
 
 
 def _text_loss(
-    output: Any,
+    output: ModelOutput,
     stream: TensorStream,
     *,
     exclude_non_agent_roles: bool,
@@ -91,7 +95,7 @@ def _text_loss(
     batch_size = activations.shape[0]
     numerators = activations.new_zeros(batch_size, dtype=torch.float32)
     counts = activations.new_zeros(batch_size, dtype=torch.float32)
-    for batch_idx in range(batch_size):
+    for batch_idx in range(0 if stream.collective_only else batch_size):
         mask = valid_labels[batch_idx]
         count = mask.sum()
         if not bool(count):
@@ -105,20 +109,14 @@ def _text_loss(
             )
         numerators[batch_idx] = token_loss.sum()
         counts[batch_idx] = count
+    if not bool(counts.sum()):
+        # Empty local text still connects the backbone and classifier to DDP, without
+        # reducing the entire vocabulary weight tensor on ordinary nonempty batches.
+        numerators = (
+            numerators + activations.float().sum(dim=(1, 2)) * 0 + classifier.reshape(-1)[0].float() * 0
+        )
     per_sample = numerators / counts.clamp_min(1.0)
     return numerators, counts, per_sample
-
-
-def _text_label_count(
-    stream: TensorStream,
-    *,
-    exclude_non_agent_roles: bool,
-) -> Tensor:
-    metadata = resolve_tensor_stream_metadata(stream, None)
-    roles = ("agent", "assistant", None) if exclude_non_agent_roles else tuple(ROLE_TO_IDX)
-    tokens, valid_tokens = set_data(stream, _TEXT_LOSS_TYPES, roles=roles, metadata=metadata)
-    _, valid_labels = _valid_next_token_labels(tokens, valid_tokens)
-    return valid_labels.sum(dtype=torch.float32)
 
 
 def _collect_flow_batch(
@@ -150,6 +148,9 @@ def _collect_flow_batch(
                 raise ValueError("ISAAC flow marker is missing tags['action_target'].")
             records.append((batch_idx, event_start, event))
     if not records:
+        if stream.collective_only:
+            targets = torch.zeros(0, action_horizon, action_dim, device=device, dtype=torch.float32)
+            return _FlowBatch(targets, targets.clone(), targets.any(dim=2), [], [], [])
         raise ValueError("ISAAC training batch contains no flow action markers.")
     if len(records) != len(stream.streams) or {record[0] for record in records} != set(
         range(len(stream.streams))
@@ -163,6 +164,8 @@ def _collect_flow_batch(
     provenance_keys: list[tuple[object, ...] | None] = []
     for chunk_idx, (batch_idx, event_start, event) in enumerate(records):
         target = torch.as_tensor(event.tags["action_target"], device=device, dtype=torch.float32)
+        if not bool(torch.isfinite(target).all()):
+            raise ValueError("ISAAC action target must contain only finite values.")
         if target.ndim != 2:
             raise ValueError(f"ISAAC action target must be [H,D], got {tuple(target.shape)}.")
         horizon, real_dim = target.shape
@@ -189,16 +192,68 @@ def _collect_flow_batch(
         provenance_keys.append(action_event_provenance_key(event))
     targets = targets * full_mask
     horizon_mask = full_mask.any(dim=2)
-    real_elements = full_mask.sum(dim=(1, 2)).clamp_min(1.0)
     return _FlowBatch(
         targets=targets,
         full_mask=full_mask,
         horizon_mask=horizon_mask,
-        real_elements=real_elements,
         batch_indices=batch_indices,
         action_start_indices=action_start_indices,
         provenance_keys=provenance_keys,
     )
+
+
+def _coerce_flow_timesteps(
+    *, flow: _FlowBatch, sample_count: int, timesteps: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Validate flow timestep geometry and values without drawing randomness or changing inputs."""
+    chunk_count, horizon, _ = flow.targets.shape
+    device = flow.targets.device
+    timesteps = timesteps.to(device=device, dtype=torch.float32)
+    if sample_count == 1 and timesteps.shape == (chunk_count,):
+        timesteps = timesteps.unsqueeze(0)
+    expected_scalar = (sample_count, chunk_count)
+    expected_grid = (sample_count, chunk_count, horizon, 1)
+    if tuple(timesteps.shape) == expected_scalar:
+        expert_timesteps = timesteps
+        timestep_grid = timesteps[:, :, None, None].expand(-1, -1, horizon, 1)
+    elif tuple(timesteps.shape) == expected_grid:
+        timestep_grid = timesteps
+        valid_rows = flow.horizon_mask[None, :, :, None].expand(sample_count, -1, -1, -1)
+        first_valid = flow.horizon_mask.to(torch.int64).argmax(dim=1)
+        expert_timesteps = timestep_grid[:, torch.arange(chunk_count, device=device), first_valid, 0]
+        if not torch.allclose(
+            timestep_grid.masked_select(valid_rows),
+            expert_timesteps[:, :, None, None].expand(-1, -1, horizon, 1).masked_select(valid_rows),
+            rtol=0.0,
+            atol=0.0,
+        ):
+            raise ValueError(
+                "ISAAC flow timestep grids must be constant over valid horizon rows "
+                "while RTC and dual-timestep training are disabled."
+            )
+    else:
+        raise ValueError(
+            "ISAAC flow timesteps must have shape "
+            f"{expected_scalar} or {expected_grid}, got {tuple(timesteps.shape)}."
+        )
+    if not bool(torch.isfinite(timestep_grid).all()) or not bool(
+        ((timestep_grid >= 0.0) & (timestep_grid <= 1.0)).all()
+    ):
+        raise ValueError("ISAAC flow timesteps must be finite and lie in [0, 1].")
+    return timestep_grid, expert_timesteps
+
+
+def _coerce_flow_noise(*, flow: _FlowBatch, sample_count: int, noise: Tensor) -> Tensor:
+    """Validate flow noise geometry and values without drawing randomness or changing inputs."""
+    noise = noise.to(device=flow.targets.device, dtype=torch.float32)
+    if sample_count == 1 and noise.shape == flow.targets.shape:
+        noise = noise.unsqueeze(0)
+    expected_noise = (sample_count, *flow.targets.shape)
+    if tuple(noise.shape) != expected_noise:
+        raise ValueError(f"ISAAC flow noise must have shape {expected_noise}, got {tuple(noise.shape)}.")
+    if not bool(torch.isfinite(noise).all()):
+        raise ValueError("ISAAC flow noise must contain only finite values.")
+    return noise
 
 
 def _coerce_flow_randomness(
@@ -216,42 +271,10 @@ def _coerce_flow_randomness(
             expert.sample_timesteps(chunk_count, device=device, dtype=torch.float32)
             for _ in range(sample_count)
         ]
-        expert_timesteps = torch.stack(sampled, dim=0)
-        timestep_grid = expert_timesteps[:, :, None, None].expand(-1, -1, horizon, 1)
-    else:
-        timesteps = timesteps.to(device=device, dtype=torch.float32)
-        if sample_count == 1 and timesteps.shape == (chunk_count,):
-            timesteps = timesteps.unsqueeze(0)
-        expected_scalar = (sample_count, chunk_count)
-        expected_grid = (sample_count, chunk_count, horizon, 1)
-        if tuple(timesteps.shape) == expected_scalar:
-            expert_timesteps = timesteps
-            timestep_grid = timesteps[:, :, None, None].expand(-1, -1, horizon, 1)
-        elif tuple(timesteps.shape) == expected_grid:
-            timestep_grid = timesteps
-            valid_rows = flow.horizon_mask[None, :, :, None].expand(sample_count, -1, -1, -1)
-            first_valid = flow.horizon_mask.to(torch.int64).argmax(dim=1)
-            expert_timesteps = timestep_grid[:, torch.arange(chunk_count, device=device), first_valid, 0]
-            if not torch.allclose(
-                timestep_grid.masked_select(valid_rows),
-                expert_timesteps[:, :, None, None].expand(-1, -1, horizon, 1).masked_select(valid_rows),
-                rtol=0.0,
-                atol=0.0,
-            ):
-                raise ValueError(
-                    "ISAAC flow timestep grids must be constant over valid horizon rows "
-                    "while RTC and dual-timestep training are disabled."
-                )
-        else:
-            raise ValueError(
-                "ISAAC flow timesteps must have shape "
-                f"{expected_scalar} or {expected_grid}, got {tuple(timesteps.shape)}."
-            )
-    if not bool(torch.isfinite(timestep_grid).all()) or not bool(
-        ((timestep_grid >= 0.0) & (timestep_grid <= 1.0)).all()
-    ):
-        raise ValueError("ISAAC flow timesteps must be finite and lie in [0, 1].")
-
+        timesteps = torch.stack(sampled, dim=0)
+    timestep_grid, expert_timesteps = _coerce_flow_timesteps(
+        flow=flow, sample_count=sample_count, timesteps=timesteps
+    )
     if noise is None:
         noise = torch.randn(
             sample_count,
@@ -261,15 +284,7 @@ def _coerce_flow_randomness(
             device=device,
             dtype=torch.float32,
         )
-    else:
-        noise = noise.to(device=device, dtype=torch.float32)
-        if sample_count == 1 and noise.shape == flow.targets.shape:
-            noise = noise.unsqueeze(0)
-    expected_noise = (sample_count, chunk_count, horizon, action_dim)
-    if tuple(noise.shape) != expected_noise:
-        raise ValueError(f"ISAAC flow noise must have shape {expected_noise}, got {tuple(noise.shape)}.")
-    if not bool(torch.isfinite(noise).all()):
-        raise ValueError("ISAAC flow noise must contain only finite values.")
+    noise = _coerce_flow_noise(flow=flow, sample_count=sample_count, noise=noise)
     return timestep_grid, expert_timesteps, noise * flow.full_mask.unsqueeze(0)
 
 
@@ -299,49 +314,8 @@ def _coerce_flow_loss_mask(
     return mask, denominators
 
 
-def perceptron_isaac_loss_denominators(
-    stream: TensorStream,
-    *,
-    loss_plan: str,
-    action_dim: int,
-    action_horizon: int,
-    train_samples_per_chunk: int,
-    flow_mask_padded_action_rows: bool,
-    exclude_non_agent_roles: bool,
-    flow_loss_mask: Tensor | None = None,
-) -> dict[str, Tensor]:
-    """Compute local objective counts without materializing the 4B model forward graph."""
-    if loss_plan not in {"text_ntp_fast_flow_action", "flow_matching_action_prediction"}:
-        raise ValueError(f"Unsupported ISAAC loss plan {loss_plan!r}.")
-    if train_samples_per_chunk < 1:
-        raise ValueError("train_samples_per_chunk must be >= 1.")
-    flow = _collect_flow_batch(
-        stream,
-        action_dim=action_dim,
-        action_horizon=action_horizon,
-        mask_padded_action_rows=flow_mask_padded_action_rows,
-        device=torch.device("cpu"),
-        exclude_non_agent_roles=exclude_non_agent_roles,
-    )
-    _, per_draw_denominators = _coerce_flow_loss_mask(
-        flow=flow,
-        sample_count=train_samples_per_chunk,
-        loss_mask=flow_loss_mask,
-    )
-    denominators = {"flow": per_draw_denominators.sum(dtype=torch.float32)}
-    if loss_plan == "text_ntp_fast_flow_action":
-        text_count = _text_label_count(
-            stream,
-            exclude_non_agent_roles=exclude_non_agent_roles,
-        )
-        if not bool(text_count):
-            raise ValueError("ISAAC joint loss found no agent-role text/FAST labels.")
-        denominators["text"] = text_count
-    return denominators
-
-
 def _flow_loss(
-    output: Any,
+    output: ModelOutput,
     stream: TensorStream,
     *,
     train_samples_per_chunk: int,
@@ -351,7 +325,7 @@ def _flow_loss(
     noise: Tensor | None,
     loss_mask: Tensor | None,
     exclude_non_agent_roles: bool = True,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     expert = output.flow_matching_expert
     if expert is None:
         raise ValueError("ISAAC model output has no flow-matching expert.")
@@ -365,6 +339,37 @@ def _flow_loss(
         device=output.final_activations.device,
         exclude_non_agent_roles=exclude_non_agent_roles,
     )
+    activations = output.final_activations
+    context: FlowMatchingContext = output.flow_matching_context
+    if detach_vlm_activations:
+        context = (
+            context.detach() if isinstance(context, Tensor) else tuple(layer.detach() for layer in context)
+        )
+    if stream.collective_only:
+        # A finite context traverses the expert without inventing supervision or RNG draws.
+        draws = train_samples_per_chunk
+        dummy_actions = activations.new_zeros(
+            draws, 1, int(expert.args.action_horizon), int(expert.args.action_dim)
+        )
+        dummy_tau = activations.new_zeros(draws, 1, dtype=torch.float32)
+        predicted = expert(
+            context,
+            torch.ones(1, activations.shape[1], device=activations.device, dtype=torch.bool),
+            dummy_actions[0] if draws == 1 else dummy_actions,
+            dummy_tau[0] if draws == 1 else dummy_tau,
+            action_mask=torch.ones(
+                1, int(expert.args.action_horizon), device=activations.device, dtype=torch.bool
+            ),
+        )
+        context_layers = (context,) if isinstance(context, Tensor) else context
+        if (
+            not bool(torch.isfinite(predicted).all())
+            or not bool(torch.isfinite(activations).all())
+            or any(not bool(torch.isfinite(layer).all()) for layer in context_layers)
+        ):
+            raise ValueError("ISAAC collective-only forward must be finite.")
+        zero = predicted.float().sum() * 0 + activations.float().sum() * 0
+        return zero, zero.detach(), zero.reshape(1)[:0], zero.detach(), zero.detach()
     tau_grid, expert_tau, eps = _coerce_flow_randomness(
         expert=expert,
         flow=flow,
@@ -379,10 +384,9 @@ def _flow_loss(
     )
     targets = flow.targets.unsqueeze(0)
     x_tau = tau_grid * eps + (1.0 - tau_grid) * targets
-    clean_at_0 = bool(getattr(expert.args, "clean_at_0", True))
+    clean_at_0 = expert.args.clean_at_0
     velocity_target = eps - targets if clean_at_0 else targets - eps
 
-    activations = output.final_activations.detach() if detach_vlm_activations else output.final_activations
     context_mask, _ = build_action_context_mask(
         stream,
         action_batch_indices=flow.batch_indices,
@@ -396,7 +400,7 @@ def _flow_loss(
     expert_input = x_tau[0] if train_samples_per_chunk == 1 else x_tau
     expert_tau = expert_tau[0] if train_samples_per_chunk == 1 else expert_tau
     predicted = expert(
-        activations,
+        context,
         context_mask,
         expert_input.to(dtype=activations.dtype),
         expert_tau,
@@ -409,10 +413,11 @@ def _flow_loss(
     valid_tau = flow.horizon_mask[None, :, :, None].expand(train_samples_per_chunk, -1, -1, -1)
     mean_timestep = tau_grid.masked_select(valid_tau).mean()
     return (
-        squared_error.sum(),
-        effective_mask.sum(dtype=torch.float32),
+        per_sample.sum(),
+        per_sample.new_tensor(float(per_sample.numel())),
         per_sample,
         mean_timestep,
+        effective_mask.sum(dtype=torch.float32),
     )
 
 
@@ -427,40 +432,31 @@ def _global_objective_mean(
     numerator: Tensor,
     denominator: Tensor,
     *,
-    global_denominator: Tensor | None = None,
-    accumulation_scale: int = 1,
+    allow_empty: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Normalize local gradients by one global count spanning the complete optimizer update."""
-    if accumulation_scale < 1:
-        raise ValueError("ISAAC loss accumulation_scale must be >= 1.")
+    """Normalize local gradients by the valid-target count across this distributed batch."""
     denominator = denominator.to(device=numerator.device, dtype=torch.float32)
     global_numerator = _global_sum_detached(numerator)
     world_size = 1
     if dist.is_available() and dist.is_initialized():
         world_size = dist.get_world_size()
-    if global_denominator is None:
-        global_denominator = _global_sum_detached(denominator)
-        metric_scale = 1.0
-    else:
-        global_denominator = torch.as_tensor(
-            global_denominator,
-            device=numerator.device,
-            dtype=torch.float32,
-        )
-        metric_scale = float(accumulation_scale)
+    global_denominator = _global_sum_detached(denominator)
     if global_denominator.numel() != 1 or not bool(torch.isfinite(global_denominator)):
         raise ValueError("ISAAC global objective denominator must be one finite scalar.")
+    if allow_empty and bool(global_denominator == 0):
+        if bool(_global_sum_detached(denominator) > 0):
+            raise ValueError("ISAAC zero global objective denominator cannot hide real local supervision.")
+        return numerator * 0, global_numerator * 0, global_denominator
     if not bool(global_denominator > 0):
         raise ValueError("ISAAC global objective denominator must be positive.")
-    return (
-        numerator * (world_size * metric_scale / global_denominator),
-        global_numerator * metric_scale / global_denominator,
-        global_denominator,
-    )
+    backward = numerator * (world_size / global_denominator)
+    value = global_numerator / global_denominator
+    # The public scalar is global; DDP still averages only rank-local derivatives.
+    return backward + (value - backward.detach()), value, global_denominator
 
 
 def perceptron_isaac_training_loss(
-    output: Any,
+    output: ModelOutput,
     stream: TensorStream,
     *,
     loss_plan: str = "text_ntp_fast_flow_action",
@@ -469,11 +465,11 @@ def perceptron_isaac_training_loss(
     train_samples_per_chunk: int = 1,
     flow_mask_padded_action_rows: bool = True,
     softmax_auxiliary_loss_scale: float = 0.0,
+    moe_load_balancing_loss_coeff: float = 0.02,
+    moe_z_loss_coeff: float = 0.001,
     flow_timesteps: Tensor | None = None,
     flow_noise: Tensor | None = None,
     flow_loss_mask: Tensor | None = None,
-    global_denominators: dict[str, Tensor] | None = None,
-    accumulation_scale: int = 1,
     reduction: str = "mean",
 ) -> IsaacLossOutput:
     """Compute ISAAC's objective-normalized native training loss."""
@@ -481,15 +477,15 @@ def perceptron_isaac_training_loss(
         raise ValueError(f"Unsupported ISAAC loss plan {loss_plan!r}.")
     if reduction not in {"mean", "none"}:
         raise ValueError("ISAAC loss reduction must be 'mean' or 'none'.")
-    if softmax_auxiliary_loss_scale < 0:
-        raise ValueError("softmax_auxiliary_loss_scale must be nonnegative.")
-    if accumulation_scale < 1:
-        raise ValueError("ISAAC loss accumulation_scale must be >= 1.")
-    expected_denominators = {"flow", "text"} if loss_plan == "text_ntp_fast_flow_action" else {"flow"}
-    if global_denominators is not None and set(global_denominators) != expected_denominators:
-        raise ValueError(f"ISAAC global denominators must define {sorted(expected_denominators)} exactly.")
+    for name, coefficient in (
+        ("softmax_auxiliary_loss_scale", softmax_auxiliary_loss_scale),
+        ("moe_load_balancing_loss_coeff", moe_load_balancing_loss_coeff),
+        ("moe_z_loss_coeff", moe_z_loss_coeff),
+    ):
+        if not math.isfinite(coefficient) or coefficient < 0:
+            raise ValueError(f"{name} must be finite and nonnegative.")
 
-    flow_num, flow_count, flow_per_sample, mean_timestep = _flow_loss(
+    flow_num, flow_count, flow_per_sample, mean_timestep, element_count = _flow_loss(
         output,
         stream,
         train_samples_per_chunk=train_samples_per_chunk,
@@ -503,18 +499,14 @@ def perceptron_isaac_training_loss(
     flow_backward, flow_global, flow_global_count = _global_objective_mean(
         flow_num,
         flow_count,
-        global_denominator=None if global_denominators is None else global_denominators["flow"],
-        accumulation_scale=accumulation_scale,
+        allow_empty=True,
     )
-    metric_scale = float(accumulation_scale) if global_denominators is not None else 1.0
-    flow_chunk_count = (
-        _global_sum_detached(torch.tensor(float(flow_per_sample.numel()), device=flow_per_sample.device))
-        * metric_scale
-    )
+    flow_chunk_count = _global_sum_detached(flow_count)
+    text_global_count = flow_global_count.new_zeros(())
     metrics = {
         "flow_loss": flow_global,
         "flow_chunk_count": flow_chunk_count,
-        "flow_element_count": flow_global_count,
+        "flow_element_count": _global_sum_detached(element_count),
         "flow_mean_timestep": mean_timestep.float().detach(),
     }
     total_backward = flow_backward
@@ -528,17 +520,14 @@ def perceptron_isaac_training_loss(
         )
         text_num = text_num_by_sample.sum()
         text_count = text_count_by_sample.sum()
-        if not bool(text_count):
-            raise ValueError("ISAAC joint loss found no agent-role text/FAST labels.")
         text_backward, text_global, text_global_count = _global_objective_mean(
             text_num,
             text_count,
-            global_denominator=None if global_denominators is None else global_denominators["text"],
-            accumulation_scale=accumulation_scale,
+            allow_empty=True,
         )
         total_backward = total_backward + text_backward
         per_sample = per_sample + text_per_sample
-        metrics.update({"text_loss": text_global, "text_token_count": text_global_count})
+        metrics.update({"text_loss": text_global, "text_token_count": _global_sum_detached(text_count)})
     else:
         metrics.update(
             {
@@ -546,6 +535,23 @@ def perceptron_isaac_training_loss(
                 "text_token_count": output.final_activations.new_zeros((), dtype=torch.float32),
             }
         )
+    if not bool(flow_global_count + text_global_count > 0):
+        raise ValueError("ISAAC primary objective batch is globally empty.")
+    auxiliary = total_backward.new_zeros(())
+    for key, coefficient in (
+        ("load_balancing_loss", moe_load_balancing_loss_coeff),
+        ("router_z_loss", moe_z_loss_coeff),
+    ):
+        # Do not attach disabled branches: even zero times an overflowing loss can poison backward.
+        if coefficient == 0:
+            continue
+        layers = output.additional_info.get(key, ())
+        if layers:
+            layer_mean = torch.stack(layers).mean()
+            metrics[key] = layer_mean.detach()
+            auxiliary = auxiliary + coefficient * layer_mean
+    total_backward = total_backward + auxiliary
+    per_sample = per_sample + auxiliary
     loss = total_backward if reduction == "mean" else per_sample
-    metrics["loss"] = metrics["flow_loss"] + metrics["text_loss"]
+    metrics["loss"] = metrics["flow_loss"] + metrics["text_loss"] + auxiliary.detach()
     return IsaacLossOutput(loss=loss, per_sample_loss=per_sample, metrics=metrics)

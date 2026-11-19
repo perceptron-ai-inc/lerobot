@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
+
+pytest.importorskip("transformers", reason="install lerobot[perceptron_isaac]")
 
 import lerobot.policies.perceptron_isaac.modeling_mk1_vla as modeling_mk1_vla
 import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as modeling_qwen35_vla
@@ -15,6 +18,8 @@ from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
     Mk1CheckpointContract,
     Mk1CheckpointContractError,
     finalize_mk1_runtime_checkpoint_layout,
+    read_and_validate_safetensors_index,
+    read_mk1_config_data,
     validate_mk1_checkpoint,
 )
 from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
@@ -73,7 +78,7 @@ def _action_stream() -> TensorStream:
             role="assistant",
         ),
     ]
-    return TensorStream([create_stream(events, ALL_TYPES, schedule=False)])
+    return TensorStream([create_stream(events, ALL_TYPES)])
 
 
 def _replace_with_same_bytes(path: Path, replacement: Path) -> None:
@@ -98,29 +103,31 @@ def _qualify_cuda_runtime(
     capability: tuple[int, int] | None = None,
     device_name: str | None = None,
 ) -> None:
-    monkeypatch.setattr(modeling_mk1_vla.torch, "__version__", QUALIFIED_TORCH_CUDA_ABI)
-    monkeypatch.setattr(modeling_mk1_vla.torch.version, "cuda", "12.8")
+    monkeypatch.setattr(torch, "__version__", QUALIFIED_TORCH_CUDA_ABI)
+    monkeypatch.setattr(torch.version, "cuda", "12.8")
     if capability is not None:
         monkeypatch.setattr(
-            modeling_mk1_vla.torch.cuda,
+            torch.cuda,
             "get_device_capability",
             lambda device: capability,
         )
     if device_name is not None:
         monkeypatch.setattr(
-            modeling_mk1_vla.torch.cuda,
+            torch.cuda,
             "get_device_name",
             lambda device: device_name,
         )
 
 
-def test_mk1_reuses_pr3154_vla_shell_descriptors_verbatim() -> None:
+def test_mk1_reuses_pr3154_embedding_and_inference_shell_descriptors_verbatim() -> None:
     for name in ("_embed_text", "_embed_vector", "_embed_vision", "embed_stream", "forward"):
         assert (
             modeling_mk1_vla.Mk1Qwen36VLAModel.__dict__[name]
             is modeling_qwen35_vla.Qwen35VLAModel.__dict__[name]
         )
-    for name in ("get_input_embeddings", "action_expert", "sample_action", "train_forward"):
+    # Native train_forward now owns the approved router-auxiliary capture; its
+    # real scalar, gradient and count contract is tested in the MoE suites.
+    for name in ("get_input_embeddings", "action_expert", "sample_action"):
         assert (
             modeling_mk1_vla.Mk1Qwen36VLAForActionGeneration.__dict__[name]
             is modeling_qwen35_vla.Qwen35VLAForActionGeneration.__dict__[name]
@@ -156,7 +163,6 @@ def test_mk1_loader_constructs_only_from_checkpoint_and_leaves_no_meta_tensors(t
     assert model.model.language_model.rotary_emb.inv_freq.dtype == torch.bfloat16
     assert model.model.visual.rotary_pos_emb.inv_freq.dtype == torch.float32
     assert not any("rotary_emb.inv_freq" in key for key in model.state_dict())
-    assert all(layer.mlp.deterministic_route_reduction for layer in model.model.language_model.layers)
 
 
 def test_mk1_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> None:
@@ -309,7 +315,7 @@ def test_mk1_loader_rejects_unqualified_transformers_abi_before_checkpoint_read(
         reads += 1
         raise AssertionError("checkpoint must not be read before the Transformers ABI gate")
 
-    monkeypatch.setattr(modeling_mk1_vla.transformers, "__version__", "5.5.5")
+    monkeypatch.setattr(pytest.importorskip("transformers"), "__version__", "5.5.5")
     monkeypatch.setattr(modeling_mk1_vla, "read_mk1_config_data", unexpected_read)
 
     with pytest.raises(RuntimeError, match=rf"requires.*{QUALIFIED_TRANSFORMERS_VERSION}.*5\.5\.5"):
@@ -358,8 +364,8 @@ def test_trained_cuda_loader_rejects_unqualified_torch_abi_before_safetensor_rea
         "Mk1Qwen36VLAForActionGeneration",
         unexpected_allocation,
     )
-    monkeypatch.setattr(modeling_mk1_vla.torch, "__version__", torch_version)
-    monkeypatch.setattr(modeling_mk1_vla.torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(torch, "__version__", torch_version)
+    monkeypatch.setattr(torch.version, "cuda", cuda_version)
 
     with pytest.raises(RuntimeError, match="requires.*parity-qualified") as error:
         load_mk1_vla_from_hf(tmp_path / "config-is-mocked", device="cuda")
@@ -377,11 +383,10 @@ def test_qualified_torch_cuda_gate_exempts_only_nonproduction_execution(monkeypa
         artifact=replace(
             full_contract.artifact,
             artifact_kind="neutral_debug",
-            trained_steps=0,
         ),
     )
-    monkeypatch.setattr(modeling_mk1_vla.torch, "__version__", "2.11.0+cu128")
-    monkeypatch.setattr(modeling_mk1_vla.torch.version, "cuda", "12.8")
+    monkeypatch.setattr(torch, "__version__", "2.11.0+cu128")
+    monkeypatch.setattr(torch.version, "cuda", "12.8")
 
     modeling_mk1_vla._require_qualified_torch_cuda_abi(reduced_contract, "cuda")
     modeling_mk1_vla._require_qualified_torch_cuda_abi(neutral_contract, "cuda")
@@ -443,7 +448,8 @@ def test_mk1_loader_rejects_unknown_runtime_attention_backend(tmp_path) -> None:
             dtype=torch.float32,
             device="cpu",
             allow_test_only_reduced_geometry=True,
-            attention_backend="flash_attention_3",
+            # Deliberately violate the static Literal at the runtime validation boundary.
+            attention_backend="flash_attention_3",  # type: ignore[arg-type]
         )
 
 
@@ -451,7 +457,7 @@ def test_mk1_loader_builds_from_the_same_config_object_it_validated(tmp_path, mo
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
     reads = 0
-    original = modeling_mk1_vla.read_mk1_config_data
+    original = read_mk1_config_data
 
     def counted_read(*args, **kwargs):
         nonlocal reads
@@ -472,7 +478,7 @@ def test_mk1_loader_builds_from_the_same_config_object_it_validated(tmp_path, mo
 def test_mk1_loader_rejects_shard_replaced_after_header_validation(tmp_path, monkeypatch) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
-    original_read = modeling_mk1_vla.read_and_validate_safetensors_index
+    original_read = read_and_validate_safetensors_index
     stream_opens = []
 
     def read_then_replace(*args, **kwargs):
@@ -481,7 +487,7 @@ def test_mk1_loader_rejects_shard_replaced_after_header_validation(tmp_path, mon
         _replace_with_same_bytes(shard, tmp_path / "replacement.safetensors")
         return inventory
 
-    original_safe_open = modeling_mk1_vla.safe_open
+    original_safe_open = safe_open
 
     def opening_spy(*args, **kwargs):
         stream_opens.append(args[0])
@@ -504,7 +510,7 @@ def test_mk1_loader_rejects_shard_replaced_after_header_validation(tmp_path, mon
 def test_mk1_loader_rejects_shard_replaced_during_stream(tmp_path, monkeypatch) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
-    original_safe_open = modeling_mk1_vla.safe_open
+    original_safe_open = safe_open
     replaced = False
 
     class ReplacingHandle:

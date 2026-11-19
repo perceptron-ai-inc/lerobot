@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,6 +21,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     torch_recurrent_gated_delta_rule,
 )
 
+from .loss_perceptron_isaac import _global_sum_detached
 from .mk1_checkpoint_contract import (
     Mk1CheckpointContract,
     SafetensorsInventory,
@@ -28,6 +30,7 @@ from .mk1_checkpoint_contract import (
     validate_mk1_tokenizer,
 )
 from .modeling_qwen35_vla import (
+    ModelOutput,
     Qwen35VLAForActionGeneration,
     Qwen35VLAModel,
     build_action_expert_head,
@@ -38,8 +41,11 @@ from .modeling_qwen36_moe import (
     GenesisQwen36Model,
     Mk1Qwen36MoeConfig,
 )
+from .moe_auxiliary_losses import materialize_router_auxiliaries
+from .tensor_stream import TensorStream
+from .trained_package import VerifiedTrainedTensorStorage
 
-TORCH_SDPA_ATTENTION_BACKEND = "torch_sdpa_v1"
+TORCH_SDPA_ATTENTION_BACKEND: Literal["torch_sdpa_v1"] = "torch_sdpa_v1"
 QUALIFIED_TRANSFORMERS_VERSION = "5.5.4"
 QUALIFIED_TORCH_CUDA_ABI = "2.10.0+cu128"
 _QUALIFIED_CUDA_VERSION = "12.8"
@@ -70,6 +76,7 @@ class Mk1Qwen36VLAConfig(Mk1Qwen36MoeConfig):
         *,
         vector_max_states: int,
         action_expert: dict[str, Any],
+        action_context_schema_version: int = 1,
         **kwargs: Any,
     ) -> None:
         kwargs["tie_word_embeddings"] = False
@@ -77,6 +84,7 @@ class Mk1Qwen36VLAConfig(Mk1Qwen36MoeConfig):
         self.tie_word_embeddings = False
         self.vector_max_states = int(vector_max_states)
         self.action_expert = dict(action_expert)
+        self.action_context_schema_version = action_context_schema_version
 
 
 class Mk1Qwen36VLAModel(GenesisQwen36Model):
@@ -88,7 +96,12 @@ class Mk1Qwen36VLAModel(GenesisQwen36Model):
         super().__init__(config)
         hidden = int(config.text_config.hidden_size)
         self.vector_embedding = build_vector_encoder(config.vector_max_states, hidden)
-        self.action_expert = build_action_expert_head(config.action_expert, vlm_dim=hidden)
+        self.action_expert = build_action_expert_head(
+            config.action_expert,
+            vlm_dim=hidden,
+            context_schema_version=config.action_context_schema_version,
+            backbone_num_layers=config.text_config.num_hidden_layers,
+        )
 
     # These methods are the reviewed PR #3154 VLA shell. Assigning the method
     # descriptors keeps one implementation of rendering, mRoPE, masking, and
@@ -96,6 +109,7 @@ class Mk1Qwen36VLAModel(GenesisQwen36Model):
     _embed_text = Qwen35VLAModel._embed_text
     _embed_vector = Qwen35VLAModel._embed_vector
     _embed_vision = Qwen35VLAModel._embed_vision
+    _embed_sharded_modalities = Qwen35VLAModel._embed_sharded_modalities
     embed_stream = Qwen35VLAModel.embed_stream
     forward = Qwen35VLAModel.forward
 
@@ -119,7 +133,51 @@ class Mk1Qwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
     get_input_embeddings = Qwen35VLAForActionGeneration.get_input_embeddings
     action_expert = Qwen35VLAForActionGeneration.action_expert
     sample_action = Qwen35VLAForActionGeneration.sample_action
-    train_forward = Qwen35VLAForActionGeneration.train_forward
+
+    def train_forward(self, tensor_stream: TensorStream) -> ModelOutput:
+        """Capture every forwarded router position without retaining mutable per-layer loss state."""
+        out = self.model(tensor_stream, output_router_auxiliaries=True, output_flow_context=True)
+        layers = out.get("router_auxiliaries", ())
+        if len(layers) != len(self.model.language_model.layers):
+            raise RuntimeError("Native training must return one router auxiliary per backbone layer.")
+        if tensor_stream.collective_only:
+            # Keep the finite collective forward, but do not materialize dummy router
+            # positions or top-k dispatch counts. Genuine padding is never masked here.
+            layers = tuple(
+                replace(
+                    layer,
+                    physical_logits=layer.physical_logits[:0],
+                    logical_probabilities=layer.logical_probabilities[:0],
+                    selected_experts=layer.selected_experts[:0],
+                )
+                for layer in layers
+            )
+        positions = out.last_hidden_state.new_tensor(
+            0
+            if tensor_stream.collective_only
+            else out.last_hidden_state.shape[0] * out.last_hidden_state.shape[1]
+        )
+        if bool(_global_sum_detached(positions) > 0):
+            additional_info = materialize_router_auxiliaries(layers)
+        else:
+            # A whole empty microbatch can belong to a nonempty update window.
+            # There is no router objective for it, but all ranks keep its graph.
+            zeros = [layer.physical_logits.sum() * 0 for layer in layers]
+            additional_info = {
+                "load_balancing_loss": zeros,
+                "router_z_loss": zeros,
+                "router_token_count": [positions.detach() for _ in layers],
+                "router_dispatch_counts": [
+                    positions.new_zeros(layer.num_real_experts + layer.num_null_experts) for layer in layers
+                ],
+            }
+        return ModelOutput(
+            final_activations=out.last_hidden_state,
+            final_embedding=self.lm_head,
+            flow_matching_expert=self.model.action_expert,
+            additional_info=additional_info,
+            flow_matching_context=out["flow_matching_context"],
+        )
 
 
 def _build_config(
@@ -140,10 +198,14 @@ def _build_config(
 
     action_expert = dict(normalized["genesis_vla"]["action_expert"])
     # Sampler steps are runtime input to sample_action(), not module geometry.
-    action_expert.pop("num_inference_steps", None)
+    if action_expert.get("type") != "dit":
+        action_expert.pop("num_inference_steps", None)
+    normalized.pop("action_expert", None)
+    normalized.pop("vector_max_states", None)
     config = Mk1Qwen36VLAConfig(
         vector_max_states=contract.vector_encoder.max_states,
         action_expert=action_expert,
+        action_context_schema_version=normalized["genesis_vla"]["schema_version"],
         **normalized,
     )
     if config.tie_word_embeddings or config.text_config.tie_word_embeddings:
@@ -297,29 +359,62 @@ def load_mk1_vla_from_hf(
     *,
     dtype: torch.dtype = torch.bfloat16,
     device: str | torch.device = "cpu",
+    runtime_device: str | torch.device | None = None,
     allow_test_only_reduced_geometry: bool = False,
     attention_backend: Literal["torch_sdpa_v1"] = TORCH_SDPA_ATTENTION_BACKEND,
     route_reduction: Literal["stable_token_segment_sum_v1"] = DETERMINISTIC_ROUTE_REDUCTION,
     allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
+    load_intent: Literal["inference", "training"] = "inference",
+    verified_tensor_storage: VerifiedTrainedTensorStorage | None = None,
 ) -> tuple[Mk1Qwen36VLAForActionGeneration, Mk1Qwen36VLAConfig, Mk1CheckpointContract]:
-    """Validate, construct once on meta, and stream an MK1 VLA using the qualified SDPA backend."""
-    _require_qualified_transformers_abi()
+    """Validate, construct once on meta, and stream an MK1 VLA using the qualified SDPA backend.
+
+    ``device`` is where the weights are materialized. ``runtime_device`` (default: ``device``) is
+    where the model will run: it selects the GDN kernels and gates the production CUDA ABI, so a
+    host-memory build for a CUDA run keeps the CUDA kernels and the CUDA qualification gate.
+    Authenticated mixed trained storage may resume in F32: F32 values need no cast,
+    while BF16 values promote exactly (without recovering precision already lost).
+    This also promotes frozen BF16 tensors and doubles their host storage.
+    """
+    if load_intent not in ("inference", "training"):
+        raise ValueError("load_intent must be inference or training")
     root = Path(model_dir)
+    if verified_tensor_storage is not None and (
+        verified_tensor_storage.for_model(root) != allowed_storage_dtypes
+    ):
+        raise ValueError("Verified trained storage disagrees with allowed_storage_dtypes")
+    if load_intent == "training":
+        authenticated_mixed = verified_tensor_storage is not None and allowed_storage_dtypes == frozenset(
+            {"BF16", "F32"}
+        )
+        if dtype != torch.float32 or not (
+            allowed_storage_dtypes == frozenset({"F32"}) or authenticated_mixed
+        ):
+            raise ValueError("training load requires lossless F32 storage and runtime")
+    _require_qualified_transformers_abi()
     raw, contract = read_mk1_config_data(
         root,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
-    _require_qualified_torch_cuda_abi(contract, device)
+    if contract.action_expert.native_metadata and dtype != torch.bfloat16 and load_intent != "training":
+        raise ValueError("Isaac05 F32 runtime requires explicit training load intent")
+    run_device = device if runtime_device is None else runtime_device
+    _require_qualified_torch_cuda_abi(contract, run_device)
     inventory = read_and_validate_safetensors_index(root)
     contract.validate_tensor_inventory(inventory, allowed_storage_dtypes=allowed_storage_dtypes)
+    if verified_tensor_storage is not None:
+        verified_tensor_storage.require_header_dtypes(inventory)
     validate_mk1_tokenizer(root, contract)
+    if verified_tensor_storage is not None:
+        # Bind every loader-read metadata file through its final read, before allocation.
+        verified_tensor_storage.verify_for_materialization()
     config = _build_config(raw, contract)
     _configure_attention_backend(config, attention_backend)
     _configure_route_reduction(config, route_reduction)
 
     with init_empty_weights(include_buffers=False):
         model = Mk1Qwen36VLAForActionGeneration(config)
-        _select_gdn_backend(model, device)
+        _select_gdn_backend(model, run_device)
     expected_keys = _runtime_expected_keys(contract)
     model_keys = set(model.state_dict())
     if model_keys != expected_keys:
@@ -340,6 +435,8 @@ def load_mk1_vla_from_hf(
         dtype=dtype,
     )
     _place_config_buffers(model, device)
+    if load_intent == "training":
+        model.model.language_model.rotary_emb.prepare_for_training()
     meta_parameters = [
         name for name, parameter in model.named_parameters() if parameter.device.type == "meta"
     ]

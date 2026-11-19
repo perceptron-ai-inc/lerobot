@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
 import importlib
 import inspect
 import json
@@ -20,15 +19,21 @@ import sys
 import tempfile
 from argparse import ArgumentError
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import MISSING, Field, fields as dataclass_fields, is_dataclass
 from functools import wraps
 from pathlib import Path
 from pkgutil import ModuleInfo
-from types import ModuleType, UnionType
-from typing import Any, TypeVar, Union, cast, get_args, get_origin, get_type_hints
+from types import ModuleType
+from typing import Any, TypeVar, cast
 
 import draccus
-import yaml  # type: ignore[import-untyped]
+import yaml
+from draccus.help_formatter import SimpleHelpFormatter
+from draccus.utils import DecodingError
+from draccus.wrappers import DataclassWrapper
+from draccus.wrappers.choice_wrapper import ChoiceWrapper, UnionWrapper
+from draccus.wrappers.field_wrapper import FieldWrapper
+from draccus.wrappers.suppressing_argparse import SuppressingArgumentParser
+from draccus.wrappers.wrapper import AggregateWrapper, Wrapper
 
 from lerobot.utils.utils import has_method
 
@@ -44,19 +49,6 @@ _config_path_args: dict[str, str] = {}
 # Storage for non-path YAML overrides so validate() can pass them to from_pretrained.
 _config_yaml_overrides: dict[str, list[str]] = {}
 
-# Config-file fields the user actually chose, i.e. those whose value differs from the config
-# class's declared defaults, keyed by top-level field. A config file dumped by a previous run
-# (draccus serializes every default) must not make each field look deliberately set, or
-# checkpoint-owned adoption paths hard-error on fields nobody chose.
-_config_explicit_fields: dict[str, set[str]] = {}
-
-
-def _clear_config_overrides() -> None:
-    """Clear all module-global state associated with a config parse."""
-    _config_path_args.clear()
-    _config_yaml_overrides.clear()
-    _config_explicit_fields.clear()
-
 
 def _flatten_to_cli_args(d: dict, prefix: str = "") -> list[str]:
     """Recursively flatten a nested dict to CLI-style args (e.g. {"lr": 1e-4} -> ["--lr=0.0001"])."""
@@ -69,7 +61,9 @@ def _flatten_to_cli_args(d: dict, prefix: str = "") -> list[str]:
             value = str(value).lower()
         if isinstance(value, dict):
             args.extend(_flatten_to_cli_args(value, full_key))
-        elif value is not None and not isinstance(value, list):
+        elif isinstance(value, list):
+            args.append(f"--{full_key}={json.dumps(value)}")
+        elif value is not None:
             args.append(f"--{full_key}={value}")
     return args
 
@@ -87,11 +81,18 @@ def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> lis
         args = sys.argv[1:]
     attr_level_args = []
     detect_string = f"--{field_name}."
-    exclude_strings = (f"--{field_name}.{draccus.CHOICE_TYPE_KEY}=", f"--{field_name}.{PATH_KEY}=")
-    for arg in args:
-        if arg.startswith(detect_string) and not arg.startswith(exclude_strings):
-            denested_arg = f"--{arg.removeprefix(detect_string)}"
-            attr_level_args.append(denested_arg)
+    excluded_names = (draccus.CHOICE_TYPE_KEY, PATH_KEY)
+    for index, arg in enumerate(args):
+        if not arg.startswith(detect_string):
+            continue
+
+        denested_arg = arg.removeprefix(detect_string)
+        if denested_arg.split("=", maxsplit=1)[0] in excluded_names:
+            continue
+
+        attr_level_args.append(f"--{denested_arg}")
+        if "=" not in arg and index + 1 < len(args) and not args[index + 1].startswith("--"):
+            attr_level_args.append(args[index + 1])
 
     return attr_level_args
 
@@ -99,10 +100,12 @@ def get_cli_overrides(field_name: str, args: Sequence[str] | None = None) -> lis
 def parse_arg(arg_name: str, args: Sequence[str] | None = None) -> str | None:
     if args is None:
         args = sys.argv[1:]
-    prefix = f"--{arg_name}="
-    for arg in args:
-        if arg.startswith(prefix):
-            return arg[len(prefix) :]
+    option = f"--{arg_name}"
+    for index, arg in enumerate(args):
+        if arg.startswith(f"{option}="):
+            return arg.removeprefix(f"{option}=")
+        if arg == option and index + 1 < len(args) and not args[index + 1].startswith("--"):
+            return args[index + 1]
     return None
 
 
@@ -110,7 +113,7 @@ def parse_plugin_args(plugin_arg_suffix: str, args: Sequence[str]) -> dict[str, 
     """Parse plugin-related arguments from command-line arguments.
 
     This function extracts arguments from command-line arguments that match a specified suffix pattern.
-    It processes arguments in the format '--key=value' and returns them as a dictionary.
+    It accepts arguments in the formats '--key=value' and '--key value' and returns them as a dictionary.
 
     Args:
         plugin_arg_suffix (str): The suffix to identify plugin-related arguments.
@@ -127,13 +130,18 @@ def parse_plugin_args(plugin_arg_suffix: str, args: Sequence[str]) -> dict[str, 
         {'env.discover_packages_path': 'my_package'}
     """
     plugin_args = {}
-    for arg in args:
-        if "=" in arg and plugin_arg_suffix in arg:
-            key, value = arg.split("=", 1)
-            # Remove leading '--' if present
-            if key.startswith("--"):
-                key = key[2:]
-            plugin_args[key] = value
+    for index, arg in enumerate(args):
+        if not arg.startswith("--"):
+            continue
+
+        key, separator, value = arg[2:].partition("=")
+        if plugin_arg_suffix not in key:
+            continue
+        if not separator:
+            if index + 1 >= len(args) or args[index + 1].startswith("--"):
+                continue
+            value = args[index + 1]
+        plugin_args[key] = value
     return plugin_args
 
 
@@ -196,106 +204,86 @@ def get_yaml_overrides(field_name: str) -> list[str]:
     return _config_yaml_overrides.get(field_name, [])
 
 
-def get_override_field_names(overrides: Sequence[str]) -> set[str]:
-    """Return explicitly overridden fields, including parents of nested fields.
-
-    Accepts both ``--field=value`` and draccus's space-separated ``--field value``; treating
-    the latter as unset would let a deliberate override be silently replaced by a
-    checkpoint-owned default.
-    """
-    names = {
-        argument.removeprefix("--").split("=", 1)[0] for argument in overrides if argument.startswith("--")
-    }
-    return names | {name.split(".", 1)[0] for name in names}
-
-
-def _field_default(field: Field[Any]) -> Any:
-    if field.default is not MISSING:
-        return field.default
-    if field.default_factory is not MISSING:
-        return field.default_factory()
-    return MISSING
-
-
-def _encoded_equal(default: Any, value: Any) -> bool:
-    """Compare a config-file value against a dataclass default through draccus encoding plus
-    a JSON round-trip, so enums/paths/tuples match their YAML/JSON spellings."""
-    try:
-        encoded = draccus.encode(default)
-    except Exception:
-        return bool(default == value)
-    with contextlib.suppress(TypeError, ValueError):
-        encoded = json.loads(json.dumps(encoded))
-    return bool(encoded == value or default == value)
-
-
-def _resolve_dataclass_target(annotation: Any, value: dict[str, Any]) -> type | None:
-    """Resolve the dataclass `value` will be decoded into, unwrapping Optional/Union and
-    draccus choice registries (via the dict's ``type`` key). None when unresolvable."""
-    candidates = get_args(annotation) if get_origin(annotation) in (Union, UnionType) else (annotation,)
-    for candidate in candidates:
-        if not isinstance(candidate, type) or not is_dataclass(candidate):
-            continue
-        choice = value.get(draccus.CHOICE_TYPE_KEY)
-        get_choice_class = getattr(candidate, "get_choice_class", None)
-        if choice is None or not callable(get_choice_class):
-            return candidate
-        try:
-            resolved = get_choice_class(str(choice))
-        except KeyError:
-            return None
-        return resolved if isinstance(resolved, type) and is_dataclass(resolved) else None
-    return None
-
-
-def _class_fields_and_hints(config_class: type | None) -> tuple[dict[str, Field[Any]] | None, dict[str, Any]]:
-    if config_class is None or not is_dataclass(config_class):
-        return None, {}
-    field_map = {f.name: f for f in dataclass_fields(config_class)}
-    try:
-        hints = get_type_hints(config_class)
-    except Exception:
-        hints = {}
-    return field_map, hints
-
-
-def _nondefault_leaf_names(config_class: type | None, data: dict[str, Any], prefix: str = "") -> set[str]:
-    """Dotted names of the leaves in `data` that differ from `config_class`'s declared field
-    defaults. Unknown classes/fields and fields without defaults count as explicit."""
-    names: set[str] = set()
-    field_map, hints = _class_fields_and_hints(config_class)
-    for key, value in data.items():
-        if key in (PATH_KEY, draccus.CHOICE_TYPE_KEY):
-            continue
-        dotted = f"{prefix}.{key}" if prefix else key
-        field = field_map.get(key) if field_map is not None else None
-        if field is None:
-            names.add(dotted)
-            continue
-        if isinstance(value, dict):
-            target = _resolve_dataclass_target(hints.get(key, field.type), value)
-            if target is not None:
-                names |= _nondefault_leaf_names(target, value, dotted)
-                continue
-        default = _field_default(field)
-        if default is MISSING or not _encoded_equal(default, value):
-            names.add(dotted)
-    return names
-
-
-def get_explicit_override_fields(field_name: str) -> set[str]:
-    overrides = get_yaml_overrides(field_name) + (get_cli_overrides(field_name) or [])
-    return _config_explicit_fields.get(field_name, set()) | get_override_field_names(overrides)
-
-
 def get_type_arg(field_name: str, args: Sequence[str] | None = None) -> str | None:
     return parse_arg(f"{field_name}.{draccus.CHOICE_TYPE_KEY}", args)
+
+
+def _register_scoped_actions(
+    wrapper: Wrapper, parser: SuppressingArgumentParser, cli_args: Sequence[str]
+) -> None:
+    """Like draccus's own Wrapper.register_actions, but for a ChoiceType field only recurses into
+    the already-selected subclass (per CLI `.type` args), instead of every registered choice.
+
+    This mirrors draccus 0.11.x's internal wrapper traversal because its public parser eagerly registers
+    every choice before parsing the command line. Keep this in sync when updating draccus.
+    """
+    if isinstance(wrapper, ChoiceWrapper):
+        group = parser.add_argument_group(title=wrapper.title, description=wrapper.description)
+        children = wrapper._children
+        arg_name = f"{wrapper.dest}.{draccus.CHOICE_TYPE_KEY}" if wrapper.dest else draccus.CHOICE_TYPE_KEY
+        group.add_argument(
+            f"--{arg_name}",
+            choices=list(children.keys()),
+            help=f"Which type of {wrapper.title} to use",
+            required=wrapper.required,
+        )
+        selected = get_type_arg(wrapper.dest, cli_args) if wrapper.dest else None
+        if selected in children:
+            _register_scoped_actions(children[selected], parser, cli_args)
+    elif isinstance(wrapper, DataclassWrapper):
+        group = parser.add_argument_group(title=wrapper.title, description=wrapper.description)
+        for child in wrapper._children:
+            if isinstance(child, AggregateWrapper):
+                parser.add_argument(
+                    f"--{child.name}", type=str, required=False, help=f"Config file for {child.name}"
+                )
+                _register_scoped_actions(child, parser, cli_args)
+            elif isinstance(child, FieldWrapper):
+                child.add_action(group)
+    elif isinstance(wrapper, UnionWrapper):
+        group = parser.add_argument_group(title=wrapper.title, description=wrapper.description)
+        has_field_wrapper = False
+        for child in wrapper._children:
+            if isinstance(child, (DataclassWrapper, ChoiceWrapper)):
+                _register_scoped_actions(child, parser, cli_args)
+            elif isinstance(child, FieldWrapper):
+                has_field_wrapper = True
+        if has_field_wrapper:
+            group.add_argument(f"--{wrapper.dest}", required=False)
+    else:
+        wrapper.register_actions(parser)
+
+
+def print_scoped_help(config_class: type, cli_args: Sequence[str]) -> None:
+    """Prints --help output scoped to the choices already resolved on the CLI (e.g. --env.type=pusht),
+    instead of draccus's default of expanding every registered subclass of every ChoiceType field."""
+    parser = SuppressingArgumentParser(formatter_class=SimpleHelpFormatter)
+    parser.add_argument(
+        f"--{draccus.utils.CONFIG_ARG}", type=str, help="Path for a config file to parse with draccus"
+    )
+    _register_scoped_actions(DataclassWrapper(config_class), parser, cli_args)
+    parser.print_help()
 
 
 def filter_arg(field_to_filter: str, args: Sequence[str] | None = None) -> list[str]:
     if args is None:
         return []
-    return [arg for arg in args if not arg.startswith(f"--{field_to_filter}=")]
+    option = f"--{field_to_filter}"
+    filtered_args = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == option:
+            index += 1
+            if index < len(args) and not args[index].startswith("--"):
+                index += 1
+            continue
+        if arg.startswith(f"{option}="):
+            index += 1
+            continue
+        filtered_args.append(arg)
+        index += 1
+    return filtered_args
 
 
 def filter_path_args(fields_to_filter: str | list[str], args: Sequence[str] | None = None) -> list[str]:
@@ -327,29 +315,35 @@ def filter_path_args(fields_to_filter: str | list[str], args: Sequence[str] | No
                     argument=None,
                     message=f"Cannot specify both --{field}.{PATH_KEY} and --{field}.{draccus.CHOICE_TYPE_KEY}",
                 )
-            filtered_args = [arg for arg in filtered_args if not arg.startswith(f"--{field}.")]
+            option_prefix = f"--{field}."
+            retained_args = []
+            index = 0
+            while index < len(filtered_args):
+                arg = filtered_args[index]
+                if arg.startswith(option_prefix):
+                    index += 1
+                    if (
+                        "=" not in arg
+                        and index < len(filtered_args)
+                        and not filtered_args[index].startswith("--")
+                    ):
+                        index += 1
+                    continue
+                retained_args.append(arg)
+                index += 1
+            filtered_args = retained_args
 
     return filtered_args
 
 
-def extract_path_fields_from_config(
-    config_path: str, path_fields: list[str], config_class: type | None = None
-) -> str:
+def extract_path_fields_from_config(config_path: str, path_fields: list[str]) -> str:
     """Extract `path` fields from a YAML/JSON config before draccus processes it.
 
     When a user specifies e.g. ``policy.path: lerobot/smolvla_base`` in a YAML config,
     draccus will fail because ``path`` is not a valid field on policy config classes.
     This function extracts those path values, stores them in ``_config_path_args`` for
     later retrieval by ``get_path_arg()``, and returns a cleaned temp config file path.
-
-    ``config_class`` (the top-level config dataclass) lets non-path fields register as
-    explicit overrides only where they differ from the class's declared defaults.
     """
-    # Defensive reset for direct callers. wrap() already clears all three registries at the
-    # start of every CLI parse -- which is what protects a second parse in the same process,
-    # since this function only runs when a --config_path is passed.
-    _clear_config_overrides()
-
     config_file = Path(config_path)
     suffix = config_file.suffix.lower()
 
@@ -364,34 +358,6 @@ def extract_path_fields_from_config(
 
     if not isinstance(config_data, dict):
         return config_path
-
-    # Record which config-file fields the user actually chose -- those that differ from the
-    # config class's declared defaults -- not just the ``path_fields`` handled below.
-    # Consumers such as ``EnvConfig.reconcile_policy_contract`` ask
-    # ``get_explicit_override_fields`` whether the user set a field on purpose: values
-    # written in a --config_path YAML must not look unset (they'd be silently replaced by
-    # checkpoint-owned values instead of raising on conflict), while a config file dumped by
-    # a previous run (draccus serializes every default) must not make each field look
-    # deliberately set. Comparing against defaults also covers list- and None-valued fields,
-    # which CLI-style flattening silently dropped.
-    field_map, hints = _class_fields_and_hints(config_class)
-    for field, value in config_data.items():
-        if field in path_fields:
-            continue
-        class_field = field_map.get(field) if field_map is not None else None
-        names: set[str]
-        if isinstance(value, dict):
-            annotation = hints.get(field, class_field.type) if class_field is not None else None
-            target = _resolve_dataclass_target(annotation, value) if class_field is not None else None
-            names = _nondefault_leaf_names(target, value)
-        elif class_field is None:
-            names = {field}
-        else:
-            default = _field_default(class_field)
-            names = set() if default is not MISSING and _encoded_equal(default, value) else {field}
-        names |= {name.split(".", 1)[0] for name in names}
-        if names:
-            _config_explicit_fields[field] = names
 
     modified = False
     for field in path_fields:
@@ -429,21 +395,12 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
     def wrapper_outer(fn: F) -> F:
         @wraps(fn)
         def wrapper_inner(*args: Any, **kwargs: Any) -> Any:
-            # The registries describe exactly one parse and are module-global. Clear
-            # them for EVERY invocation -- including the pre-supplied-cfg branch below,
-            # which performs no parse: a programmatically built config must not inherit
-            # a previous CLI parse's explicit-override entries (a stale env.fps override
-            # from an earlier --config_path run would otherwise hard-fail
-            # reconcile_policy_contract on a config that never mentioned fps).
-            _clear_config_overrides()
             argspec = inspect.getfullargspec(fn)
             argtype = argspec.annotations[argspec.args[0]]
             if len(args) > 0 and type(args[0]) is argtype:
                 cfg = args[0]
                 args = args[1:]
             else:
-                # (Registries were already cleared unconditionally above, before anything
-                # consults them -- filter_path_args below reads the get_path_arg fallback.)
                 cli_args = sys.argv[1:]
                 plugin_args = parse_plugin_args(PLUGIN_DISCOVERY_SUFFIX, cli_args)
                 for plugin_cli_arg, plugin_path in plugin_args.items():
@@ -453,26 +410,31 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
                         # add the relevant CLI arg to the error message
                         raise PluginLoadError(f"{e}\nFailed plugin CLI Arg: {plugin_cli_arg}") from e
                     cli_args = filter_arg(plugin_cli_arg, cli_args)
+                if "--help" in cli_args or "-h" in cli_args:
+                    print_scoped_help(argtype, cli_args)
+                    sys.exit(0)
                 config_path_cli = parse_arg("config_path", cli_args)
                 if has_method(argtype, "__get_path_fields__"):
                     path_fields = argtype.__get_path_fields__()
                     cli_args = filter_path_args(path_fields, cli_args)
                     # Also extract path fields from the YAML/JSON config file
                     if config_path_cli:
-                        config_path_cli = extract_path_fields_from_config(
-                            config_path_cli, path_fields, argtype
-                        )
-                if has_method(argtype, "from_pretrained") and config_path_cli:
-                    cli_args = filter_arg("config_path", cli_args)
-                    cfg = argtype.from_pretrained(config_path_cli, cli_args=cli_args)
-                else:
-                    if config_path_cli:
+                        config_path_cli = extract_path_fields_from_config(config_path_cli, path_fields)
+                try:
+                    if has_method(argtype, "from_pretrained") and config_path_cli:
                         cli_args = filter_arg("config_path", cli_args)
-                    cfg = draccus.parse(
-                        config_class=argtype,
-                        config_path=config_path_cli or config_path,
-                        args=cli_args,
-                    )
+                        cfg = argtype.from_pretrained(config_path_cli, cli_args=cli_args)
+                    else:
+                        if config_path_cli:
+                            cli_args = filter_arg("config_path", cli_args)
+                        cfg = draccus.parse(
+                            config_class=argtype,
+                            config_path=config_path_cli or config_path,
+                            args=cli_args,
+                        )
+                except DecodingError as e:
+                    print(f"error: {e}", file=sys.stderr)
+                    sys.exit(1)
             response = fn(cfg, *args, **kwargs)
             return response
 

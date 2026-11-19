@@ -15,9 +15,9 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..configs import CameraConfig, ColorMode, Cv2Backends, Cv2Rotation, OutputResizeMode
+from ..configs import CameraConfig, ColorMode, Cv2Backends, Cv2Rotation
 
-__all__ = ["OpenCVCameraConfig", "ColorMode", "Cv2Rotation", "Cv2Backends", "OutputResizeMode"]
+__all__ = ["OpenCVCameraConfig", "ColorMode", "Cv2Rotation", "Cv2Backends"]
 
 
 @CameraConfig.register_subclass("opencv")
@@ -49,17 +49,8 @@ class OpenCVCameraConfig(CameraConfig):
         color_mode: Color mode for image output (RGB or BGR). Defaults to RGB.
         rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
         warmup_s: Time reading frames before returning from connect (in seconds)
-        startup_timeout_s: Maximum wait for the first frame. This is separate from
-            ``warmup_s`` so slow USB camera startup does not require forcing a long
-            stabilization delay after frames begin arriving.
         fourcc: FOURCC code for video format (e.g., "MJPG", "YUYV", "I420"). Defaults to None (auto-detect).
         backend: OpenCV backend identifier (https://docs.opencv.org/3.4/d4/d15/group__videoio__flags__base.html). Defaults to ANY.
-        output_width: Optional width returned by the camera after capture and rotation.
-            This does not change the device mode requested by ``width``/``height``.
-        output_height: Optional height returned by the camera after capture and rotation.
-            Must be set together with ``output_width``.
-        output_resize_mode: ``stretch`` matches the target dimensions directly; ``letterbox``
-            preserves aspect ratio and center-pads with black.
 
     Note:
         - Only 3-channel color output (RGB/BGR) is currently supported.
@@ -71,22 +62,13 @@ class OpenCVCameraConfig(CameraConfig):
     color_mode: ColorMode = ColorMode.RGB
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
-    startup_timeout_s: float = 10.0
     fourcc: str | None = None
     backend: Cv2Backends = Cv2Backends.ANY
-    output_width: int | None = None
-    output_height: int | None = None
-    output_resize_mode: OutputResizeMode = OutputResizeMode.STRETCH
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
         self.rotation = Cv2Rotation(self.rotation)
         self.backend = Cv2Backends(self.backend)
-        self.output_resize_mode = OutputResizeMode(self.output_resize_mode)
-        self.output_resize_mode.validate_dimensions(self.output_width, self.output_height)
-
-        if self.startup_timeout_s <= 0:
-            raise ValueError("`startup_timeout_s` must be positive.")
 
         if self.fourcc is not None and (not isinstance(self.fourcc, str) or len(self.fourcc) != 4):
             raise ValueError(

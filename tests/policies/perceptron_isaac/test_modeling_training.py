@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
 import torch
+
+pytest.importorskip("transformers", reason="install lerobot[perceptron_isaac]")
+pytest.importorskip("mharmony", reason="install lerobot[perceptron_isaac]")
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
@@ -39,7 +43,7 @@ def _config() -> PerceptronIsaacConfig:
 def _policy_with_tiny_model() -> PerceptronIsaacPolicy:
     policy = PerceptronIsaacPolicy(_config())
     policy._isaac_model = TinyIsaacModel()
-    policy._configure_training_parameters = lambda: None
+    policy._training_parameters_configured = True
     return policy
 
 

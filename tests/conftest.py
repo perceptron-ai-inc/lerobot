@@ -35,6 +35,7 @@ _draccus_docstring.get_attribute_docstring = functools.cache(_draccus_docstring.
 # Fixtures that depend on optional packages are only registered when those packages are available,
 # so that tests can be collected and run even with a minimal install.
 pytest_plugins = [
+    "tests.fixtures.cadence",
     "tests.fixtures.optimizers",
 ]
 
@@ -112,23 +113,3 @@ def assert_contract_is_typed(features: dict[PipelineFeatureType, dict[str, Polic
     assert all(isinstance(v, dict) for v in features.values())
     assert all(all(isinstance(nk, str) for nk in v) for v in features.values())
     assert all(all(isinstance(nv, PolicyFeature) for nv in v.values()) for v in features.values())
-
-
-@pytest.fixture(
-    params=(
-        {"output_width": 64},
-        {"output_height": 48},
-        {"output_width": 0, "output_height": 48},
-        {"output_width": -1, "output_height": 48},
-        {"output_resize_mode": "letterbox"},
-        {"output_width": 64, "output_height": 48, "output_resize_mode": "crop"},
-    )
-)
-def assert_invalid_output_resize_config(request):
-    """Assert the backend-neutral output resize contract for a config factory."""
-
-    def assert_invalid(make_config):
-        with pytest.raises(ValueError, match="output_width|output_resize_mode"):
-            make_config(**request.param)
-
-    return assert_invalid

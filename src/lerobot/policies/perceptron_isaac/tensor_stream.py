@@ -1,7 +1,6 @@
 # ruff: noqa
 from __future__ import annotations
 
-import heapq
 import math
 from collections import defaultdict
 from collections.abc import Callable, Hashable
@@ -9,7 +8,6 @@ from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from typing import (
     Any,
-    TypeAlias,
     TypeVar,
 )
 
@@ -131,18 +129,8 @@ class VectorType(ModalityType):
 
 
 # maps idx -> type (sorted by value to maintain ALL_TYPES[t.value] == t invariant)
-ALL_TYPES = sorted(
-    [
-        tp
-        for types in [
-            list(VisionType),
-            list(AudioType),
-            list(SyntheticType),
-            list(TextType),
-            list(VectorType),
-        ]
-        for tp in types
-    ],
+ALL_TYPES: list[ModalityType] = sorted(
+    [*VisionType, *AudioType, *SyntheticType, *TextType, *VectorType],
     key=lambda t: t.value,
 )
 assert all(ALL_TYPES[t.value] == t for t in ALL_TYPES), "ALL_TYPES must preserve enum value -> type lookup"
@@ -156,7 +144,6 @@ def _prod_dims(dims: list[int]) -> int:
 
 
 _LONG_TOKEN_MODALITIES = frozenset({TextType, SyntheticType})
-_BULK_LONG_TRANSFER_MIN_TENSORS = 4
 
 
 # @dataclass
@@ -444,7 +431,7 @@ class Stream:
                 setattr(new_ev, k, v)
             mapped.append(new_ev)
 
-        return create_stream(mapped, priority=self.priority, schedule=False)
+        return create_stream(mapped, priority=self.priority)
 
     @record_function("Stream.compact")
     def compact(self) -> torch.Tensor:
@@ -458,7 +445,7 @@ class Stream:
 
     def shallow_copy(self) -> Stream:
         events_copy = [ev.shallow_copy() for ev in self.events]
-        return create_stream(events=events_copy, priority=self.priority, schedule=False)
+        return create_stream(events=events_copy, priority=self.priority)
 
     def __hash__(self) -> int:
         """Hash Stream based on structure."""
@@ -486,8 +473,30 @@ class Stream:
 class TensorStream:
     streams: list[Stream]
     _device: torch.device | None = None
+    # A finite collective-only payload is not real supervision or router traffic.
+    collective_only: bool = False
+
+    @classmethod
+    def collective_dummy(cls) -> TensorStream:
+        event = Event.from_text_tokens(
+            torch.zeros(2, dtype=torch.long), time=(0.0, 0.0), type=TextType.text, role="user"
+        )
+        return cls([create_stream([event], list(TextType))], collective_only=True)
 
     def __post_init__(self):
+        if self.collective_only:
+            # The empty contribution cannot be used to hide real supervision or padding.
+            if len(self.streams) != 1 or len(self.streams[0].events) != 1:
+                raise ValueError("ISAAC collective-only stream must contain one finite sentinel event.")
+            sentinel = self.streams[0].events[0]
+            if (
+                sentinel.type != TextType.text
+                or sentinel.role != "user"
+                or tuple(sentinel.data.shape) != (2, 1)
+                or bool(sentinel.data.ne(0).any())
+                or sentinel.tags
+            ):
+                raise ValueError("ISAAC collective-only stream cannot contain real supervision.")
         for stream in self.streams:
             for event in stream.events:
                 assert isinstance(event.data, torch.Tensor)
@@ -507,67 +516,15 @@ class TensorStream:
 
     def flat_stream(self) -> Stream:
         if not self.streams:
-            return create_stream([], priority=[], schedule=False)
+            return create_stream([], priority=[])
         return create_stream(
             [event for stream in self.streams for event in stream],
             priority=self.streams[0].priority,
-            schedule=False,
         )
 
     @property
     def device(self):
         return self._device
-
-    def _bulk_move_long_token_events(
-        self,
-        *,
-        target_device: torch.device,
-        non_blocking: bool,
-    ) -> set[int]:
-        if target_device.type != "cuda":
-            return set()
-
-        long_token_events: list[Event] = []
-        total_numel = 0
-        for stream in self.streams:
-            for ev in stream:
-                if (
-                    ev.type.modality in _LONG_TOKEN_MODALITIES
-                    and isinstance(ev.data, torch.Tensor)
-                    and ev.data.device.type == "cpu"
-                    and ev.data.ndim == 1
-                    and ev.data.is_contiguous()
-                ):
-                    long_token_events.append(ev)
-                    total_numel += ev.data.numel()
-
-        if len(long_token_events) < _BULK_LONG_TRANSFER_MIN_TENSORS or total_numel == 0:
-            return set()
-
-        # Many tiny token copies show up as TensorStream.to overhead in steady-state
-        # profiling. Flattening only the 1D long-token case keeps semantics unchanged
-        # while collapsing those H2D copies into one pinned transfer.
-        flat_cpu = torch.empty(total_numel, dtype=torch.long, pin_memory=True)
-        offset = 0
-        lengths: list[int] = []
-        original_shapes: list[torch.Size] = []
-        for ev in long_token_events:
-            length = ev.data.numel()
-            flat_cpu[offset : offset + length].copy_(ev.data.reshape(-1))
-            lengths.append(length)
-            original_shapes.append(ev.data.shape)
-            offset += length
-
-        flat_gpu = flat_cpu.to(device=target_device, non_blocking=non_blocking)
-
-        moved_event_ids: set[int] = set()
-        offset = 0
-        for ev, length, original_shape in zip(long_token_events, lengths, original_shapes, strict=False):
-            ev.data = flat_gpu.narrow(0, offset, length).view(original_shape)
-            moved_event_ids.add(id(ev))
-            offset += length
-
-        return moved_event_ids
 
     @property
     def shape(self):
@@ -600,16 +557,8 @@ class TensorStream:
         dtype unless an explicit *dtype* argument is supplied.
         """
         target_device = torch.device(device)
-        bulk_moved_event_ids = self._bulk_move_long_token_events(
-            target_device=target_device,
-            non_blocking=non_blocking,
-        )
-
         for stream in self.streams:
             for ev in stream:
-                if id(ev) in bulk_moved_event_ids:
-                    continue
-
                 # ------------------------------------------------------------------
                 # Decide the dtype for *this* event.
                 # ------------------------------------------------------------------
@@ -699,26 +648,9 @@ class TensorStream:
         )
 
 
-def _schedule_stream(stream: Stream) -> Stream:
+def create_stream(events: list[Event], priority: list[ModalityType]) -> Stream:
     """
-    Internal function that reorders (schedules) the events in a Stream
-    based on the stream's priority.
-
-    By default, this calls schedule_events(...) and reorders the events accordingly.
-    The new ordering is assigned in-place to stream.events.
-
-    Example usage (indirect):
-        new_stream = _schedule_stream(old_stream)
-    """
-    scheduled_inds = schedule_events(stream, priority=stream.priority)
-    stream.events = [stream.events[i] for i in scheduled_inds]
-    return stream
-
-
-def create_stream(events: list[Event], priority: list[ModalityType], schedule: bool = True) -> Stream:
-    """
-    Creates a new Stream with the given events and priority.
-    If 'schedule' is True, the events are reordered by calling _schedule_stream.
+    Create a Stream in the supplied event order with the given priority metadata.
 
     The events list is shallow-copied so that the returned Stream owns its
     own events container. Without this, downstream code that appends to
@@ -729,14 +661,10 @@ def create_stream(events: list[Event], priority: list[ModalityType], schedule: b
         evt1 = Event(torch.zeros(10), AudioType.waveform, (0.0, 1.0))
         evt2 = Event(torch.ones(10), AudioType.waveform, (1.0, 2.0))
         my_stream = create_stream(events=[evt1, evt2],
-                                  priority=[AudioType.waveform],
-                                  schedule=False)
+                                  priority=[AudioType.waveform])
         print(my_stream)
     """
-    stream = Stream(list(events), priority)
-    if schedule:
-        stream = _schedule_stream(stream)
-    return stream
+    return Stream(list(events), priority)
 
 
 GroupKeyT = TypeVar("GroupKeyT", bound=Hashable)
@@ -745,7 +673,6 @@ GroupKeyT = TypeVar("GroupKeyT", bound=Hashable)
 def group_streams(
     stream: Stream,
     group_fn: Callable[[Event], GroupKeyT],
-    schedule=True,
 ) -> dict[GroupKeyT, Stream]:
     """
     Splits a single Stream into multiple sub-Streams, grouped by the output of group_fn(event).
@@ -757,7 +684,7 @@ def group_streams(
 
     Returns:
         A dictionary mapping each group key to a Stream of events belonging to that group.
-        If 'schedule' is True, each sub-Stream is scheduled via create_stream(..., schedule=True).
+        Each group preserves the supplied event order and owns its event list.
 
     Example usage:
         substreams = group_streams(my_stream, lambda ev: ev.type)
@@ -766,101 +693,4 @@ def group_streams(
     for ev in stream:
         group = group_fn(ev)
         split_streams[group].append(ev)
-    for g, events in split_streams.items():
-        split_streams[g] = create_stream(events, stream.priority, schedule=schedule)
-    return dict(split_streams)  # type: ignore[no-matching-overload]
-
-
-# Define Category for clarity
-Category: TypeAlias = Any
-
-
-def schedule_events(stream: Stream, priority: list[Category]) -> list[int]:
-    """
-    Schedule events based on their start time and priority using a topological sort algorithm.
-
-    The priority list defines the ordering of categories.
-
-    This function:
-      1. Pairs each event with its original index.
-      2. Sorts events by start time.
-      3. Builds a dependency graph based on overlapping events.
-      4. Uses a heap to perform a deterministic topological sort with tie-breakers.
-
-    Raises:
-        ValueError: If a cycle is detected in the events (i.e., no valid ordering exists).
-
-    Returns:
-        List[int]: A list of original indices representing the scheduled order of events.
-    """
-    priority_index: dict[Category, int] = {category: idx for idx, category in enumerate(priority)}
-
-    # Pair each event metadata with its original index
-    events = []
-    for i, event in enumerate(stream.events):
-        events.append(
-            (
-                i,
-                event.time[0],
-                event.time[1],
-                event.type,
-            )
-        )
-
-    sorted_events = sorted(events, key=lambda e: e[1])  # sort by start time
-    num_events = len(sorted_events)
-
-    # Build dependency graph
-    graph = defaultdict(set)
-    indegree = {i: 0 for i in range(num_events)}
-
-    for i in range(num_events):
-        idx_i, start_i, end_i, category_i = sorted_events[i]
-        prio_i = priority_index[category_i]
-        for j in range(i + 1, num_events):
-            idx_j, start_j, end_j, category_j = sorted_events[j]
-            if start_j >= end_i:
-                break
-            if end_i > start_j and end_j > start_i:
-                prio_j = priority_index[category_j]
-                if prio_i < prio_j:
-                    graph[i].add(j)
-                    indegree[j] += 1
-                elif prio_i > prio_j:
-                    graph[j].add(i)
-                    indegree[i] += 1
-
-    # Use heap for deterministic tie-breakers: (start_time, priority, original_index)
-    heap = [
-        (
-            sorted_events[i][1],
-            priority_index[sorted_events[i][3]],
-            sorted_events[i][0],
-            i,
-        )
-        for i in range(num_events)
-        if indegree[i] == 0
-    ]
-    heapq.heapify(heap)
-    resolved_order = []
-
-    while heap:
-        _, _, _, u = heapq.heappop(heap)
-        resolved_order.append(u)
-        for v in graph[u]:
-            indegree[v] -= 1
-            if indegree[v] == 0:
-                heapq.heappush(
-                    heap,
-                    (
-                        sorted_events[v][1],
-                        priority_index[sorted_events[v][3]],
-                        sorted_events[v][0],
-                        v,
-                    ),
-                )
-
-    if len(resolved_order) != num_events:
-        raise ValueError("Cycle detected in events, cannot resolve order")
-
-    return [sorted_events[i][0] for i in resolved_order]
+    return {group: create_stream(events, stream.priority) for group, events in split_streams.items()}

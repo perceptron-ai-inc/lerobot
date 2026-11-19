@@ -1,0 +1,11 @@
+# ISAAC-only Linux x86_64 / H100 profile. Not a generic LeRobot lock.
+# Install with the cu128 wheel index; see the policy README.
+# Historical receipts prove Torch/torchvision/CUDA, not a complete pip freeze.
+# Other pins match the qualified offline CPU environment; mharmony's git revision is in pyproject.toml.
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+accelerate==1.15.0
+transformers==5.5.4
+mharmony==0.1.0
+safetensors==0.8.0
+tokenizers==0.22.2

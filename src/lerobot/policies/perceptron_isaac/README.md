@@ -1,277 +1,141 @@
-# Perceptron ISAAC
+# Perceptron ISAAC native runtime (draft)
 
-`policy.type=perceptron_isaac` is a first-class LeRobot v0.6 policy for ISAAC
-Qwen3.5-VLA flow-matching checkpoints. Inference, finetuning, LIBERO eval, and
-local robot rollout use the normal LeRobot policy and processor APIs. There is
-no Genesis inference server and no ISAAC branch in LeRobot's policy factory,
-training loop, eval loop, or rollout dispatcher.
+In-tree `perceptron_isaac` policy and processors for preconverted native MK1
+and Isaac-0.5 packages. The offline checkpoint producer is not included.
+Generic Qwen checkpoint packages, PEFT, expert-only training and FSDP1 training
+are unsupported and fail explicitly. Developer parity artifact tooling is not included.
 
-MolmoAct2 is outside this integration.
+## Scoped installation
 
-## Native surface
+Use a fresh, dedicated Python >=3.12 environment on Linux x86_64. From this
+checkout, use the ISAAC constraints instead of generic `uv sync --locked`:
 
-- `PerceptronIsaacConfig`, `PerceptronIsaacPolicy`, and convention-discovered
-  pre/postprocessor factories.
-- Local Qwen3.5-VLA backbone and action expert inference.
-- Native NTP, FAST, and flow-matching training loss. Training fixtures can
-  inject the sampled flow timesteps, noise, and loss mask directly.
-- Policy-owned online observation history and episode-relative frame clock.
-  Processors are stateless and never synthesize or retain model time.
-- Authenticated one-time checkpoint import, including streamed shard
-  conversion, one-time RMSNorm correction, inline processor state, and a
-  hash-pinned FAST processor artifact.
-- `lerobot-eval` for LIBERO and synchronous `lerobot-rollout` for SO100,
-  SO101, and bimanual YAM.
-- A strict Genesis MDS v2 to `LeRobotDataset` converter for preserved YAM data.
-- Self-authenticating inference/training parity artifacts with exact fixture
-  checks and tolerance-based numerical/gradient checks.
-
-## External package boundary
-
-mharmony and TensorStream are maintained and released separately and are not
-vendored into LeRobot. Their publishable runtime packages are not yet declared
-by the `perceptron_isaac` extra, so a clean install is not currently sufficient
-for rendering, training, or inference. Genesis is intended to remain an
-export-time checkpoint source rather than the long-term runtime dependency.
-
-A sibling checkout, custom `PYTHONPATH`, or direct import from
-`genesis.data.mharmony` is a release blocker. The package boundary and pinned
-versions are recorded in
-[`docs/PERCEPTRON_ISAAC_PROVENANCE.md`](../../../../docs/PERCEPTRON_ISAAC_PROVENANCE.md).
-
-## Install
-
-From this repository:
-
-```bash
-uv sync --locked --extra perceptron_isaac
-uv run python -c "from lerobot.policies.perceptron_isaac import PerceptronIsaacPolicy"
+```sh
+python -m pip install -c constraints/perceptron_isaac-cu128.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
+  '.[training,perceptron_isaac]'
 ```
 
-The base extra installs the currently declared model dependencies and supports
-CPU development and dependency-independent tests. The mharmony availability
-smoke remains gated until its external runtime package is publishable and pinned.
-Production NVIDIA inference will additionally require the CUDA kernels:
+Equivalent uv pip installation (in the dedicated activated environment):
 
-```bash
-uv sync --locked --extra perceptron_isaac_cuda
+```sh
+uv pip install -c constraints/perceptron_isaac-cu128.txt \
+  --index https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match \
+  '.[training,perceptron_isaac]'
 ```
 
-The CUDA extra currently targets Linux; it includes `perceptron_isaac` and adds
-`flash-linear-attention==0.4.1` plus `causal-conv1d==1.6.0`.
+These select Torch 2.10.0+cu128, torchvision 0.25.0+cu128, Accelerate 1.15.0,
+Transformers 5.5.4 and immutable mharmony 0.1.0 source. Access to the mharmony
+Git repository is required. No flash-attn or kernels extra is required.
+The generic upstream lock remains unchanged and does not qualify this extra.
+ISAAC CI uses a separate `.venv-isaac` environment and these constraints, not the
+generic lock. It checks the Torch/torchvision/CUDA build versions even in CPU tests.
+Clean noneditable installation on this new upstream base remains a merge gate.
 
-MK1 Fast production inference has a dedicated, narrower qualified runtime:
-PyTorch `2.10.0+cu128`, Transformers `5.5.4`, the `torch_sdpa_v1` attention
-backend, and an NVIDIA H100. The project-default PyTorch 2.11 environment is
-useful for CPU development, neutral-debug packages, and explicitly reduced test
-fixtures, but it is not the v12 action-parity runtime. A full `trained_policy`
-checkpoint loaded onto CUDA fails before tensor streaming or model allocation
-unless PyTorch reports the exact 2.10.0 release and CUDA 12.8. Provision that
-ABI in the deployment environment in addition to installing
-`perceptron_isaac_cuda`; the CUDA extra does not override the repository-wide
-PyTorch selection.
+Historical execution records directly establish Torch 2.10.0+cu128,
+torchvision 0.25.0+cu128 and CUDA 12.8, with mharmony named in configuration.
+They do not provide a complete historical pip freeze. The current offline CPU
+environment uses Python 3.12.7, Transformers 5.5.4, mharmony 0.1.0,
+tokenizers 0.22.2 and Accelerate 1.15.0. The SDK source remains pinned to
+`9a57efbf8ada2d73641fc40081f4e4fa6ff2ab92`; CPU checks are not new GPU qualification.
 
-Once the external package boundary is complete, this command must install every
-runtime dependency from the lockfile. Developer checkouts and untracked local
-wheels are not supported installation steps.
+## Preconverted package and training entry point
 
-For bimanual YAM support on Linux:
-
-```bash
-uv sync --locked --extra perceptron_isaac --extra yam --group yam-hardware
-```
-
-The `yam` extra installs the published Portal dependency; the development-only
-`yam-hardware` group pins the reviewed i2rt revision because PyPI metadata cannot
-carry that direct Git dependency. `uv.lock` also constrains the
-scikit-build-core version required by i2rt's pinned ruckig build.
-
-## Import a checkpoint once
-
-Raw converted HF exports are not deployable. A deployable directory is created
-only after the three Genesis contract JSONs have been checked against the
-converter-emitted `policy_state_identity.safetensors` sidecar or the DCP-owned
-identity tensor.
-
-The two are not equally strong, and the recorded provenance says which was used:
-
-- **`dcp_authenticated`** — checked against the DCP checkpoint's own identity
-  tensor, which the HF export cannot forge. Note that supplying
-  `--dcp-checkpoint` unpickles that checkpoint's metadata before anything is
-  compared, so point it only at your own training output.
-- **`hf_identity_authenticated`** — sidecar only. The sidecar ships in the same
-  directory as the JSONs it binds and its payload is exactly
-  `build_dcp_identity()` of those JSONs, so anyone who can write the export can
-  regenerate a passing sidecar. This proves internal consistency, not provenance.
-
-Model weights are not covered by either check: the import binds the contract
-JSONs and detects mid-import mutation of the shards, but nothing compares the
-weights against an external source-of-truth digest.
-
-```bash
-uv run lerobot-isaac-import \
-  --hf-export /path/to/raw-hf-export \
-  --deployment-adapter /path/to/isaac_deployment_adapter.json \
-  --output /path/to/isaac-lerobot-package \
-  --policy-state-dataset cloud/isaac_yam \
-  --normalization-scope yam \
-  --allow-fast-remote-code
-```
-
-Pass `--dcp-checkpoint /path/to/dcp-checkpoint` as an optional independent
-cross-check. If both identity sources are present, the importer requires both
-to match the contract JSONs exactly.
-
-The importer validates the complete nested Genesis schemas and the separately
-reviewed deployment adapter, which is bound to the exact three contract-file
-hashes. It then streams model shards, applies the Qwen3.5 RMSNorm correction
-once, copies immutable model/tokenizer assets, records provenance, and saves
-portable LeRobot processor pipelines. Imported packages disable camera fallback
-and carry strict state, action, camera, FPS, safety, joint-frame, and
-normalization-profile metadata.
-
-The checkpoint is the source of truth for policy semantics. Published packages
-must include their immutable source revision, contract hashes, selected
-normalization scope, and reproducible validation results in the model card.
-
-## LIBERO
-
-Install both the policy and simulator extras on Linux:
-
-```bash
-uv sync --locked --extra perceptron_isaac --extra libero
-```
-
-An imported LIBERO package is evaluated through the standard command:
-
-```bash
-uv run lerobot-eval \
-  --policy.path=/path/to/isaac-lerobot-package \
-  --policy.device=cuda:0 \
-  --env.type=libero \
-  --env.task=libero_spatial \
-  --eval.batch_size=1 \
-  --eval.n_episodes=20 \
-  --seed=0 \
-  --output_dir=/tmp/isaac-libero-spatial
-```
-
-Before any environment is created, LIBERO adopts the package's target FPS,
-256×256 image geometry, and ordered camera mapping. An explicitly supplied
-conflicting FPS, resolution, camera mapping, or camera order is rejected, whether
-it was passed on the command line or set in a `--config_path` YAML. Simulator
-control frequency and policy frame time therefore use the same checkpoint-owned
-rate.
-
-ISAAC online inference currently supports one environment per policy instance.
-The evaluator caps its auto-selected batch size to one; an explicit
-`--eval.batch_size` greater than one is rejected before environment creation.
-
-## Finetuning
-
-Use the imported policy and normal v0.6 trainer:
-
-```bash
-uv run lerobot-train \
-  --policy.path=/path/to/isaac-lerobot-package \
-  --dataset.repo_id=local/isaac_yam \
-  --dataset.root=/path/to/lerobot-dataset \
-  --batch_size=1 \
-  --gradient_accumulation_steps=8 \
-  --steps=1000 \
-  --output_dir=outputs/train/isaac-yam
-```
-
-The trainer uses generic Accelerator accumulation and records accumulation,
-world-size, and effective-batch metadata for sample-correct resume. The native
-policy owns the joint objective; the shared trainer contains no ISAAC loss
-branch.
-
-Training batches must include episode-relative dataset timestamps. Flow parity
-must pass explicit `[K,N,H,1]` timesteps and `[K,N,H,A]` noise tensors rather
-than relying on matching RNG consumption order.
-
-## Convert preserved YAM MDS data
-
-```bash
-uv run lerobot-isaac-convert-mds \
-  --shard /path/to/shard.00000.mds \
-  --output-root /path/to/isaac-yam-lerobot \
-  --repo-id local/isaac_yam \
-  --fps 30
-```
-
-The converter validates the exact Genesis MDS v2 schema, three-camera
-`top,left,right` order, canonical left-then-right 14D joint/gripper order,
-finite vectors, timestamps, video lengths, and FPS. It writes atomically and
-records source shard hashes. Dataset quantile verification records every
-5,000-bin initial/rebin grid and enforces the per-dimension budget
-`E_lerobot + E_source + 1e-6`. Model normalization remains the imported
-checkpoint's canonical q01/q99 profile and preserves the ISAAC min/max-fallback
-and identity-mask semantics.
-
-## Parity artifacts
-
-Compare an immutable Genesis oracle artifact with a native artifact:
-
-```bash
-uv run lerobot-isaac-parity \
-  --reference /path/to/genesis-oracle \
-  --candidate /path/to/native-result \
-  --report /tmp/isaac-parity-report.json
-```
-
-Sampled timesteps, noise, and optional loss masks are exact inputs. Losses use
-`1e-6 + 1e-5*abs(reference)`. Selected gradients require cosine similarity of
-at least `0.9999`, relative L2 error at most `1e-3`, and the declared zero-norm
-policy. The reference artifact owns the acceptance policy; a candidate cannot
-relax it.
-
-Native training follows Genesis's terminality rule for the supervised assistant
-footer: a chunk whose last action step is the trajectory's terminal step keeps
-`<|end|>`, and every non-terminal chunk is supervised with `<|return|>`. Genesis's
-LeRobot-native builder emits a window that never reaches the terminal step, so
-non-terminal is the default. Online inference keeps the post-action `<|return|>`
-footer.
-
-## SO100 and SO101
-
-Older checkpoints trained in the pre-v0.5 joint convention must serialize the
-following processor fields in their package config:
+The qualified package is already published; do not run a converter:
 
 ```text
-joint_signs   = [1, -1, 1, 1, 1, 1]
-joint_offsets = [0, 90, 90, 0, 0, 0]
+s3://perceptron-checkpoints/phil/isaac_0_5-step-100000-fp32-native-lerobot-vocabfix-113238
+69 files; 142,967,074,649 bytes
+SHA256SUMS: 85d9743e3f46d19cd5291a00607cfe0abc54eb56d1a40a4fbcd20493e293cc9b
 ```
 
-The input step applies `q_model = signs*q_lerobot + offsets` before rendering;
-the output step applies the exact inverse after unnormalization. Signs are
-restricted to `+1/-1`, offsets must be finite, and the transform cannot exceed
-the state/action width. Normally calibrate the arm using current LeRobot; do
-not encode the old convention into calibration.
+Stage that complete package without changing its layout or authenticated assets.
+Set `NATIVE_POLICY_DIR` to its `lerobot_policy` directory, `DATASET_REPO_ID`
+to a compatible dataset, and `GPUS` to the number of GPUs on the training node.
+Use `torchrun` and set FSDP2 through LeRobot's CLI flags. Set `STEPS` to the
+desired training length and use the same value for the learning-rate decay.
 
-## YAM rollout safety
+```sh
+STEPS=100000
+torchrun --standalone --nproc_per_node="$GPUS" -m lerobot.scripts.lerobot_train \
+  --policy.path="$NATIVE_POLICY_DIR" --dataset.repo_id="$DATASET_REPO_ID" \
+  --steps="$STEPS" --policy.max_train_steps="$STEPS" \
+  --dataset.video_backend=pyav --policy.train_storage_fp32=true \
+  --policy.train_expert_only=false --policy.use_peft=false \
+  --parallelism.dp_shard=-1 --accelerator.mixed_precision=bf16 \
+  --accelerator.fsdp.reduce_dtype=float32 --accelerator.gradient_accumulation.steps=1 \
+  --policy.push_to_hub=false --save_checkpoint=false --save_checkpoint_to_hub=false \
+  --env_eval_freq=0 --eval_steps=0
+```
 
-`bi_yam_follower_guarded` uses two local guarded Portal processes and exposes exactly
-14 positions in this order: left joints 0–5, left gripper, right joints 0–5,
-right gripper. `bi_yam_leader` is read-only.
+Native FP32 initialization requires training, F32 package storage, live FSDP2,
+FP32 master storage, no PEFT and no expert-only training. It fails closed on
+unsupported private Torch interfaces, missing/root-uncovered trainables or
+non-FP32 masters. Other load paths retain BF16 behavior. Production MK1's
+qualified hardware/ABI is H100 SM90 / CUDA 12.8. Budget for the 143 GB package,
+full model host materialization and optimizer state; the mechanics proof used
+16 H100s over two hosts, not a laptop or single-GPU recipe.
 
-The default YAM configuration is torque-off. Rollout loads and validates the
-policy, processors, strict feature contract, CUDA device lock, and warm
-predictions before connecting. Prediction-only mode still runs the complete
-observation/policy/postprocessor path but never calls `send_action`.
+## Observation conditioning
 
-Motion requires all of the following explicit, independently checked inputs:
+Historical executed-action conditioning is unsupported in training and inference.
+Legacy policy configs, saved processors and render metadata with
+`action_conditioning=true` fail explicitly; use `false`. There is no executed-action
+recorder lifecycle. Visual history, last-state proprio, mistake conditioning and
+FAST action targets/codecs remain supported.
 
-- fresh supervisor readiness bound to the exact Portal processes and CAN
-  interfaces;
-- live CAN feedback and compatible guarded RPC schemas;
-- fresh monotonic observations and timeout-bounded RPCs;
-- `torque_enabled=true`, `execute_actions=true`, and explicit per-joint delta
-  caps for both arms;
-- an authenticated package with a closed-loop-safe normalization profile.
+Online evaluation retains each environment's image/state history and returns
+`[B, D]` actions from `[B, H, D]` model chunks. Vector environments share the
+rollout clock and synchronized chunk refills. The maintained evaluation loop
+freezes completed environments and resets the entire group between rollouts;
+`policy.reset()` clears queued actions and observation histories together.
+Changing the live batch size requires that global reset. Settling emits one idle
+row per environment without adding frames to model history or time.
 
-Both 7D targets are validated before either arm is commanded. Any validation,
-RPC, acknowledgement, bounds, or watchdog failure requests zero torque on both
-arms. A public model release must document live hardware acceptance separately
-from offline software tests.
+## Training objective and retired RTC
+
+Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
+`action-noise`. Flow first averages valid weighted elements within each draw,
+then draws within each chunk, then chunks equally. Text remains token-normalized.
+Each forward normalizes text tokens and Flow chunks across data-parallel ranks,
+including unequal local counts after filtering. ISAAC gradient accumulation is
+unsupported: set `accelerator.gradient_accumulation.steps=1`. The standard config
+preflight rejects larger values before allocating the model or engine. Other
+policies retain LeRobot's native gradient accumulation. There is no custom
+prepared-window staging or partial-window checkpoint/replay path.
+
+`moe_auxiliary_losses.py` materializes global logical dispatch counts and router
+probabilities for each layer. Balance (0.02) and router z-loss (0.001) average
+across layers, independently of the LM softmax penalty (0.0001). Every forwarded
+position participates, including padding remaining after NTP truncation.
+
+Training load intent and one-time training setup recompute nonpersistent text
+RoPE frequencies in F32 from the original formula, including BF16-source training.
+They do not replace parameters or widen a rounded BF16 table. Inference retains
+the released BF16 frequency table and phase behavior.
+
+RTC execution, prefix pinning and dual-time conditioning are retired. Legacy
+RTC-off settings remain readable. Released RTC-capable source metadata and
+weights remain authenticated and unchanged; source recipe values do not enable
+RTC at runtime. Enabled requests fail before sampling or changing rollout clocks.
+
+## Evidence and limits
+
+Job 113283 proved two dense FP32-master FSDP2 steps with all 35,723,506,864
+parameters learnable. All 16 ranks recorded before/after same-PID standard-CLI
+execution with the importer absent/unfindable/unloaded and no outside LeRobot
+modules. That proof was on HF base `8c920c4` plus runtime `9c315c1` and CUT
+`ac7c0ec74a19811cc939e99b1fe51bc77437e7e37350936e9d3f30c52f497dd1`,
+not this updated HF base `ae2b57f`.
+
+Raw/portable-export saving is deferred and fails before gathering weights or writing
+package assets. Source-bound native MK1 saves remain implemented. Focused CPU tests
+cover reduced native save/finalize/moved reload, exact FP32 values and signed zero;
+that is not production-scale checkpoint qualification.
+
+This draft does not claim current-base multi-GPU qualification, production-scale
+save/reload/move, evaluation, convergence or model quality. Keep saving, evaluation
+and Hub publishing disabled for the published raw export. The existing checkpoint vocabulary loader
+sets process-global `QWEN35_VOCAB_PATH`; do not interleave different package
+owners in one process. Instance-bound vocabulary requires a separately reviewed
+public mharmony API change; strict vocabulary authentication is not relaxed here.

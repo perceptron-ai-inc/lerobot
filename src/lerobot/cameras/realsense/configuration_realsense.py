@@ -14,7 +14,7 @@
 
 from dataclasses import dataclass
 
-from ..configs import CameraConfig, ColorMode, Cv2Rotation, OutputResizeMode
+from ..configs import CameraConfig, ColorMode, Cv2Rotation
 
 
 @CameraConfig.register_subclass("intelrealsense")
@@ -46,9 +46,6 @@ class RealSenseCameraConfig(CameraConfig):
         use_depth: Whether to enable depth stream. Defaults to False.
         rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
         warmup_s: Time reading frames before returning from connect (in seconds)
-        startup_timeout_s: Maximum wait for the first frame. RealSense devices on
-            constrained USB links may need substantially longer than their later
-            per-frame interval.
         exposure: Manual exposure value for the color sensor. When set, auto-exposure is
             disabled and this fixed value is used. Valid ranges are camera-model specific
             and reported if the value is rejected. Defaults to None (leave unchanged).
@@ -60,12 +57,6 @@ class RealSenseCameraConfig(CameraConfig):
             white balance is disabled and this fixed value is used. Valid ranges are
             camera-model specific and reported if the value is rejected. Defaults to None
             (leave unchanged).
-        output_width: Optional width returned by the camera after capture and rotation.
-            This does not change the sensor mode requested by ``width``/``height``.
-        output_height: Optional height returned by the camera after capture and rotation.
-            Must be set together with ``output_width``.
-        output_resize_mode: ``stretch`` matches the target dimensions directly; ``letterbox``
-            preserves aspect ratio and center-pads with black.
 
     Note:
         - Either name or serial_number must be specified.
@@ -81,22 +72,13 @@ class RealSenseCameraConfig(CameraConfig):
     use_depth: bool = False
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
-    startup_timeout_s: float = 10.0
     exposure: int | None = None
     gain: int | None = None
     white_balance: int | None = None
-    output_width: int | None = None
-    output_height: int | None = None
-    output_resize_mode: OutputResizeMode = OutputResizeMode.STRETCH
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
         self.rotation = Cv2Rotation(self.rotation)
-        self.output_resize_mode = OutputResizeMode(self.output_resize_mode)
-        self.output_resize_mode.validate_dimensions(self.output_width, self.output_height)
-
-        if self.startup_timeout_s <= 0:
-            raise ValueError("`startup_timeout_s` must be positive.")
 
         if not self.use_rgb and not self.use_depth:
             raise ValueError("At least one of `use_rgb` or `use_depth` must be enabled.")

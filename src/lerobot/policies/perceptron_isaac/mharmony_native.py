@@ -10,19 +10,20 @@ from __future__ import annotations
 import base64
 import io
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 
-from lerobot.policies.processor_utils import coerce_rgb_uint8
-
-from .configuration_perceptron_isaac import PerceptronIsaacConfig
+from .checkpoint_integrity import load_json_object
+from .configuration_perceptron_isaac import PerceptronIsaacConfig, reject_legacy_action_conditioning
 from .fast_processor import encode_fast_action_tokens
 from .isaac_stats import (
     IsaacNormalizationStats,
     load_isaac_stats,
+    normalize_isaac_action_quantiles,
     normalize_isaac_actions,
     normalize_isaac_proprio,
 )
@@ -33,6 +34,7 @@ from .mharmony_adapter import (
     rendered_stream_to_local_tensor_stream,
 )
 from .mharmony_contract import SUPPORTED_MHARMONY_VERSION, normalize_mharmony_version_marker
+from .processor_utils import coerce_rgb_uint8
 
 DEFAULT_LIBERO_ACTION_LAYOUT: tuple[str, ...] = ()
 DEFAULT_LIBERO_CAMERA_VIEWS = ("primary", "wrist")
@@ -42,6 +44,9 @@ DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS = (
         "size": 2048,
     },
 )
+# Genesis names the coordinate block by this exact marker
+# (genesis/data/mharmony/encoding_cache.py::COORD_GROUP_NAME).
+COORD_TOKEN_GROUP_NAME = "coord"  # nosec B105 - reserved-token group label, not a credential
 GENESIS_TEXT_TYPE_TAG = "genesis_text_type"
 GENESIS_TEXT_TYPE_TIMESTAMP = "timestamp"
 GENESIS_TEXT_TYPE_ACTION = "action"
@@ -54,6 +59,14 @@ ACTION_MESSAGE_STOP_TOKEN = "return"  # nosec B105 - harmony control-token name,
 DEFAULT_INFERENCE_FPS = 20.0
 DEFAULT_ANCHOR_TIMESTAMP_SECONDS = 30.0
 QWEN_TIMESTAMP_PRECISION = 2
+
+
+class _ImagePreprocessConfig(TypedDict):
+    patch_size: int
+    max_num_patches: int | None
+    min_num_patches: int | None
+    pixel_shuffle_scale: int
+    temporal_patch_size: int
 
 
 class IsaacActionOutlierError(ValueError):
@@ -97,9 +110,30 @@ class IsaacMharmonyRenderMetadata:
     temporal_patch_size: int = 2
     max_num_patches: int | None = 576
     min_num_patches: int | None = None
+    image_resize_size: list[int] | None = None
     training_proprio_contract: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        reject_legacy_action_conditioning(self.action_conditioning)
+        if self.image_resize_size is not None and (
+            not isinstance(self.image_resize_size, list)
+            or len(self.image_resize_size) != 2
+            or any(
+                isinstance(size, bool) or not isinstance(size, int) or size <= 0
+                for size in self.image_resize_size
+            )
+        ):
+            raise ValueError("ISAAC image_resize_size must contain positive integer height and width.")
+        if self.image_resize_size is not None:
+            height, width = self.image_resize_size
+            factor = self.patch_size * self.pixel_shuffle_scale
+            if factor <= 0 or height % factor or width % factor:
+                raise ValueError("ISAAC fixed image resize must align with the merged patch grid.")
+            patches = height * width // (self.patch_size * self.patch_size)
+            if (self.max_num_patches is not None and patches > self.max_num_patches) or (
+                self.min_num_patches is not None and patches < self.min_num_patches
+            ):
+                raise ValueError("ISAAC fixed image resize conflicts with recipe patch bounds.")
         object.__setattr__(
             self,
             "mharmony_version",
@@ -118,7 +152,13 @@ class IsaacMharmonyRenderMetadata:
             action_dim=int(config.action_dim),
             proprio_dim=int(config.proprio_dim),
             vector_max_states=int(config.vector_max_states),
-            target_fps=float(stats_fps) if stats_fps is not None else DEFAULT_INFERENCE_FPS,
+            target_fps=(
+                float(stats_fps)
+                if stats_fps is not None
+                else float(config.target_fps)
+                if config.target_fps is not None
+                else DEFAULT_INFERENCE_FPS
+            ),
             dataset_name=str(config.dataset_name),
             robot_type=str(config.robot_type),
             include_scene_description=bool(config.include_scene_description),
@@ -146,7 +186,22 @@ class IsaacMharmonyRenderMetadata:
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def validate_image_preprocess_for_config(self, config: PerceptronIsaacConfig) -> None:
+        """Reject explicit runtime overrides of the checkpoint's image preprocessing recipe."""
+        for name, actual, expected in (
+            ("patch_size", config.render_patch_size, self.patch_size),
+            ("pixel_shuffle_scale", config.render_pixel_shuffle_scale, self.pixel_shuffle_scale),
+            ("temporal_patch_size", config.render_temporal_patch_size, self.temporal_patch_size),
+            ("max_num_patches", config.render_max_num_patches, self.max_num_patches),
+            ("min_num_patches", config.render_min_num_patches, self.min_num_patches),
+        ):
+            if actual is not None and actual != expected:
+                raise ValueError(
+                    f"ISAAC runtime image preprocessing {name}={actual} conflicts with recipe {expected}."
+                )
+
     def validate_for_config(self, config: PerceptronIsaacConfig) -> None:
+        self.validate_image_preprocess_for_config(config)
         if self.schema != "perceptron_isaac_mharmony_render_v1":
             raise ValueError(f"Unsupported Isaac mharmony metadata schema {self.schema!r}.")
         if tuple(self.camera_order) != tuple(config.camera_order):
@@ -176,7 +231,9 @@ class IsaacMharmonyRenderMetadata:
             raise ValueError(
                 "Isaac mharmony metadata requires robot_type for the robotics configuration block."
             )
-        if str(self.robot_type) != str(config.robot_type):
+        if str(self.robot_type) != str(config.robot_type) and not _matches_source_bound_libero_prompt(
+            self, config
+        ):
             raise ValueError(
                 f"Isaac mharmony robot_type {self.robot_type!r} does not match config {config.robot_type!r}."
             )
@@ -228,6 +285,66 @@ class IsaacMharmonyRenderMetadata:
                 dataset_name=self.dataset_name,
                 proprio_dim=self.proprio_dim,
             )
+
+
+def _matches_source_bound_libero_prompt(
+    metadata: IsaacMharmonyRenderMetadata, config: PerceptronIsaacConfig
+) -> bool:
+    """Reconcile an admitted source prompt, never weaken the physical LIBERO ABI.
+
+    Artifact admission authenticates the checkpoint-local recipe. This check
+    requires its selected source profile; a bare robot-name alias is insufficient.
+    """
+    if not (
+        config.strict_environment_feature_contract is True
+        and config.robot_type == "libero"
+        and config.control_mode == "ee"
+        and config.dataset_name == "libero"
+        and config.policy_state_dataset == "libero"
+        and metadata.dataset_name == "libero"
+        and metadata.robot_type == "franka"
+        and metadata.control_mode is None
+        and metadata.objective_form == "Flow"
+        and metadata.action_representation == "absolute"
+        and metadata.action_dim == 7
+        and metadata.proprio_dim == 8
+    ):
+        return False
+    if not config.hf_model_path or not config.normalization_profile_scope:
+        return False
+    path = Path(config.hf_model_path) / "policy_inference_recipe.json"
+    if not path.is_file():
+        return False
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict) or not isinstance(raw.get("recipes"), list):
+        raise ValueError("Source-bound LIBERO prompt requires a recipe object/list.")
+    selected = [
+        entry
+        for entry in raw["recipes"]
+        if isinstance(entry, dict)
+        and entry.get("policy_state_dataset") == config.policy_state_dataset
+        and entry.get("normalization_scope") == config.normalization_profile_scope
+        and entry.get("objective") == "Flow"
+    ]
+    if len(selected) != 1:
+        return False
+    profile = selected[0].get("deployment_profile")
+    if not isinstance(profile, dict):
+        return False
+    camera = profile.get("camera")
+    state_action = profile.get("state_action_schema")
+    if not isinstance(camera, dict) or not isinstance(state_action, dict):
+        return False
+    return (
+        profile.get("robot_type") == metadata.robot_type
+        and camera.get("observation_keys") == metadata.camera_order == ["image", "wrist_image"]
+        and camera.get("prompt_views") == metadata.camera_views == ["primary", "wrist"]
+        and state_action.get("name") == "gripper_7"
+        and state_action.get("control_mode") is metadata.control_mode
+        and state_action.get("components")
+        == metadata.action_layout
+        == ["world_vector", "rotation_delta", "gripper_closedness_action"]
+    )
 
 
 def build_isaac_training_proprio_contract(
@@ -394,6 +511,184 @@ def _validate_training_proprio_contract(
         raise ValueError("ISAAC training proprio components must cover the state exactly once.")
 
 
+RECIPE_RESERVED_GROUP_KEYS = frozenset({"name", "offset", "size", "tokenizer"})
+
+
+@dataclass(frozen=True)
+class ReservedTokenGroup:
+    """One mHarmony reserved-token block as a checkpoint's inference recipe declares it.
+
+    ``offset`` is required: mHarmony bump-allocates a group that omits it, so an
+    offset-less group does not name a fixed id range and cannot be checked against a
+    checkpoint's trained layout.
+    """
+
+    name: str | None
+    offset: int
+    size: int
+    tokenizer: str | None
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "offset": self.offset, "size": self.size, "tokenizer": self.tokenizer}
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.size
+
+
+def _recipe_int(group: Mapping[str, Any], key: str, location: str, *, minimum: int) -> int:
+    value = group.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{location}.{key} must be an integer, got {value!r}.")
+    if value < minimum:
+        raise ValueError(f"{location}.{key} must be >= {minimum}, got {value}.")
+    return value
+
+
+def _recipe_optional_string(group: Mapping[str, Any], key: str, location: str) -> str | None:
+    value = group.get(key)
+    if value is None or isinstance(value, str):
+        return value
+    raise ValueError(f"{location}.{key} must be a string or null, got {value!r}.")
+
+
+def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
+    """Read the reserved-token groups a checkpoint's inference recipe declares.
+
+    Every malformed or ambiguous layout raises instead of falling back to a default:
+    a wrong group set is not a cosmetic problem. The config-derived default
+    (``DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS``) carries no coord block and no offset, so
+    mHarmony bump-allocates its FAST pool to id 248087 while an Isaac-0.5 checkpoint is
+    trained with that pool at 249321 -- a 1234-id shift that would silently mis-encode
+    every FAST action token if it were ever used in place of the real declaration.
+
+    Ordering is deliberately not constrained here: mHarmony resolves explicit offsets
+    order-independently, and the shipped export lists its FAST group before its coord
+    group. The checkpoint-range cross-check stays with
+    ``Mk1CheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
+    an artifact independent of this recipe.
+    """
+    return _recipe_reserved_token_groups(load_json_object(path))
+
+
+def _recipe_reserved_token_groups(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    location = "policy_inference_recipe.json"
+    if not isinstance(raw, dict):
+        raise ValueError(f"{location} must be a JSON object, got {type(raw).__name__}.")
+    recipes = raw.get("recipes")
+    if not isinstance(recipes, list) or not recipes or not isinstance(recipes[0], Mapping):
+        raise ValueError(f"{location}.recipes must be a non-empty list of objects.")
+    rendering = recipes[0].get("rendering")
+    if not isinstance(rendering, Mapping):
+        raise ValueError(f"{location}.recipes[0].rendering must be an object.")
+    raw_groups = rendering.get("reserved_token_groups")
+    if not isinstance(raw_groups, list) or not raw_groups:
+        raise ValueError(f"{location}.recipes[0].rendering.reserved_token_groups must be a non-empty list.")
+
+    groups: list[ReservedTokenGroup] = []
+    for index, raw_group in enumerate(raw_groups):
+        group_location = f"{location}.recipes[0].rendering.reserved_token_groups[{index}]"
+        if not isinstance(raw_group, Mapping):
+            raise ValueError(f"{group_location} must be an object.")
+        unknown = sorted(set(raw_group) - RECIPE_RESERVED_GROUP_KEYS)
+        if unknown:
+            raise ValueError(f"{group_location} has unsupported keys {unknown}.")
+        if "offset" not in raw_group:
+            raise ValueError(
+                f"{group_location} must declare an explicit offset; an offset-less group is "
+                "bump-allocated by mHarmony and so names no fixed id range."
+            )
+        groups.append(
+            ReservedTokenGroup(
+                name=_recipe_optional_string(raw_group, "name", group_location),
+                offset=_recipe_int(raw_group, "offset", group_location, minimum=0),
+                size=_recipe_int(raw_group, "size", group_location, minimum=1),
+                tokenizer=_recipe_optional_string(raw_group, "tokenizer", group_location),
+            )
+        )
+
+    coord_groups = [group for group in groups if group.name == COORD_TOKEN_GROUP_NAME]
+    if len(coord_groups) > 1:
+        raise ValueError(
+            f"{location} declares {len(coord_groups)} {COORD_TOKEN_GROUP_NAME!r} reserved-token "
+            "groups; exactly one names the coordinate block."
+        )
+    ordered = sorted(groups, key=lambda group: group.offset)
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        if current.offset < previous.end:
+            raise ValueError(
+                f"{location} reserved-token groups overlap: "
+                f"[{previous.offset}, {previous.end}) and [{current.offset}, {current.end})."
+            )
+    return [group.to_json_dict() for group in groups]
+
+
+def _apply_recipe_image_preprocess(
+    metadata: IsaacMharmonyRenderMetadata, raw: dict[str, Any]
+) -> IsaacMharmonyRenderMetadata:
+    """Consume the supported image recipe at the existing checkpoint admission boundary."""
+    recipes = raw["recipes"]  # Reserved-group parsing has already validated this structure.
+    image = recipes[0].get("image_preprocess")
+    if any(recipe.get("image_preprocess") != image for recipe in recipes):
+        raise ValueError("ISAAC image preprocessing recipes are ambiguous; all recipes must agree.")
+    if image is None:
+        return metadata  # All reserved-pool-only recipes retain the working defaults.
+    # Validate every declaration: JSON numbers such as 16 and 16.0 compare equal
+    # in Python, but only integer fields satisfy the supported recipe schema.
+    parsed = [
+        _parse_recipe_image_preprocess(
+            metadata,
+            recipe["image_preprocess"],
+            location=f"policy_inference_recipe.json.recipes[{index}].image_preprocess",
+        )
+        for index, recipe in enumerate(recipes)
+    ]
+    return parsed[0]
+
+
+def _parse_recipe_image_preprocess(
+    metadata: IsaacMharmonyRenderMetadata, image: object, *, location: str
+) -> IsaacMharmonyRenderMetadata:
+    """Validate one image recipe before deriving its render metadata."""
+    required = {
+        "patch_size",
+        "pixel_shuffle_scale_factor",
+        "temporal_patch_size",
+        "max_num_patches",
+        "min_num_patches",
+    }
+    if (
+        not isinstance(image, dict)
+        or not required <= set(image)
+        or set(image) - required - {"image_resize_size"}
+    ):
+        raise ValueError(f"{location} has unsupported or missing image preprocessing fields.")
+    patch = _recipe_int(image, "patch_size", location, minimum=1)
+    scale = _recipe_int(image, "pixel_shuffle_scale_factor", location, minimum=1)
+    temporal = _recipe_int(image, "temporal_patch_size", location, minimum=1)
+    maximum = (
+        None
+        if image["max_num_patches"] is None
+        else _recipe_int(image, "max_num_patches", location, minimum=1)
+    )
+    minimum = (
+        None
+        if image["min_num_patches"] is None
+        else _recipe_int(image, "min_num_patches", location, minimum=1)
+    )
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError(f"{location} min_num_patches exceeds max_num_patches.")
+    return replace(
+        metadata,
+        patch_size=patch,
+        pixel_shuffle_scale=scale,
+        temporal_patch_size=temporal,
+        max_num_patches=maximum,
+        min_num_patches=minimum,
+        image_resize_size=image.get("image_resize_size"),
+    )
+
+
 def load_native_render_metadata(
     config: PerceptronIsaacConfig, *, stats_fps: float | None = None
 ) -> IsaacMharmonyRenderMetadata:
@@ -401,15 +696,18 @@ def load_native_render_metadata(
         metadata = IsaacMharmonyRenderMetadata.from_json_file(config.native_render_metadata_path)
     else:
         metadata = IsaacMharmonyRenderMetadata.from_config(config, stats_fps=stats_fps)
+        recipe_path = config.resolve_native_recipe_path()
+        if recipe_path is not None:
+            recipe = load_json_object(recipe_path)
+            metadata = replace(
+                metadata,
+                mharmony_reserved_token_groups=_recipe_reserved_token_groups(recipe),
+            )
+            metadata = _apply_recipe_image_preprocess(metadata, recipe)
     if stats_fps is not None and metadata.target_fps is None:
         metadata = replace(metadata, target_fps=float(stats_fps))
     metadata.validate_for_config(config)
     return metadata
-
-
-def assert_native_mharmony_available() -> None:
-    """Compatibility name for the public native renderer preflight."""
-    load_mharmony()
 
 
 @dataclass(frozen=True)
@@ -424,7 +722,7 @@ class IsaacMharmonyContentPlan:
 
 
 def load_native_isaac_stats(config: PerceptronIsaacConfig) -> IsaacNormalizationStats:
-    stats_path = config.native_stats_path or config.stats_path
+    stats_path = config.resolve_native_stats_path()
     if not stats_path:
         raise RuntimeError(
             "Perceptron Isaac inference_backend='native_mharmony' requires native_stats_path "
@@ -442,9 +740,9 @@ def build_isaac_mharmony_content_plan(
     anchor_timestamp_seconds: float | None = None,
     normalized_action_target: np.ndarray | None = None,
     fast_action_tokens: list[int] | None = None,
-    historical_fast_action_tokens: list[list[int] | None] | None = None,
     action_is_pad: list[bool] | None = None,
     terminal: bool = False,
+    inference_clip_normalized_proprio: bool = True,
 ) -> IsaacMharmonyContentPlan:
     """Build the native LIBERO no-scene mharmony content plan.
 
@@ -452,6 +750,9 @@ def build_isaac_mharmony_content_plan(
     contract for the supported native eval surface: Flow actions, explicit deltas,
     timestamps, RGB images, last-state-only proprio, and no scene description.
     """
+    if not isinstance(inference_clip_normalized_proprio, bool):
+        raise ValueError("inference_clip_normalized_proprio must be a boolean.")
+    training_prompt = normalized_action_target is not None or fast_action_tokens is not None
     _validate_native_inference_contract(metadata, stats)
     history = _normalize_observation_history(observation_window, metadata)
     fps = _metadata_fps(metadata, stats)
@@ -483,34 +784,7 @@ def build_isaac_mharmony_content_plan(
             },
         }
     ]
-    aligned_historical_tokens: list[list[int] | None]
-    if historical_fast_action_tokens is None:
-        aligned_historical_tokens = [None for _ in range(int(metadata.n_obs_steps))]
-    else:
-        aligned_historical_tokens = historical_fast_action_tokens
-    if len(aligned_historical_tokens) != int(metadata.n_obs_steps):
-        raise ValueError(
-            "historical_fast_action_tokens must align with the checkpoint observation window; "
-            f"got {len(aligned_historical_tokens)} for n_obs_steps={metadata.n_obs_steps}."
-        )
-    if not metadata.action_conditioning and any(tokens is not None for tokens in aligned_historical_tokens):
-        raise ValueError("Historical FAST action tokens require action_conditioning=true.")
-
-    for step_idx, (frame, timestamp_seconds, action_tokens) in enumerate(
-        zip(history, timestamps, aligned_historical_tokens, strict=True)
-    ):
-        if action_tokens is not None:
-            if step_idx == 0:
-                raise ValueError("Historical FAST action tokens cannot precede the first observation.")
-            if not action_tokens:
-                raise ValueError("Historical FAST action token spans must be non-empty.")
-            user_content.append(
-                {
-                    "kind": "tokens",
-                    "tokens": [int(token) for token in action_tokens],
-                    "tags": _historical_fast_action_tags(metadata, step_idx),
-                }
-            )
+    for step_idx, (frame, timestamp_seconds) in enumerate(zip(history, timestamps, strict=True)):
         user_content.append(_timestamp_content_item(step_idx, timestamp_seconds, metadata))
         for camera_idx, camera in enumerate(metadata.camera_order):
             user_content.append(
@@ -528,7 +802,14 @@ def build_isaac_mharmony_content_plan(
             )
         if step_idx == metadata.n_obs_steps - 1:
             user_content.append(
-                _vector_content_item(frame["proprio"], step_idx, timestamp_seconds, metadata, stats)
+                _vector_content_item(
+                    frame["proprio"],
+                    step_idx,
+                    timestamp_seconds,
+                    metadata,
+                    stats,
+                    clip_normalized_proprio=True if training_prompt else inference_clip_normalized_proprio,
+                )
             )
 
     flow_tags = _flow_action_tags(
@@ -538,7 +819,6 @@ def build_isaac_mharmony_content_plan(
         action_is_pad=action_is_pad,
         terminal=terminal,
     )
-    training_prompt = normalized_action_target is not None or fast_action_tokens is not None
     if training_prompt:
         flow_tags = _project_genesis_training_action_tags(flow_tags)
     assistant_content = [
@@ -580,35 +860,26 @@ class IsaacNativeMharmonyRenderer:
         *,
         observation_window: list[dict[str, Any]],
         prompt: str,
-        fast_processor: Any | None = None,
         device: Any = "cuda",
         dtype: Any = None,
-        patch_size: int = 16,
-        max_num_patches: int | None = 576,
+        patch_size: int | None = None,
+        max_num_patches: int | None = None,
         min_num_patches: int | None = None,
-        pixel_shuffle_scale: int = 2,
-        temporal_patch_size: int = 1,
+        pixel_shuffle_scale: int | None = None,
+        temporal_patch_size: int | None = None,
         anchor_timestamp_seconds: float | None = None,
         scene_events: Any = None,
+        inference_clip_normalized_proprio: bool = True,
     ):
         if scene_events:
             raise ValueError("native_mharmony supports no-scene LIBERO inference only.")
-        historical_fast_action_tokens = None
-        if self.metadata.action_conditioning:
-            if fast_processor is None:
-                raise ValueError("Native action-conditioned inference requires the packaged FAST processor.")
-            historical_fast_action_tokens = encode_isaac_historical_fast_actions(
-                observation_window=observation_window,
-                metadata=self.metadata,
-                fast_processor=fast_processor,
-            )
         plan = build_isaac_mharmony_content_plan(
             observation_window=observation_window,
             prompt=prompt,
             metadata=self.metadata,
             stats=self.stats,
             anchor_timestamp_seconds=anchor_timestamp_seconds,
-            historical_fast_action_tokens=historical_fast_action_tokens,
+            inference_clip_normalized_proprio=inference_clip_normalized_proprio,
         )
         return self._render_plan_to_tensor_stream(
             plan,
@@ -636,11 +907,11 @@ class IsaacNativeMharmonyRenderer:
         max_sequence_length: int = 4096,
         device: Any = "cpu",
         dtype: Any = None,
-        patch_size: int = 16,
-        max_num_patches: int | None = 576,
+        patch_size: int | None = None,
+        max_num_patches: int | None = None,
         min_num_patches: int | None = None,
-        pixel_shuffle_scale: int = 2,
-        temporal_patch_size: int = 1,
+        pixel_shuffle_scale: int | None = None,
+        temporal_patch_size: int | None = None,
         anchor_timestamp_seconds: float | None = None,
         terminal: bool = False,
         stats: IsaacNormalizationStats | None = None,
@@ -649,9 +920,9 @@ class IsaacNativeMharmonyRenderer:
 
         ``terminal`` mirrors Genesis's ``_action_completion_metadata``: a chunk whose last
         action step is the trajectory's terminal step keeps the ``<|end|>`` footer, while every
-        non-terminal chunk is supervised with ``<|return|>``. Genesis's LeRobot-native training
-        builder emits a synthetic window that never reaches the terminal step, so non-terminal
-        is the correct default here.
+        non-terminal chunk is supervised with ``<|return|>``. The dataset processor supplies
+        terminality from the last real action and its authoritative episode endpoint.
+        Without that metadata, non-terminal remains the conservative default.
 
         ``stats`` overrides the builder's normalization for this one sample, which is what
         multi-suite LIBERO training needs: Genesis normalizes each LIBERO suite by its own
@@ -667,7 +938,7 @@ class IsaacNativeMharmonyRenderer:
             raise ValueError(
                 f"ISAAC training action_chunk must have shape {expected_shape}, got {action.shape}."
             )
-        normalized = normalize_isaac_actions(action, stats.action).astype(np.float32, copy=False)
+        normalized = normalize_isaac_action_quantiles(action, stats.action).astype(np.float32, copy=False)
         max_abs = float(np.max(np.abs(normalized))) if normalized.size else 0.0
         if skip_outlier_threshold > 0.0 and max_abs > skip_outlier_threshold:
             raise IsaacActionOutlierError(
@@ -683,6 +954,12 @@ class IsaacNativeMharmonyRenderer:
             normalized = np.clip(normalized, -clip_normalized_max, clip_normalized_max)
         else:
             fast_normalized = normalized
+        if stats.action.mask is not None:
+            raw = action
+            if clip_normalized_actions:
+                lower, upper = stats.action.effective_action_bounds()
+                raw = np.clip(raw, lower, upper)
+            normalized = np.where(stats.action.mask, normalized, raw).astype(np.float32, copy=False)
         if action_is_pad is None:
             action_is_pad = [False] * expected_shape[0]
         if len(action_is_pad) != expected_shape[0] or any(
@@ -752,7 +1029,7 @@ class IsaacNativeMharmonyRenderer:
                         role=None,
                     )
                 )
-            padded.append(create_stream(events, sample.priority, schedule=False))
+            padded.append(create_stream(events, sample.priority))
         return TensorStream(padded)
 
     def _render_plan_to_tensor_stream(
@@ -761,11 +1038,11 @@ class IsaacNativeMharmonyRenderer:
         *,
         device: Any,
         dtype: Any,
-        patch_size: int,
+        patch_size: int | None,
         max_num_patches: int | None,
         min_num_patches: int | None,
-        pixel_shuffle_scale: int,
-        temporal_patch_size: int,
+        pixel_shuffle_scale: int | None,
+        temporal_patch_size: int | None,
         rewrite_final_assistant_footer: bool = True,
     ):
         mharmony = load_mharmony()
@@ -808,7 +1085,7 @@ class IsaacNativeMharmonyRenderer:
         effective_min_num_patches = min_num_patches
         if effective_min_num_patches is None:
             effective_min_num_patches = self.metadata.min_num_patches
-        preprocess_config = {
+        preprocess_config: _ImagePreprocessConfig = {
             "patch_size": patch_size or self.metadata.patch_size,
             "max_num_patches": effective_max_num_patches,
             "min_num_patches": effective_min_num_patches,
@@ -834,7 +1111,6 @@ class IsaacNativeMharmonyRenderer:
         if rewrite_final_assistant_footer:
             rendered = _maybe_swap_final_assistant_footer(
                 rendered,
-                harmony_conv=conversation,
                 stop_token=self.metadata.message_stop_token,
                 encoding=encoding,
             )
@@ -853,7 +1129,15 @@ class IsaacNativeMharmonyRenderer:
         pixel_shuffle_scale: int,
         temporal_patch_size: int,
     ):
-        key = (patch_size, max_num_patches, min_num_patches, pixel_shuffle_scale, temporal_patch_size)
+        resize = self.metadata.image_resize_size
+        key = (
+            patch_size,
+            max_num_patches,
+            min_num_patches,
+            pixel_shuffle_scale,
+            temporal_patch_size,
+            None if resize is None else tuple(resize),
+        )
         if self._image_processor is None or self._image_processor_key != key:
             self._image_processor = create_qwen35_image_processor(
                 patch_size=patch_size,
@@ -934,7 +1218,6 @@ def _normalize_observation_history(
             {
                 "images": {camera: images[camera] for camera in metadata.camera_order},
                 "proprio": proprio,
-                "previous_action": frame.get("previous_action"),
             }
         )
     return normalized
@@ -952,42 +1235,6 @@ def _fast_action_reserved_pool_size(metadata: IsaacMharmonyRenderMetadata) -> in
             "ISAAC mharmony metadata must expose exactly one reserved group for the FAST action tokenizer."
         )
     return group_sizes[0]
-
-
-def encode_isaac_historical_fast_actions(
-    *,
-    observation_window: list[dict[str, Any]],
-    metadata: IsaacMharmonyRenderMetadata,
-    fast_processor: Any,
-) -> list[list[int] | None]:
-    """FAST-tokenize normalized executed actions before their causal observations."""
-    if not metadata.action_conditioning:
-        raise ValueError("Historical FAST action encoding requires action_conditioning=true.")
-    if metadata.action_conditioning_role != "user":
-        raise ValueError("Native historical FAST action encoding supports only the user role.")
-    history = _normalize_observation_history(observation_window, metadata)
-    reserved_pool_size = _fast_action_reserved_pool_size(metadata)
-    token_spans: list[list[int] | None] = []
-    for observation_index, frame in enumerate(history):
-        previous_action = frame["previous_action"]
-        if observation_index == 0 or previous_action is None:
-            token_spans.append(None)
-            continue
-        normalized_action = np.asarray(previous_action, dtype=np.float32).reshape(-1)
-        expected_shape = (int(metadata.action_dim),)
-        if normalized_action.shape != expected_shape:
-            raise ValueError(
-                "Historical normalized action must match checkpoint action_dim; "
-                f"expected {expected_shape}, got {normalized_action.shape}."
-            )
-        token_spans.append(
-            encode_fast_action_tokens(
-                fast_processor,
-                normalized_action.reshape(1, 1, -1),
-                reserved_pool_size=reserved_pool_size,
-            )
-        )
-    return token_spans
 
 
 def _build_preamble(*, prompt: str, metadata: IsaacMharmonyRenderMetadata, fps: float) -> str:
@@ -1064,8 +1311,15 @@ def _vector_content_item(
     timestamp_seconds: float,
     metadata: IsaacMharmonyRenderMetadata,
     stats: IsaacNormalizationStats,
+    *,
+    clip_normalized_proprio: bool = True,
 ) -> dict[str, Any]:
-    normalized = normalize_isaac_proprio(np.asarray(proprio, dtype=np.float32).reshape(-1), stats.proprio)
+    normalized = normalize_isaac_proprio(
+        np.asarray(proprio, dtype=np.float32).reshape(-1),
+        stats.proprio,
+        profile=stats.profile,
+        clip_normalized=clip_normalized_proprio,
+    )
     fallback_dims = _effective_bounds_fallback_dim_count(
         stats.proprio.q01, stats.proprio.q99, stats.proprio.minimum, stats.proprio.maximum
     )
@@ -1191,22 +1445,6 @@ def _flow_action_tags(
     }
 
 
-def _historical_fast_action_tags(
-    metadata: IsaacMharmonyRenderMetadata, observation_index: int
-) -> dict[str, Any]:
-    return {
-        "action_conditioning": "fast",
-        "action_conditioning_indices": [0],
-        "action_conditioning_observation_window": [observation_index - 1, observation_index],
-        "action_dim": int(metadata.action_dim),
-        "action_horizon": 1,
-        "normalized": False,
-        "token_group": FAST_ACTION_TOKEN_GROUP_NAME,
-        "tokenizer": FAST_ACTION_TOKENIZER_NAME,
-        GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION,
-    }
-
-
 def _fast_action_tags(flow_tags: dict[str, Any]) -> dict[str, Any]:
     tags = dict(flow_tags)
     tags.update(
@@ -1272,7 +1510,7 @@ def _plan_item_to_mh_content(
         media_ref = mharmony.MediaRef(
             id=str(item["media_id"]),
             mime="image/png",
-            bytes_b64=_image_to_png_b64(item["image"]),
+            bytes_b64=_image_to_png_b64(item["image"], image_resize_size=metadata.image_resize_size),
             metadata=item.get("metadata"),
         )
         return mharmony.ImageContent(media_ref=media_ref, metadata=item.get("metadata"))
@@ -1288,9 +1526,29 @@ def _plan_item_to_mh_content(
     raise ValueError(f"Unsupported Isaac mharmony content kind {kind!r}.")
 
 
-def _image_to_png_b64(image: Any) -> str:
+def _image_to_png_b64(image: Any, *, image_resize_size: list[int] | None = None) -> str:
     from PIL import Image as PILImage
 
+    # The pinned public SDK accepts patch bounds, not a fixed-resize argument.
+    # Resize before media admission so bounds-only recipes keep their aspect ratio.
+    if image_resize_size is not None:
+        if isinstance(image, bytes | bytearray):
+            with PILImage.open(io.BytesIO(bytes(image))) as pil:
+                rgb = pil.convert("RGB")
+        else:
+            rgb = PILImage.fromarray(
+                coerce_rgb_uint8(
+                    image,
+                    contiguous=True,
+                    shape_error="Unsupported Isaac image shape for native mharmony: {shape}.",
+                ),
+                mode="RGB",
+            )
+        height, width = image_resize_size
+        rgb = rgb.resize((width, height), resample=PILImage.Resampling.BICUBIC)
+        buf = io.BytesIO()
+        rgb.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
     if isinstance(image, bytes | bytearray):
         with PILImage.open(io.BytesIO(bytes(image))) as pil:
             rgb = pil.convert("RGB")
@@ -1310,22 +1568,12 @@ def _image_to_png_b64(image: Any) -> str:
 def _maybe_swap_final_assistant_footer(
     rendered: dict[str, Any],
     *,
-    harmony_conv,
     stop_token: str | None,
     encoding,
 ) -> dict[str, Any]:
     if not stop_token:
         return rendered
-    messages = getattr(harmony_conv, "messages", None)
-    if not messages:
-        return rendered
-    last_message = messages[-1]
-    last_role = getattr(getattr(last_message, "author", None), "role", None)
-    if getattr(last_role, "value", last_role) != "assistant":
-        return rendered
-    if getattr(last_message, "channel", None) != "final":
-        return rendered
-
+    # The sole caller constructs a final assistant message; mharmony serializes it without mutation.
     events = rendered.get("stream", {}).get("events", [])
     if not isinstance(events, list):
         return rendered
@@ -1343,22 +1591,3 @@ def _maybe_swap_final_assistant_footer(
             data["Tokens"] = [replacement]
             break
     return rendered
-
-
-def _content_from_dict(types, raw: dict[str, Any]):
-    kind = str(raw.get("kind") or "text")
-    if kind == "text":
-        return types.MHText(str(raw.get("text") or ""))
-    if kind == "tokens":
-        return types.MHTokens(tokens=[int(token) for token in raw.get("tokens", [])], tags=raw.get("tags"))
-    if kind == "vector":
-        values = np.asarray(raw.get("values"), dtype=np.float32).reshape(-1).tolist()
-        shape = [int(x) for x in (raw.get("shape") or [len(values)])]
-        return types.MHVector(
-            values=values,
-            shape=shape,
-            dtype=str(raw.get("dtype") or "float32"),
-            metadata=raw.get("metadata"),
-            name=raw.get("name"),
-        )
-    raise ValueError(f"Unsupported Isaac mharmony content kind {kind!r}.")
