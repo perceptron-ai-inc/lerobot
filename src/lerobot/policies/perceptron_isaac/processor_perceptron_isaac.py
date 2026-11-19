@@ -10,6 +10,7 @@ import logging
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields as dataclass_fields
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -39,6 +40,7 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
+from .checkpoint_integrity import canonical_json_sha256
 from .configuration_perceptron_isaac import (
     PerceptronIsaacConfig,
     is_portable_isaac05_repository,
@@ -46,10 +48,12 @@ from .configuration_perceptron_isaac import (
 )
 from .fast_processor import load_fast_action_processor
 from .isaac_stats import (
+    IsaacNormalizationProfile,
     IsaacNormalizationStats,
     IsaacStatsBlock,
     apply_gripper_passthrough,
     isaac_stats_from_state_dict,
+    isaac_stats_to_dict,
     isaac_stats_to_state_dict,
     isaac_stats_value_differences,
     load_isaac_stats,
@@ -129,7 +133,13 @@ def _adopt_dataset_state_feature_names(
     config.state_feature_names = names
 
 
-def _dataset_stats_to_isaac_stats(dataset_stats, config, *, dataset_fps):
+def _dataset_stats_to_isaac_stats(
+    dataset_stats,
+    config: PerceptronIsaacConfig,
+    *,
+    dataset_fps: float | None,
+    source_profile: IsaacNormalizationProfile | None = None,
+) -> IsaacNormalizationStats:
     """Convert LeRobot dataset quantiles into native Isaac normalization stats."""
     action_raw = dataset_stats.get("action")
     proprio_raw = dataset_stats.get("observation.state") or dataset_stats.get("state")
@@ -173,6 +183,8 @@ def _dataset_stats_to_isaac_stats(dataset_stats, config, *, dataset_fps):
     # only trustworthy comparison (isaac_stats_value_differences), but the label should
     # not collide on top of that.
     base_profile_id = config.normalization_profile_id
+    if base_profile_id is None and source_profile is not None:
+        base_profile_id = source_profile.profile_id
     if base_profile_id and not str(base_profile_id).endswith("#finetune_dataset"):
         profile_id = f"{base_profile_id}#finetune_dataset"
     else:
@@ -205,6 +217,26 @@ def _dataset_stats_to_isaac_stats(dataset_stats, config, *, dataset_fps):
             action_feature_names=list(config.action_feature_names or []),
             state_feature_names=list(config.state_feature_names or []),
         )
+    if source_profile is not None:
+        assert profile_id is not None
+        serialized = isaac_stats_to_dict(stats)
+        action_stats_sha256 = canonical_json_sha256(serialized["action"])
+        proprio_stats_sha256 = canonical_json_sha256(serialized["proprio"])
+        profile_data = {
+            "profile_id": profile_id,
+            "action_stats_sha256": action_stats_sha256,
+            "proprio_stats_sha256": proprio_stats_sha256,
+            "clip_normalized_proprio": source_profile.clip_normalized_proprio,
+            "proprio_clip_normalized_max": source_profile.proprio_clip_normalized_max,
+        }
+        profile = replace(
+            source_profile,
+            profile_id=profile_id,
+            profile_sha256=canonical_json_sha256(profile_data),
+            action_stats_sha256=action_stats_sha256,
+            proprio_stats_sha256=proprio_stats_sha256,
+        )
+        stats = replace(stats, profile=profile)
     return stats
 
 
@@ -230,6 +262,35 @@ def _install_normalization_stats(preprocessor, postprocessor, stats):
         if isinstance(step, PerceptronIsaacActionUnnormalizeProcessorStep):
             step._stats = stats
             _sync_normalization_labels(step, stats)
+
+
+def _install_finetune_dataset_stats(
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+    config: PerceptronIsaacConfig,
+    dataset_stats: dict[str, dict[str, torch.Tensor]],
+    *,
+    dataset_fps: float | None,
+) -> None:
+    base_stats = next(
+        (
+            step._stats
+            for step in preprocessor.steps
+            if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep) and step._stats is not None
+        ),
+        None,
+    )
+    if base_stats is None:
+        path = config.resolve_native_stats_path()
+        if path is not None and Path(path).is_file():
+            base_stats = load_isaac_stats(path)
+    stats = _dataset_stats_to_isaac_stats(
+        dataset_stats,
+        config,
+        dataset_fps=dataset_fps,
+        source_profile=base_stats.profile if base_stats is not None else None,
+    )
+    _install_normalization_stats(preprocessor, postprocessor, stats)
 
 
 def _record_config_stats_export(config: PerceptronIsaacConfig, preprocessor) -> None:
@@ -1636,10 +1697,12 @@ def make_perceptron_isaac_pre_post_processors(
         to_output=transition_to_policy_action,
     )
     if dataset_stats is not None:
-        _install_normalization_stats(
+        _install_finetune_dataset_stats(
             preprocessor,
             postprocessor,
-            _dataset_stats_to_isaac_stats(dataset_stats, config, dataset_fps=declared_fps),
+            config,
+            dataset_stats,
+            dataset_fps=declared_fps,
         )
     _record_config_stats_export(config, preprocessor)
     return preprocessor, postprocessor
@@ -2029,10 +2092,12 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                     config.suite_stats_path,
                 )
     if dataset_stats is not None:
-        _install_normalization_stats(
+        _install_finetune_dataset_stats(
             preprocessor,
             postprocessor,
-            _dataset_stats_to_isaac_stats(dataset_stats, config, dataset_fps=declared_fps),
+            config,
+            dataset_stats,
+            dataset_fps=declared_fps,
         )
     elif dataset_meta is None:
         # Serving/eval load: the package must not be split-brained between its

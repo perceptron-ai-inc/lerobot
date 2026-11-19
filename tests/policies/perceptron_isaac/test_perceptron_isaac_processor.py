@@ -160,6 +160,59 @@ def test_per_suite_normalization_survives_loading_from_a_package(tmp_path):
     assert pack.suite_by_task_index_path == str(suite_map)
 
 
+@pytest.mark.parametrize(("cap", "restore_from_package"), [(1.0, True), (10.0, False)])
+def test_finetune_keeps_proprio_clip_with_new_stats_through_save_and_reload(tmp_path, cap, restore_from_package):
+    config = _saved_processor_config(tmp_path)
+    source = Path(config.native_stats_path)
+    payload = json.loads(source.read_text())
+    payload["profile_id"] = "base"
+    payload["_profile"] = {
+        "profile_id": "base",
+        "profile_sha256": "a" * 64,
+        "action_stats_sha256": "b" * 64,
+        "proprio_stats_sha256": "c" * 64,
+        "clip_normalized_proprio": True,
+        "proprio_clip_normalized_max": cap,
+    }
+    source.write_text(json.dumps(payload))
+    pre, post = make_pre_post_processors(config)
+    pre.save_pretrained(tmp_path)
+    post.save_pretrained(tmp_path)
+    dataset_stats = {
+        ACTION: {"q01": torch.full((7,), -0.4), "q99": torch.full((7,), 0.4)},
+        OBS_STATE: {"q01": torch.full((8,), -0.25), "q99": torch.full((8,), 0.25)},
+    }
+
+    pre, post = make_pre_post_processors(
+        config,
+        pretrained_path=str(tmp_path) if restore_from_package else None,
+        dataset_stats=dataset_stats,
+    )
+    output = tmp_path / "finetuned"
+    pre.save_pretrained(output)
+    post.save_pretrained(output)
+    config._save_pretrained(output)
+
+    saved_stats_path = output / "isaac_stats.json"
+    saved_stats = load_isaac_stats(saved_stats_path)
+    assert saved_stats.profile_id == "base#finetune_dataset"
+    assert saved_stats.profile is not None
+    assert saved_stats.profile.profile_sha256 != payload["_profile"]["profile_sha256"]
+    assert saved_stats.profile.action_stats_sha256 != payload["_profile"]["action_stats_sha256"]
+    assert saved_stats.profile.proprio_stats_sha256 != payload["_profile"]["proprio_stats_sha256"]
+    assert saved_stats.profile.proprio_clip_normalized_max == cap
+    np.testing.assert_allclose(saved_stats.action.q99, 0.4)
+    np.testing.assert_allclose(saved_stats.proprio.q99, 0.25)
+
+    loaded_cfg = PerceptronIsaacConfig.from_pretrained(output)
+    loaded_cfg.native_stats_path = str(saved_stats_path)
+    loaded_pre, _ = make_pre_post_processors(loaded_cfg, pretrained_path=str(output))
+    packed = next(step for step in loaded_pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
+    assert packed._stats.profile == saved_stats.profile
+    normed = normalize_isaac_proprio(np.full(8, 20.0), packed._stats.proprio, profile=packed._stats.profile)
+    np.testing.assert_allclose(normed, cap)
+
+
 def test_libero_serving_switches_both_processors_without_changing_the_package(tmp_path):
     config = _saved_processor_config(tmp_path)
     config.target_fps = 20.0
