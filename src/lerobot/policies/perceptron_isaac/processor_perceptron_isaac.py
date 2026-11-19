@@ -89,6 +89,7 @@ PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY = RETAINED_SAMPLE_INDICES_KEY
 # with the checkpoint's serialized stats instead of independently path-loading
 # config.native_stats_path (which, for PEFT finetunes, points at the base package).
 PERCEPTRON_ISAAC_SERVING_STATS_KEY = "perceptron_isaac_serving_stats"
+LIBERO_SERVING_STATS_FILENAME = "libero_serving_stats.json"
 
 _TASK_TRAILING_SENTENCE_PUNCTUATION = ".,!?;:,\u2026"
 _TASK_TRAILING_CLOSERS = "\"'\u201d\u2019)]}"
@@ -219,7 +220,7 @@ def _sync_normalization_labels(step: Any, stats: IsaacNormalizationStats) -> Non
     step.normalization_validation_status = stats.validation_status
 
 
-def _install_dataset_stats(preprocessor, postprocessor, stats):
+def _install_normalization_stats(preprocessor, postprocessor, stats):
     for step in preprocessor.steps:
         if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep):
             step._stats = stats
@@ -1635,7 +1636,7 @@ def make_perceptron_isaac_pre_post_processors(
         to_output=transition_to_policy_action,
     )
     if dataset_stats is not None:
-        _install_dataset_stats(
+        _install_normalization_stats(
             preprocessor,
             postprocessor,
             _dataset_stats_to_isaac_stats(dataset_stats, config, dataset_fps=declared_fps),
@@ -2028,7 +2029,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                     config.suite_stats_path,
                 )
     if dataset_stats is not None:
-        _install_dataset_stats(
+        _install_normalization_stats(
             preprocessor,
             postprocessor,
             _dataset_stats_to_isaac_stats(dataset_stats, config, dataset_fps=declared_fps),
@@ -2043,5 +2044,26 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
         # native_stats_path (the base package's, for every pre-export finetune) --
         # running the check would fail every healthy finetune resume.
         _require_restored_stats_match_config_paths(preprocessor, postprocessor, config)
+        if config.libero_suite is not None:
+            stats_path = package_root / LIBERO_SERVING_STATS_FILENAME
+            if not stats_path.is_file():
+                raise ValueError(f"Checkpoint does not provide LIBERO suite profiles at {stats_path}.")
+            suite_stats = load_isaac_suite_stats(stats_path)
+            if config.libero_suite not in suite_stats:
+                raise ValueError(
+                    f"Unknown LIBERO suite {config.libero_suite!r}. Choose from {sorted(suite_stats)}."
+                )
+            stats = suite_stats[config.libero_suite]
+            if (
+                stats.profile_scope != config.libero_suite
+                or stats.action_dim != config.action_dim
+                or stats.proprio_dim != config.proprio_dim
+                or stats.action_horizon != config.chunk_size
+                or stats.target_fps != config.target_fps
+            ):
+                raise ValueError(f"LIBERO stats for {config.libero_suite!r} disagree with the policy contract.")
+            stats = _maybe_passthrough_grippers(config, stats)
+            require_closed_loop_safe_isaac_stats(stats)
+            _install_normalization_stats(preprocessor, postprocessor, stats)
     _record_config_stats_export(config, preprocessor)
     return preprocessor, postprocessor

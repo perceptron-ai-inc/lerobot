@@ -47,6 +47,7 @@ from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
     Qwen35VLAConfig,
 )
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
+    LIBERO_SERVING_STATS_FILENAME,
     PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY,
     PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY,
     PERCEPTRON_ISAAC_RENDER_META_KEY,
@@ -157,6 +158,32 @@ def test_per_suite_normalization_survives_loading_from_a_package(tmp_path):
     pack = next(s for s in loaded.steps if isinstance(s, PerceptronIsaacMharmonyPackProcessorStep))
     assert pack.suite_stats_path == str(suite_stats)
     assert pack.suite_by_task_index_path == str(suite_map)
+
+
+def test_libero_serving_switches_both_processors_without_changing_the_package(tmp_path):
+    config = _saved_processor_config(tmp_path)
+    config.target_fps = 20.0
+    table = {}
+    for suite, lower in (("libero_10", -0.9), ("libero_spatial", -0.3)):
+        path = tmp_path / f"{suite}.json"
+        _write_native_stats(path, action_q01=lower, profile_scope=suite)
+        table[suite] = json.loads(path.read_text())
+    (tmp_path / LIBERO_SERVING_STATS_FILENAME).write_text(json.dumps(table))
+
+    for suite, data in table.items():
+        config.libero_suite = suite
+        pre, post = make_pre_post_processors(config, pretrained_path=str(tmp_path))
+        pack = next(step for step in pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
+        unnormalize = next(
+            step for step in post.steps if isinstance(step, PerceptronIsaacActionUnnormalizeProcessorStep)
+        )
+        assert pack._stats is unnormalize._stats
+        assert pack._stats.profile_scope == suite
+        np.testing.assert_allclose(pack._stats.action.q01, data["action"]["q01"])
+
+    config.libero_suite = "invalid"
+    with pytest.raises(ValueError, match="Unknown LIBERO suite"):
+        make_pre_post_processors(config, pretrained_path=str(tmp_path))
 
 
 def test_from_pretrained_factory_rejects_half_configured_suite_normalization(tmp_path):

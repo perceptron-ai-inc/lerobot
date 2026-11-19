@@ -263,6 +263,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # inference is single-scope by contract and leaves them unset.
     suite_stats_path: str | None = None
     suite_by_task_index_path: str | None = None
+    # Select one of the checkpoint's LIBERO normalization profiles for inference.
+    libero_suite: str | None = None
     # Checkpoint-local, immutable copy of physical-intelligence/fast. Importing
     # a checkpoint records the complete tree digest before remote code is used.
     fast_processor_path: str | None = None
@@ -339,6 +341,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         )
 
     def validate_training_intent(self, intent: PolicyTrainingIntent) -> None:
+        if self.libero_suite is not None:
+            raise ValueError("libero_suite selects serving normalization and cannot be set for training.")
         if intent.gradient_accumulation_steps != 1:
             raise ValueError(
                 "ISAAC training does not support gradient accumulation; "
