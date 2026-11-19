@@ -110,6 +110,7 @@ class _RolloutHarness:
 
 @contextmanager
 def _rollout_harness(config: PerceptronIsaacConfig) -> Iterator[_RolloutHarness]:
+    pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
     policy = PerceptronIsaacPolicy(config)
     sampler = _ProprioChunkSampler()
     # The checkpoint loader/model is the only policy boundary replaced. No I/O or model download.
