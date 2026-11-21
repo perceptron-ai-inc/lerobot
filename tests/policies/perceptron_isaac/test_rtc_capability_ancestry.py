@@ -86,7 +86,7 @@ def _write_action_recipe(package: Path, *, max_delay: int, probability: float | 
     )
 
 
-def test_config_reads_the_budget_before_weights_load_and_detects_a_recorded_stage(tmp_path: Path) -> None:
+def test_config_reads_the_budget_before_weights_load_and_the_recorded_stage(tmp_path: Path) -> None:
     package = tmp_path / "package"
     _write_action_recipe(package, max_delay=3, probability=0.5)
     config = _config(chunk_size=6, n_action_steps=2, hf_model_path="hf_model")
@@ -94,14 +94,11 @@ def test_config_reads_the_budget_before_weights_load_and_detects_a_recorded_stag
     config.pretrained_path = package
     assert config.rtc_capability() == RtcCapability(3, 3, 0.5, None)
     assert config.rtc_training_max_delay == 3
-    # A package written by lerobot-train before the stage field existed still ran without RTC.
-    (package / "train_config.json").write_text("{}")
-    assert config.rtc_capability() == RtcCapability(3, 3, 0.5, 0)
-    assert config.rtc_capability().inherited
-    # The recorded field wins over the sidecar heuristic and leaves the declared budget alone.
-    (package / "train_config.json").unlink()
+    assert not config.rtc_capability().inherited
+    # A stage that trained without RTC marks the budget inherited and leaves it unchanged.
     config.rtc_final_stage_max_delay_steps = 0
     assert config.rtc_capability() == RtcCapability(3, 3, 0.5, 0)
+    assert config.rtc_capability().inherited
     assert config.rtc_training_max_delay == 3
 
 

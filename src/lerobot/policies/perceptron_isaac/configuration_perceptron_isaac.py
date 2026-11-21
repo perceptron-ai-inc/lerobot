@@ -33,8 +33,6 @@ NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
 # The inference recipe a Genesis export ships at its root. Its rendering block is the
 # checkpoint's own declaration of the mHarmony reserved-token layout it was trained with.
 NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
-# lerobot-train writes this beside config.json; it marks a package that a training stage produced.
-TRAIN_CONFIG_FILENAME = "train_config.json"
 
 
 def reject_legacy_action_conditioning(enabled: bool) -> None:
@@ -710,16 +708,10 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         stages. A stage that ran without RTC records that, which marks the budget inherited:
         prefix inference stays admitted, but it is unvalidated for the resulting weights.
         """
-        final_stage = self.rtc_final_stage_max_delay_steps
-        if final_stage is None and any(
-            (root / TRAIN_CONFIG_FILENAME).is_file() for root in self._checkpoint_package_roots()
-        ):
-            # Checkpoints trained before the field existed: ISAAC training has never sampled RTC.
-            final_stage = 0
         return resolve_rtc_capability(
             self._hf_model_action_metadata(),
             prediction_steps=self.chunk_size,
-            final_stage_max_delay_steps=final_stage,
+            final_stage_max_delay_steps=self.rtc_final_stage_max_delay_steps,
         )
 
     @property

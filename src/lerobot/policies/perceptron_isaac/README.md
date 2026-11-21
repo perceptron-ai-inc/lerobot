@@ -123,8 +123,7 @@ and SO-100/101 recipes do not, and LIBERO does. New packages record the flag in
 their render metadata; older packages are resolved from the Flow recipe that
 `policy_state_dataset` and `normalization_profile_scope` select in
 `hf_model/policy_inference_recipe.json`, and a checkpoint with no declaration
-keeps emitting. Fine-tunes saved before this flag was honored were trained with
-the item and now render without it.
+keeps emitting.
 
 RTC inference pins a prefix for checkpoints with a prefix budget. The budget is
 the action-expert recipe in `hf_model/config.json` (`rtc_max_delay_steps`, off
