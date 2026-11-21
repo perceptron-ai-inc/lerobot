@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -140,13 +141,28 @@ class _PrefixRecordingSampler(_ProprioChunkSampler):
         return chunk
 
 
+def _sync_rtc_config(tmp_path: Path, *, budget: int, rtc_prefix_length: int) -> PerceptronIsaacConfig:
+    """chunk_size=4 and n_action_steps=2, on a checkpoint recipe that declares ``budget`` steps."""
+    stats_path = tmp_path / "stats.json"
+    _write_rollout_stats(stats_path)
+    config = _rollout_config(stats_path)
+    package = tmp_path / "package"
+    (package / "hf_model").mkdir(parents=True)
+    (package / "hf_model" / "config.json").write_text(
+        json.dumps(
+            {"action_expert": {"rtc_max_delay_steps": budget, "rtc_probability": 0.5 if budget else None}}
+        )
+    )
+    config.pretrained_path = package
+    config.hf_model_path = str(package / "hf_model")
+    config.rtc_prefix_length = rtc_prefix_length
+    return config
+
+
 def test_select_action_pins_previous_chunk_unexecuted_rows(
     tmp_path: Path, sdk_plans: list[IsaacMharmonyContentPlan]
 ) -> None:
-    stats_path = tmp_path / "stats.json"
-    _write_rollout_stats(stats_path)
-    config = _rollout_config(stats_path)  # chunk_size=4, n_action_steps=2
-    config.rtc_prefix_length = 2
+    config = _sync_rtc_config(tmp_path, budget=2, rtc_prefix_length=2)
     with _rollout_harness(config) as harness:
         sampler = _PrefixRecordingSampler()
         harness.policy._isaac_model = sampler
@@ -169,6 +185,55 @@ def test_select_action_pins_previous_chunk_unexecuted_rows(
         harness.policy._isaac_model = sampler
         harness.policy.select_action(_live_batch(9, batch_size=2))
         assert sampler.prefixes[-1] == (None, None)
+
+
+def test_dropping_queued_actions_discards_the_prefix_carry(
+    tmp_path: Path, sdk_plans: list[IsaacMharmonyContentPlan]
+) -> None:
+    """A task change drops the queue mid-chunk, so the old chunk's later rows never execute."""
+    config = _sync_rtc_config(tmp_path, budget=2, rtc_prefix_length=2)
+    with _rollout_harness(config) as harness:
+        sampler = _PrefixRecordingSampler()
+        harness.policy._isaac_model = sampler
+        harness.policy.select_action(_live_batch(0, batch_size=1))
+        assert harness.policy._last_norm_chunk is not None
+        discarded = harness.policy._last_norm_chunk.clone()
+
+        # SyncInferenceEngine does this when the instruction changes.
+        harness.policy.drop_queued_actions()
+
+        assert harness.policy._last_norm_chunk is None
+        action = harness.policy.select_action(_live_batch(1, batch_size=1))
+        assert sampler.prefixes[-1] == (None, None)
+        assert not torch.equal(action, discarded[:, config.n_action_steps])
+
+
+@pytest.mark.parametrize("budget", [0, 1])
+def test_sync_prefix_beyond_the_budget_is_rejected_before_the_first_action(
+    tmp_path: Path, budget: int
+) -> None:
+    config = _sync_rtc_config(tmp_path, budget=budget, rtc_prefix_length=2)
+    with _rollout_harness(config) as harness:
+        sampler = _PrefixRecordingSampler()
+        harness.policy._isaac_model = sampler
+        with pytest.raises(ValueError, match=f"prefix budget {budget}"):
+            harness.policy.select_action(_live_batch(0, batch_size=1))
+        assert sampler.prefixes == [], "no prediction ran, so no action was returned"
+
+
+def test_prefix_length_without_prefix_rows_is_rejected(
+    tmp_path: Path, sdk_plans: list[IsaacMharmonyContentPlan]
+) -> None:
+    config = _sync_rtc_config(tmp_path, budget=2, rtc_prefix_length=0)
+    with _rollout_harness(config) as harness:
+        sampler = _PrefixRecordingSampler()
+        harness.policy._isaac_model = sampler
+        with pytest.raises(ValueError, match="action_prefix is required"):
+            harness.policy.predict_action_chunk(_live_batch(0, batch_size=1), prefix_length=2)
+        assert sampler.prefixes == []
+        # A zero length without rows is still the ordinary prefix-free call.
+        harness.policy.predict_action_chunk(_live_batch(0, batch_size=1), prefix_length=0)
+        assert sampler.prefixes == [(None, None)]
 
 
 def test_select_action_owns_the_sync_prefix(tmp_path: Path) -> None:

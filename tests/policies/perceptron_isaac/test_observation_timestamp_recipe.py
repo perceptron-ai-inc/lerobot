@@ -213,11 +213,13 @@ def test_sync_and_chunk_inference_omit_timestamp_items_for_a_timestamp_free_reci
         assert chunk.shape == (1, config.chunk_size, config.action_dim)
         assert len(sdk_plans) == 2
         assert _timestamp_items(sdk_plans[-1]) == []
-        # Asynchronous callers are admitted because the model needs no episode time.
-        assert harness.policy.chunk_inference_spec().prediction_steps == config.chunk_size
+        # The model has no time input, so chunk callers owe it no episode time.
+        spec = harness.policy.chunk_inference_spec()
+        assert spec.prediction_steps == config.chunk_size
+        assert not spec.needs_episode_time
 
 
-def test_timestamp_emitting_recipe_keeps_sync_tokens_and_refuses_chunk_inference(
+def test_timestamp_emitting_recipe_keeps_sync_tokens_and_asks_chunk_callers_for_episode_time(
     tmp_path: Path, sdk_plans: list[IsaacMharmonyContentPlan]
 ) -> None:
     config = _package_config(tmp_path, recipe_emit=True, n_obs_steps=1)
@@ -226,5 +228,4 @@ def test_timestamp_emitting_recipe_keeps_sync_tokens_and_refuses_chunk_inference
         items = _timestamp_items(sdk_plans[-1])
         assert len(items) == 1
         assert items[0]["metadata"]["timestamp_seconds"] == 0.0
-        with pytest.raises(ValueError, match="episode-time tokens"):
-            harness.policy.chunk_inference_spec()
+        assert harness.policy.chunk_inference_spec().needs_episode_time

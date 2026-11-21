@@ -1272,17 +1272,13 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         ``predict_action_chunk`` renders the current observation itself, so one observation
         step is required. Guided RTC is never offered. Trained RTC is offered when the
         checkpoint declares or inherits a prefix budget. A checkpoint whose recipe emits
-        episode-time tokens is refused: asynchronous callers predict once per chunk and
-        cannot give the model its per-step episode time. An admitted policy has its
-        weights loaded when this returns.
+        episode-time tokens declares ``needs_episode_time``: chunk callers predict once per
+        chunk, so they supply each observation's episode-relative capture time and the
+        policy's per-step frame clock is not used. The weights are loaded when this returns.
         """
         if self.config.n_obs_steps != 1:
             raise ValueError("Chunk inference requires n_obs_steps=1; observation history is unsupported.")
         metadata = self._native_render_metadata or load_native_render_metadata(self.config)
-        if metadata.emit_observation_timestamps is not False:
-            raise ValueError(
-                "This ISAAC checkpoint renders episode-time tokens, which chunk inference cannot supply."
-            )
         # FP32-storage packages defer their weight load to first use. Chunk callers put every
         # prediction under a deadline, so load here, before a robot connects or a clock starts.
         if self._isaac_model is None and self.config.hf_model_path:
@@ -1303,6 +1299,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             execution_steps=int(self.config.n_action_steps),
             modes=tuple(modes),
             training_max_delay=capability.prefix_budget,
+            needs_episode_time=metadata.emit_observation_timestamps is not False,
         )
 
     def _trained_rtc_prefix(
@@ -1326,14 +1323,27 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 f"prev_chunk_left_over must be [steps >= {delay}, {expected_width}] normalized actions, "
                 f"got {tuple(prev_chunk_left_over.shape)}."
             )
+        self._require_prefix_within_budget(delay, "RTC inference_delay")
+        return prev_chunk_left_over[:delay].unsqueeze(0), delay
+
+    def _require_prefix_within_budget(self, length: int, name: str) -> None:
+        """Reject a prefix longer than the checkpoint was trained to continue from."""
         if self._rtc_prefix_budget is None:
             self._rtc_prefix_budget = self.rtc_capability().prefix_budget
-        if delay > self._rtc_prefix_budget:
+        if length > self._rtc_prefix_budget:
             raise ValueError(
-                f"RTC inference_delay {delay} exceeds this checkpoint's trained-RTC prefix budget "
+                f"{name} {length} exceeds this checkpoint's trained-RTC prefix budget "
                 f"{self._rtc_prefix_budget}."
             )
-        return prev_chunk_left_over[:delay].unsqueeze(0), delay
+
+    def drop_queued_actions(self) -> None:
+        """Discard queued actions together with the sync RTC carry computed with them.
+
+        The carried rows continue a chunk that will no longer execute, for example after an
+        instruction change, so the next refill must not pin them.
+        """
+        super().drop_queued_actions()
+        self._last_norm_chunk = None
 
     @torch.no_grad()
     def predict_action_chunk(
@@ -1363,6 +1373,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             if action_prefix is not None or prefix_length is not None:
                 raise ValueError("Pass either an explicit action_prefix or the RTC engine continuation.")
             action_prefix, prefix_length = self._trained_rtc_prefix(inference_delay, prev_chunk_left_over)
+        if action_prefix is None and prefix_length:
+            raise ValueError("action_prefix is required when prefix_length is non-zero.")
         self.eval()
         if self._isaac_model is None:
             self._load_backbone()
@@ -1454,6 +1466,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             raise ValueError(
                 "select_action is the sync path; the RTC engine calls predict_action_chunk instead."
             )
+        if self.config.rtc_prefix_length > 0:
+            # Checked on every call, before any action is returned: the first chunk has no
+            # prefix, so the sampler would otherwise reject an oversized one only at the refill.
+            self._require_prefix_within_budget(int(self.config.rtc_prefix_length), "rtc_prefix_length")
         self._require_deployable_action_artifact()
         self.eval()
         if ACTION in batch:

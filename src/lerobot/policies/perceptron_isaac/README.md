@@ -139,19 +139,27 @@ velocity in both.
 
 - Sync (`--inference.type=sync --policy.rtc_prefix_length=P`): each refill pins
   its first `P` rows to the previous chunk's rows
-  `[n_action_steps, n_action_steps + P)`. `P` must fit the budget and
-  `n_action_steps + P` must not exceed `chunk_size`. `P=0`, the default, leaves
-  sampling unchanged.
+  `[n_action_steps, n_action_steps + P)`. `P` must fit the budget, which is
+  checked before the first action is returned, and `n_action_steps + P` must not
+  exceed `chunk_size`. Dropping the queued actions, as an instruction change
+  does, also drops the carried rows. `P=0`, the default, leaves sampling
+  unchanged.
 - Asynchronous (`--inference.type=rtc --inference.rtc.mode=trained`): the engine
   passes its measured `inference_delay` and the previous chunk's remaining
   normalized actions; the first `inference_delay` rows become the prefix, and a
   zero delay samples without one. The 60-step YAM and SO-100/101 checkpoints
   declare a budget of 30, which requires `--inference.rtc.execution_horizon=30`.
-  Guided RTC is not offered. A checkpoint whose recipe emits episode-time tokens
-  is refused for asynchronous inference, because the engine predicts once per
-  chunk and cannot supply per-step episode time. FP32-storage packages defer
-  their weight load to first use; asking for the chunk spec loads them, so the
-  load happens at startup and not inside the engine's first deadline.
+  Guided RTC is not offered. FP32-storage packages defer their weight load to
+  first use; asking for the chunk spec loads them, so the load happens at
+  startup and not inside the engine's first deadline.
+
+Asynchronous callers predict once per chunk, so they cannot use the policy's
+per-step frame clock. A checkpoint whose recipe emits episode-time tokens sets
+`needs_episode_time` in its chunk spec. The engine then supplies each
+observation's capture time, relative to the episode's first predicted
+observation, as the batch `timestamp`, and the prompt renders that time. This
+covers plain asynchronous chunk mode too: LIBERO emits timestamps and has no
+RTC budget.
 
 ## Evidence and limits
 

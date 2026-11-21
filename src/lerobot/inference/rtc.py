@@ -28,6 +28,7 @@ from typing import Any
 import torch
 
 from lerobot.policies import ActionQueue, PreTrainedPolicy, RTCConfig, prepare_observation_for_inference
+from lerobot.policies.chunk import EPISODE_TIME_KEY
 from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyProcessorPipeline,
@@ -502,6 +503,9 @@ class RTCInferenceEngine(InferenceEngine):
             inference_count = 0
             warmup_previous: tuple[torch.Tensor, torch.Tensor] | None = None
             consecutive_discards = 0
+            # Capture time of the episode's first predicted observation, for policies that
+            # declare needs_episode_time.
+            episode_origin: float | None = None
             while not self._shutdown_event.is_set() and not self.failed:
                 for event in self._runtime.drain_wait_events():
                     if event["event"] == "waiting":
@@ -517,6 +521,7 @@ class RTCInferenceEngine(InferenceEngine):
                     self._reset_pending = False
                 if reset_pending:
                     warmup_previous = None
+                    episode_origin = None
                     self._policy.reset()
                     self._preprocessor.reset()
                     self._postprocessor.reset()
@@ -594,6 +599,12 @@ class RTCInferenceEngine(InferenceEngine):
                     self._robot.robot_type,
                 )
                 batch["task"] = [task]
+                if self._policy_spec.needs_episode_time:
+                    if episode_origin is None:
+                        episode_origin = capture_time
+                    batch[EPISODE_TIME_KEY] = torch.tensor(
+                        [capture_time - episode_origin], dtype=torch.float32, device=policy_device
+                    )
                 with chunk_inference_context(request.mode):
                     preprocessed = self._preprocessor(batch)
                     prediction = predict_chunk(

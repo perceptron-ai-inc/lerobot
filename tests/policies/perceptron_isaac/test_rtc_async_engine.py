@@ -117,7 +117,11 @@ def _policy(config: PerceptronIsaacConfig) -> Iterator[tuple[PerceptronIsaacPoli
 
 
 def _engine(
-    policy: PerceptronIsaacPolicy, config: PerceptronIsaacConfig, *, mode: str = "trained"
+    policy: PerceptronIsaacPolicy,
+    config: PerceptronIsaacConfig,
+    *,
+    mode: str = "trained",
+    rtc_enabled: bool = True,
 ) -> RTCInferenceEngine:
     preprocessor, postprocessor = make_perceptron_isaac_pre_post_processors(config)
     return RTCInferenceEngine(
@@ -125,7 +129,7 @@ def _engine(
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         robot_wrapper=SimpleNamespace(robot_type="mock", action_features={}, supports_hold=True),
-        rtc_config=RTCConfig(enabled=True, mode=mode, execution_horizon=2),
+        rtc_config=RTCConfig(enabled=rtc_enabled, mode=mode, execution_horizon=2),
         dataset_features=_DATASET_FEATURES,
         task=_TASK,
         fps=30,
@@ -197,18 +201,49 @@ def test_startup_refuses_trained_rtc_without_a_budget(tmp_path: Path) -> None:
             )
 
 
-def test_startup_refuses_asynchronous_inference_for_a_timestamp_emitting_recipe(tmp_path: Path) -> None:
-    config = _rtc_config(tmp_path, budget=2, recipe_emit=True)
-    with (
-        _policy(config) as (policy, _),
-        pytest.raises(ValueError, match="episode-time tokens.*inference.type=sync"),
-    ):
-        validate_local_chunk_policy(policy)
+def test_plain_async_inference_gives_a_timestamp_recipe_its_episode_time(
+    tmp_path: Path, sdk_plans: list[IsaacMharmonyContentPlan]
+) -> None:
+    """Like the published LIBERO package: timestamps on, one observation step, no RTC budget."""
+    config = _rtc_config(tmp_path, budget=0, recipe_emit=True)
+    with _policy(config) as (policy, sampler):
+        spec = validate_local_chunk_policy(policy)
+        assert spec.modes == (ExecutionMode.CHUNK,)
+        assert spec.needs_episode_time
+        engine = _engine(policy, config, rtc_enabled=False)
+        assert engine._runtime.mode is ExecutionMode.CHUNK
+        clock = [time.monotonic()]
+        engine._runtime.clock = lambda: clock[0]
+
+        def predict_after(seconds: float, tick: int) -> None:
+            clock[0] += seconds
+            engine._robot.observation_time = clock[0]
+            _run_one_prediction(engine, sampler, tick=tick)
+
+        engine.start()
+        try:
+            engine.resume()
+            predict_after(0.0, tick=0)
+            predict_after(0.5, tick=1)
+            # A reset starts a new episode, whose first observation is time zero again.
+            engine.reset()
+            predict_after(0.25, tick=2)
+        finally:
+            sampler.release.release(20)
+            engine.stop()
+        assert not engine.failed, engine.failure_traceback
+        assert [prefix for prefix, _ in sampler.prefixes] == [None, None, None]
+    # Each prompt carries the observation's episode-relative capture time, not a frame count.
+    assert [plan.anchor_timestamp_seconds for plan in sdk_plans] == [0.0, 0.5, 0.0]
+    for plan in sdk_plans:
+        items = [item for item in plan.user_content if item["kind"] == "timestamp"]
+        assert len(items) == 1
+        assert items[0]["metadata"]["timestamp_seconds"] == plan.anchor_timestamp_seconds
 
 
-@pytest.mark.parametrize(("recipe_emit", "expected_loads"), [(False, 1), (True, 0)])
-def test_chunk_spec_loads_deferred_weights_once_for_an_admitted_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recipe_emit: bool, expected_loads: int
+@pytest.mark.parametrize("recipe_emit", [False, True])
+def test_chunk_spec_loads_deferred_weights_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recipe_emit: bool
 ) -> None:
     """FP32-storage packages defer loading; chunk callers need it done before their deadlines."""
     policy = PerceptronIsaacPolicy(_rtc_config(tmp_path, budget=2, recipe_emit=recipe_emit))
@@ -221,12 +256,11 @@ def test_chunk_spec_loads_deferred_weights_once_for_an_admitted_policy(
 
     monkeypatch.setattr(policy, "_load_backbone", load_backbone)
     for _ in range(2):
-        if recipe_emit:
-            with pytest.raises(ValueError, match="episode-time tokens"):
-                policy.chunk_inference_spec()
-        else:
-            assert policy.chunk_inference_spec().training_max_delay == 2
-    assert len(loads) == expected_loads
+        spec = policy.chunk_inference_spec()
+        assert spec.training_max_delay == 2
+        # Only a recipe that renders episode-time tokens asks its caller for episode time.
+        assert spec.needs_episode_time is recipe_emit
+    assert len(loads) == 1
 
 
 def test_engine_continuation_becomes_the_prefix_and_reset_clears_it(
