@@ -67,6 +67,7 @@ from .mharmony_native import (
     IsaacActionOutlierError,
     IsaacMharmonyRenderMetadata,
     IsaacNativeMharmonyRenderer,
+    hydrate_isaac_observation_timestamps,
     hydrate_isaac_training_proprio_contract,
     load_native_render_metadata,
 )
@@ -2052,6 +2053,19 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
         if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep):
             step.device = str(config.device)
             step._dataset_metadata = dataset_meta
+            if (
+                step.render_metadata is not None
+                and step.render_metadata.get("emit_observation_timestamps") is None
+            ):
+                # Packages saved before the field: follow the checkpoint's selected recipe so
+                # training and serving prompts carry episode time only where it was trained.
+                step.render_metadata = hydrate_isaac_observation_timestamps(
+                    IsaacMharmonyRenderMetadata(**step.render_metadata),
+                    recipe_path=config.resolve_inference_recipe_path(),
+                    policy_state_dataset=config.policy_state_dataset,
+                    normalization_scope=config.normalization_profile_scope,
+                ).to_json_dict()
+                step._stream_builder = None
             if step.render_metadata is not None:
                 IsaacMharmonyRenderMetadata(**step.render_metadata).validate_image_preprocess_for_config(
                     config

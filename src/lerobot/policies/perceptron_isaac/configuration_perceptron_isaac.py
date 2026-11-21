@@ -25,6 +25,7 @@ from .hardware_features import so100_hardware_feature_aliases
 from .isaac_stats import require_closed_loop_safe_isaac_profile
 from .mharmony_contract import SUPPORTED_MHARMONY_VERSION, normalize_mharmony_version_marker
 from .processor_utils import flatten_feature_names
+from .rtc import RtcCapability, resolve_rtc_capability
 
 # Checkpoint-local stats sidecar, saved relative to keep native packages relocatable.
 NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
@@ -32,6 +33,8 @@ NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
 # The inference recipe a Genesis export ships at its root. Its rendering block is the
 # checkpoint's own declaration of the mHarmony reserved-token layout it was trained with.
 NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
+# lerobot-train writes this beside config.json; it marks a package that a training stage produced.
+TRAIN_CONFIG_FILENAME = "train_config.json"
 
 
 def reject_legacy_action_conditioning(enabled: bool) -> None:
@@ -292,6 +295,11 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     train_max_sequence_length: int = 4096
     flow_rtc_max_delay_steps: int = 0
     flow_rtc_delay_sampling: str = "uniform"
+    # Written by a training stage: the RTC max prefix that stage sampled (0 = RTC off).
+    # None means no such stage is recorded, so the action-expert recipe in hf_model describes
+    # the stage that trained these weights. That recipe always carries the declared inference
+    # prefix budget, which a stage keeps unchanged; see rtc_capability().
+    rtc_final_stage_max_delay_steps: int | None = None
     flow_dual_timestep_ratio: float = 0.0
     flow_mask_padded_action_rows: bool = True  # MolmoAct expert masks padded terminal action rows
     softmax_auxiliary_loss_scale: float = 0.0001
@@ -516,6 +524,11 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                 "Native ISAAC training does not yet implement dual-timestep sampling; "
                 "flow_dual_timestep_ratio must be 0."
             )
+        final_stage = self.rtc_final_stage_max_delay_steps
+        if final_stage is not None and (
+            isinstance(final_stage, bool) or not isinstance(final_stage, int) or final_stage < 0
+        ):
+            raise ValueError("rtc_final_stage_max_delay_steps must be a nonnegative integer or null.")
         for name, coefficient in (
             ("softmax_auxiliary_loss_scale", self.softmax_auxiliary_loss_scale),
             ("moe_load_balancing_loss_coeff", self.moe_load_balancing_loss_coeff),
@@ -641,6 +654,78 @@ class PerceptronIsaacConfig(PreTrainedConfig):
             if candidate.is_file():
                 return str(candidate)
         return None
+
+    def resolve_inference_recipe_path(self) -> str | None:
+        """Return the checkpoint's inference recipe wherever its layout keeps it.
+
+        A raw export keeps it at the export root and a package keeps it in ``hf_model``.
+        After loading, both are read from the verified runtime snapshot.
+        """
+        for root in self.checkpoint_asset_roots():
+            for candidate in (
+                root / NATIVE_RECIPE_EXPORT_FILENAME,
+                root / "hf_model" / NATIVE_RECIPE_EXPORT_FILENAME,
+            ):
+                if candidate.is_file():
+                    return str(candidate)
+        return None
+
+    def _checkpoint_package_roots(self) -> tuple[Path, ...]:
+        """Local package directories this config was loaded from, before or after loading."""
+        candidates = (
+            vars(self).get("_checkpoint_source_root"),
+            self._pretrained_config_directory,
+            self.pretrained_path,
+        )
+        roots: list[Path] = []
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            root = Path(str(candidate))
+            if root.is_dir() and root not in roots:
+                roots.append(root)
+        return tuple(roots)
+
+    def _hf_model_action_metadata(self) -> dict[str, Any] | None:
+        """Read the checkpoint's action-expert recipe without loading weights."""
+        if not self.hf_model_path:
+            return None
+        model_path = Path(str(self.hf_model_path))
+        directories = (
+            (model_path,)
+            if model_path.is_absolute()
+            else tuple(root / model_path for root in self._checkpoint_package_roots())
+        )
+        for directory in directories:
+            config_path = directory / CONFIG_NAME
+            if config_path.is_file():
+                action = json.loads(config_path.read_text(encoding="utf-8")).get("action_expert")
+                return action if isinstance(action, dict) else None
+        return None
+
+    def rtc_capability(self) -> RtcCapability:
+        """The checkpoint's trained-RTC prefix budget and whether its weights were trained for it.
+
+        The budget is declared by the action-expert recipe and inherited through training
+        stages. A stage that ran without RTC records that, which marks the budget inherited:
+        prefix inference stays admitted, but it is unvalidated for the resulting weights.
+        """
+        final_stage = self.rtc_final_stage_max_delay_steps
+        if final_stage is None and any(
+            (root / TRAIN_CONFIG_FILENAME).is_file() for root in self._checkpoint_package_roots()
+        ):
+            # Checkpoints trained before the field existed: ISAAC training has never sampled RTC.
+            final_stage = 0
+        return resolve_rtc_capability(
+            self._hf_model_action_metadata(),
+            prediction_steps=self.chunk_size,
+            final_stage_max_delay_steps=final_stage,
+        )
+
+    @property
+    def rtc_training_max_delay(self) -> int:
+        """LeRobot's name for a checkpoint's trained-RTC prefix budget (0 = none)."""
+        return self.rtc_capability().prefix_budget
 
     def to_dict(self) -> dict[str, Any]:
         """Return portable asset paths and export identity without mutating runtime paths.

@@ -29,6 +29,7 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
+from ..chunk import ChunkPolicySpec, ExecutionMode
 from ..pretrained import PreTrainedPolicy
 from .checkpoint_integrity import (
     DirectorySnapshot,
@@ -66,6 +67,7 @@ from .processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_STREAM_KEY,
     PerceptronIsaacMharmonyPackProcessorStep,
 )
+from .rtc import RtcCapability
 from .trained_package import (
     CANONICAL_INNER_MODEL_STORAGE,
     MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
@@ -83,13 +85,6 @@ from .trained_package import (
 
 if TYPE_CHECKING:
     from .modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
-
-_ASYNC_RTC_ENGINE_UNSUPPORTED = (
-    "perceptron_isaac does not support LeRobot's asynchronous RTC engine because the policy owns "
-    "its observation clock. Use --inference.type=sync with --policy.rtc_prefix_length=P for "
-    "prefix-pinned RTC."
-)
-
 
 T = TypeVar("T", bound="PerceptronIsaacPolicy")
 logger = logging.getLogger(__name__)
@@ -355,6 +350,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._isaac_model: Mk1Qwen36VLAForActionGeneration | None = None
         self._stats: IsaacNormalizationStats | None = None
         self._native_render_metadata: IsaacMharmonyRenderMetadata | None = None
+        # Read on the first trained-RTC request; the recipe does not change under a loaded policy.
+        self._rtc_prefix_budget: int | None = None
         self._verified_runtime_assets: DirectorySnapshot | None = None
         self._verified_external_runtime_assets: list[DirectorySnapshot] = []
         # Checkpoint-serialized normalization stats adopted from the restored
@@ -994,6 +991,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._training_parameters_configured:
             return
         self._training_parameters_configured = True
+        # Record this stage's RTC setting beside the declared budget it leaves unchanged, so
+        # the saved package says its weights were last trained without RTC prefixes.
+        self.config.rtc_final_stage_max_delay_steps = int(self.config.flow_rtc_max_delay_steps)
         from .modeling_qwen35_vla import setup_qwen35_vla_for_training
 
         setup_qwen35_vla_for_training(
@@ -1258,6 +1258,83 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         out["task"] = rendered_complementary.get("task", task_source)
         return out
 
+    def rtc_capability(self) -> RtcCapability:
+        """The checkpoint's trained-RTC prefix budget and its provenance (see the config)."""
+        return self.config.rtc_capability()
+
+    def supports_rtc(self) -> bool:
+        """Trained RTC only, and only when the checkpoint declares or inherits a prefix budget."""
+        return self.rtc_capability().prefix_budget > 0
+
+    def chunk_inference_spec(self) -> ChunkPolicySpec:
+        """Declare exactly the chunk modes ISAAC implements for asynchronous callers.
+
+        ``predict_action_chunk`` renders the current observation itself, so one observation
+        step is required. Guided RTC is never offered. Trained RTC is offered when the
+        checkpoint declares or inherits a prefix budget. A checkpoint whose recipe emits
+        episode-time tokens is refused: asynchronous callers predict once per chunk and
+        cannot give the model its per-step episode time. An admitted policy has its
+        weights loaded when this returns.
+        """
+        if self.config.n_obs_steps != 1:
+            raise ValueError("Chunk inference requires n_obs_steps=1; observation history is unsupported.")
+        metadata = self._native_render_metadata or load_native_render_metadata(self.config)
+        if metadata.emit_observation_timestamps is not False:
+            raise ValueError(
+                "This ISAAC checkpoint renders episode-time tokens, which chunk inference cannot supply."
+            )
+        # FP32-storage packages defer their weight load to first use. Chunk callers put every
+        # prediction under a deadline, so load here, before a robot connects or a clock starts.
+        if self._isaac_model is None and self.config.hf_model_path:
+            self._load_backbone()
+        capability = self.rtc_capability()
+        modes = [ExecutionMode.CHUNK]
+        if capability.prefix_budget > 0:
+            modes.append(ExecutionMode.RTC_TRAINED)
+            if capability.inherited:
+                logger.warning(
+                    "ISAAC RTC prefix budget %d is inherited from the source checkpoint. The final "
+                    "training stage ran without RTC prefixes, so prefix inference is unvalidated "
+                    "for these weights.",
+                    capability.prefix_budget,
+                )
+        return ChunkPolicySpec(
+            prediction_steps=int(self.config.chunk_size),
+            execution_steps=int(self.config.n_action_steps),
+            modes=tuple(modes),
+            training_max_delay=capability.prefix_budget,
+        )
+
+    def _trained_rtc_prefix(
+        self, inference_delay: int | None, prev_chunk_left_over: Tensor | None
+    ) -> tuple[Tensor | None, int | None]:
+        """Turn the RTC engine's continuation into the DiT prefix for the measured delay."""
+        delay = 0 if inference_delay is None else int(inference_delay)
+        if delay < 0:
+            raise ValueError(f"RTC inference_delay must be nonnegative, got {delay}.")
+        if delay == 0:
+            return None, None
+        if prev_chunk_left_over is None:
+            raise ValueError("A positive RTC inference_delay requires prev_chunk_left_over.")
+        expected_width = int(self.config.action_dim)
+        if (
+            prev_chunk_left_over.ndim != 2
+            or prev_chunk_left_over.shape[1] != expected_width
+            or prev_chunk_left_over.shape[0] < delay
+        ):
+            raise ValueError(
+                f"prev_chunk_left_over must be [steps >= {delay}, {expected_width}] normalized actions, "
+                f"got {tuple(prev_chunk_left_over.shape)}."
+            )
+        if self._rtc_prefix_budget is None:
+            self._rtc_prefix_budget = self.rtc_capability().prefix_budget
+        if delay > self._rtc_prefix_budget:
+            raise ValueError(
+                f"RTC inference_delay {delay} exceeds this checkpoint's trained-RTC prefix budget "
+                f"{self._rtc_prefix_budget}."
+            )
+        return prev_chunk_left_over[:delay].unsqueeze(0), delay
+
     @torch.no_grad()
     def predict_action_chunk(
         self,
@@ -1266,6 +1343,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         prefix_length: int | None = None,
         *,
         flow_noise: Tensor | None = None,
+        inference_delay: int | None = None,
+        prev_chunk_left_over: Tensor | None = None,
         **kwargs,
     ) -> Tensor:
         """Run the flow expert on a native mharmony stream.
@@ -1275,12 +1354,15 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         Optional ``flow_noise`` supplies sample-major full-width DiT noise without RNG draws.
         Optional ``action_prefix`` ``[B, P, action_dim]`` holds normalized RTC prefix rows; the
         DiT expert pins them and rejects prefixes beyond the checkpoint's RTC support.
+        LeRobot's RTC engine instead passes ``inference_delay`` and ``prev_chunk_left_over``:
+        the first ``inference_delay`` rows of that normalized ``[steps, action_dim]``
+        continuation become the prefix, and a zero delay samples without one.
         """
         self._require_deployable_action_artifact()
-        # LeRobot's asynchronous RTC engine calls this method directly, bypassing
-        # select_action's policy-owned observation history and settle clock.
-        if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
-            raise NotImplementedError(_ASYNC_RTC_ENGINE_UNSUPPORTED)
+        if inference_delay is not None or prev_chunk_left_over is not None:
+            if action_prefix is not None or prefix_length is not None:
+                raise ValueError("Pass either an explicit action_prefix or the RTC engine continuation.")
+            action_prefix, prefix_length = self._trained_rtc_prefix(inference_delay, prev_chunk_left_over)
         self.eval()
         if self._isaac_model is None:
             self._load_backbone()
@@ -1369,7 +1451,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if "action_prefix" in kwargs or "prefix_length" in kwargs:
             raise ValueError("select_action owns the RTC prefix; set rtc_prefix_length instead.")
         if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
-            raise NotImplementedError(_ASYNC_RTC_ENGINE_UNSUPPORTED)
+            raise ValueError(
+                "select_action is the sync path; the RTC engine calls predict_action_chunk instead."
+            )
         self._require_deployable_action_artifact()
         self.eval()
         if ACTION in batch:

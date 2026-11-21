@@ -112,9 +112,17 @@ class IsaacMharmonyRenderMetadata:
     min_num_patches: int | None = None
     image_resize_size: list[int] | None = None
     training_proprio_contract: dict[str, Any] | None = None
+    # Whether each observation is preceded by an episode-time item, as the checkpoint's
+    # recipe trained it. None means the metadata predates the field: loaders then read the
+    # checkpoint's selected recipe, and a checkpoint with no declaration keeps emitting.
+    emit_observation_timestamps: bool | None = None
 
     def __post_init__(self) -> None:
         reject_legacy_action_conditioning(self.action_conditioning)
+        if self.emit_observation_timestamps is not None and not isinstance(
+            self.emit_observation_timestamps, bool
+        ):
+            raise ValueError("ISAAC emit_observation_timestamps must be a boolean or null.")
         if self.image_resize_size is not None and (
             not isinstance(self.image_resize_size, list)
             or len(self.image_resize_size) != 2
@@ -690,6 +698,70 @@ def _parse_recipe_image_preprocess(
     )
 
 
+def read_recipe_observation_timestamps(
+    path: str | Path,
+    *,
+    policy_state_dataset: str | None,
+    normalization_scope: str | None = None,
+) -> bool | None:
+    """Read ``emit_observation_timestamps`` from the checkpoint's selected Flow recipe.
+
+    The selection is the one normalization already uses: the Flow recipes of
+    ``policy_state_dataset``, narrowed to ``normalization_scope`` when a recipe carries
+    that scope. Returns None when the selected recipes do not declare the flag, and
+    raises when they disagree, because the prompt would then be ambiguous.
+    """
+    location = "policy_inference_recipe.json"
+    recipes = load_json_object(path).get("recipes")
+    if not isinstance(recipes, list):
+        raise ValueError(f"{location}.recipes must be a list.")
+    flow = [
+        recipe
+        for recipe in recipes
+        if isinstance(recipe, Mapping)
+        and recipe.get("objective") == "Flow"
+        and recipe.get("policy_state_dataset") == policy_state_dataset
+    ]
+    scoped = [recipe for recipe in flow if recipe.get("normalization_scope") == normalization_scope]
+    declared: set[bool] = set()
+    for recipe in scoped or flow:
+        lowering = recipe.get("lowering")
+        observation = lowering.get("observation") if isinstance(lowering, Mapping) else None
+        if not isinstance(observation, Mapping) or "emit_observation_timestamps" not in observation:
+            continue
+        value = observation["emit_observation_timestamps"]
+        if not isinstance(value, bool):
+            raise ValueError(f"{location} emit_observation_timestamps must be a boolean, got {value!r}.")
+        declared.add(value)
+    if len(declared) > 1:
+        raise ValueError(
+            f"{location} Flow recipes for dataset {policy_state_dataset!r} disagree on "
+            "emit_observation_timestamps."
+        )
+    return declared.pop() if declared else None
+
+
+def hydrate_isaac_observation_timestamps(
+    metadata: IsaacMharmonyRenderMetadata,
+    *,
+    recipe_path: str | Path | None,
+    policy_state_dataset: str | None = None,
+    normalization_scope: str | None = None,
+) -> IsaacMharmonyRenderMetadata:
+    """Resolve ``emit_observation_timestamps`` for render metadata that predates the field."""
+    if metadata.emit_observation_timestamps is not None:
+        return metadata
+    declared = None
+    if recipe_path is not None and Path(recipe_path).is_file():
+        declared = read_recipe_observation_timestamps(
+            recipe_path,
+            policy_state_dataset=str(policy_state_dataset or metadata.dataset_name),
+            normalization_scope=normalization_scope,
+        )
+    # With no declaration anywhere, keep the emission such checkpoints have always used.
+    return replace(metadata, emit_observation_timestamps=True if declared is None else declared)
+
+
 def load_native_render_metadata(
     config: PerceptronIsaacConfig, *, stats_fps: float | None = None
 ) -> IsaacMharmonyRenderMetadata:
@@ -705,6 +777,12 @@ def load_native_render_metadata(
                 mharmony_reserved_token_groups=_recipe_reserved_token_groups(recipe),
             )
             metadata = _apply_recipe_image_preprocess(metadata, recipe)
+    metadata = hydrate_isaac_observation_timestamps(
+        metadata,
+        recipe_path=config.resolve_inference_recipe_path(),
+        policy_state_dataset=config.policy_state_dataset,
+        normalization_scope=config.normalization_profile_scope,
+    )
     if stats_fps is not None and metadata.target_fps is None:
         metadata = replace(metadata, target_fps=float(stats_fps))
     metadata.validate_for_config(config)
@@ -749,7 +827,9 @@ def build_isaac_mharmony_content_plan(
 
     This mirrors the Genesis ``trajectory_flow_matching_pipeline`` inference
     contract for the supported native eval surface: Flow actions, explicit deltas,
-    timestamps, RGB images, last-state-only proprio, and no scene description.
+    RGB images, last-state-only proprio, and no scene description. Episode-time
+    items precede each observation only when the checkpoint's recipe emits them
+    (``emit_observation_timestamps``); the plan records the timestamps either way.
     """
     if not isinstance(inference_clip_normalized_proprio, bool):
         raise ValueError("inference_clip_normalized_proprio must be a boolean.")
@@ -785,8 +865,11 @@ def build_isaac_mharmony_content_plan(
             },
         }
     ]
+    # Unresolved metadata (None) keeps the emission every checkpoint used before the field.
+    emit_timestamps = metadata.emit_observation_timestamps is not False
     for step_idx, (frame, timestamp_seconds) in enumerate(zip(history, timestamps, strict=True)):
-        user_content.append(_timestamp_content_item(step_idx, timestamp_seconds, metadata))
+        if emit_timestamps:
+            user_content.append(_timestamp_content_item(step_idx, timestamp_seconds, metadata))
         for camera_idx, camera in enumerate(metadata.camera_order):
             user_content.append(
                 {

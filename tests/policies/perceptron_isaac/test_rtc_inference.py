@@ -171,12 +171,13 @@ def test_select_action_pins_previous_chunk_unexecuted_rows(
         assert sampler.prefixes[-1] == (None, None)
 
 
-def test_async_rtc_engine_kwargs_are_rejected(tmp_path: Path) -> None:
+def test_select_action_owns_the_sync_prefix(tmp_path: Path) -> None:
     stats_path = tmp_path / "stats.json"
     _write_rollout_stats(stats_path)
     with _rollout_harness(_rollout_config(stats_path)) as harness:
-        with pytest.raises(NotImplementedError, match="rtc_prefix_length"):
-            harness.policy.predict_action_chunk({}, inference_delay=2, prev_chunk_left_over=None)
         batch: dict[str, Any] = _live_batch(0)
         with pytest.raises(ValueError, match="owns the RTC prefix"):
             harness.policy.select_action(batch, action_prefix=torch.zeros(2, 1, 2))
+        # The RTC engine's continuation belongs to predict_action_chunk (test_rtc_async_engine.py).
+        with pytest.raises(ValueError, match="sync path"):
+            harness.policy.select_action(batch, inference_delay=1, prev_chunk_left_over=torch.zeros(2, 2))

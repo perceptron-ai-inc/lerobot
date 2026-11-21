@@ -158,6 +158,64 @@ def effective_rtc_max_prefix_steps(
     return min(max_delay_steps, action_horizon - 1)
 
 
+@dataclass(frozen=True)
+class RtcCapability:
+    """A checkpoint's trained-RTC inference budget and the stage that last trained its weights.
+
+    ``prefix_budget`` is the declared inference prefix budget: the longest prefix the
+    sampler admits, 0 when the checkpoint declares none. ``declared_max_delay_steps`` and
+    ``declared_probability`` repeat the action-expert recipe, which training stages carry
+    forward unchanged. ``final_stage_max_delay_steps`` is what the final training stage
+    itself sampled: None when the declaring recipe is that stage, 0 when a later stage
+    trained without RTC prefixes.
+    """
+
+    prefix_budget: int
+    declared_max_delay_steps: int
+    declared_probability: float | None
+    final_stage_max_delay_steps: int | None
+
+    @property
+    def inherited(self) -> bool:
+        """Whether the budget is an ancestor's declaration rather than this stage's training.
+
+        An inherited budget still admits prefixes. It records provenance only: nothing has
+        validated prefix inference on the weights the final stage produced.
+        """
+        return self.prefix_budget > 0 and self.final_stage_max_delay_steps == 0
+
+
+def resolve_rtc_capability(
+    action: Mapping[str, Any] | None,
+    *,
+    prediction_steps: int,
+    final_stage_max_delay_steps: int | None,
+) -> RtcCapability:
+    """Combine an action-expert recipe with the final training stage's RTC record.
+
+    ``action`` is the checkpoint's ``action_expert`` metadata. A missing recipe, or a legacy
+    block without RTC fields, declares no budget, so trained prefixes stay rejected.
+    """
+    max_delay = 0 if action is None else action.get("rtc_max_delay_steps", 0)
+    probability = None if action is None else action.get("rtc_probability")
+    if isinstance(max_delay, bool) or not isinstance(max_delay, int):
+        raise ValueError(f"action_expert rtc_max_delay_steps must be an integer, got {max_delay!r}.")
+    if probability is not None and (
+        isinstance(probability, bool) or not isinstance(probability, int | float)
+    ):
+        raise ValueError(f"action_expert rtc_probability must be a number or null, got {probability!r}.")
+    return RtcCapability(
+        prefix_budget=effective_rtc_max_prefix_steps(
+            max_delay_steps=max_delay,
+            probability=probability,
+            action_horizon=prediction_steps,
+        ),
+        declared_max_delay_steps=max_delay,
+        declared_probability=None if probability is None else float(probability),
+        final_stage_max_delay_steps=final_stage_max_delay_steps,
+    )
+
+
 @dataclass(frozen=True, eq=False)
 class ResolvedRTCActionPrefix:
     """Validated RTC prefix geometry shared by native and HF sampling."""
