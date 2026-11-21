@@ -113,7 +113,7 @@ def _trained_policy(root: Path, *, max_delay: int, probability: float | None) ->
     config.freeze_input_embeddings = True
     render_metadata_path = root / "native_render_metadata.json"
     _render_metadata(config, render_metadata_path)
-    # Chunk inference is offered only to recipes that render no episode-time tokens.
+    # RTC-capable releases (YAM, SO-100/101) use recipes that render no episode-time tokens.
     render_metadata = json.loads(render_metadata_path.read_text())
     render_metadata["emit_observation_timestamps"] = False
     render_metadata_path.write_text(json.dumps(render_metadata))
