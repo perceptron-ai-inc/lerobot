@@ -66,7 +66,6 @@ from .processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_STREAM_KEY,
     PerceptronIsaacMharmonyPackProcessorStep,
 )
-from .rtc import reject_rtc_prefix
 from .trained_package import (
     CANONICAL_INNER_MODEL_STORAGE,
     MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
@@ -84,6 +83,13 @@ from .trained_package import (
 
 if TYPE_CHECKING:
     from .modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
+
+_ASYNC_RTC_ENGINE_UNSUPPORTED = (
+    "perceptron_isaac does not support LeRobot's asynchronous RTC engine because the policy owns "
+    "its observation clock. Use --inference.type=sync with --policy.rtc_prefix_length=P for "
+    "prefix-pinned RTC."
+)
+
 
 T = TypeVar("T", bound="PerceptronIsaacPolicy")
 logger = logging.getLogger(__name__)
@@ -685,6 +691,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._online_state_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
         self._rollout_batch_size: int | None = None
         self._online_render_step: PerceptronIsaacMharmonyPackProcessorStep | None = None
+        self._last_norm_chunk: Tensor | None = None
         self._frame_index: int = -1
         # Settle frames are counted separately so they never advance the episode clock.
         self._settle_index: int = 0
@@ -1266,14 +1273,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         Returns normalized actions shaped ``[B, chunk_size, action_dim]``. The
         postprocessor is responsible for action unnormalization and clipping.
         Optional ``flow_noise`` supplies sample-major full-width DiT noise without RNG draws.
+        Optional ``action_prefix`` ``[B, P, action_dim]`` holds normalized RTC prefix rows; the
+        DiT expert pins them and rejects prefixes beyond the checkpoint's RTC support.
         """
         self._require_deployable_action_artifact()
-        reject_rtc_prefix(action_prefix, prefix_length)
-        # Fail before loading or advancing clocks on retired RTC inference requests.
+        # LeRobot's asynchronous RTC engine calls this method directly, bypassing
+        # select_action's policy-owned observation history and settle clock.
         if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
-            raise NotImplementedError(
-                "perceptron_isaac does not support RTC inference. Use --inference.type=sync."
-            )
+            raise NotImplementedError(_ASYNC_RTC_ENGINE_UNSUPPORTED)
         self.eval()
         if self._isaac_model is None:
             self._load_backbone()
@@ -1296,16 +1303,20 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         n_flow = max(1, int(getattr(self.config, "num_flow_samples", 1) or 1))
 
         def _sample() -> Tensor:
-            noise_kwargs: dict[str, Any] = {}
+            sample_kwargs: dict[str, Any] = {}
             if flow_noise is not None:
-                noise_kwargs["flow_noise"] = flow_noise
+                sample_kwargs["flow_noise"] = flow_noise
+            # Prefix-free requests keep the exact released sampler call.
+            if action_prefix is not None:
+                sample_kwargs["action_prefix"] = action_prefix.to(device=self._resolve_device())
+                sample_kwargs["prefix_length"] = prefix_length
             return model.sample_action(
                 stream,
                 num_steps=self.config.num_inference_steps,
                 action_dim=self.config.action_dim,
                 num_action_steps=self.config.chunk_size,
                 num_flow_samples=n_flow,
-                **noise_kwargs,
+                **sample_kwargs,
             )
 
         def _run_samples() -> Tensor:
@@ -1344,14 +1355,21 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         if not bool(torch.isfinite(actions_norm).all()):
             raise RuntimeError("Perceptron Isaac model returned non-finite normalized actions.")
-        return actions_norm[:, :, : self.config.action_dim].float()
+        actions_norm = actions_norm[:, :, : self.config.action_dim].float()
+        self._last_norm_chunk = actions_norm.detach()
+        return actions_norm
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Any], *, flow_noise: Tensor | None = None, **kwargs) -> Tensor:
-        """Serve one action; optional ``flow_noise`` is used only when refilling the chunk."""
-        reject_rtc_prefix(kwargs.get("action_prefix"), kwargs.get("prefix_length"))
+        """Serve one action; optional ``flow_noise`` is used only when refilling the chunk.
+
+        With ``rtc_prefix_length > 0``, each refill pins the first ``rtc_prefix_length`` rows
+        to the previous chunk's still-unexecuted rows ``[n_action_steps, n_action_steps + P)``.
+        """
+        if "action_prefix" in kwargs or "prefix_length" in kwargs:
+            raise ValueError("select_action owns the RTC prefix; set rtc_prefix_length instead.")
         if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
-            raise NotImplementedError("perceptron_isaac does not support RTC inference; use sync inference.")
+            raise NotImplementedError(_ASYNC_RTC_ENGINE_UNSUPPORTED)
         self._require_deployable_action_artifact()
         self.eval()
         if ACTION in batch:
@@ -1392,12 +1410,18 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._frame_index += 1
 
         if len(self._queues[ACTION]) == 0:
+            chunk_kwargs: dict[str, Any] = {}
+            if flow_noise is not None:
+                chunk_kwargs["flow_noise"] = flow_noise
+            rtc_p = int(self.config.rtc_prefix_length)
+            if rtc_p > 0 and self._last_norm_chunk is not None:
+                # Pin the previous chunk's committed, not-yet-executed rows. The config
+                # guarantees n_action_steps + rtc_prefix_length <= chunk_size.
+                start = self.config.n_action_steps
+                chunk_kwargs["action_prefix"] = self._last_norm_chunk[:, start : start + rtc_p]
+                chunk_kwargs["prefix_length"] = rtc_p
             model_batch = batch if has_stream else self._render_online_stream_batch(batch)
-            actions = (
-                self.predict_action_chunk(model_batch)
-                if flow_noise is None
-                else self.predict_action_chunk(model_batch, flow_noise=flow_noise)
-            )
+            actions = self.predict_action_chunk(model_batch, **chunk_kwargs)
             actions = actions[:, : self.config.n_action_steps]
             self._queues[ACTION].extend(actions.transpose(0, 1))
         return self._queues[ACTION].popleft()

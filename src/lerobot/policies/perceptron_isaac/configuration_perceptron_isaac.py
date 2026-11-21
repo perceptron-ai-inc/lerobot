@@ -111,6 +111,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # --- expert / inference ---
     # Native eval/serving backend. No Genesis bridge backend is supported.
     inference_backend: str = "native_mharmony"
+    # Compatibility label only: released packages serialize "molmoact". The head is always the
+    # native DiT built from the checkpoint's action_expert metadata; this value selects nothing.
     action_expert_type: str = "molmoact"
     num_inference_steps: int = 10
     # Flow-sample averaging: sample the flow ODE `num_flow_samples` times (fresh noise each) and
@@ -155,7 +157,10 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # Settle frames never advance the episode clock -- see PerceptronIsaacPolicy.select_action.
     num_settle_steps: int = 0
     settle_gripper: float = -1.0
-    # Compatibility-only RTC-off field. RTC execution is retired even for RTC-capable source weights.
+    # Prefix-pinned RTC inference. P > 0 pins the first P rows of each refilled chunk to the
+    # previous chunk's unexecuted rows [n_action_steps, n_action_steps + P). Requires
+    # n_action_steps + P <= chunk_size; the DiT expert rejects P beyond the checkpoint's
+    # declared RTC support (rtc_max_delay_steps). 0 disables RTC.
     rtc_prefix_length: int = 0
 
     # --- vision / cameras ---
@@ -415,8 +420,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
                 "Perceptron Isaac artifact_kind must be 'trained_policy' or 'neutral_debug', "
                 f"got {self.artifact_kind!r}."
             )
-        # Both names resolve to the same vendored expert head: 'dit' is genesis's
-        # post-#3402 name for it (see build_action_expert_head's alias).
+        # Both labels describe the native DiT head (see the field comment).
         if self.action_expert_type not in {"molmoact", "dit"}:
             raise ValueError(
                 "Perceptron Isaac action_expert_type must be 'molmoact' or 'dit'; "
@@ -481,8 +485,13 @@ class PerceptronIsaacConfig(PreTrainedConfig):
             self.native_stats_path = self.stats_path
         self.config_toml_path = None
         self.per_suite_stats_dir = None
-        if self.rtc_prefix_length != 0:
-            raise ValueError("Perceptron Isaac RTC execution is unsupported; rtc_prefix_length must be 0.")
+        if self.rtc_prefix_length < 0:
+            raise ValueError(f"rtc_prefix_length must be >= 0; got {self.rtc_prefix_length}.")
+        if self.n_action_steps + self.rtc_prefix_length > self.chunk_size:
+            raise ValueError(
+                f"n_action_steps ({self.n_action_steps}) + rtc_prefix_length ({self.rtc_prefix_length}) "
+                f"cannot exceed chunk_size ({self.chunk_size})."
+            )
         if self.train_samples_per_chunk < 1:
             raise ValueError("train_samples_per_chunk must be >= 1.")
         if self.train_skip_outlier_threshold < 0.0:

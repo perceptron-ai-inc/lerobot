@@ -92,7 +92,7 @@ freezes completed environments and resets the entire group between rollouts;
 Changing the live batch size requires that global reset. Settling emits one idle
 row per environment without adding frames to model history or time.
 
-## Training objective and retired RTC
+## Training objective and RTC
 
 Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
 `action-noise`. Flow first averages valid weighted elements within each draw,
@@ -114,10 +114,20 @@ RoPE frequencies in F32 from the original formula, including BF16-source trainin
 They do not replace parameters or widen a rounded BF16 table. Inference retains
 the released BF16 frequency table and phase behavior.
 
-RTC execution, prefix pinning and dual-time conditioning are retired. Legacy
-RTC-off settings remain readable. Released RTC-capable source metadata and
-weights remain authenticated and unchanged; source recipe values do not enable
-RTC at runtime. Enabled requests fail before sampling or changing rollout clocks.
+The action expert is always the native DiT. Legacy MK1 checkpoints, whose action
+block says `type="molmoact"`, hold the same network and load into it with RTC off.
+
+RTC inference pins a prefix for checkpoints whose metadata declares RTC support
+(`rtc_max_delay_steps > 0`). Set `--policy.rtc_prefix_length=P` with sync
+inference. Each chunk refill pins its first `P` rows to the previous chunk's rows
+`[n_action_steps, n_action_steps + P)`; those rows use clean flow time 1 and zero
+velocity. `P` must not exceed `rtc_max_delay_steps`, and `n_action_steps + P` must
+not exceed `chunk_size`. The Isaac 0.5 YAM checkpoint declares
+`rtc_max_delay_steps=30`, so `--policy.n_action_steps=10 --policy.rtc_prefix_length=12`
+is valid. `P=0`, the default, leaves sampling unchanged. LeRobot's asynchronous
+runner (`--inference.type=rtc`) is not supported: the model is conditioned on
+episode time, which this policy counts per control step. RTC training is not
+implemented.
 
 ## Evidence and limits
 

@@ -30,7 +30,6 @@ from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
     ActionExpertContext,
     DiTActionExpertHead,
-    MolmoActExpertHead,
     build_action_expert_head,
 )
 from lerobot.policies.perceptron_isaac.tensor_stream import (
@@ -74,7 +73,7 @@ def _rms_norm(value: torch.Tensor) -> torch.Tensor:
 
 
 def _expected_projected_kv(
-    head: MolmoActExpertHead, context: torch.Tensor
+    head: DiTActionExpertHead, context: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     expert = head.action_expert
     key = _rms_norm(functional.linear(context, expert.context_k_proj.weight)).reshape(
@@ -324,7 +323,7 @@ def test_real_native_sample_action_uses_selected_post_residual_layers_in_batch_h
         torch.manual_seed(2026)
         model = _tiny_backbone(serialization=serialization, hidden_norm=hidden_norm)
         head = model.model.action_expert
-        assert isinstance(head, MolmoActExpertHead)
+        assert isinstance(head, DiTActionExpertHead)
         layerwise = serialization != "schema1"
         decoder_outputs: list[torch.Tensor] = []
         reads: list[list[CrossAttentionRead]] = [[], []]

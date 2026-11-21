@@ -1,4 +1,4 @@
-"""Native DiT metadata, retired RTC refusal, and ordinary MolmoAct compatibility."""
+"""Native DiT metadata, RTC prefix gating, and ordinary MolmoAct compatibility."""
 
 import pytest
 import torch
@@ -72,6 +72,17 @@ def test_genesis_dit_contract_builds_the_vendored_head():
     assert head.args.rtc_max_delay_steps == 0
 
 
+def test_legacy_mk1_action_block_loads_as_dit_without_rtc():
+    head = build_action_expert_head(_molmoact_cfg(), vlm_dim=_VLM_DIM)
+    assert type(head).__name__ == "DiTActionExpertHead"
+    assert head.args.rtc_max_delay_steps == 0
+    assert head.args.rtc_probability is None
+    with pytest.raises(ValueError, match="clean-at-0"):
+        build_action_expert_head(_molmoact_cfg(clean_at_0=True), vlm_dim=_VLM_DIM)
+    with pytest.raises(ValueError, match="unexpected fields"):
+        build_action_expert_head(_molmoact_cfg(rtc_max_delay_steps=2), vlm_dim=_VLM_DIM)
+
+
 def test_dit_contract_schema_drift_fails_loud():
     with pytest.raises(ValueError, match="schema_version"):
         build_action_expert_head(_dit_contract(schema_version=2), vlm_dim=_VLM_DIM)
@@ -89,17 +100,23 @@ def test_unknown_expert_type_still_fails_loud():
         build_action_expert_head({"type": "genesis-flow-v2"}, vlm_dim=_VLM_DIM)
 
 
-@pytest.mark.parametrize("kind", ["dit", "molmoact"])
-@pytest.mark.parametrize("budget", [0, 2])
-def test_source_rtc_budget_never_enables_execution(kind, budget):
-    config = (
-        _dit_contract(rtc_max_delay_steps=budget)
-        if kind == "dit"
-        else _molmoact_cfg(rtc_max_delay_steps=budget)
-    )
-    head = build_action_expert_head(config, vlm_dim=_VLM_DIM)
-    with pytest.raises(ValueError, match="RTC"):
+def test_legacy_mk1_action_block_rejects_rtc_prefix():
+    head = build_action_expert_head(_molmoact_cfg(), vlm_dim=_VLM_DIM)
+    with pytest.raises(ValueError, match="maximum supported RTC prefix 0"):
         head.sample(torch.zeros(1, 3, _VLM_DIM), action_prefix=torch.zeros(1, 2, 4), prefix_length=2)
+
+
+def test_dit_head_without_declared_rtc_support_rejects_prefix():
+    head = build_action_expert_head(_dit_contract(rtc_max_delay_steps=0), vlm_dim=_VLM_DIM)
+    with pytest.raises(ValueError, match="maximum supported RTC prefix 0"):
+        head.sample(torch.zeros(1, 3, _VLM_DIM), action_prefix=torch.zeros(1, 2, 4), prefix_length=2)
+
+
+def test_dit_head_with_declared_rtc_support_pins_prefix():
+    head = build_action_expert_head(_dit_contract(rtc_max_delay_steps=2), vlm_dim=_VLM_DIM)
+    prefix = torch.full((1, 2, 4), 0.25)
+    actions = head.sample(torch.zeros(1, 3, _VLM_DIM), action_prefix=prefix, prefix_length=2)
+    torch.testing.assert_close(actions[:, :2], prefix, rtol=0, atol=0)
 
 
 def test_dit_contract_declaring_rtc_training_is_supported():

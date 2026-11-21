@@ -165,7 +165,8 @@ class IsaacMharmonyRenderMetadata:
             action_conditioning=bool(config.action_conditioning),
             action_conditioning_role=str(config.action_conditioning_role),
             mistake_conditioning=bool(config.mistake_conditioning),
-            rtc_prefix_length=int(config.rtc_prefix_length),
+            # RTC prefixes enter only the DiT sampler, never the rendered prompt.
+            rtc_prefix_length=0,
             mharmony_version=config.mharmony_version,
             patch_size=int(config.render_patch_size),
             pixel_shuffle_scale=int(config.render_pixel_shuffle_scale),

@@ -42,10 +42,7 @@ from lerobot.policies.perceptron_isaac.mharmony_native import (
     load_native_render_metadata,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
-from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
-    MolmoActExpertHead,
-    Qwen35VLAConfig,
-)
+from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import Qwen35VLAConfig
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     LIBERO_SERVING_STATS_FILENAME,
     PERCEPTRON_ISAAC_ANCHOR_TIMESTAMPS_KEY,
@@ -62,7 +59,6 @@ from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     make_perceptron_isaac_pre_post_processors_from_pretrained,
     normalize_perceptron_isaac_task_text,
 )
-from lerobot.policies.perceptron_isaac.rtc import SharedFinalContext
 from lerobot.processor import PolicyProcessorPipeline, batch_to_transition, transition_to_batch
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -495,11 +491,6 @@ class FakeRandomFlowIsaacModel(FakeIsaacModel):
         return torch.stack(samples, dim=0).mean(dim=0)
 
 
-class ZeroVelocityActionExpert:
-    def forward_with_context(self, x, t_tensor, *, context):
-        return torch.zeros_like(x)
-
-
 def _tiny_policy(
     root: Path,
     model: FakeIsaacModel | FakeMixedPrecisionIsaacModel | None = None,
@@ -581,39 +572,6 @@ def _write_native_stats(
             }
         )
     )
-
-
-def test_molmoact_expert_averages_flow_samples_with_one_context_build():
-    head = MolmoActExpertHead.__new__(MolmoActExpertHead)
-    torch.nn.Module.__init__(head)
-    # This narrow sampler fixture bypasses __init__, so supply its required context contract.
-    head.conditioning = SharedFinalContext()
-    head.vlm_dim = 4
-    head.num_inference_steps = 1
-    head.action_dim = 1
-    head.action_horizon = 1
-    head.clean_at_0 = False
-    head.action_expert = ZeroVelocityActionExpert()
-    context_calls = []
-
-    def _fake_context(*args, **kwargs):
-        context_calls.append((args, kwargs))
-        return object()
-
-    head._build_single_context = _fake_context
-    torch.manual_seed(123)
-    actual = head.sample(
-        torch.zeros(1, 2, 4),
-        num_steps=1,
-        num_action_steps=1,
-        action_dim=1,
-        num_flow_samples=4,
-    )
-    torch.manual_seed(123)
-    expected = torch.stack([torch.randn(1, 1, 1) for _ in range(4)], dim=0).mean(dim=0)
-
-    assert len(context_calls) == 1
-    torch.testing.assert_close(actual, expected)
 
 
 def test_qwen35_vla_config_forces_untied_embeddings():

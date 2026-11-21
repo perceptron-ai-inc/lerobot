@@ -25,7 +25,6 @@ from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
     ActionExpertContext,
     DiTActionExpertHead,
     MolmoAct2ActionExpertConfig,
-    MolmoActExpertHead,
     Qwen35VLAForActionGeneration,
     build_action_expert_head,
 )
@@ -306,7 +305,7 @@ def test_real_expert_batch8_matches_serial_explicit_noise(batch: int, layerwise:
 class ContextOnlyBackbone(nn.Module):
     """Supply fixed post-residual tensors, not a transformer or a checkpoint."""
 
-    def __init__(self, head: MolmoActExpertHead, layers: tuple[torch.Tensor, ...]) -> None:
+    def __init__(self, head: DiTActionExpertHead, layers: tuple[torch.Tensor, ...]) -> None:
         super().__init__()
         self.action_expert = head
         self.hidden_layers = layers
@@ -331,7 +330,7 @@ class SamplerModelShell(nn.Module):
 
     sample_action = Qwen35VLAForActionGeneration.sample_action
 
-    def __init__(self, head: MolmoActExpertHead, layers: tuple[torch.Tensor, ...]) -> None:
+    def __init__(self, head: DiTActionExpertHead, layers: tuple[torch.Tensor, ...]) -> None:
         super().__init__()
         self.model = ContextOnlyBackbone(head, layers)
 
@@ -364,13 +363,3 @@ def test_model_forwards_flow_noise_to_expert_noise_and_crops_only_after_sampling
     torch.testing.assert_close(noise, original, rtol=0, atol=0)
     assert len(expert.reads) == 10
     assert all(read.state.shape == (8, 10, 64) for read in expert.reads)
-
-
-def test_model_rejects_explicit_noise_for_non_dit_head_without_rng() -> None:
-    legacy_head = MolmoActExpertHead(_tiny_action_config(layerwise=False), vlm_dim=8).float().eval()
-    layers, _ = _context_inputs(1)
-    model = SamplerModelShell(legacy_head, layers)
-    before = torch.get_rng_state().clone()
-    with pytest.raises(ValueError, match="flow_noise.*DiT"):
-        model.sample_action(_prepacked_stream(), flow_noise=torch.zeros(10, 64))
-    assert torch.equal(torch.get_rng_state(), before)

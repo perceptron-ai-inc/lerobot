@@ -979,7 +979,7 @@ def test_portable_isaac05_loads_native_fp32_without_checkpoint_python(tmp_path: 
     assert contract == expected
     assert type(model).__module__ == "lerobot.policies.perceptron_isaac.modeling_mk1_vla"
     assert config.model_type == "qwen3_5_moe"
-    assert model.action_expert.expert_type == "dit"
+    assert type(model.action_expert).__name__ == "DiTActionExpertHead"
     assert config.action_expert == action
     assert set(model.state_dict()) == set(contract.expected_tensor_shapes())
     assert value.item() != value.bfloat16().float().item()
