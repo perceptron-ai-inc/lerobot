@@ -183,7 +183,9 @@ def test_explicit_render_sidecar_keeps_precedence_over_recipe(tmp_path: Path) ->
     sidecar.write_text(json.dumps(declared))
     config.native_render_metadata_path = str(sidecar)
     metadata = load_native_render_metadata(config)
-    assert metadata.to_json_dict() == declared
+    # The sidecar predates the timestamp flag and this recipe does not declare it, so the
+    # loader resolves the original emission; every sidecar value keeps its precedence.
+    assert metadata.to_json_dict() == {**declared, "emit_observation_timestamps": True}
 
 
 def test_runtime_image_override_cannot_silently_conflict_with_recipe(tmp_path: Path) -> None:

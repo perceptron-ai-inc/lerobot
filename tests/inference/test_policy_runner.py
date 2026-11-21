@@ -22,6 +22,7 @@ import torch
 
 from lerobot.inference import ExecutionMode, FeatureSpec, ObservationSnapshot, PolicyRunner
 from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.chunk import EPISODE_TIME_KEY
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.processor import RelativeActionsProcessorStep
@@ -233,3 +234,38 @@ def test_deployment_can_disable_text_and_cannot_enable_an_unsupported_head():
     policy.supports_text_generation = lambda: False
     with pytest.raises(ValueError, match="has no text capability"):
         runner_for(policy, language_enabled=True)
+
+
+class _EpisodeTimeRecorder(ConformingPolicy):
+    """Records the episode time each prediction's batch carries, if any."""
+
+    needs_time = True
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.episode_times: list[float | None] = []
+
+    def chunk_inference_spec(self):
+        return replace(super().chunk_inference_spec(), needs_episode_time=self.needs_time)
+
+    def predict_action_chunk(self, batch, **kwargs):
+        value = batch.get(EPISODE_TIME_KEY)
+        self.episode_times.append(None if value is None else float(value))
+        return super().predict_action_chunk(batch, **kwargs)
+
+
+def test_runner_supplies_episode_relative_capture_time_only_when_declared():
+    policy = _EpisodeTimeRecorder(tiny_config())
+    runner = runner_for(policy)
+    for capture_time in (10.0, 10.5, 12.0):
+        runner.predict(replace(observation(), capture_time=capture_time))
+    assert policy.episode_times == [0.0, 0.5, 2.0]
+    # A full reset starts a new episode; the next observation is its time zero.
+    runner.reset()
+    runner.predict(replace(observation(), capture_time=20.0))
+    assert policy.episode_times[-1] == 0.0
+
+    plain = _EpisodeTimeRecorder(tiny_config())
+    plain.needs_time = False
+    runner_for(plain).predict(observation())
+    assert plain.episode_times == [None]

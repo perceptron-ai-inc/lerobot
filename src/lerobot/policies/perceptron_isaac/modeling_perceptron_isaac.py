@@ -29,6 +29,7 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
+from ..chunk import ChunkPolicySpec, ExecutionMode
 from ..pretrained import PreTrainedPolicy
 from .checkpoint_integrity import (
     DirectorySnapshot,
@@ -66,7 +67,7 @@ from .processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_STREAM_KEY,
     PerceptronIsaacMharmonyPackProcessorStep,
 )
-from .rtc import reject_rtc_prefix
+from .rtc import RtcCapability
 from .trained_package import (
     CANONICAL_INNER_MODEL_STORAGE,
     MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
@@ -349,6 +350,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._isaac_model: Mk1Qwen36VLAForActionGeneration | None = None
         self._stats: IsaacNormalizationStats | None = None
         self._native_render_metadata: IsaacMharmonyRenderMetadata | None = None
+        # Read on the first trained-RTC request; the recipe does not change under a loaded policy.
+        self._rtc_prefix_budget: int | None = None
         self._verified_runtime_assets: DirectorySnapshot | None = None
         self._verified_external_runtime_assets: list[DirectorySnapshot] = []
         # Checkpoint-serialized normalization stats adopted from the restored
@@ -685,6 +688,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._online_state_queue: deque[np.ndarray] = deque(maxlen=max(1, int(self.config.n_obs_steps)))
         self._rollout_batch_size: int | None = None
         self._online_render_step: PerceptronIsaacMharmonyPackProcessorStep | None = None
+        self._last_norm_chunk: Tensor | None = None
         self._frame_index: int = -1
         # Settle frames are counted separately so they never advance the episode clock.
         self._settle_index: int = 0
@@ -987,6 +991,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._training_parameters_configured:
             return
         self._training_parameters_configured = True
+        # Record this stage's RTC setting beside the declared budget it leaves unchanged, so
+        # the saved package says its weights were last trained without RTC prefixes.
+        self.config.rtc_final_stage_max_delay_steps = int(self.config.flow_rtc_max_delay_steps)
         from .modeling_qwen35_vla import setup_qwen35_vla_for_training
 
         setup_qwen35_vla_for_training(
@@ -1251,6 +1258,93 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         out["task"] = rendered_complementary.get("task", task_source)
         return out
 
+    def rtc_capability(self) -> RtcCapability:
+        """The checkpoint's trained-RTC prefix budget and its provenance (see the config)."""
+        return self.config.rtc_capability()
+
+    def supports_rtc(self) -> bool:
+        """Trained RTC only, and only when the checkpoint declares or inherits a prefix budget."""
+        return self.rtc_capability().prefix_budget > 0
+
+    def chunk_inference_spec(self) -> ChunkPolicySpec:
+        """Declare exactly the chunk modes ISAAC implements for asynchronous callers.
+
+        ``predict_action_chunk`` renders the current observation itself, so one observation
+        step is required. Guided RTC is never offered. Trained RTC is offered when the
+        checkpoint declares or inherits a prefix budget. A checkpoint whose recipe emits
+        episode-time tokens declares ``needs_episode_time``: chunk callers predict once per
+        chunk, so they supply each observation's episode-relative capture time and the
+        policy's per-step frame clock is not used. The weights are loaded when this returns.
+        """
+        if self.config.n_obs_steps != 1:
+            raise ValueError("Chunk inference requires n_obs_steps=1; observation history is unsupported.")
+        metadata = self._native_render_metadata or load_native_render_metadata(self.config)
+        # FP32-storage packages defer their weight load to first use. Chunk callers put every
+        # prediction under a deadline, so load here, before a robot connects or a clock starts.
+        if self._isaac_model is None and self.config.hf_model_path:
+            self._load_backbone()
+        capability = self.rtc_capability()
+        modes = [ExecutionMode.CHUNK]
+        if capability.prefix_budget > 0:
+            modes.append(ExecutionMode.RTC_TRAINED)
+            if capability.inherited:
+                logger.warning(
+                    "ISAAC RTC prefix budget %d is inherited from the source checkpoint. The final "
+                    "training stage ran without RTC prefixes, so prefix inference is unvalidated "
+                    "for these weights.",
+                    capability.prefix_budget,
+                )
+        return ChunkPolicySpec(
+            prediction_steps=int(self.config.chunk_size),
+            execution_steps=int(self.config.n_action_steps),
+            modes=tuple(modes),
+            training_max_delay=capability.prefix_budget,
+            needs_episode_time=metadata.emit_observation_timestamps is not False,
+        )
+
+    def _trained_rtc_prefix(
+        self, inference_delay: int | None, prev_chunk_left_over: Tensor | None
+    ) -> tuple[Tensor | None, int | None]:
+        """Turn the RTC engine's continuation into the DiT prefix for the measured delay."""
+        delay = 0 if inference_delay is None else int(inference_delay)
+        if delay < 0:
+            raise ValueError(f"RTC inference_delay must be nonnegative, got {delay}.")
+        if delay == 0:
+            return None, None
+        if prev_chunk_left_over is None:
+            raise ValueError("A positive RTC inference_delay requires prev_chunk_left_over.")
+        expected_width = int(self.config.action_dim)
+        if (
+            prev_chunk_left_over.ndim != 2
+            or prev_chunk_left_over.shape[1] != expected_width
+            or prev_chunk_left_over.shape[0] < delay
+        ):
+            raise ValueError(
+                f"prev_chunk_left_over must be [steps >= {delay}, {expected_width}] normalized actions, "
+                f"got {tuple(prev_chunk_left_over.shape)}."
+            )
+        self._require_prefix_within_budget(delay, "RTC inference_delay")
+        return prev_chunk_left_over[:delay].unsqueeze(0), delay
+
+    def _require_prefix_within_budget(self, length: int, name: str) -> None:
+        """Reject a prefix longer than the checkpoint was trained to continue from."""
+        if self._rtc_prefix_budget is None:
+            self._rtc_prefix_budget = self.rtc_capability().prefix_budget
+        if length > self._rtc_prefix_budget:
+            raise ValueError(
+                f"{name} {length} exceeds this checkpoint's trained-RTC prefix budget "
+                f"{self._rtc_prefix_budget}."
+            )
+
+    def drop_queued_actions(self) -> None:
+        """Discard queued actions together with the sync RTC carry computed with them.
+
+        The carried rows continue a chunk that will no longer execute, for example after an
+        instruction change, so the next refill must not pin them.
+        """
+        super().drop_queued_actions()
+        self._last_norm_chunk = None
+
     @torch.no_grad()
     def predict_action_chunk(
         self,
@@ -1259,6 +1353,8 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         prefix_length: int | None = None,
         *,
         flow_noise: Tensor | None = None,
+        inference_delay: int | None = None,
+        prev_chunk_left_over: Tensor | None = None,
         **kwargs,
     ) -> Tensor:
         """Run the flow expert on a native mharmony stream.
@@ -1266,14 +1362,19 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         Returns normalized actions shaped ``[B, chunk_size, action_dim]``. The
         postprocessor is responsible for action unnormalization and clipping.
         Optional ``flow_noise`` supplies sample-major full-width DiT noise without RNG draws.
+        Optional ``action_prefix`` ``[B, P, action_dim]`` holds normalized RTC prefix rows; the
+        DiT expert pins them and rejects prefixes beyond the checkpoint's RTC support.
+        LeRobot's RTC engine instead passes ``inference_delay`` and ``prev_chunk_left_over``:
+        the first ``inference_delay`` rows of that normalized ``[steps, action_dim]``
+        continuation become the prefix, and a zero delay samples without one.
         """
         self._require_deployable_action_artifact()
-        reject_rtc_prefix(action_prefix, prefix_length)
-        # Fail before loading or advancing clocks on retired RTC inference requests.
-        if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
-            raise NotImplementedError(
-                "perceptron_isaac does not support RTC inference. Use --inference.type=sync."
-            )
+        if inference_delay is not None or prev_chunk_left_over is not None:
+            if action_prefix is not None or prefix_length is not None:
+                raise ValueError("Pass either an explicit action_prefix or the RTC engine continuation.")
+            action_prefix, prefix_length = self._trained_rtc_prefix(inference_delay, prev_chunk_left_over)
+        if action_prefix is None and prefix_length:
+            raise ValueError("action_prefix is required when prefix_length is non-zero.")
         self.eval()
         if self._isaac_model is None:
             self._load_backbone()
@@ -1296,16 +1397,20 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         n_flow = max(1, int(getattr(self.config, "num_flow_samples", 1) or 1))
 
         def _sample() -> Tensor:
-            noise_kwargs: dict[str, Any] = {}
+            sample_kwargs: dict[str, Any] = {}
             if flow_noise is not None:
-                noise_kwargs["flow_noise"] = flow_noise
+                sample_kwargs["flow_noise"] = flow_noise
+            # Prefix-free requests keep the exact released sampler call.
+            if action_prefix is not None:
+                sample_kwargs["action_prefix"] = action_prefix.to(device=self._resolve_device())
+                sample_kwargs["prefix_length"] = prefix_length
             return model.sample_action(
                 stream,
                 num_steps=self.config.num_inference_steps,
                 action_dim=self.config.action_dim,
                 num_action_steps=self.config.chunk_size,
                 num_flow_samples=n_flow,
-                **noise_kwargs,
+                **sample_kwargs,
             )
 
         def _run_samples() -> Tensor:
@@ -1344,14 +1449,27 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
         if not bool(torch.isfinite(actions_norm).all()):
             raise RuntimeError("Perceptron Isaac model returned non-finite normalized actions.")
-        return actions_norm[:, :, : self.config.action_dim].float()
+        actions_norm = actions_norm[:, :, : self.config.action_dim].float()
+        self._last_norm_chunk = actions_norm.detach()
+        return actions_norm
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Any], *, flow_noise: Tensor | None = None, **kwargs) -> Tensor:
-        """Serve one action; optional ``flow_noise`` is used only when refilling the chunk."""
-        reject_rtc_prefix(kwargs.get("action_prefix"), kwargs.get("prefix_length"))
+        """Serve one action; optional ``flow_noise`` is used only when refilling the chunk.
+
+        With ``rtc_prefix_length > 0``, each refill pins the first ``rtc_prefix_length`` rows
+        to the previous chunk's still-unexecuted rows ``[n_action_steps, n_action_steps + P)``.
+        """
+        if "action_prefix" in kwargs or "prefix_length" in kwargs:
+            raise ValueError("select_action owns the RTC prefix; set rtc_prefix_length instead.")
         if "inference_delay" in kwargs or "prev_chunk_left_over" in kwargs:
-            raise NotImplementedError("perceptron_isaac does not support RTC inference; use sync inference.")
+            raise ValueError(
+                "select_action is the sync path; the RTC engine calls predict_action_chunk instead."
+            )
+        if self.config.rtc_prefix_length > 0:
+            # Checked on every call, before any action is returned: the first chunk has no
+            # prefix, so the sampler would otherwise reject an oversized one only at the refill.
+            self._require_prefix_within_budget(int(self.config.rtc_prefix_length), "rtc_prefix_length")
         self._require_deployable_action_artifact()
         self.eval()
         if ACTION in batch:
@@ -1392,12 +1510,18 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         self._frame_index += 1
 
         if len(self._queues[ACTION]) == 0:
+            chunk_kwargs: dict[str, Any] = {}
+            if flow_noise is not None:
+                chunk_kwargs["flow_noise"] = flow_noise
+            rtc_p = int(self.config.rtc_prefix_length)
+            if rtc_p > 0 and self._last_norm_chunk is not None:
+                # Pin the previous chunk's committed, not-yet-executed rows. The config
+                # guarantees n_action_steps + rtc_prefix_length <= chunk_size.
+                start = self.config.n_action_steps
+                chunk_kwargs["action_prefix"] = self._last_norm_chunk[:, start : start + rtc_p]
+                chunk_kwargs["prefix_length"] = rtc_p
             model_batch = batch if has_stream else self._render_online_stream_batch(batch)
-            actions = (
-                self.predict_action_chunk(model_batch)
-                if flow_noise is None
-                else self.predict_action_chunk(model_batch, flow_noise=flow_noise)
-            )
+            actions = self.predict_action_chunk(model_batch, **chunk_kwargs)
             actions = actions[:, : self.config.n_action_steps]
             self._queues[ACTION].extend(actions.transpose(0, 1))
         return self._queues[ACTION].popleft()

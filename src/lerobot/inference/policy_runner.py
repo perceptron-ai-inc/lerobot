@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from lerobot.policies import PreTrainedPolicy, validate_trained_rtc_horizon
+from lerobot.policies.chunk import EPISODE_TIME_KEY
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     NormalizerProcessorStep,
@@ -81,6 +82,8 @@ class PolicyRunner:
         self.max_text_input = max_text_input
         self.max_text_output = max_text_output
         self._model_action_dim: int | None = None
+        # Capture time of the session's first predicted observation since the last full reset.
+        self._episode_origin: float | None = None
         if max_text_input <= 0 or max_text_output <= 0:
             raise ValueError("Text input and output bounds must be positive.")
         supports_language = policy.supports_text_generation()
@@ -241,7 +244,14 @@ class PolicyRunner:
             raise ValueError(f"Execution mode {mode.value!r} was not enabled by this deployment.")
         started = time.perf_counter()
         with chunk_inference_context(mode):
-            prepared = self.preprocessor(self._batch(observation))
+            batch = self._batch(observation)
+            if self._policy_spec.needs_episode_time:
+                if self._episode_origin is None:
+                    self._episode_origin = observation.capture_time
+                batch[EPISODE_TIME_KEY] = torch.tensor(
+                    [observation.capture_time - self._episode_origin], dtype=torch.float32
+                )
+            prepared = self.preprocessor(batch)
             preprocessed_at = time.perf_counter()
             prediction = predict_chunk(
                 self.policy,
@@ -311,6 +321,7 @@ class PolicyRunner:
         if not full:
             self.policy.drop_queued_actions()
             return
+        self._episode_origin = None
         self.policy.reset()
         self.preprocessor.reset()
         self.postprocessor.reset()

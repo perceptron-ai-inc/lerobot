@@ -92,7 +92,7 @@ freezes completed environments and resets the entire group between rollouts;
 Changing the live batch size requires that global reset. Settling emits one idle
 row per environment without adding frames to model history or time.
 
-## Training objective and retired RTC
+## Training objective and RTC
 
 Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
 `action-noise`. Flow first averages valid weighted elements within each draw,
@@ -114,10 +114,52 @@ RoPE frequencies in F32 from the original formula, including BF16-source trainin
 They do not replace parameters or widen a rounded BF16 table. Inference retains
 the released BF16 frequency table and phase behavior.
 
-RTC execution, prefix pinning and dual-time conditioning are retired. Legacy
-RTC-off settings remain readable. Released RTC-capable source metadata and
-weights remain authenticated and unchanged; source recipe values do not enable
-RTC at runtime. Enabled requests fail before sampling or changing rollout clocks.
+The action expert is always the native DiT. Legacy MK1 checkpoints, whose action
+block says `type="molmoact"`, hold the same network and load into it with RTC off.
+
+Prompts carry an episode-time item before each observation only when the
+checkpoint's selected recipe sets `emit_observation_timestamps`. The released YAM
+and SO-100/101 recipes do not, and LIBERO does. New packages record the flag in
+their render metadata; older packages are resolved from the Flow recipe that
+`policy_state_dataset` and `normalization_profile_scope` select in
+`hf_model/policy_inference_recipe.json`, and a checkpoint with no declaration
+keeps emitting.
+
+RTC inference pins a prefix for checkpoints with a prefix budget. The budget is
+the action-expert recipe in `hf_model/config.json` (`rtc_max_delay_steps`, off
+when `rtc_probability` is 0), and training stages carry it forward unchanged. A
+training stage records its own setting in `rtc_final_stage_max_delay_steps`.
+ISAAC training does not sample RTC prefixes, so a fine-tune of an RTC-capable
+checkpoint records 0 there and keeps the source budget as an inherited
+declaration: prefixes are admitted, a warning says so, and nothing has validated
+them on the new weights. A checkpoint with no budget rejects every prefix.
+
+Two callers reach the prefix sampler. Pinned rows use clean flow time 1 and zero
+velocity in both.
+
+- Sync (`--inference.type=sync --policy.rtc_prefix_length=P`): each refill pins
+  its first `P` rows to the previous chunk's rows
+  `[n_action_steps, n_action_steps + P)`. `P` must fit the budget, which is
+  checked before the first action is returned, and `n_action_steps + P` must not
+  exceed `chunk_size`. Dropping the queued actions, as an instruction change
+  does, also drops the carried rows. `P=0`, the default, leaves sampling
+  unchanged.
+- Asynchronous (`--inference.type=rtc --inference.rtc.mode=trained`): the engine
+  passes its measured `inference_delay` and the previous chunk's remaining
+  normalized actions; the first `inference_delay` rows become the prefix, and a
+  zero delay samples without one. The 60-step YAM and SO-100/101 checkpoints
+  declare a budget of 30, which requires `--inference.rtc.execution_horizon=30`.
+  Guided RTC is not offered. FP32-storage packages defer their weight load to
+  first use; asking for the chunk spec loads them, so the load happens at
+  startup and not inside the engine's first deadline.
+
+Asynchronous callers predict once per chunk, so they cannot use the policy's
+per-step frame clock. A checkpoint whose recipe emits episode-time tokens sets
+`needs_episode_time` in its chunk spec. The engine then supplies each
+observation's capture time, relative to the episode's first predicted
+observation, as the batch `timestamp`, and the prompt renders that time. This
+covers plain asynchronous chunk mode too: LIBERO emits timestamps and has no
+RTC budget.
 
 ## Evidence and limits
 
@@ -132,6 +174,17 @@ Raw/portable-export saving is deferred and fails before gathering weights or wri
 package assets. Source-bound native MK1 saves remain implemented. Focused CPU tests
 cover reduced native save/finalize/moved reload, exact FP32 values and signed zero;
 that is not production-scale checkpoint qualification.
+
+Trained RTC ran through `lerobot-rollout` on one H100 against the published 60-step
+YAM and SO-100/101 packages on 2026-11-21, with a virtual robot replaying each
+package's sample observation. No hardware was driven. The first prediction had no
+prefix, later predictions pinned the engine's continuation exactly, and a reset
+cleared it. A prefix-conditioned prediction took about 0.95 s for YAM and 0.78 s for
+SO-100/101, which is 24 to 29 of the 30 budgeted steps at 30 Hz. With no margin, the
+30 Hz runs ended with an exhausted action buffer after 17 and 24 predictions. At
+15 Hz both ran 40 s to completion; YAM also needed
+`--inference.max_observation_age_s=10`, because its 2.6 s first prediction otherwise
+ages the first chunk past the 5 s default.
 
 This draft does not claim current-base multi-GPU qualification, production-scale
 save/reload/move, evaluation, convergence or model quality. Keep saving, evaluation

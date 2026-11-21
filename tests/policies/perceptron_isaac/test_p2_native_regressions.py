@@ -1,4 +1,4 @@
-"""P2.09/P2.14: native RTC-off metadata and retired execution refusals.
+"""P2.09/P2.14: native RTC metadata, prefix-pinned RTC inference and RTC training refusals.
 
 Only fixture JSON is varied. Native parsing, inventory validation and tensor loading
 remain real; the input checkpoint bytes must never be migrated in place.
@@ -101,20 +101,30 @@ def test_rtc_off_native_acceptance_keeps_structural_integrity(tmp_path: Path, mi
         Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
 
 
-@pytest.mark.parametrize("allow_ood", [False, True])
 @pytest.mark.parametrize("length_form", ["inferred", "scalar", "list", "tensor"])
-def test_rtc_capable_dit_rejects_execution_prefix_even_with_ood_override(
-    allow_ood: bool, length_form: str
-) -> None:
+def test_rtc_capable_dit_pins_execution_prefix(length_form: str) -> None:
     head = build_action_expert_head(_dit_contract(rtc_max_delay_steps=2, rtc_probability=0.5), vlm_dim=16)
-    prefix_length = _prefix_length(length_form)
-    with pytest.raises(ValueError, match="(?i)(rtc|prefix)"):
-        head.sample(
-            torch.zeros(1, 3, 16),
-            action_prefix=torch.zeros(1, 1, 4),
-            prefix_length=prefix_length,
-            allow_ood_rtc_prefix=allow_ood,
+    prefix = torch.full((1, 1, 4), -0.5)
+    actions = head.sample(
+        torch.zeros(1, 3, 16),
+        action_prefix=prefix,
+        prefix_length=_prefix_length(length_form),
+    )
+    torch.testing.assert_close(actions[:, :1], prefix, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("allow_ood", [False, True])
+def test_rtc_capable_dit_rejects_prefix_beyond_support_unless_ood(allow_ood: bool) -> None:
+    head = build_action_expert_head(_dit_contract(rtc_max_delay_steps=2, rtc_probability=0.5), vlm_dim=16)
+    prefix = torch.zeros(1, 3, 4)
+    if allow_ood:
+        actions = head.sample(
+            torch.zeros(1, 3, 16), action_prefix=prefix, prefix_length=3, allow_ood_rtc_prefix=True
         )
+        torch.testing.assert_close(actions[:, :3], prefix, rtol=0, atol=0)
+        return
+    with pytest.raises(ValueError, match="exceeds the maximum supported RTC prefix 2"):
+        head.sample(torch.zeros(1, 3, 16), action_prefix=prefix, prefix_length=3)
 
 
 def _prefix_length(length_form: str) -> int | list[int] | Tensor | None:
@@ -133,7 +143,7 @@ def _prefix_length(length_form: str) -> int | list[int] | Tensor | None:
 
 @pytest.mark.parametrize("length_form", ["inferred", "scalar", "tensor"])
 def test_legacy_expert_also_rejects_rtc_execution_prefix(length_form: str) -> None:
-    head = build_action_expert_head(_molmoact_cfg(rtc_max_delay_steps=2), vlm_dim=16)
+    head = build_action_expert_head(_molmoact_cfg(), vlm_dim=16)
     with pytest.raises(ValueError, match="(?i)(rtc|prefix)"):
         head.sample(
             torch.zeros(1, 3, 16),
