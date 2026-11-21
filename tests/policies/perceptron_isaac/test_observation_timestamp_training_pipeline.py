@@ -16,6 +16,8 @@ import pytest
 pytest.importorskip("datasets", reason="requires lerobot[dataset]")
 pytest.importorskip("mharmony", reason="mharmony is required (install lerobot[perceptron_isaac])")
 
+import mharmony
+
 from lerobot.policies.perceptron_isaac.mharmony_native import IsaacMharmonyRenderMetadata
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_STREAM_KEY,
@@ -92,6 +94,12 @@ def test_restored_training_pipeline_follows_the_recipe(
     assert pack.render_metadata["emit_observation_timestamps"] is (recipe_emit is not False)
     pack.dtype = "float32"
     pack._fast_processor = FastInputSpy()
-    stream = restored(data_batch())[PERCEPTRON_ISAAC_STREAM_KEY]
+    try:
+        stream = restored(data_batch())[PERCEPTRON_ISAAC_STREAM_KEY]
+    except mharmony.HarmonyError as error:
+        if "vocab.json not found" not in str(error):
+            raise
+        # The restored flag is checked above. Counting rendered events needs the real encoding.
+        pytest.skip("the local Qwen3.5 vocabulary that mHarmony encodes with is unavailable")
     timestamp_events = [event for event in stream.streams[0].events if event.type == TextType.timestamp]
     assert len(timestamp_events) == expected_events
