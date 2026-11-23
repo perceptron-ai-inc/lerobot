@@ -75,6 +75,13 @@ def test_capability_rejects_malformed_recipe_values() -> None:
             prediction_steps=4,
             final_stage_max_delay_steps=None,
         )
+    # Ranges are checked in the same place as types.
+    with pytest.raises(ValueError, match="rtc_max_delay_steps must be an integer >= 0"):
+        RtcCapability(-1, None, prediction_steps=4)
+    with pytest.raises(ValueError, match=r"rtc_probability must be a number in \[0, 1\]"):
+        RtcCapability(2, 1.5, prediction_steps=4)
+    with pytest.raises(ValueError, match="prediction_steps must be an integer >= 1"):
+        RtcCapability(2, 0.5, prediction_steps=0)
     with pytest.raises(ValueError, match="rtc_final_stage_max_delay_steps"):
         _config(rtc_final_stage_max_delay_steps=-1)
 
@@ -90,14 +97,14 @@ def test_config_reads_the_budget_before_weights_load_and_the_recorded_stage(tmp_
     package = tmp_path / "package"
     _write_action_recipe(package, max_delay=3, probability=0.5)
     config = _config(chunk_size=6, n_action_steps=2, hf_model_path="hf_model")
-    assert config.rtc_capability() == RtcCapability(0, 0, None, None), "no package to read yet"
+    assert config.rtc_capability() == RtcCapability(0, None, prediction_steps=6), "no package to read yet"
     config.pretrained_path = package
-    assert config.rtc_capability() == RtcCapability(3, 3, 0.5, None)
+    assert config.rtc_capability() == RtcCapability(3, 0.5, prediction_steps=6)
     assert config.rtc_training_max_delay == 3
     assert not config.rtc_capability().inherited
     # A stage that trained without RTC marks the budget inherited and leaves it unchanged.
     config.rtc_final_stage_max_delay_steps = 0
-    assert config.rtc_capability() == RtcCapability(3, 3, 0.5, 0)
+    assert config.rtc_capability() == RtcCapability(3, 0.5, prediction_steps=6, final_stage_max_delay_steps=0)
     assert config.rtc_capability().inherited
     assert config.rtc_training_max_delay == 3
 
@@ -164,7 +171,8 @@ def test_rtc_off_finetune_of_an_rtc_capable_source_inherits_the_budget(
 
     capability = reloaded.rtc_capability()
     # chunk_size=2 in the fixture, so one row can be pinned while one is still generated.
-    assert capability == RtcCapability(1, 12, 0.5, 0)
+    assert capability == RtcCapability(12, 0.5, prediction_steps=2, final_stage_max_delay_steps=0)
+    assert capability.prefix_budget == 1
     assert capability.inherited
     assert reloaded.supports_rtc()
     with caplog.at_level(logging.WARNING):
@@ -192,7 +200,8 @@ def test_checkpoint_without_a_declared_or_inherited_budget_rejects_trained_prefi
     reloaded = _save_and_reload(policy, tmp_path / "saved")
 
     capability = reloaded.rtc_capability()
-    assert capability == RtcCapability(0, 0, None, 0)
+    assert capability == RtcCapability(0, None, prediction_steps=2, final_stage_max_delay_steps=0)
+    assert capability.prefix_budget == 0
     assert not capability.inherited
     assert not reloaded.supports_rtc()
     assert reloaded.chunk_inference_spec().modes == (ExecutionMode.CHUNK,)

@@ -28,6 +28,7 @@ pytest.importorskip("datasets", reason="rollout requires the dataset extra")
 
 from lerobot.inference import ObservationSnapshot, RTCInferenceConfig, rtc
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.chunk import ExecutionMode
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.rollout import RolloutConfig, context
 from lerobot.rollout.robot_wrapper import ThreadSafeRobot
@@ -67,6 +68,27 @@ def test_unsupported_local_policy_explains_sync_fallback_before_hardware(monkeyp
         assert reason in str(raised.value)
         assert isinstance(raised.value.__cause__, ValueError)
         assert reason in str(raised.value.__cause__)
+
+
+def test_undeclared_rtc_mode_is_rejected_before_hardware(monkeypatch):
+    """A policy that declares trained RTC only refuses guided RTC without connecting the robot."""
+    policy = ControlledPolicy()
+    spec = replace(policy.chunk_inference_spec(), modes=(ExecutionMode.CHUNK, ExecutionMode.RTC_TRAINED))
+    monkeypatch.setattr(policy, "chunk_inference_spec", lambda: spec)
+    cfg = RolloutConfig(
+        robot=MockRobotConfig(),
+        policy=ACTConfig(device="cpu", pretrained_path=Path("unused")),
+        inference=RTCInferenceConfig(rtc=RTCConfig(enabled=True, mode="guided")),
+        device="cpu",
+    )
+    monkeypatch.setattr(context, "_load_pretrained_policy", lambda _: policy)
+
+    def unexpected_hardware(*args, **kwargs):
+        pytest.fail("The execution mode must be checked before constructing hardware")
+
+    monkeypatch.setattr(context, "make_robot_from_config", unexpected_hardware)
+    with pytest.raises(ValueError, match="asynchronous execution mode 'rtc_guided'"):
+        context.build_rollout_context(cfg, Event())
 
 
 def test_local_rtc_without_hold_runs_actions_but_rejects_language(caplog):

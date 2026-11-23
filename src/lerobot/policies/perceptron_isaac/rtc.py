@@ -1,17 +1,16 @@
-"""Import-light DiT metadata and real-time chunking (RTC) inference contracts.
+"""DiT metadata and real-time chunking (RTC) inference contracts.
 
-Torch is imported lazily so metadata validation stays import-light. RTC prefix
-execution is validated against the RTC support declared by the checkpoint.
+RTC prefix execution is validated against the RTC support declared by the checkpoint.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from numbers import Real
+from typing import Any, Literal
 
-if TYPE_CHECKING:
-    import torch
+import torch
 
 DIT_ACTION_EXPERT_CONFIG_SCHEMA_VERSION = 1
 DIT_ACTION_EXPERT_CONFIG_V1_FIELDS = (
@@ -133,47 +132,49 @@ def validate_dit_action_metadata(
     return conditioning
 
 
-def rtc_is_enabled(*, max_delay_steps: int, probability: float | None) -> bool:
-    """Return whether training can produce a non-empty RTC prefix."""
-    return int(max_delay_steps) > 0 and probability != 0.0
-
-
-def effective_rtc_max_prefix_steps(
-    *,
-    max_delay_steps: int,
-    probability: float | None,
-    action_horizon: int,
-) -> int:
-    """Return the largest prefix length in the RTC training support."""
-    max_delay_steps = int(max_delay_steps)
-    action_horizon = int(action_horizon)
-    if max_delay_steps < 0:
-        raise ValueError(f"max_delay_steps must be >= 0; got {max_delay_steps}.")
-    if probability is not None and not 0.0 <= float(probability) <= 1.0:
-        raise ValueError(f"probability must be None or in [0, 1]; got {probability}.")
-    if action_horizon < 1:
-        raise ValueError(f"action_horizon must be >= 1; got {action_horizon}.")
-    if not rtc_is_enabled(max_delay_steps=max_delay_steps, probability=probability):
-        return 0
-    return min(max_delay_steps, action_horizon - 1)
-
-
 @dataclass(frozen=True)
 class RtcCapability:
-    """A checkpoint's trained-RTC inference budget and the stage that last trained its weights.
+    """A checkpoint's trained-RTC support. Its fields are validated once, when it is built.
 
-    ``prefix_budget`` is the declared inference prefix budget: the longest prefix the
-    sampler admits, 0 when the checkpoint declares none. ``declared_max_delay_steps`` and
-    ``declared_probability`` repeat the action-expert recipe, which training stages carry
-    forward unchanged. ``final_stage_max_delay_steps`` is what the final training stage
-    itself sampled: None when the declaring recipe is that stage, 0 when a later stage
+    ``declared_max_delay_steps`` and ``declared_probability`` repeat the action-expert
+    recipe, which training stages carry forward unchanged, and ``prediction_steps`` is the
+    chunk length they apply to. ``final_stage_max_delay_steps`` is what the final training
+    stage itself sampled: None when the declaring recipe is that stage, 0 when a later stage
     trained without RTC prefixes.
     """
 
-    prefix_budget: int
     declared_max_delay_steps: int
     declared_probability: float | None
-    final_stage_max_delay_steps: int | None
+    prediction_steps: int
+    final_stage_max_delay_steps: int | None = None
+
+    def __post_init__(self) -> None:
+        """Reject a malformed recipe before anything samples with it."""
+        max_delay = self.declared_max_delay_steps
+        if isinstance(max_delay, bool) or not isinstance(max_delay, int) or max_delay < 0:
+            raise ValueError(f"action_expert rtc_max_delay_steps must be an integer >= 0, got {max_delay!r}.")
+        probability = self.declared_probability
+        if probability is not None and (
+            isinstance(probability, bool)
+            or not isinstance(probability, Real)
+            or not 0.0 <= probability <= 1.0
+        ):
+            raise ValueError(
+                f"action_expert rtc_probability must be a number in [0, 1] or null, got {probability!r}."
+            )
+        steps = self.prediction_steps
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(f"prediction_steps must be an integer >= 1, got {steps!r}.")
+
+    @property
+    def prefix_budget(self) -> int:
+        """The longest prefix the sampler admits, 0 when the recipe trained none.
+
+        At least one row of every chunk stays model-generated.
+        """
+        if self.declared_max_delay_steps == 0 or self.declared_probability == 0.0:
+            return 0
+        return min(self.declared_max_delay_steps, self.prediction_steps - 1)
 
     @property
     def inherited(self) -> bool:
@@ -191,34 +192,22 @@ def resolve_rtc_capability(
     prediction_steps: int,
     final_stage_max_delay_steps: int | None,
 ) -> RtcCapability:
-    """Combine an action-expert recipe with the final training stage's RTC record.
+    """Read an action-expert recipe's RTC fields with the final training stage's RTC record.
 
     ``action`` is the checkpoint's ``action_expert`` metadata. A missing recipe, or a legacy
     block without RTC fields, declares no budget, so trained prefixes stay rejected.
     """
-    max_delay = 0 if action is None else action.get("rtc_max_delay_steps", 0)
-    probability = None if action is None else action.get("rtc_probability")
-    if isinstance(max_delay, bool) or not isinstance(max_delay, int):
-        raise ValueError(f"action_expert rtc_max_delay_steps must be an integer, got {max_delay!r}.")
-    if probability is not None and (
-        isinstance(probability, bool) or not isinstance(probability, int | float)
-    ):
-        raise ValueError(f"action_expert rtc_probability must be a number or null, got {probability!r}.")
     return RtcCapability(
-        prefix_budget=effective_rtc_max_prefix_steps(
-            max_delay_steps=max_delay,
-            probability=probability,
-            action_horizon=prediction_steps,
-        ),
-        declared_max_delay_steps=max_delay,
-        declared_probability=None if probability is None else float(probability),
+        declared_max_delay_steps=0 if action is None else action.get("rtc_max_delay_steps", 0),
+        declared_probability=None if action is None else action.get("rtc_probability"),
+        prediction_steps=prediction_steps,
         final_stage_max_delay_steps=final_stage_max_delay_steps,
     )
 
 
 @dataclass(frozen=True, eq=False)
 class ResolvedRTCActionPrefix:
-    """Validated RTC prefix geometry shared by native and HF sampling."""
+    """A validated RTC prefix request. Sampling runs on it without further checks."""
 
     source_dim: int | None
     output_dim: int
@@ -243,18 +232,11 @@ def prepare_rtc_conditioning(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build compact suffix/prefix conditioning for checkpointed DiT blocks.
 
-    RTC has a sampled suffix timestep per chunk and the fixed clean timestep 1
+    ``base_timesteps`` is ``[B]`` and ``prefix_mask`` is the ``[B,H]`` row mask of a resolved
+    prefix. RTC has a sampled suffix timestep per chunk and the fixed clean timestep 1
     for prefix rows. Blocks project these two values inside their activation-
     checkpointed forward, then select them per row.
     """
-    import torch
-
-    if base_timesteps.dim() != 1:
-        raise ValueError(f"base_timesteps must have shape [B]; got {tuple(base_timesteps.shape)}.")
-    if prefix_mask.dim() != 2 or prefix_mask.shape[0] != base_timesteps.shape[0]:
-        raise ValueError(
-            f"prefix_mask must have shape [B,H] with B={base_timesteps.shape[0]}; got {tuple(prefix_mask.shape)}."
-        )
     suffix_conditioning = time_conditioning(base_timesteps)
     # The clean RTC prefix always uses flow time 1, independent of the chunk or
     # flow draw. Compute it once; block projections broadcast this single row.
@@ -274,39 +256,31 @@ def project_rtc_modulation(
     chunks: int,
 ) -> tuple[torch.Tensor, ...]:
     """Project two compact RTC values and select the result per action row."""
-    import torch
-
     suffix = modulation(suffix_conditioning)
     prefix = modulation(prefix_conditioning)
     selected = torch.where(prefix_mask, prefix.unsqueeze(1), suffix.unsqueeze(1))
     return tuple(selected.chunk(chunks, dim=-1))
 
 
-def validate_rtc_prefix_capability(
+def _prefix_lengths(
+    prefix_length: int | Sequence[int] | torch.Tensor | None,
     *,
-    prefix_length: int,
-    max_delay_steps: int,
-    probability: float | None,
-    action_horizon: int,
-    allow_ood: bool = False,
-) -> int:
-    """Validate a requested prefix against the RTC training support."""
-    prefix_length = int(prefix_length)
-    effective_max = effective_rtc_max_prefix_steps(
-        max_delay_steps=max_delay_steps,
-        probability=probability,
-        action_horizon=action_horizon,
-    )
-    if prefix_length < 0:
-        raise ValueError(f"prefix_length must be >= 0; got {prefix_length}.")
-    if prefix_length > effective_max and not allow_ood:
+    batch_size: int,
+    default: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Per-row prefix lengths ``[B]`` from a scalar, a sequence, a tensor, or ``default``."""
+    if prefix_length is None or isinstance(prefix_length, int):
+        length = default if prefix_length is None else prefix_length
+        return torch.full((batch_size,), length, device=device, dtype=torch.long)
+    lengths = torch.as_tensor(prefix_length, device=device, dtype=torch.long)
+    if lengths.dim() == 0:
+        return lengths.expand(batch_size)
+    if tuple(lengths.shape) != (batch_size,):
         raise ValueError(
-            f"prefix_length={prefix_length} exceeds the maximum supported RTC prefix {effective_max} "
-            f"(configured max_delay_steps={int(max_delay_steps)}, probability={probability}, "
-            f"action_horizon={int(action_horizon)}). Pass allow_ood_rtc_prefix=True only for an explicit "
-            "out-of-distribution research experiment."
+            f"prefix_length must be a scalar or have shape [{batch_size}]; got {tuple(lengths.shape)}."
         )
-    return effective_max
+    return lengths
 
 
 def resolve_rtc_action_prefix(
@@ -315,83 +289,52 @@ def resolve_rtc_action_prefix(
     prefix_length: int | Sequence[int] | torch.Tensor | None,
     action_dim: int | None,
     batch_size: int,
-    action_horizon: int,
     expert_action_dim: int,
-    rtc_max_delay_steps: int,
-    rtc_probability: float | None,
+    capability: RtcCapability,
     device: torch.device,
     allow_ood: bool = False,
 ) -> ResolvedRTCActionPrefix:
-    """Validate and normalize an RTC action-prefix request."""
-    import torch
+    """Validate an RTC prefix request in one place and normalize it.
 
-    action_horizon = int(action_horizon)
-    expert_action_dim = int(expert_action_dim)
-    output_dim = expert_action_dim if action_dim is None else int(action_dim)
-    if output_dim < 1 or output_dim > expert_action_dim:
+    ``capability`` carries the chunk length being sampled and the checkpoint's prefix budget.
+    """
+    output_dim = expert_action_dim if action_dim is None else action_dim
+    if not 1 <= output_dim <= expert_action_dim:
         raise ValueError(f"action_dim must be in [1, {expert_action_dim}]; got {output_dim}.")
-
-    if action_prefix is None:
-        if isinstance(prefix_length, torch.Tensor):
-            has_prefix_length = bool(prefix_length.detach().to(device="cpu").any().item())
-        elif prefix_length is None:
-            has_prefix_length = False
-        elif isinstance(prefix_length, int):
-            has_prefix_length = prefix_length != 0
-        else:
-            has_prefix_length = any(int(value) != 0 for value in prefix_length)
-        if has_prefix_length:
-            raise ValueError("action_prefix is required when prefix_length is non-zero.")
-        return ResolvedRTCActionPrefix(None, output_dim, None, 0)
-
-    if action_prefix.dim() != 3 or action_prefix.shape[0] != batch_size:
+    if action_prefix is not None and (action_prefix.dim() != 3 or action_prefix.shape[0] != batch_size):
         raise ValueError(
             f"action_prefix must have shape [B, P, D] with B={batch_size}; got {tuple(action_prefix.shape)}."
         )
-    source_dim = int(action_prefix.shape[2])
-    if source_dim < 1 or source_dim > expert_action_dim:
-        raise ValueError(f"action_prefix last dim must be in [1, {expert_action_dim}]; got {source_dim}.")
-
-    if prefix_length is None:
-        lengths = torch.full((batch_size,), action_prefix.shape[1], device=device, dtype=torch.long)
-    elif isinstance(prefix_length, torch.Tensor):
-        lengths = prefix_length.to(device=device, dtype=torch.long)
-        if lengths.dim() == 0:
-            lengths = lengths.expand(batch_size)
-        elif tuple(lengths.shape) != (batch_size,):
-            raise ValueError(
-                f"prefix_length tensor must have shape [] or [{batch_size}]; got {tuple(lengths.shape)}."
-            )
-    elif isinstance(prefix_length, int):
-        lengths = torch.full((batch_size,), prefix_length, device=device, dtype=torch.long)
-    else:
-        lengths = torch.as_tensor(list(prefix_length), device=device, dtype=torch.long)
-        if tuple(lengths.shape) != (batch_size,):
-            raise ValueError(
-                f"prefix_length sequence must have length {batch_size}; got {tuple(lengths.shape)}."
-            )
-
-    max_allowed = action_horizon - 1
-    # One host transfer for every check below: this runs per /predict and per chunk in the
-    # inference-MSE eval, so each extra `.item()` on a device tensor is a blocking sync.
+    rows = 0 if action_prefix is None else action_prefix.shape[1]
+    lengths = _prefix_lengths(prefix_length, batch_size=batch_size, default=rows, device=device)
+    # One host transfer for every check below: this runs per chunk, so each extra `.item()`
+    # on a device tensor is a blocking sync.
     lengths_cpu = lengths.detach().to("cpu")
-    if bool(((lengths_cpu < 0) | (lengths_cpu > max_allowed)).any().item()):
+    max_length = int(lengths_cpu.max().item()) if lengths_cpu.numel() else 0
+
+    if action_prefix is None:
+        if bool((lengths_cpu != 0).any().item()):
+            raise ValueError("action_prefix is required when prefix_length is non-zero.")
+        return ResolvedRTCActionPrefix(None, output_dim, None, 0)
+
+    horizon = capability.prediction_steps
+    if bool(((lengths_cpu < 0) | (lengths_cpu >= horizon)).any().item()):
         raise ValueError(
-            f"prefix_length values must be in [0, {max_allowed}] so RTC leaves at least one model-generated "
+            f"prefix_length values must be in [0, {horizon - 1}] so RTC leaves at least one model-generated "
             f"suffix row; got {lengths_cpu.tolist()}."
         )
-    max_length = int(lengths_cpu.max().item()) if lengths_cpu.numel() else 0
-    validate_rtc_prefix_capability(
-        prefix_length=max_length,
-        max_delay_steps=rtc_max_delay_steps,
-        probability=rtc_probability,
-        action_horizon=action_horizon,
-        allow_ood=allow_ood,
-    )
-    if action_prefix.shape[1] < max_length:
+    if max_length > capability.prefix_budget and not allow_ood:
         raise ValueError(
-            f"action_prefix has only {action_prefix.shape[1]} rows but max prefix_length={max_length}."
+            f"prefix_length={max_length} exceeds the maximum supported RTC prefix {capability.prefix_budget} "
+            f"(configured max_delay_steps={capability.declared_max_delay_steps}, "
+            f"probability={capability.declared_probability}, action_horizon={horizon}). "
+            "Pass allow_ood_rtc_prefix=True only for an explicit out-of-distribution research experiment."
         )
+    if rows < max_length:
+        raise ValueError(f"action_prefix has only {rows} rows but max prefix_length={max_length}.")
+    source_dim = action_prefix.shape[2]
+    if not 1 <= source_dim <= expert_action_dim:
+        raise ValueError(f"action_prefix last dim must be in [1, {expert_action_dim}]; got {source_dim}.")
     if max_length > 0 and action_dim is None and source_dim != expert_action_dim:
         raise ValueError(
             "action_dim is required when action_prefix is narrower than the expert action width; "
@@ -417,8 +360,6 @@ def materialize_rtc_action_prefix(
     dim_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Materialize the fixed prefix values and their row mask."""
-    import torch
-
     if action_prefix is None or resolved.max_length == 0:
         return None, None
     assert resolved.lengths is not None
@@ -452,7 +393,6 @@ def integrate_rtc_euler(
     dim_mask: torch.Tensor | None,
 ) -> torch.Tensor:
     """Integrate a flow velocity while pinning an optional RTC prefix."""
-    import torch
 
     def apply_masks(state: torch.Tensor) -> torch.Tensor:
         if dim_mask is not None:

@@ -82,6 +82,17 @@ def validate_local_chunk_policy(policy: PreTrainedPolicy) -> ChunkPolicySpec:
     return spec
 
 
+def require_chunk_execution_mode(spec: ChunkPolicySpec, rtc_config: RTCConfig) -> ExecutionMode:
+    """Resolve the requested asynchronous mode and reject one the policy does not declare.
+
+    Rollout calls this before it connects hardware, and the engine calls it again when it starts.
+    """
+    mode = ExecutionMode(f"rtc_{rtc_config.mode}") if rtc_config.enabled else ExecutionMode.CHUNK
+    if mode not in spec.modes:
+        raise ValueError(f"Policy does not support asynchronous execution mode {mode.value!r}")
+    return mode
+
+
 def supports_rtc_inference(policy: PreTrainedPolicy) -> bool:
     """Whether a policy declares RTC support and accepts the RTC call shape."""
     supports_rtc = getattr(policy, "supports_rtc", None)
@@ -158,9 +169,7 @@ class RTCInferenceEngine(InferenceEngine):
             raise ValueError("Language deadline must be finite and positive")
         self._language_timeout_s = language_timeout_s
         self._action_timeout_s = action_timeout_s
-        mode = ExecutionMode(f"rtc_{rtc_config.mode}") if rtc_config.enabled else ExecutionMode.CHUNK
-        if mode not in self._policy_spec.modes:
-            raise ValueError(f"Policy does not support asynchronous execution mode {mode.value!r}")
+        mode = require_chunk_execution_mode(self._policy_spec, rtc_config)
         self._runtime = ChunkRuntime(
             mode=mode,
             action_interval=1 / fps,

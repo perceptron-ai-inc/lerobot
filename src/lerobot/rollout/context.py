@@ -42,6 +42,7 @@ from lerobot.inference import (
     RemoteInferenceConfig,
     RTCInferenceConfig,
     create_inference_engine,
+    require_chunk_execution_mode,
     supports_rtc_inference,
     validate_local_chunk_policy,
 )
@@ -468,15 +469,17 @@ def build_rollout_context(
     policy = _load_pretrained_policy(policy_config)
 
     if is_rtc:
-        validate_local_chunk_policy(policy)
-
-    if is_rtc and cfg.inference.rtc.enabled:
-        if not supports_rtc_inference(policy):
+        chunk_spec = validate_local_chunk_policy(policy)
+        if cfg.inference.rtc.enabled and not supports_rtc_inference(policy):
             raise ValueError(
                 f"RTC inference is not supported by policy type '{policy_config.type}': "
                 "the policy must implement RTC semantics and predict_action_chunk must accept "
                 "inference_delay and prev_chunk_left_over. Use '--inference.type=sync' instead."
             )
+        # The engine checks the mode again when it starts, but that is after the robot connects.
+        require_chunk_execution_mode(chunk_spec, cfg.inference.rtc)
+
+    if is_rtc and cfg.inference.rtc.enabled:
         policy.config.rtc_config = cfg.inference.rtc
         if hasattr(policy, "init_rtc_processor"):
             policy.init_rtc_processor()

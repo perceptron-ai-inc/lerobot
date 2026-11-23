@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from numbers import Real
 from typing import Any, Literal, Optional, TypeAlias
 from collections.abc import Sequence
@@ -34,6 +34,7 @@ from .rtc import (
     ActionExpertConditioning,
     ActionExpertStepModulation,
     LayerHiddenContext,
+    RtcCapability,
     integrate_rtc_euler,
     materialize_rtc_action_prefix,
     prepare_rtc_conditioning,
@@ -1169,6 +1170,10 @@ class DiTActionExpertHead(nn.Module):
         self.vlm_dim = int(vlm_dim)
         self.action_dim = self.args.action_dim
         self.action_horizon = self.args.action_horizon
+        # The recipe's RTC fields are validated once, here; sampling only reads the result.
+        self.rtc_capability = RtcCapability(
+            self.args.rtc_max_delay_steps, self.args.rtc_probability, self.action_horizon
+        )
         self.num_inference_steps = self.args.num_inference_steps
         self.hidden_dim = self.args.hidden_dim
         cfg = MolmoAct2ActionExpertConfig(
@@ -1396,10 +1401,12 @@ class DiTActionExpertHead(nn.Module):
             prefix_length=prefix_length,
             action_dim=action_dim,
             batch_size=batch_size,
-            action_horizon=horizon,
             expert_action_dim=full_dim,
-            rtc_max_delay_steps=self.args.rtc_max_delay_steps,
-            rtc_probability=self.args.rtc_probability,
+            capability=(
+                self.rtc_capability
+                if horizon == self.action_horizon
+                else replace(self.rtc_capability, prediction_steps=horizon)
+            ),
             device=device,
             allow_ood=bool(allow_ood_rtc_prefix),
         )
@@ -1438,7 +1445,7 @@ class DiTActionExpertHead(nn.Module):
             dim_mask = torch.zeros(1, 1, full_dim, dtype=state_dtype, device=device)
             dim_mask[:, :, :out_dim] = 1.0
 
-        prefix_tensor, prefix_mask = materialize_rtc_action_prefix(
+        row_prefix_tensor, row_prefix_mask = materialize_rtc_action_prefix(
             resolved_prefix,
             action_prefix,
             batch_size=batch_size,
@@ -1448,6 +1455,7 @@ class DiTActionExpertHead(nn.Module):
             dtype=state_dtype,
             dim_mask=dim_mask,
         )
+        prefix_tensor, prefix_mask = row_prefix_tensor, row_prefix_mask
         if prefix_tensor is not None and prefix_mask is not None and sample_count > 1:
             # Every flow candidate shares the committed prefix of its batch row.
             prefix_tensor = expand_candidates(prefix_tensor)
@@ -1496,7 +1504,11 @@ class DiTActionExpertHead(nn.Module):
         )
         if sample_count == 1:
             return x
-        return x.reshape(sample_count, batch_size, horizon, full_dim).mean(dim=0)
+        averaged = x.reshape(sample_count, batch_size, horizon, full_dim).mean(dim=0)
+        if row_prefix_tensor is not None and row_prefix_mask is not None:
+            # Every candidate holds the same pinned rows, but their mean can round away from them.
+            averaged = torch.where(row_prefix_mask, row_prefix_tensor, averaged)
+        return averaged
 
 
 # Geometry fields a legacy action block may carry; it never declares a recipe or RTC support.

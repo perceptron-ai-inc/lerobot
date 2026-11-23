@@ -149,9 +149,10 @@ velocity in both.
   normalized actions; the first `inference_delay` rows become the prefix, and a
   zero delay samples without one. The 60-step YAM and SO-100/101 checkpoints
   declare a budget of 30, which requires `--inference.rtc.execution_horizon=30`.
-  Guided RTC is not offered. FP32-storage packages defer their weight load to
-  first use; asking for the chunk spec loads them, so the load happens at
-  startup and not inside the engine's first deadline.
+  Guided RTC is not offered, and `lerobot-rollout` refuses it before connecting
+  the robot. FP32-storage packages defer their weight load to first use; asking
+  for the chunk spec loads them, so the load happens at startup and not inside
+  the engine's first deadline.
 
 Asynchronous callers predict once per chunk, so they cannot use the policy's
 per-step frame clock. A checkpoint whose recipe emits episode-time tokens sets

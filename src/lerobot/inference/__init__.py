@@ -39,7 +39,12 @@ from .factory import (
 )
 from .policy_runner import PolicyRunner
 from .prediction import ChunkPrediction, chunk_inference_context, predict_chunk
-from .rtc import RTCInferenceEngine, supports_rtc_inference, validate_local_chunk_policy
+from .rtc import (
+    RTCInferenceEngine,
+    require_chunk_execution_mode,
+    supports_rtc_inference,
+    validate_local_chunk_policy,
+)
 from .sync import SyncInferenceEngine
 
 __all__ = [
@@ -77,6 +82,7 @@ __all__ = [
     "estimate_delay",
     "next_interpolated_action",
     "predict_chunk",
+    "require_chunk_execution_mode",
     "supports_rtc_inference",
     "trained_overlap_valid",
     "validate_local_chunk_policy",

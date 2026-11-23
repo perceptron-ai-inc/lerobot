@@ -55,6 +55,23 @@ def test_per_row_prefix_lengths_are_pinned_for_every_flow_candidate(num_flow_sam
     assert not torch.equal(actions[0, 1], prefix[0, 1])
 
 
+def test_flow_sample_average_returns_the_pinned_rows_exactly() -> None:
+    """Every candidate holds the same pinned rows, but a float32 mean of them can round."""
+    head = _rtc_head()
+    torch.manual_seed(11)
+    prefix = torch.randn(2, 2, 4)
+    # The premise: a plain mean over three copies of these rows is not exact.
+    assert not torch.equal(prefix.repeat(3, 1, 1, 1).mean(dim=0), prefix)
+    actions = head.sample(torch.randn(2, 3, 16), action_prefix=prefix, prefix_length=2, num_flow_samples=3)
+    torch.testing.assert_close(actions[:, :2], prefix, rtol=0, atol=0)
+
+
+def test_malformed_prefix_lengths_are_rejected_by_the_resolver() -> None:
+    head = _rtc_head()
+    with pytest.raises(ValueError, match="prefix_length must be a scalar or have shape"):
+        head.sample(torch.randn(2, 3, 16), action_prefix=torch.zeros(2, 2, 4), prefix_length=[1, 1, 1])
+
+
 def test_prefix_conditions_the_generated_suffix() -> None:
     head = _rtc_head()
     context = torch.randn(1, 3, 16)
