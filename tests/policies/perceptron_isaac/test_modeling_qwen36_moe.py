@@ -102,7 +102,7 @@ def _text_config(
             "partial_rotary_factor": 0.5,
             "mrope_section": [1, 1, 1],
         },
-        genesis_moe=_metadata(
+        isaac05_moe=_metadata(
             num_real_experts=num_real_experts,
             num_null_experts=num_null_experts,
             top_k=top_k,
@@ -218,17 +218,17 @@ def test_isaac_config_requires_identical_root_and_text_contracts() -> None:
     config = IsaacQwen36MoeConfig(
         text_config=text_config.to_dict(),
         vision_config=vision_config.to_dict(),
-        genesis_moe=copy.deepcopy(text_config.genesis_moe),
+        isaac05_moe=copy.deepcopy(text_config.isaac05_moe),
     )
-    assert config.text_config.genesis_moe == config.genesis_moe
+    assert config.text_config.isaac05_moe == config.isaac05_moe
 
-    mismatched = copy.deepcopy(text_config.genesis_moe)
+    mismatched = copy.deepcopy(text_config.isaac05_moe)
     mismatched["route_scale"] = 0.5
     with pytest.raises(ValueError, match="must be identical"):
         IsaacQwen36MoeConfig(
             text_config=text_config.to_dict(),
             vision_config=vision_config.to_dict(),
-            genesis_moe=mismatched,
+            isaac05_moe=mismatched,
         )
 
 
@@ -478,7 +478,7 @@ def test_multimodal_model_installs_explicit_sdpa_for_text_and_vision() -> None:
     config = IsaacQwen36MoeConfig(
         text_config=text_config.to_dict(),
         vision_config=vision_config.to_dict(),
-        genesis_moe=copy.deepcopy(text_config.genesis_moe),
+        isaac05_moe=copy.deepcopy(text_config.isaac05_moe),
     )
 
     model = IsaacQwen36Model(config)

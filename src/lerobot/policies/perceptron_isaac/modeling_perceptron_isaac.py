@@ -73,6 +73,7 @@ from .trained_package import (
     ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
     ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2,
     ISAAC_MODEL_IMPORT_FILENAME,
+    ISAAC_SOURCE_MODEL_IMPORT_FILENAME,
     ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
     ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
     ISAAC_TRAINED_PACKAGE_MANIFEST_SCHEMA,
@@ -581,6 +582,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._config_declares_isaac(self.config):
             from .isaac_checkpoint_contract import (
                 ISAAC_TEST_GEOMETRY_MARKER,
+                LEGACY_TEST_GEOMETRY_MARKER,
                 IsaacCheckpointContractError,
                 finalize_isaac_runtime_checkpoint_layout,
                 validate_isaac_checkpoint,
@@ -593,7 +595,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     model_root,
                     allow_test_only_reduced_geometry=bool(
                         inner_config.get(ISAAC_TEST_GEOMETRY_MARKER, False)
-                        or inner_config.get("isaac05_test_only_reduced_geometry", False)
+                        or inner_config.get(LEGACY_TEST_GEOMETRY_MARKER, False)
                     ),
                     allowed_storage_dtypes=inner_state.storage_dtypes,
                 )
@@ -604,7 +606,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     save_directory / "isaac_import_provenance.json",
                     save_directory / "source_isaac_import_provenance.json",
                 ),
-                (model_root / "mk1_model_import.json", model_root / "source_mk1_model_import.json"),
+                (
+                    model_root / ISAAC_MODEL_IMPORT_FILENAME,
+                    model_root / ISAAC_SOURCE_MODEL_IMPORT_FILENAME,
+                ),
             )
         else:
             raise RuntimeError("Perceptron ISAAC supports only native Isaac-0.5 checkpoints.")
@@ -876,14 +881,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 return False
             if not isinstance(raw, dict):
                 return False
-            if raw.get("model_type") == "isaac_0_5":
-                return True
-            genesis_vla = raw.get("genesis_vla")
-            return bool(
-                raw.get("model_type") == "qwen3_5_moe"
-                and isinstance(genesis_vla, dict)
-                and genesis_vla.get("backbone_family") == "mk1_qwen3_6_moe"
-            )
+            from .isaac_checkpoint_contract import declares_legacy_layout
+
+            return raw.get("model_type") == "isaac_0_5" or declares_legacy_layout(raw)
 
         return False
 
@@ -1812,7 +1812,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 _verify_sha256(
                     model_import_digest,
                     f"{context} source model-import identity",
-                    model_root / "source_mk1_model_import.json",
+                    model_root / ISAAC_SOURCE_MODEL_IMPORT_FILENAME,
                 )
                 shard_paths = frozenset(source_inventory.shards)
                 metadata_digests = {
@@ -1915,13 +1915,15 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     ) -> None:
         """Verify the exhaustive Isaac model import record before allocating weights."""
         from .isaac_checkpoint_contract import (
+            LEGACY_BACKBONE_FAMILY,
+            LEGACY_KEY_PREFIX,
             IsaacCheckpointContractError,
             read_isaac_config,
             validate_isaac_tokenizer,
         )
 
         context = "Isaac model import"
-        record_name = "mk1_model_import.json"
+        record_name = ISAAC_MODEL_IMPORT_FILENAME
         model_path = getattr(config, "hf_model_path", None)
         if not model_path:
             raise RuntimeError("A trained Perceptron Isaac package requires hf_model_path.")
@@ -1965,7 +1967,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if (
             record["schema"] != "perceptron_isaac_mk1_model_import_v2"
             or record["algorithm"] != "byte_for_byte_safetensors_copy"
-            or record["backbone_family"] != "mk1_qwen3_6_moe"
+            or record["backbone_family"] != LEGACY_BACKBONE_FAMILY
             or record["rmsnorm_weight_convention"] != "zero_centered_1_plus_weight"
         ):
             raise RuntimeError("Isaac model import record identity is unsupported.")
@@ -2102,7 +2104,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         ):
             raise RuntimeError("Isaac model import artifact identity disagrees with the package config.")
         raw_config = _load_json_object(model_root / "config.json", "Isaac config.json")
-        if raw_config.get("genesis_artifact") != artifact:
+        if raw_config.get(f"{LEGACY_KEY_PREFIX}artifact") != artifact:
             raise RuntimeError("Isaac inner config artifact identity disagrees with its import record.")
 
         try:

@@ -28,12 +28,18 @@ from .rtc import (
 
 ISAAC_MODEL_TYPE = "qwen3_5_moe"
 ISAAC_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
-ISAAC_ARCHITECTURE = "GenesisQwen3_5MoeForConditionalGeneration"
+ISAAC_ARCHITECTURE = "Isaac05ForConditionalGeneration"
 ISAAC_VLA_SCHEMA_VERSION = 1
-ISAAC_BACKBONE_FAMILY = "mk1_qwen3_6_moe"
 ISAAC_STATE_DICT_SCHEMA = "pr3154_v1"
 ISAAC_RMSNORM_CONVENTION = "zero_centered_1_plus_weight"
-ISAAC_TEST_GEOMETRY_MARKER = "genesis_test_only_reduced_geometry"
+ISAAC_TEST_GEOMETRY_MARKER = "isaac05_test_only_reduced_geometry"
+# The layout that exports used before the Isaac-0.5 release. It is read by renaming its blocks
+# to the released names; nothing writes it.
+LEGACY_KEY_PREFIX = "genesis_"
+LEGACY_ARCHITECTURE = "GenesisQwen3_5MoeForConditionalGeneration"
+LEGACY_BACKBONE_FAMILY = "mk1_qwen3_6_moe"
+LEGACY_TEST_GEOMETRY_MARKER = f"{LEGACY_KEY_PREFIX}test_only_reduced_geometry"
+_LAYOUT_BLOCKS = ("artifact", "coord_tokens", "moe", "vla", "test_only_reduced_geometry")
 ISAAC_SAFETENSORS_INDEX = "model.safetensors.index.json"
 ISAAC_FAST_TOKENIZER = "physical-intelligence/fast"
 ISAAC_FAST_TOKEN_OFFSET = 249321
@@ -62,7 +68,6 @@ _CUSTOM_MOE_KEYS = {
 }
 _VLA_KEYS = {
     "schema_version",
-    "backbone_family",
     "state_dict_schema",
     "rmsnorm_weight_convention",
     "vector_encoder",
@@ -111,7 +116,7 @@ def validate_checkpoint_action_expert_semantics(raw: Mapping[str, Any]) -> None:
     for path, block in (
         ("isaac05_vla.action_expert", raw.get("isaac05_vla")),
         ("action_expert", raw),
-        ("genesis_vla.action_expert", raw.get("genesis_vla")),
+        (f"{LEGACY_KEY_PREFIX}vla.action_expert", raw.get(f"{LEGACY_KEY_PREFIX}vla")),
     ):
         if isinstance(block, Mapping):
             action = block.get("action_expert")
@@ -330,11 +335,7 @@ class IsaacCheckpointContract:
         """
         root = _object(raw_config, "config")
         validate_checkpoint_action_expert_semantics(root)
-        native_format = root.get("model_type") == "isaac_0_5"
-        if native_format:
-            root = _normalize_isaac05(root)
-        elif _object_field(_object_field(root, "genesis_vla"), "action_expert").get("type") == "dit":
-            _fail("the legacy layout requires the molmoact action ABI")
+        root = _normalize_isaac05(root) if root.get("model_type") == "isaac_0_5" else _normalize_legacy(root)
         test_marker = root.get(ISAAC_TEST_GEOMETRY_MARKER, False)
         if test_marker is not False and test_marker is not True:
             _fail(f"{ISAAC_TEST_GEOMETRY_MARKER} must be a boolean")
@@ -351,27 +352,27 @@ class IsaacCheckpointContract:
         if root.get("tie_word_embeddings") is not False:
             _fail("tie_word_embeddings must be false")
 
-        artifact = _parse_artifact(_object_field(root, "genesis_artifact"))
+        artifact = _parse_artifact(_object_field(root, "isaac05_artifact"))
         _validate_standard_runtime_fields(root, path="config")
 
         text_raw = _object_field(root, "text_config")
         vision_raw = _object_field(root, "vision_config")
         _validate_standard_runtime_fields(text_raw, path="text_config")
         _validate_standard_runtime_fields(vision_raw, path="vision_config")
-        root_moe = _object_field(root, "genesis_moe")
-        text_moe = _object_field(text_raw, "genesis_moe")
+        root_moe = _object_field(root, "isaac05_moe")
+        text_moe = _object_field(text_raw, "isaac05_moe")
         if root_moe != text_moe:
-            _fail("root and text_config genesis_moe blocks must be identical")
+            _fail("root and text_config isaac05_moe blocks must be identical")
         moe = _parse_moe(root_moe, test_geometry=test_geometry)
 
-        mtp_raw = _object_field(_object_field(root, "genesis_vla"), "mtp")
+        mtp_raw = _object_field(_object_field(root, "isaac05_vla"), "mtp")
         mtp = _parse_mtp(mtp_raw)
         text = _parse_text(text_raw, moe=moe, mtp=mtp, test_geometry=test_geometry)
         vision = _parse_vision(vision_raw, text=text, test_geometry=test_geometry)
         special_tokens = _parse_special_tokens(root, text_raw, text=text, test_geometry=test_geometry)
-        coord = _parse_coord(_object_field(root, "genesis_coord_tokens"), text, test_geometry=test_geometry)
+        coord = _parse_coord(_object_field(root, "isaac05_coord_tokens"), text, test_geometry=test_geometry)
         vector, action = _parse_vla(
-            _object_field(root, "genesis_vla"), text=text, test_geometry=test_geometry
+            _object_field(root, "isaac05_vla"), text=text, test_geometry=test_geometry
         )
 
         return cls(
@@ -562,7 +563,7 @@ class IsaacCheckpointContract:
             _fail("mHarmony coord reserved-token size must be an integer")
         if (offset, size) != (self.coord_tokens.offset, self.coord_tokens.size):
             _fail(
-                "mHarmony coord reserved-token range disagrees with genesis_coord_tokens: "
+                "mHarmony coord reserved-token range disagrees with isaac05_coord_tokens: "
                 f"groups=({offset}, {size}), checkpoint=({self.coord_tokens.offset}, {self.coord_tokens.size})"
             )
 
@@ -586,6 +587,8 @@ def read_isaac_config_data(
         if artifact.get("tensor_count") != len(shapes) or artifact.get("tensor_bytes") != expected_bytes:
             _fail("isaac05_artifact tensor count/bytes disagree with F32 geometry")
         raw = _normalize_isaac05(raw)
+    else:
+        raw = _normalize_legacy(raw)
     return raw, contract
 
 
@@ -820,13 +823,9 @@ def finalize_isaac_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     root = Path(model_dir)
     config_path = root / "config.json"
     raw = _read_json_object(config_path)
-    # A raw Isaac-0.5 export stores the VLA block under ``isaac05_vla``; ``_normalize_isaac05``
-    # renames it to ``genesis_vla``, but only in the dict it returns, so both spellings are
-    # valid on disk. Read whichever the saved config actually uses.
-    vla = next(
-        (raw[name] for name in ("genesis_vla", "isaac05_vla") if isinstance(raw.get(name), dict)),
-        None,
-    )
+    # The saved config keeps the layout of its source package, so read whichever name it uses.
+    vla_names = ("isaac05_vla", f"{LEGACY_KEY_PREFIX}vla")
+    vla = next((raw[name] for name in vla_names if isinstance(raw.get(name), dict)), None)
     text_config = raw.get("text_config")
     mtp = vla.get("mtp") if isinstance(vla, dict) else None
     if not isinstance(mtp, dict) or not isinstance(text_config, dict):
@@ -899,7 +898,7 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
     _require_values(
         root,
         {
-            "architectures": ["Isaac05ForConditionalGeneration"],
+            "architectures": [ISAAC_ARCHITECTURE],
             "storage_dtype": "float32",
             "runtime_dtype": "bfloat16",
             "dtype": "bfloat16",
@@ -907,17 +906,15 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
         "isaac05",
     )
     text = _object_field(root, "text_config")
-    for name in ("artifact", "coord_tokens", "moe", "vla", "test_only_reduced_geometry"):
-        destination = f"genesis_{name}"
-        if destination in root:
-            _fail(f"isaac05 must not mix legacy field {destination}")
-        source = f"isaac05_{name}"
-        if source not in root:
-            _fail(f"isaac05 missing {source}")
-        root[destination] = root.pop(source)
-    if "genesis_moe" in text:
-        _fail("isaac05 text must not mix legacy genesis_moe")
-    moe = _object_field(root, "genesis_moe")
+    for name in _LAYOUT_BLOCKS:
+        legacy = f"{LEGACY_KEY_PREFIX}{name}"
+        if legacy in root:
+            _fail(f"isaac05 must not mix legacy field {legacy}")
+        if f"isaac05_{name}" not in root:
+            _fail(f"isaac05 missing isaac05_{name}")
+    if f"{LEGACY_KEY_PREFIX}moe" in text:
+        _fail(f"isaac05 text must not mix legacy {LEGACY_KEY_PREFIX}moe")
+    moe = _object_field(root, "isaac05_moe")
     if moe != _object_field(text, "isaac05_moe"):
         _fail("root and text_config isaac05_moe blocks must be identical")
     _require_exact_keys(
@@ -928,12 +925,10 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
         null_expert_semantics="skip_compute_renormalize_real_routes",
         shared_expert_mode="sigmoid_gated_additive",
     )
-    root["genesis_moe"] = normalized_moe
-    root["text_config"] = dict(text)
-    root["text_config"].pop("isaac05_moe")
-    root["text_config"]["genesis_moe"] = copy.deepcopy(normalized_moe)
-    vla = _object_field(root, "genesis_vla")
-    _require_exact_keys(vla, _VLA_KEYS - {"backbone_family"}, "isaac05_vla")
+    root["isaac05_moe"] = normalized_moe
+    root["text_config"] = dict(text, isaac05_moe=copy.deepcopy(normalized_moe))
+    vla = _object_field(root, "isaac05_vla")
+    _require_exact_keys(vla, _VLA_KEYS, "isaac05_vla")
     nested_action = _object_field(vla, "action_expert")
     root_action = _object_field(root, "action_expert")
     # Validate both copies before equality, which aliases booleans with numeric RTC values.
@@ -958,21 +953,59 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
         ISAAC_FAST_TOKEN_SIZE,
     ):
         _fail("production isaac05 FAST token range differs from the native contract")
-    root["genesis_vla"] = dict(vla, backbone_family=ISAAC_BACKBONE_FAMILY)
-    artifact = dict(_object_field(root, "genesis_artifact"))
+    artifact = dict(_object_field(root, "isaac05_artifact"))
     for key in ("tensor_count", "tensor_bytes"):
         if key in artifact:
             if _integer(artifact, key, "isaac05_artifact") <= 0:
                 _fail(f"isaac05_artifact.{key} must be positive")
             artifact.pop(key)
-    root["genesis_artifact"] = artifact
+    root["isaac05_artifact"] = artifact
     root["model_type"] = ISAAC_MODEL_TYPE
+    return root
+
+
+def rename_legacy_blocks(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Return config data with the pre-release block names replaced by the released ones."""
+    root = dict(raw)
+    for name in _LAYOUT_BLOCKS:
+        legacy = f"{LEGACY_KEY_PREFIX}{name}"
+        if legacy in root:
+            root[f"isaac05_{name}"] = root.pop(legacy)
+    text = root.get("text_config")
+    legacy_moe = f"{LEGACY_KEY_PREFIX}moe"
+    if isinstance(text, Mapping) and legacy_moe in text:
+        text = dict(text)
+        text["isaac05_moe"] = text.pop(legacy_moe)
+        root["text_config"] = text
+    return root
+
+
+def declares_legacy_layout(raw: Mapping[str, Any]) -> bool:
+    """Whether config data names the pre-release layout; this does not validate it."""
+    vla = raw.get(f"{LEGACY_KEY_PREFIX}vla")
+    return (
+        raw.get("model_type") == ISAAC_MODEL_TYPE
+        and isinstance(vla, Mapping)
+        and vla.get("backbone_family") == LEGACY_BACKBONE_FAMILY
+    )
+
+
+def _normalize_legacy(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Check what only the pre-release layout declares, then give the parser the released names."""
+    legacy_vla = _object_field(raw, f"{LEGACY_KEY_PREFIX}vla")
+    if _object_field(legacy_vla, "action_expert").get("type") == "dit":
+        _fail("the legacy layout requires the molmoact action ABI")
+    if raw.get("architectures") != [LEGACY_ARCHITECTURE]:
+        _fail(f"architectures must be [{LEGACY_ARCHITECTURE!r}]")
+    _require_values(legacy_vla, {"backbone_family": LEGACY_BACKBONE_FAMILY}, f"{LEGACY_KEY_PREFIX}vla")
+    root = rename_legacy_blocks(raw)
     root["architectures"] = [ISAAC_ARCHITECTURE]
+    root["isaac05_vla"] = {key: value for key, value in legacy_vla.items() if key != "backbone_family"}
     return root
 
 
 def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> IsaacMoeContract:
-    _require_exact_keys(raw, _CUSTOM_MOE_KEYS, "genesis_moe")
+    _require_exact_keys(raw, _CUSTOM_MOE_KEYS, "isaac05_moe")
     real = _integer(raw, "num_real_experts")
     null = _integer(raw, "num_null_experts")
     physical = _integer(raw, "physical_router_outputs")
@@ -981,7 +1014,7 @@ def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> IsaacMoeContra
     route_scale = _number(raw, "route_scale")
     router_contract = raw.get("router_contract")
     if not isinstance(router_contract, list) or router_contract != [real, null]:
-        _fail("genesis_moe.router_contract must equal [num_real_experts, num_null_experts]")
+        _fail("isaac05_moe.router_contract must equal [num_real_experts, num_null_experts]")
     fixed = {
         "router_contract_version": 1,
         "shared_null_router_row": True,
@@ -992,15 +1025,15 @@ def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> IsaacMoeContra
         "shared_expert_mode": "sigmoid_gated_additive",
         "uses_expert_bias": False,
     }
-    _require_values(raw, fixed, "genesis_moe")
+    _require_values(raw, fixed, "isaac05_moe")
     if real <= 0 or null != real:
-        _fail("genesis_moe requires equal positive real and logical-null expert counts")
+        _fail("isaac05_moe requires equal positive real and logical-null expert counts")
     if physical != real + 1 or logical != real + null:
-        _fail("genesis_moe compact physical/logical router dimensions are inconsistent")
+        _fail("isaac05_moe compact physical/logical router dimensions are inconsistent")
     if not 0 < top_k <= logical:
-        _fail("genesis_moe.top_k is outside the logical router range")
+        _fail("isaac05_moe.top_k is outside the logical router range")
     if route_scale != 1.0:
-        _fail("genesis_moe.route_scale must be 1.0")
+        _fail("isaac05_moe.route_scale must be 1.0")
     if not test_geometry and (real, null, physical, logical, top_k) != (256, 256, 257, 512, 8):
         _fail("production Isaac requires the 256-real/256-null compact router and top-k 8")
     return IsaacMoeContract(real, null, physical, logical, top_k, route_scale)
@@ -1015,15 +1048,15 @@ def _parse_artifact(raw: Mapping[str, Any]) -> IsaacArtifactContract:
     """
     missing = _ARTIFACT_IDENTITY_KEYS - set(raw)
     if missing:
-        _fail(f"genesis_artifact is missing required identity fields: {sorted(missing)}")
-    schema_version = _integer(raw, "schema_version", "genesis_artifact")
+        _fail(f"isaac05_artifact is missing required identity fields: {sorted(missing)}")
+    schema_version = _integer(raw, "schema_version", "isaac05_artifact")
     if schema_version != 1:
-        _fail(f"genesis_artifact.schema_version must be 1, got {schema_version}")
+        _fail(f"isaac05_artifact.schema_version must be 1, got {schema_version}")
     artifact_kind = raw.get("artifact_kind")
     if artifact_kind not in {"trained_policy", "neutral_debug"}:
-        _fail("genesis_artifact.artifact_kind must be 'trained_policy' or 'neutral_debug'")
+        _fail("isaac05_artifact.artifact_kind must be 'trained_policy' or 'neutral_debug'")
     if artifact_kind == "trained_policy" and set(raw) - {"trained_steps"} != _ARTIFACT_IDENTITY_KEYS:
-        _fail("trained genesis_artifact fields do not match schema version 1")
+        _fail("trained isaac05_artifact fields do not match schema version 1")
     return IsaacArtifactContract(schema_version, artifact_kind)
 
 
@@ -1100,11 +1133,11 @@ def _parse_text(
     if moe_intermediate <= 0 or shared_intermediate <= 0:
         _fail("text_config expert widths must be positive")
     if _integer(raw, "num_experts", "text_config") != moe.num_real_experts:
-        _fail("text_config.num_experts must equal genesis_moe.num_real_experts")
+        _fail("text_config.num_experts must equal isaac05_moe.num_real_experts")
     if _integer(raw, "num_experts_per_tok", "text_config") != moe.top_k:
-        _fail("text_config.num_experts_per_tok must equal genesis_moe.top_k")
+        _fail("text_config.num_experts_per_tok must equal isaac05_moe.top_k")
     if _integer(raw, "mtp_num_hidden_layers", "text_config") != mtp.physical_layers:
-        _fail("text_config.mtp_num_hidden_layers must equal genesis_vla.mtp.physical_layers")
+        _fail("text_config.mtp_num_hidden_layers must equal isaac05_vla.mtp.physical_layers")
     fixed = {
         "attention_bias": False,
         "attention_dropout": 0.0,
@@ -1260,13 +1293,13 @@ def _parse_coord(
 ) -> IsaacCoordTokenContract:
     enabled = raw.get("enabled")
     if enabled is False:
-        _require_exact_keys(raw, _COORD_DISABLED_KEYS, "genesis_coord_tokens")
+        _require_exact_keys(raw, _COORD_DISABLED_KEYS, "isaac05_coord_tokens")
         return IsaacCoordTokenContract(enabled=False)
     if enabled is not True:
-        _fail("genesis_coord_tokens.enabled must be a boolean")
-    _require_exact_keys(raw, _COORD_ENABLED_KEYS, "genesis_coord_tokens")
-    offset = _integer(raw, "offset", "genesis_coord_tokens")
-    size = _integer(raw, "size", "genesis_coord_tokens")
+        _fail("isaac05_coord_tokens.enabled must be a boolean")
+    _require_exact_keys(raw, _COORD_ENABLED_KEYS, "isaac05_coord_tokens")
+    offset = _integer(raw, "offset", "isaac05_coord_tokens")
+    size = _integer(raw, "size", "isaac05_coord_tokens")
     if offset < 0 or size <= 0 or offset + size > text.vocab_size:
         _fail("coordinate token range lies outside the exported vocabulary")
     if not test_geometry and (offset, size) != (248320, 1001):
@@ -1335,29 +1368,28 @@ def _validate_native_action_metadata(
 def _parse_vla(
     raw: Mapping[str, Any], *, text: IsaacTextContract, test_geometry: bool
 ) -> tuple[IsaacVectorEncoderContract, IsaacActionExpertContract]:
-    _require_exact_keys(raw, _VLA_KEYS, "genesis_vla")
-    schema = _integer(raw, "schema_version", "genesis_vla")
+    _require_exact_keys(raw, _VLA_KEYS, "isaac05_vla")
+    schema = _integer(raw, "schema_version", "isaac05_vla")
     if schema not in (1, 2):
-        _fail("genesis_vla.schema_version must be 1 or 2")
+        _fail("isaac05_vla.schema_version must be 1 or 2")
     _require_values(
         raw,
         {
-            "backbone_family": ISAAC_BACKBONE_FAMILY,
             "state_dict_schema": ISAAC_STATE_DICT_SCHEMA,
             "rmsnorm_weight_convention": ISAAC_RMSNORM_CONVENTION,
         },
-        "genesis_vla",
+        "isaac05_vla",
     )
-    vector_raw = _object_field(raw, "vector_encoder", "genesis_vla")
-    _require_exact_keys(vector_raw, _VECTOR_KEYS, "genesis_vla.vector_encoder")
+    vector_raw = _object_field(raw, "vector_encoder", "isaac05_vla")
+    _require_exact_keys(vector_raw, _VECTOR_KEYS, "isaac05_vla.vector_encoder")
     _require_values(
         vector_raw,
         {"type": "linear_silu_linear", "bias": False},
-        "genesis_vla.vector_encoder",
+        "isaac05_vla.vector_encoder",
     )
-    max_states = _integer(vector_raw, "max_states", "genesis_vla.vector_encoder")
-    hidden_dim = _integer(vector_raw, "hidden_dim", "genesis_vla.vector_encoder")
-    output_dim = _integer(vector_raw, "output_dim", "genesis_vla.vector_encoder")
+    max_states = _integer(vector_raw, "max_states", "isaac05_vla.vector_encoder")
+    hidden_dim = _integer(vector_raw, "hidden_dim", "isaac05_vla.vector_encoder")
+    output_dim = _integer(vector_raw, "output_dim", "isaac05_vla.vector_encoder")
     if min(max_states, hidden_dim, output_dim) <= 0:
         _fail("vector encoder dimensions must be positive")
     if hidden_dim != text.hidden_size or output_dim != text.hidden_size:
@@ -1366,7 +1398,7 @@ def _parse_vla(
         _fail("production Isaac vector encoder max_states must be 128")
     vector = IsaacVectorEncoderContract(max_states, hidden_dim, output_dim)
 
-    action_raw = _object_field(raw, "action_expert", "genesis_vla")
+    action_raw = _object_field(raw, "action_expert", "isaac05_vla")
     native = action_raw.get("type") == "dit"
     metadata = tuple(sorted(action_raw.items())) if native else ()
     if native:
@@ -1385,11 +1417,11 @@ def _parse_vla(
                 action_raw, schema_version=schema, backbone_num_layers=text.num_hidden_layers
             )
         except ValueError as exc:
-            _fail(f"genesis_vla.action_expert: {exc}")
+            _fail(f"isaac05_vla.action_expert: {exc}")
         expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
-        _require_exact_keys(action_raw, expected, "genesis_vla.action_expert")
+        _require_exact_keys(action_raw, expected, "isaac05_vla.action_expert")
         action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
-    _require_exact_keys(action_raw, _ACTION_KEYS, "genesis_vla.action_expert")
+    _require_exact_keys(action_raw, _ACTION_KEYS, "isaac05_vla.action_expert")
     _require_values(
         action_raw,
         {
@@ -1401,17 +1433,17 @@ def _parse_vla(
             "context_layer_norm": True,
             "causal_attn": False,
         },
-        "genesis_vla.action_expert",
+        "isaac05_vla.action_expert",
     )
     action = IsaacActionExpertContract(
-        action_dim=_integer(action_raw, "action_dim", "genesis_vla.action_expert"),
-        action_horizon=_integer(action_raw, "action_horizon", "genesis_vla.action_expert"),
-        num_layers=_integer(action_raw, "num_layers", "genesis_vla.action_expert"),
-        hidden_dim=_integer(action_raw, "hidden_dim", "genesis_vla.action_expert"),
-        num_heads=_integer(action_raw, "num_heads", "genesis_vla.action_expert"),
-        mlp_ratio=_number(action_raw, "mlp_ratio", "genesis_vla.action_expert"),
-        timestep_embed_dim=_integer(action_raw, "timestep_embed_dim", "genesis_vla.action_expert"),
-        ffn_multiple_of=_integer(action_raw, "ffn_multiple_of", "genesis_vla.action_expert"),
+        action_dim=_integer(action_raw, "action_dim", "isaac05_vla.action_expert"),
+        action_horizon=_integer(action_raw, "action_horizon", "isaac05_vla.action_expert"),
+        num_layers=_integer(action_raw, "num_layers", "isaac05_vla.action_expert"),
+        hidden_dim=_integer(action_raw, "hidden_dim", "isaac05_vla.action_expert"),
+        num_heads=_integer(action_raw, "num_heads", "isaac05_vla.action_expert"),
+        mlp_ratio=_number(action_raw, "mlp_ratio", "isaac05_vla.action_expert"),
+        timestep_embed_dim=_integer(action_raw, "timestep_embed_dim", "isaac05_vla.action_expert"),
+        ffn_multiple_of=_integer(action_raw, "ffn_multiple_of", "isaac05_vla.action_expert"),
     )
     if (
         min(
@@ -1436,13 +1468,13 @@ def _parse_vla(
 
 
 def _parse_mtp(raw: Mapping[str, Any]) -> IsaacMtpContract:
-    _require_exact_keys(raw, _MTP_KEYS, "genesis_vla.mtp")
-    _require_values(raw, {"action_runtime": "exclude"}, "genesis_vla.mtp")
+    _require_exact_keys(raw, _MTP_KEYS, "isaac05_vla.mtp")
+    _require_values(raw, {"action_runtime": "exclude"}, "isaac05_vla.mtp")
     present = raw.get("present")
     if not isinstance(present, bool):
-        _fail("genesis_vla.mtp.present must be a boolean")
-    physical = _integer(raw, "physical_layers", "genesis_vla.mtp")
-    rollout = _integer(raw, "rollout_steps", "genesis_vla.mtp")
+        _fail("isaac05_vla.mtp.present must be a boolean")
+    physical = _integer(raw, "physical_layers", "isaac05_vla.mtp")
+    rollout = _integer(raw, "rollout_steps", "isaac05_vla.mtp")
     expected = (1, 3) if present else (0, 0)
     if (physical, rollout) != expected:
         state = "present=true" if present else "present=false"
@@ -1668,14 +1700,14 @@ def _object_field(raw: Mapping[str, Any], key: str, path: str = "config") -> Map
     return _object(raw.get(key), f"{path}.{key}")
 
 
-def _integer(raw: Mapping[str, Any], key: str, path: str = "genesis_moe") -> int:
+def _integer(raw: Mapping[str, Any], key: str, path: str = "isaac05_moe") -> int:
     value = raw.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
         _fail(f"{path}.{key} must be an integer")
     return value
 
 
-def _number(raw: Mapping[str, Any], key: str, path: str = "genesis_moe") -> float:
+def _number(raw: Mapping[str, Any], key: str, path: str = "isaac05_moe") -> float:
     value = raw.get(key)
     if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value):
         _fail(f"{path}.{key} must be a finite number")

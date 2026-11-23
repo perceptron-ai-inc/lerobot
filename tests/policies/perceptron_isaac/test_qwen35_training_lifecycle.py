@@ -13,6 +13,7 @@ from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import rename_legacy_blocks
 from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
     IsaacQwen36VLAConfig,
     IsaacQwen36VLAForActionGeneration,
@@ -32,7 +33,9 @@ def reduced_native_model(
     raw["text_config"]["vocab_size"] = vocab_size
     raw["vision_config"]["patch_size"] = 16
     expert = dict(raw["genesis_vla"]["action_expert"], action_dim=action_dim, action_horizon=2)
-    config = IsaacQwen36VLAConfig(vector_max_states=proprio_dim, action_expert=expert, **raw)
+    config = IsaacQwen36VLAConfig(
+        vector_max_states=proprio_dim, action_expert=expert, **rename_legacy_blocks(raw)
+    )
     config._attn_implementation = "sdpa"
     config.text_config._attn_implementation = "sdpa"
     config.vision_config._attn_implementation = "sdpa"

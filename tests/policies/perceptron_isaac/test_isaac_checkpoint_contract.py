@@ -12,6 +12,7 @@ from safetensors.torch import save_file
 
 from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
     ISAAC_TEST_GEOMETRY_MARKER,
+    LEGACY_TEST_GEOMETRY_MARKER,
     IsaacCheckpointContract,
     IsaacCheckpointContractError,
     read_and_validate_safetensors_index,
@@ -237,7 +238,7 @@ def _config(*, test_geometry: bool, mtp_present: bool = True, coord_enabled: boo
         },
     }
     if test_geometry:
-        config[ISAAC_TEST_GEOMETRY_MARKER] = True
+        config[LEGACY_TEST_GEOMETRY_MARKER] = True
     return config
 
 
@@ -525,7 +526,7 @@ def test_reduced_geometry_requires_serialized_and_call_site_opt_in() -> None:
     with pytest.raises(IsaacCheckpointContractError, match="test-only"):
         IsaacCheckpointContract.parse_allowlisted(config)
 
-    del config[ISAAC_TEST_GEOMETRY_MARKER]
+    del config[LEGACY_TEST_GEOMETRY_MARKER]
     with pytest.raises(IsaacCheckpointContractError, match="production Isaac"):
         IsaacCheckpointContract.parse_allowlisted(config, allow_test_only_reduced_geometry=True)
 
@@ -861,7 +862,7 @@ def _write_portable_isaac05_checkpoint(
     }
     raw["storage_dtype"] = "float32"
     raw["runtime_dtype"] = raw["dtype"] = "bfloat16"
-    raw["isaac05_test_only_reduced_geometry"] = raw.pop(ISAAC_TEST_GEOMETRY_MARKER)
+    raw[ISAAC_TEST_GEOMETRY_MARKER] = raw.pop(LEGACY_TEST_GEOMETRY_MARKER)
     for name in ("artifact", "coord_tokens", "moe", "vla"):
         raw[f"isaac05_{name}"] = raw.pop(f"genesis_{name}")
     raw["text_config"]["isaac05_moe"] = raw["text_config"].pop("genesis_moe")

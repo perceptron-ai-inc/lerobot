@@ -52,7 +52,7 @@ def test_native_schema2_contract_preserves_metadata_and_schema1_tensor_geometry(
     normalized, contract = read_isaac_config_data(fixture.root, allow_test_only_reduced_geometry=True)
 
     assert dict(contract.action_expert.native_metadata) == fixture.raw["action_expert"]
-    assert normalized["genesis_vla"]["action_expert"] == fixture.raw["action_expert"]
+    assert normalized["isaac05_vla"]["action_expert"] == fixture.raw["action_expert"]
     assert contract.expected_tensor_shapes() == fixture.schema1_contract.expected_tensor_shapes()
     assert contract.artifact == fixture.schema1_contract.artifact
     assert (fixture.root / "config.json").read_bytes() == before
@@ -153,7 +153,7 @@ def test_native_schema1_control_has_no_layerwise_relabeling(tmp_path: Path) -> N
     normalized, contract = read_isaac_config_data(root, allow_test_only_reduced_geometry=True)
 
     assert contract == expected
-    assert normalized["genesis_vla"]["action_expert"] == raw["action_expert"]
+    assert normalized["isaac05_vla"]["action_expert"] == raw["action_expert"]
     assert raw["action_expert"]["schema_version"] == 1
     assert "context_layers" not in dict(contract.action_expert.native_metadata)
     assert (root / "config.json").read_bytes() == before

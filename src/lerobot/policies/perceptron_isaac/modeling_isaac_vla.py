@@ -26,6 +26,7 @@ from .isaac_checkpoint_contract import (
     SafetensorsInventory,
     read_and_validate_safetensors_index,
     read_isaac_config_data,
+    rename_legacy_blocks,
     validate_isaac_tokenizer,
 )
 from .loss_perceptron_isaac import _global_sum_detached
@@ -184,7 +185,8 @@ def _build_config(
     raw: dict[str, Any],
     contract: IsaacCheckpointContract,
 ) -> IsaacQwen36VLAConfig:
-    normalized = copy.deepcopy(raw)
+    # Config data read directly from a pre-release file still carries its own block names.
+    normalized = rename_legacy_blocks(copy.deepcopy(raw))
     for key, value in _QUALIFIED_COMMON_EXECUTION_DEFAULTS.items():
         normalized.setdefault(key, value)
     for section_name in ("text_config", "vision_config"):
@@ -196,7 +198,7 @@ def _build_config(
     for key, value in _QUALIFIED_TEXT_EXECUTION_DEFAULTS.items():
         normalized["text_config"].setdefault(key, value)
 
-    action_expert = dict(normalized["genesis_vla"]["action_expert"])
+    action_expert = dict(normalized["isaac05_vla"]["action_expert"])
     # Sampler steps are runtime input to sample_action(), not module geometry.
     if action_expert.get("type") != "dit":
         action_expert.pop("num_inference_steps", None)
@@ -205,7 +207,7 @@ def _build_config(
     config = IsaacQwen36VLAConfig(
         vector_max_states=contract.vector_encoder.max_states,
         action_expert=action_expert,
-        action_context_schema_version=normalized["genesis_vla"]["schema_version"],
+        action_context_schema_version=normalized["isaac05_vla"]["schema_version"],
         **normalized,
     )
     if config.tie_word_embeddings or config.text_config.tie_word_embeddings:

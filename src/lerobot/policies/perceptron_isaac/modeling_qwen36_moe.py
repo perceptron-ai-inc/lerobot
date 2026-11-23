@@ -154,7 +154,7 @@ def _required_metadata_value(
 ) -> Any:
     value = metadata.get(key)
     if not isinstance(value, expected_type) or (isinstance(value, bool) and expected_type is not bool):
-        raise ValueError(f"genesis_moe.{key} has invalid value {value!r}")
+        raise ValueError(f"isaac05_moe.{key} has invalid value {value!r}")
     return value
 
 
@@ -182,7 +182,7 @@ class IsaacNullMoeContract:
         version = _required_metadata_value(metadata, "router_contract_version", int)
         if version != _ROUTER_CONTRACT_VERSION:
             raise ValueError(
-                f"genesis_moe.router_contract_version must be {_ROUTER_CONTRACT_VERSION}, got {version}"
+                f"isaac05_moe.router_contract_version must be {_ROUTER_CONTRACT_VERSION}, got {version}"
             )
 
         num_real = _required_metadata_value(metadata, "num_real_experts", int)
@@ -190,11 +190,11 @@ class IsaacNullMoeContract:
         top_k = _required_metadata_value(metadata, "top_k", int)
         route_scale = float(_required_metadata_value(metadata, "route_scale", (int, float)))
         if num_real <= 0 or num_null <= 0:
-            raise ValueError("genesis_moe requires positive real and null expert counts")
+            raise ValueError("isaac05_moe requires positive real and null expert counts")
         if top_k <= 0 or top_k > num_real + num_null:
-            raise ValueError(f"genesis_moe.top_k must be in [1, {num_real + num_null}], got {top_k}")
+            raise ValueError(f"isaac05_moe.top_k must be in [1, {num_real + num_null}], got {top_k}")
         if not math.isfinite(route_scale) or route_scale <= 0:
-            raise ValueError(f"genesis_moe.route_scale must be finite and positive, got {route_scale}")
+            raise ValueError(f"isaac05_moe.route_scale must be finite and positive, got {route_scale}")
 
         contract = cls(
             num_real_experts=num_real,
@@ -217,23 +217,23 @@ class IsaacNullMoeContract:
         for key, expected in exact_values.items():
             actual = metadata.get(key)
             if actual != expected:
-                raise ValueError(f"genesis_moe.{key} must be {expected!r}, got {actual!r}")
+                raise ValueError(f"isaac05_moe.{key} must be {expected!r}, got {actual!r}")
         return contract
 
     @classmethod
     def from_text_config(cls, config: Qwen3_5MoeTextConfig) -> IsaacNullMoeContract:
-        metadata = getattr(config, "genesis_moe", None)
+        metadata = getattr(config, "isaac05_moe", None)
         if not isinstance(metadata, Mapping):
-            raise ValueError("Isaac Qwen3.6 text_config requires a genesis_moe object")
+            raise ValueError("Isaac Qwen3.6 text_config requires a isaac05_moe object")
         contract = cls.from_metadata(metadata)
         if config.num_experts != contract.num_real_experts:
             raise ValueError(
-                "text_config.num_experts must match genesis_moe.num_real_experts: "
+                "text_config.num_experts must match isaac05_moe.num_real_experts: "
                 f"{config.num_experts} != {contract.num_real_experts}"
             )
         if config.num_experts_per_tok != contract.top_k:
             raise ValueError(
-                "text_config.num_experts_per_tok must match genesis_moe.top_k: "
+                "text_config.num_experts_per_tok must match isaac05_moe.top_k: "
                 f"{config.num_experts_per_tok} != {contract.top_k}"
             )
         if config.shared_expert_intermediate_size != config.moe_intermediate_size:
@@ -249,14 +249,14 @@ class IsaacQwen36MoeConfig(Qwen3_5MoeConfig):
 
     def __post_init__(self, **kwargs: Any) -> None:
         super().__post_init__(**kwargs)
-        root_metadata = getattr(self, "genesis_moe", None)
-        text_metadata = getattr(self.text_config, "genesis_moe", None)
+        root_metadata = getattr(self, "isaac05_moe", None)
+        text_metadata = getattr(self.text_config, "isaac05_moe", None)
         if not isinstance(root_metadata, Mapping) or not isinstance(text_metadata, Mapping):
             raise ValueError(
-                "Isaac Qwen3.6 config requires matching root and text_config genesis_moe objects"
+                "Isaac Qwen3.6 config requires matching root and text_config isaac05_moe objects"
             )
         if dict(root_metadata) != dict(text_metadata):
-            raise ValueError("Isaac Qwen3.6 root and text_config genesis_moe objects must be identical")
+            raise ValueError("Isaac Qwen3.6 root and text_config isaac05_moe objects must be identical")
         IsaacNullMoeContract.from_text_config(self.text_config)
 
 
