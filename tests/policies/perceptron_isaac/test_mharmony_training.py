@@ -26,9 +26,9 @@ from lerobot.policies.perceptron_isaac.mharmony_adapter import (
     rendered_stream_to_local_tensor_stream,
 )
 from lerobot.policies.perceptron_isaac.mharmony_native import (
-    GENESIS_TEXT_TYPE_ACTION,
-    GENESIS_TEXT_TYPE_ACTION_C,
-    GENESIS_TEXT_TYPE_TAG,
+    TEXT_TYPE_ACTION,
+    TEXT_TYPE_ACTION_C,
+    TEXT_TYPE_TAG,
     IsaacMharmonyContentPlan,
     IsaacMharmonyRenderMetadata,
     IsaacNativeMharmonyRenderer,
@@ -111,8 +111,8 @@ def test_joint_plan_places_flow_marker_immediately_before_fast_span():
 
     assert len(plan.assistant_content) == 2
     marker, fast = plan.assistant_content
-    assert marker["tags"][GENESIS_TEXT_TYPE_TAG] == GENESIS_TEXT_TYPE_ACTION_C
-    assert fast["tags"][GENESIS_TEXT_TYPE_TAG] == GENESIS_TEXT_TYPE_ACTION
+    assert marker["tags"][TEXT_TYPE_TAG] == TEXT_TYPE_ACTION_C
+    assert fast["tags"][TEXT_TYPE_TAG] == TEXT_TYPE_ACTION
     assert fast["tokens"] == [7, 8]
     np.testing.assert_allclose(marker["tags"]["action_target"], action)
     for key in ("action_index", "action_window", "action_indices", "action_is_pad"):
@@ -212,7 +212,7 @@ def test_terminal_training_chunks_keep_the_end_footer(monkeypatch: pytest.Monkey
     assert _footer_rewrite_for(True, monkeypatch) is False
 
 
-def test_joint_plan_exactly_matches_genesis_final_prompt_metadata():
+def test_joint_plan_exactly_matches_final_prompt_metadata():
     bounds = IsaacStatsBlock(q01=np.zeros(14), q99=np.ones(14))
     stats = IsaacNormalizationStats(
         schema="flow_matching_stats_v1",
@@ -278,7 +278,7 @@ def test_joint_plan_exactly_matches_genesis_final_prompt_metadata():
     flow, fast = plan.assistant_content
     shared_keys = {
         "token_group",
-        GENESIS_TEXT_TYPE_TAG,
+        TEXT_TYPE_TAG,
         "action_index",
         "trajectory_action",
         "objective_form",
@@ -327,7 +327,7 @@ def test_public_rendered_stream_lowering_preserves_isaac_contract():
                     "time": [0.5, 0.5],
                     "modality": "text",
                     "role": "developer",
-                    "tags": {GENESIS_TEXT_TYPE_TAG: "timestamp"},
+                    "tags": {TEXT_TYPE_TAG: "timestamp"},
                     "data": {"Tokens": [21]},
                 },
                 {
@@ -350,7 +350,7 @@ def test_public_rendered_stream_lowering_preserves_isaac_contract():
                     "role": "assistant",
                     "channel": "final",
                     "tags": {
-                        GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C,
+                        TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C,
                         "action_target": [[0.25, -0.5]],
                         "action_is_pad": [False],
                     },
@@ -762,7 +762,7 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
                             "modality": "text",
                             "role": "assistant",
                             "channel": "final",
-                            "tags": {GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C},
+                            "tags": {TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C},
                             "data": {"Tokens": [248_087]},
                         }
                     ]
@@ -785,7 +785,7 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
                 "kind": "timestamp",
                 "normalized_seconds": 1.25,
                 "precision": 2,
-                "tags": {GENESIS_TEXT_TYPE_TAG: "timestamp"},
+                "tags": {TEXT_TYPE_TAG: "timestamp"},
             },
             {
                 "kind": "image",
@@ -805,7 +805,7 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
             {
                 "kind": "tokens",
                 "tokens": [0],
-                "tags": {GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C},
+                "tags": {TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C},
             }
         ],
     )

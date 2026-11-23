@@ -64,7 +64,7 @@ def _molmoact_cfg(**overrides):
     return cfg
 
 
-def test_genesis_dit_contract_builds_the_vendored_head():
+def test_dit_contract_builds_the_vendored_head():
     head = build_action_expert_head(_dit_contract(), vlm_dim=_VLM_DIM)
     assert type(head).__name__ == "DiTActionExpertHead"
     reference = build_action_expert_head(_molmoact_cfg(), vlm_dim=_VLM_DIM)
@@ -87,7 +87,7 @@ def test_dit_contract_schema_drift_fails_loud():
     with pytest.raises(ValueError, match="schema_version"):
         build_action_expert_head(_dit_contract(schema_version=2), vlm_dim=_VLM_DIM)
     with pytest.raises(ValueError, match="unexpected fields"):
-        build_action_expert_head(_dit_contract(new_genesis_field=1), vlm_dim=_VLM_DIM)
+        build_action_expert_head(_dit_contract(new_field=1), vlm_dim=_VLM_DIM)
 
 
 def test_non_dit_config_with_schema_version_is_rejected():

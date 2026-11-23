@@ -16,18 +16,18 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContract,
-    Mk1CheckpointContractError,
-    read_mk1_config_data,
-    validate_mk1_checkpoint,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContract,
+    IsaacCheckpointContractError,
+    read_isaac_config_data,
+    validate_isaac_checkpoint,
 )
 from tests.policies.perceptron_isaac._layerwise_fixtures import (
     declare_native_layerwise,
     layerwise_action_config,
     write_layerwise_checkpoint,
 )
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _config,
     _write_portable_isaac05_checkpoint,
 )
@@ -49,7 +49,7 @@ def test_native_schema2_contract_preserves_metadata_and_schema1_tensor_geometry(
     fixture = write_layerwise_checkpoint(tmp_path / "model")
     before = (fixture.root / "config.json").read_bytes()
 
-    normalized, contract = read_mk1_config_data(fixture.root, allow_test_only_reduced_geometry=True)
+    normalized, contract = read_isaac_config_data(fixture.root, allow_test_only_reduced_geometry=True)
 
     assert dict(contract.action_expert.native_metadata) == fixture.raw["action_expert"]
     assert normalized["genesis_vla"]["action_expert"] == fixture.raw["action_expert"]
@@ -62,7 +62,7 @@ def test_migrated_schema2_preserves_full_40_layer_production_declaration_without
     # The archived migrated form versions genesis_vla, not the legacy MolmoAct
     # action block. Native Isaac05 instead versions its duplicated DiT action block.
     raw = _config(test_geometry=False, mtp_present=False, coord_enabled=False)
-    schema1 = Mk1CheckpointContract.parse_allowlisted(raw)
+    schema1 = IsaacCheckpointContract.parse_allowlisted(raw)
     raw["genesis_vla"]["schema_version"] = 2
     raw["genesis_vla"]["action_expert"].update(
         context_source="layer_hidden",
@@ -71,7 +71,7 @@ def test_migrated_schema2_preserves_full_40_layer_production_declaration_without
     )
     before = copy.deepcopy(raw)
 
-    contract = Mk1CheckpointContract.parse_allowlisted(raw)
+    contract = IsaacCheckpointContract.parse_allowlisted(raw)
 
     assert contract.text.num_hidden_layers == 40
     assert contract.action_expert.num_layers == 36
@@ -85,8 +85,8 @@ def test_schema2_requires_every_conditioning_field(tmp_path: Path, field: str) -
     for action in (fixture.raw["action_expert"], fixture.raw["isaac05_vla"]["action_expert"]):
         del action[field]
 
-    with pytest.raises(Mk1CheckpointContractError, match=field):
-        Mk1CheckpointContract.parse_allowlisted(fixture.raw, allow_test_only_reduced_geometry=True)
+    with pytest.raises(IsaacCheckpointContractError, match=field):
+        IsaacCheckpointContract.parse_allowlisted(fixture.raw, allow_test_only_reduced_geometry=True)
 
 
 @pytest.mark.parametrize(
@@ -117,8 +117,8 @@ def test_native_schema2_rejects_malformed_conditioning(
     for action in (fixture.raw["action_expert"], fixture.raw["isaac05_vla"]["action_expert"]):
         action[field] = value
 
-    with pytest.raises(Mk1CheckpointContractError, match=message):
-        Mk1CheckpointContract.parse_allowlisted(fixture.raw, allow_test_only_reduced_geometry=True)
+    with pytest.raises(IsaacCheckpointContractError, match=message):
+        IsaacCheckpointContract.parse_allowlisted(fixture.raw, allow_test_only_reduced_geometry=True)
 
 
 @pytest.mark.parametrize("schema", [0, 3, True, 2.0, "2", None])
@@ -127,8 +127,8 @@ def test_native_action_schema_version_remains_strict(tmp_path: Path, schema: obj
     for action in (fixture.raw["action_expert"], fixture.raw["isaac05_vla"]["action_expert"]):
         action["schema_version"] = schema
 
-    with pytest.raises(Mk1CheckpointContractError, match="schema_version"):
-        Mk1CheckpointContract.parse_allowlisted(fixture.raw, allow_test_only_reduced_geometry=True)
+    with pytest.raises(IsaacCheckpointContractError, match="schema_version"):
+        IsaacCheckpointContract.parse_allowlisted(fixture.raw, allow_test_only_reduced_geometry=True)
 
 
 @pytest.mark.parametrize("copy_name", ["root", "nested"])
@@ -141,8 +141,8 @@ def test_native_schema2_still_cross_checks_both_action_copies(tmp_path: Path, co
     for field in ("context_source", "context_layers", "context_hidden_norm"):
         del action[field]
     # Individually valid schema-1/schema-2 copies must never normalize into equality.
-    with pytest.raises(Mk1CheckpointContractError, match="identical"):
-        Mk1CheckpointContract.parse_allowlisted(fixture.raw, allow_test_only_reduced_geometry=True)
+    with pytest.raises(IsaacCheckpointContractError, match="identical"):
+        IsaacCheckpointContract.parse_allowlisted(fixture.raw, allow_test_only_reduced_geometry=True)
 
 
 def test_native_schema1_control_has_no_layerwise_relabeling(tmp_path: Path) -> None:
@@ -150,7 +150,7 @@ def test_native_schema1_control_has_no_layerwise_relabeling(tmp_path: Path) -> N
     expected, raw, _ = _write_portable_isaac05_checkpoint(root)
     before = (root / "config.json").read_bytes()
 
-    normalized, contract = read_mk1_config_data(root, allow_test_only_reduced_geometry=True)
+    normalized, contract = read_isaac_config_data(root, allow_test_only_reduced_geometry=True)
 
     assert contract == expected
     assert normalized["genesis_vla"]["action_expert"] == raw["action_expert"]
@@ -167,7 +167,7 @@ def test_native_schema1_control_has_no_layerwise_relabeling(tmp_path: Path) -> N
 def test_schema2_raw_native_loader_preserves_values_signed_zero_and_source_bytes(
     tmp_path: Path, dtype: torch.dtype, intent: Literal["training", "inference"]
 ) -> None:
-    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
+    from lerobot.policies.perceptron_isaac.modeling_isaac_vla import load_isaac_vla_from_hf
 
     fixture = write_layerwise_checkpoint(tmp_path / "model")
     key = "lm_head.weight"
@@ -180,7 +180,7 @@ def test_schema2_raw_native_loader_preserves_values_signed_zero_and_source_bytes
             save_file(state, shard)
     before = {path.name: path.read_bytes() for path in fixture.root.iterdir()}
 
-    model, config, contract = load_mk1_vla_from_hf(
+    model, config, contract = load_isaac_vla_from_hf(
         fixture.root,
         dtype=dtype,
         device="cpu",
@@ -204,11 +204,11 @@ def test_schema2_raw_native_loader_preserves_values_signed_zero_and_source_bytes
 
 
 def test_schema2_raw_native_loader_still_requires_training_intent_for_f32(tmp_path: Path) -> None:
-    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
+    from lerobot.policies.perceptron_isaac.modeling_isaac_vla import load_isaac_vla_from_hf
 
     fixture = write_layerwise_checkpoint(tmp_path / "model")
     with pytest.raises(ValueError, match="training load intent"):
-        load_mk1_vla_from_hf(
+        load_isaac_vla_from_hf(
             fixture.root,
             dtype=torch.float32,
             allowed_storage_dtypes=frozenset({"F32"}),
@@ -218,7 +218,7 @@ def test_schema2_raw_native_loader_still_requires_training_intent_for_f32(tmp_pa
 
 @pytest.mark.parametrize("defect", ["shape", "dtype", "tokenizer"])
 def test_schema2_raw_validation_precedes_native_construction(tmp_path: Path, defect: str) -> None:
-    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
+    from lerobot.policies.perceptron_isaac.modeling_isaac_vla import load_isaac_vla_from_hf
 
     fixture = write_layerwise_checkpoint(tmp_path / "model")
     if defect == "tokenizer":
@@ -235,11 +235,11 @@ def test_schema2_raw_validation_precedes_native_construction(tmp_path: Path, def
         save_file(state, shard)
         message = "total_size|shape|dtype"
     with patch(
-        "lerobot.policies.perceptron_isaac.modeling_mk1_vla.Mk1Qwen36VLAForActionGeneration",
+        "lerobot.policies.perceptron_isaac.modeling_isaac_vla.IsaacQwen36VLAForActionGeneration",
         side_effect=AssertionError("invalid source reached native construction"),
     ) as constructor:
         with pytest.raises(ValueError, match=message):
-            load_mk1_vla_from_hf(
+            load_isaac_vla_from_hf(
                 fixture.root,
                 allowed_storage_dtypes=frozenset({"F32"}),
                 allow_test_only_reduced_geometry=True,
@@ -248,7 +248,7 @@ def test_schema2_raw_validation_precedes_native_construction(tmp_path: Path, def
 
 
 def test_public_portable_schema2_loads_in_tree_without_rewriting_source(tmp_path: Path) -> None:
-    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
+    from lerobot.policies.perceptron_isaac.modeling_isaac_vla import IsaacQwen36VLAForActionGeneration
     from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
     from tests.policies.perceptron_isaac.test_portable_model_repo import _native_portable_package
 
@@ -261,7 +261,7 @@ def test_public_portable_schema2_loads_in_tree_without_rewriting_source(tmp_path
 
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
 
-    assert isinstance(policy._isaac_model, Mk1Qwen36VLAForActionGeneration)
+    assert isinstance(policy._isaac_model, IsaacQwen36VLAForActionGeneration)
     assert policy._isaac_model.config.action_expert == raw["action_expert"]
     assert (
         policy.config.artifact_kind == "neutral_debug"
@@ -272,7 +272,7 @@ def test_public_portable_schema2_loads_in_tree_without_rewriting_source(tmp_path
 def test_legacy_production_schema1_geometry_remains_allowlisted() -> None:
     raw: dict[str, Any] = _config(test_geometry=False, mtp_present=False, coord_enabled=False)
     before = copy.deepcopy(raw)
-    contract = Mk1CheckpointContract.parse_allowlisted(raw)
+    contract = IsaacCheckpointContract.parse_allowlisted(raw)
     assert contract.text.num_hidden_layers == 40
     assert contract.action_expert.num_layers == 36
     assert contract.action_expert.native_metadata == ()
@@ -281,7 +281,7 @@ def test_legacy_production_schema1_geometry_remains_allowlisted() -> None:
 
 def test_schema2_inventory_does_not_add_parameters(tmp_path: Path) -> None:
     fixture = write_layerwise_checkpoint(tmp_path / "model")
-    contract, inventory = validate_mk1_checkpoint(
+    contract, inventory = validate_isaac_checkpoint(
         fixture.root,
         allow_test_only_reduced_geometry=True,
         allowed_storage_dtypes=frozenset({"F32"}),

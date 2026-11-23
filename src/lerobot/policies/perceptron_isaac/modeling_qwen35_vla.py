@@ -1965,11 +1965,11 @@ def setup_qwen35_vla_for_training(
     """
     if rtc_max_delay_steps != 0 or dual_timestep_ratio != 0:
         raise ValueError("RTC delay and dual-timestep training are unsupported.")
-    from .modeling_qwen36_moe import GenesisQwen36TextRotaryEmbedding
+    from .modeling_qwen36_moe import IsaacQwen36TextRotaryEmbedding
 
     # BF16-source training retains its serving load path; rederive before distributed preparation too.
     for module in model.modules():
-        if isinstance(module, GenesisQwen36TextRotaryEmbedding):
+        if isinstance(module, IsaacQwen36TextRotaryEmbedding):
             module.prepare_for_training()
     expert = model.model.action_expert
     if expert is not None and hasattr(expert, "args"):

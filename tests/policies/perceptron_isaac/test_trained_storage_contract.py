@@ -21,18 +21,18 @@ from safetensors.torch import load_file, save_file
 pytest.importorskip("transformers", reason="requires the existing perceptron_isaac test environment")
 
 from lerobot.distributed import checkpoint, utils as distributed_utils
-from lerobot.policies.perceptron_isaac import mk1_checkpoint_contract, modeling_mk1_vla
+from lerobot.policies.perceptron_isaac import isaac_checkpoint_contract, modeling_isaac_vla
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import canonical_json_sha256, file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
-from lerobot.policies.perceptron_isaac.mharmony_native import IsaacMharmonyRenderMetadata
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContract,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContract,
     SafetensorsInventory,
     SafetensorsShardIdentity,
 )
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAConfig,
-    Mk1Qwen36VLAForActionGeneration,
+from lerobot.policies.perceptron_isaac.mharmony_native import IsaacMharmonyRenderMetadata
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAConfig,
+    IsaacQwen36VLAForActionGeneration,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.trained_package import (
@@ -40,8 +40,8 @@ from lerobot.policies.perceptron_isaac.trained_package import (
     finalize_canonical_trained_package,
 )
 from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _config, _source_package
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
-    _config as _mk1_config,
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
+    _config as _isaac_config,
     _write_checkpoint,
     _write_portable_isaac05_checkpoint,
 )
@@ -51,7 +51,7 @@ from tests.policies.perceptron_isaac.test_portable_model_repo import (
     _StubFsdpPlugin,
 )
 
-SourceFamily = Literal["isaac05", "legacy_mk1"]
+SourceFamily = Literal["isaac05", "legacy"]
 StorageProfile = Literal["all_bf16", "all_f32", "mixed"]
 SaveDefect = Literal["unsupported_dtype", "missing_key", "extra_key", "wrong_shape", "mixed_prefix"]
 LoadIntent = Literal["inference", "training"]
@@ -67,8 +67,8 @@ class LoadCall:
 @pytest.fixture
 def reduced_loader(monkeypatch: pytest.MonkeyPatch) -> list[LoadCall]:
     """Permit fixture geometry only; never overwrite the policy's dtype/storage/intent decision."""
-    real_validate = mk1_checkpoint_contract.validate_mk1_checkpoint
-    real_load = modeling_mk1_vla.load_mk1_vla_from_hf
+    real_validate = isaac_checkpoint_contract.validate_isaac_checkpoint
+    real_load = modeling_isaac_vla.load_isaac_vla_from_hf
     calls: list[LoadCall] = []
 
     def validate(
@@ -76,7 +76,7 @@ def reduced_loader(monkeypatch: pytest.MonkeyPatch) -> list[LoadCall]:
         *,
         allow_test_only_reduced_geometry: bool = False,
         allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
-    ) -> tuple[Mk1CheckpointContract, SafetensorsInventory]:
+    ) -> tuple[IsaacCheckpointContract, SafetensorsInventory]:
         return real_validate(
             model_dir,
             allow_test_only_reduced_geometry=True,
@@ -95,7 +95,7 @@ def reduced_loader(monkeypatch: pytest.MonkeyPatch) -> list[LoadCall]:
         allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
         load_intent: LoadIntent = "inference",
         verified_tensor_storage: VerifiedTrainedTensorStorage | None = None,
-    ) -> tuple[Mk1Qwen36VLAForActionGeneration, Mk1Qwen36VLAConfig, Mk1CheckpointContract]:
+    ) -> tuple[IsaacQwen36VLAForActionGeneration, IsaacQwen36VLAConfig, IsaacCheckpointContract]:
         assert torch.device(device).type == "cpu"
         assert runtime_device is None or torch.device(runtime_device).type == "cpu"
         calls.append(LoadCall(dtype, allowed_storage_dtypes, load_intent))
@@ -112,8 +112,8 @@ def reduced_loader(monkeypatch: pytest.MonkeyPatch) -> list[LoadCall]:
             verified_tensor_storage=verified_tensor_storage,
         )
 
-    monkeypatch.setattr(mk1_checkpoint_contract, "validate_mk1_checkpoint", validate)
-    monkeypatch.setattr(modeling_mk1_vla, "load_mk1_vla_from_hf", load)
+    monkeypatch.setattr(isaac_checkpoint_contract, "validate_isaac_checkpoint", validate)
+    monkeypatch.setattr(modeling_isaac_vla, "load_isaac_vla_from_hf", load)
     return calls
 
 
@@ -125,9 +125,11 @@ def _render_metadata(config: PerceptronIsaacConfig, path: Path) -> None:
 
 def _source_policy(root: Path, family: SourceFamily, *, mtp_present: bool = False) -> PerceptronIsaacPolicy:
     config = _source_package(root)
-    if family == "legacy_mk1":
+    if family == "legacy":
         shutil.rmtree(root / "hf_model")
-        _write_checkpoint(root / "hf_model", config=_mk1_config(test_geometry=True, mtp_present=mtp_present))
+        _write_checkpoint(
+            root / "hf_model", config=_isaac_config(test_geometry=True, mtp_present=mtp_present)
+        )
         source_identity = root / "hf_model" / "source_mk1_model_import.json"
         source_identity.write_text('{"fixture": "native-source-identity"}\n')
         config.mk1_source_model_import_sha256 = file_sha256(source_identity)
@@ -221,7 +223,7 @@ def _live_fsdp2(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy_mk1"])
+@pytest.mark.parametrize("family", ["isaac05", "legacy"])
 @pytest.mark.parametrize("profile", ["all_bf16", "all_f32", "mixed"])
 def test_public_trained_save_move_resume_preserves_storage_and_values(
     tmp_path: Path,
@@ -308,7 +310,7 @@ def test_public_trained_save_move_resume_preserves_storage_and_values(
     assert _files(moved) == before_reload, "Loading/training setup must not write the saved package"
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy_mk1"])
+@pytest.mark.parametrize("family", ["isaac05", "legacy"])
 @pytest.mark.parametrize(
     "defect", ["unsupported_dtype", "missing_key", "extra_key", "wrong_shape", "mixed_prefix"]
 )
@@ -365,7 +367,7 @@ def test_invalid_gathered_save_fails_before_destination_changes(
 
 
 def test_runtime_save_omits_only_source_mtp_tensors(tmp_path: Path, reduced_loader: list[LoadCall]) -> None:
-    policy = _source_policy(tmp_path / "source", "legacy_mk1", mtp_present=True)
+    policy = _source_policy(tmp_path / "source", "legacy", mtp_present=True)
     expected = _set_trained_values(policy, "mixed")
     assert not any(name.startswith("mtp.") for name in expected)
     destination = tmp_path / "saved"
@@ -405,7 +407,7 @@ def test_non_main_save_gathers_then_returns_without_validating_empty_state_or_wr
     assert _files(destination) == before
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy_mk1"])
+@pytest.mark.parametrize("family", ["isaac05", "legacy"])
 @pytest.mark.parametrize("tamper", ["weight_bytes", "unlisted_file", "missing_file", "source_identity"])
 def test_public_trained_reload_authenticates_the_entire_payload_before_loading(
     tmp_path: Path,
@@ -438,7 +440,7 @@ def test_public_trained_reload_authenticates_the_entire_payload_before_loading(
     assert _files(saved) == before
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy_mk1"])
+@pytest.mark.parametrize("family", ["isaac05", "legacy"])
 def test_original_source_still_rejects_wrong_family_storage_dtype(
     tmp_path: Path, reduced_loader: list[LoadCall], family: SourceFamily
 ) -> None:
@@ -448,7 +450,7 @@ def test_original_source_still_rejects_wrong_family_storage_dtype(
         _write_portable_isaac05_checkpoint(model_root)
         wrong_dtype = torch.bfloat16
     else:
-        _write_checkpoint(model_root, config=_mk1_config(test_geometry=True, mtp_present=False))
+        _write_checkpoint(model_root, config=_isaac_config(test_geometry=True, mtp_present=False))
         wrong_dtype = torch.float32
     # Update actual index sizes, but keep the original F32 source export profile unchanged.
     total_bytes = 0
@@ -652,16 +654,16 @@ def test_lazy_trained_load_rechecks_metadata_after_loader_reads(
     _storage_package(root, "all_f32")
     policy = PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
     assert policy._isaac_model is None
-    read_name = "read_mk1_config_data" if read_boundary == "config" else "validate_mk1_tokenizer"
+    read_name = "read_isaac_config_data" if read_boundary == "config" else "validate_isaac_tokenizer"
     real_read = (
-        mk1_checkpoint_contract.read_mk1_config_data
+        isaac_checkpoint_contract.read_isaac_config_data
         if read_boundary == "config"
-        else mk1_checkpoint_contract.validate_mk1_tokenizer
+        else isaac_checkpoint_contract.validate_isaac_tokenizer
     )
     metadata = root / "hf_model" / ("config.json" if read_boundary == "config" else "tokenizer.json")
     reads: list[str] = []
     constructions: list[str] = []
-    real_build = modeling_mk1_vla._build_config
+    real_build = modeling_isaac_vla._build_config
 
     def read_then_change(*args: Any, **kwargs: Any) -> Any:
         result = real_read(*args, **kwargs)
@@ -673,8 +675,8 @@ def test_lazy_trained_load_rechecks_metadata_after_loader_reads(
         constructions.append("build")
         return real_build(*args, **kwargs)
 
-    monkeypatch.setattr(modeling_mk1_vla, read_name, read_then_change)
-    monkeypatch.setattr(modeling_mk1_vla, "_build_config", observe_build)
+    monkeypatch.setattr(modeling_isaac_vla, read_name, read_then_change)
+    monkeypatch.setattr(modeling_isaac_vla, "_build_config", observe_build)
     with pytest.raises((RuntimeError, ValueError), match="changed|identity|digest"):
         policy._load_backbone()
     assert reads == [read_boundary]
@@ -684,14 +686,14 @@ def test_lazy_trained_load_rechecks_metadata_after_loader_reads(
 def _mock_shard_timestamp_precision(
     monkeypatch: pytest.MonkeyPatch, precision: Literal["seconds", "nanoseconds"]
 ) -> None:
-    real_capture = mk1_checkpoint_contract._capture_shard_identity
+    real_capture = isaac_checkpoint_contract._capture_shard_identity
     stamp = 1_000_000_000 if precision == "seconds" else 1_000_000_001
 
     def capture(shard: Path) -> SafetensorsShardIdentity:
         identity = real_capture(shard)
         return replace(identity, mtime_ns=stamp, ctime_ns=stamp)
 
-    monkeypatch.setattr(mk1_checkpoint_contract, "_capture_shard_identity", capture)
+    monkeypatch.setattr(isaac_checkpoint_contract, "_capture_shard_identity", capture)
 
 
 @pytest.mark.parametrize("precision", ["seconds", "nanoseconds"])
@@ -729,13 +731,13 @@ def test_lazy_trained_load_rejects_a_changed_authenticated_shard_before_allocati
 ) -> None:
     _mock_shard_timestamp_precision(monkeypatch, "seconds")
     constructions: list[str] = []
-    real_build = modeling_mk1_vla._build_config
+    real_build = modeling_isaac_vla._build_config
 
     def observe_build(*args: Any, **kwargs: Any) -> Any:
         constructions.append("build")
         return real_build(*args, **kwargs)
 
-    monkeypatch.setattr(modeling_mk1_vla, "_build_config", observe_build)
+    monkeypatch.setattr(modeling_isaac_vla, "_build_config", observe_build)
     root = tmp_path / "package"
     _storage_package(root, "all_f32")
     policy = PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
@@ -765,7 +767,7 @@ def test_raw_mixed_training_requires_verified_outer_storage(
     root = tmp_path / "package"
     _storage_package(root, "mixed")
     with pytest.raises(ValueError, match="training load requires"):
-        modeling_mk1_vla.load_mk1_vla_from_hf(
+        modeling_isaac_vla.load_isaac_vla_from_hf(
             root / "hf_model",
             dtype=torch.float32,
             allowed_storage_dtypes=frozenset({"BF16", "F32"}),

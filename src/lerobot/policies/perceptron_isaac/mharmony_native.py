@@ -47,10 +47,10 @@ DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS = (
 # Genesis names the coordinate block by this exact marker
 # (genesis/data/mharmony/encoding_cache.py::COORD_GROUP_NAME).
 COORD_TOKEN_GROUP_NAME = "coord"  # nosec B105 - reserved-token group label, not a credential
-GENESIS_TEXT_TYPE_TAG = "genesis_text_type"
-GENESIS_TEXT_TYPE_TIMESTAMP = "timestamp"
-GENESIS_TEXT_TYPE_ACTION = "action"
-GENESIS_TEXT_TYPE_ACTION_C = "action_c"
+TEXT_TYPE_TAG = "text_type"
+TEXT_TYPE_TIMESTAMP = "timestamp"
+TEXT_TYPE_ACTION = "action"
+TEXT_TYPE_ACTION_C = "action_c"
 FLOW_ACTION_TOKEN_GROUP_NAME = "flow_action"  # nosec B105 - stream label, not a credential
 FAST_ACTION_TOKEN_GROUP_NAME = "fast_action"  # nosec B105 - stream label, not a credential
 FAST_ACTION_TOKENIZER_NAME = "physical-intelligence/fast"
@@ -574,7 +574,7 @@ def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
     Ordering is deliberately not constrained here: mHarmony resolves explicit offsets
     order-independently, and the shipped export lists its FAST group before its coord
     group. The checkpoint-range cross-check stays with
-    ``Mk1CheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
+    ``IsaacCheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
     an artifact independent of this recipe.
     """
     return _recipe_reserved_token_groups(load_json_object(path))
@@ -904,7 +904,7 @@ def build_isaac_mharmony_content_plan(
         terminal=terminal,
     )
     if training_prompt:
-        flow_tags = _project_genesis_training_action_tags(flow_tags)
+        flow_tags = _project_training_action_tags(flow_tags)
     assistant_content = [
         {
             "kind": "tokens",
@@ -1373,7 +1373,7 @@ def _timestamp_content_item(
         "normalized_seconds": normalized_seconds,
         "precision": precision,
         "tags": {
-            GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_TIMESTAMP,
+            TEXT_TYPE_TAG: TEXT_TYPE_TIMESTAMP,
             "timestamp_text": _format_timestamp_qwen(normalized_seconds, precision=precision),
             "timestamp_seconds": float(timestamp_seconds),
             "timestamp_normalized_seconds": normalized_seconds,
@@ -1504,7 +1504,7 @@ def _flow_action_tags(
         action_is_pad = [False] * horizon
     return {
         "token_group": FLOW_ACTION_TOKEN_GROUP_NAME,
-        GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C,
+        TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C,
         "trajectory_action": anchor_idx,
         "action_index": anchor_idx,
         "obs_window": [0, anchor_idx],
@@ -1535,7 +1535,7 @@ def _fast_action_tags(flow_tags: dict[str, Any]) -> dict[str, Any]:
         {
             "token_group": FAST_ACTION_TOKEN_GROUP_NAME,
             "tokenizer": FAST_ACTION_TOKENIZER_NAME,
-            GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION,
+            TEXT_TYPE_TAG: TEXT_TYPE_ACTION,
             "objective_form": "FAST",
         }
     )
@@ -1544,9 +1544,9 @@ def _fast_action_tags(flow_tags: dict[str, Any]) -> dict[str, Any]:
     return tags
 
 
-_GENESIS_TRAINING_ACTION_TAG_KEYS = (
+_TRAINING_ACTION_TAG_KEYS = (
     "token_group",
-    GENESIS_TEXT_TYPE_TAG,
+    TEXT_TYPE_TAG,
     "action_index",
     "trajectory_action",
     "objective_form",
@@ -1562,9 +1562,9 @@ _GENESIS_TRAINING_ACTION_TAG_KEYS = (
 )
 
 
-def _project_genesis_training_action_tags(tags: dict[str, Any]) -> dict[str, Any]:
+def _project_training_action_tags(tags: dict[str, Any]) -> dict[str, Any]:
     """Match Genesis conversation._collect_token_tags at the final TensorStream boundary."""
-    return {key: tags[key] for key in _GENESIS_TRAINING_ACTION_TAG_KEYS if key in tags}
+    return {key: tags[key] for key in _TRAINING_ACTION_TAG_KEYS if key in tags}
 
 
 def _plan_item_to_mh_content(

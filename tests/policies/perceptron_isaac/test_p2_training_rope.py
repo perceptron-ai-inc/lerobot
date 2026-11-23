@@ -11,14 +11,14 @@ from torch import Tensor
 
 pytest.importorskip("transformers", reason="requires lerobot[perceptron_isaac]")
 
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAForActionGeneration,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContract
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAForActionGeneration,
     _build_config,
-    load_mk1_vla_from_hf,
+    load_isaac_vla_from_hf,
 )
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import setup_qwen35_vla_for_training
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _config,
     _write_portable_isaac05_checkpoint,
 )
@@ -49,7 +49,7 @@ def test_native_load_intent_rederives_training_rope_but_keeps_bf16_serving(
         path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()
     }
     dtype = torch.float32 if intent == "training" else torch.bfloat16
-    model, config, contract = load_mk1_vla_from_hf(
+    model, config, contract = load_isaac_vla_from_hf(
         root,
         dtype=dtype,
         device="cpu",
@@ -90,8 +90,8 @@ def test_training_setup_recomputes_bf16_source_rope_without_replacing_parameters
     raw = _config(test_geometry=True, mtp_present=False)
     raw["text_config"]["head_dim"] = 12
     raw["text_config"]["rope_parameters"]["mrope_section"] = [1, 1, 1]
-    contract = Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
-    model = Mk1Qwen36VLAForActionGeneration(_build_config(raw, contract)).bfloat16().eval()
+    contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+    model = IsaacQwen36VLAForActionGeneration(_build_config(raw, contract)).bfloat16().eval()
     rotary = model.model.language_model.rotary_emb
     assert rotary.inv_freq.dtype == torch.bfloat16
     parameters = tuple(model.parameters())

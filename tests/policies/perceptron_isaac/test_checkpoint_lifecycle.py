@@ -17,7 +17,7 @@ pytest.importorskip("transformers")
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import load_isaac_vla_from_hf
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     make_perceptron_isaac_pre_post_processors,
@@ -47,7 +47,7 @@ def _config(**overrides) -> PerceptronIsaacConfig:
 
 
 def _source_package(root: Path) -> PerceptronIsaacConfig:
-    from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+    from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
         _write_portable_isaac05_checkpoint,
     )
 
@@ -106,7 +106,7 @@ def _source_package(root: Path) -> PerceptronIsaacConfig:
 
 def _load_native_fixture(config: PerceptronIsaacConfig) -> torch.nn.Module:
     assert config.hf_model_path is not None
-    model, _, _ = load_mk1_vla_from_hf(
+    model, _, _ = load_isaac_vla_from_hf(
         config.hf_model_path,
         dtype=torch.float32,
         device="cpu",
@@ -480,7 +480,7 @@ def test_native_base_save_verifies_fresh_source_config_and_retains_sidecars(
 
 @pytest.mark.parametrize("asset", ["isaac_stats.json", "hf_model/model-00001-of-00002.safetensors"])
 def test_native_save_rejects_changed_source_before_retaining_sidecars(tmp_path: Path, asset: str) -> None:
-    from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContractError
+    from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContractError
 
     source = tmp_path / "source"
     config = _source_package(source)
@@ -491,7 +491,7 @@ def test_native_save_rejects_changed_source_before_retaining_sidecars(tmp_path: 
     with (
         # A malformed shard can fail inventory validation before full digest verification.
         pytest.raises(
-            (RuntimeError, Mk1CheckpointContractError),
+            (RuntimeError, IsaacCheckpointContractError),
             match="digest mismatch|could not inspect safetensors shard",
         ),
         policy._verified_checkpoint_source(source),

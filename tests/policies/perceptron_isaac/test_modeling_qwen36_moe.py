@@ -17,20 +17,20 @@ from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 
 from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import (
     DETERMINISTIC_ROUTE_REDUCTION,
-    GENESIS_ROTARY_PRECISION,
-    GenesisNullMoeContract,
-    GenesisNullSparseMoeBlock,
-    GenesisNullTopKRouter,
-    GenesisQwen36Attention,
-    GenesisQwen36AttentionTrace,
-    GenesisQwen36DecoderLayer,
-    GenesisQwen36GatedDeltaNet,
-    GenesisQwen36Model,
-    GenesisQwen36TextModel,
-    GenesisQwen36TextRotaryEmbedding,
-    GenesisQwen36VisionAttention,
-    GenesisQwen36VisionModel,
-    Mk1Qwen36MoeConfig,
+    ROTARY_PRECISION,
+    IsaacNullMoeContract,
+    IsaacNullSparseMoeBlock,
+    IsaacNullTopKRouter,
+    IsaacQwen36Attention,
+    IsaacQwen36AttentionTrace,
+    IsaacQwen36DecoderLayer,
+    IsaacQwen36GatedDeltaNet,
+    IsaacQwen36Model,
+    IsaacQwen36MoeConfig,
+    IsaacQwen36TextModel,
+    IsaacQwen36TextRotaryEmbedding,
+    IsaacQwen36VisionAttention,
+    IsaacQwen36VisionModel,
     deterministic_token_segment_sum,
 )
 
@@ -161,17 +161,17 @@ def test_deterministic_route_reducer_is_bitwise_stable_and_preserves_ordered_sum
 
 def test_null_moe_defaults_to_qualified_stable_route_reduction() -> None:
     config = _text_config()
-    GenesisNullSparseMoeBlock(config)
+    IsaacNullSparseMoeBlock(config)
 
-    config._mk1_route_reduction = "repeated_index_add"
+    config._isaac_route_reduction = "repeated_index_add"
     with pytest.raises(ValueError, match="Unsupported MK1 route reduction"):
-        GenesisNullSparseMoeBlock(config)
+        IsaacNullSparseMoeBlock(config)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA grouped GEMM required")
 def test_deterministic_null_moe_block_is_bitwise_stable_on_cuda() -> None:
     torch.manual_seed(17)
-    block = GenesisNullSparseMoeBlock(
+    block = IsaacNullSparseMoeBlock(
         _text_config(
             num_real_experts=4,
             num_null_experts=4,
@@ -209,13 +209,13 @@ def test_contract_rejects_unsupported_metadata(key: str, value: object, message:
     metadata[key] = value
 
     with pytest.raises(ValueError, match=message):
-        GenesisNullMoeContract.from_metadata(metadata)
+        IsaacNullMoeContract.from_metadata(metadata)
 
 
-def test_mk1_config_requires_identical_root_and_text_contracts() -> None:
+def test_isaac_config_requires_identical_root_and_text_contracts() -> None:
     text_config = _text_config()
     vision_config = _vision_config()
-    config = Mk1Qwen36MoeConfig(
+    config = IsaacQwen36MoeConfig(
         text_config=text_config.to_dict(),
         vision_config=vision_config.to_dict(),
         genesis_moe=copy.deepcopy(text_config.genesis_moe),
@@ -225,16 +225,16 @@ def test_mk1_config_requires_identical_root_and_text_contracts() -> None:
     mismatched = copy.deepcopy(text_config.genesis_moe)
     mismatched["route_scale"] = 0.5
     with pytest.raises(ValueError, match="must be identical"):
-        Mk1Qwen36MoeConfig(
+        IsaacQwen36MoeConfig(
             text_config=text_config.to_dict(),
             vision_config=vision_config.to_dict(),
             genesis_moe=mismatched,
         )
 
 
-def test_text_rotary_matches_genesis_model_dtype_inv_freq_contract() -> None:
+def test_text_rotary_matches_model_dtype_inv_freq_contract() -> None:
     config = _text_config()
-    rotary = GenesisQwen36TextRotaryEmbedding(config).to(dtype=torch.bfloat16)
+    rotary = IsaacQwen36TextRotaryEmbedding(config).to(dtype=torch.bfloat16)
     hidden_states = torch.zeros(1, 4, config.hidden_size, dtype=torch.bfloat16)
     position_ids = torch.tensor(
         [
@@ -257,17 +257,17 @@ def test_text_rotary_matches_genesis_model_dtype_inv_freq_contract() -> None:
         interleaved[..., slice(offset, length, 3)] = phases[axis, ..., slice(offset, length, 3)]
     embedding = torch.cat((interleaved, interleaved), dim=-1)
 
-    assert rotary.precision_contract == GENESIS_ROTARY_PRECISION
+    assert rotary.precision_contract == ROTARY_PRECISION
     assert rotary.inv_freq.dtype == torch.bfloat16
     assert rotary.state_dict() == {}
     torch.testing.assert_close(cos, embedding.cos().to(torch.bfloat16), rtol=0, atol=0)
     torch.testing.assert_close(sin, embedding.sin().to(torch.bfloat16), rtol=0, atol=0)
 
 
-def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> None:
+def test_text_attention_matches_explicit_kv_sdpa_oracle(monkeypatch) -> None:
     torch.manual_seed(13)
     config = _text_config()
-    attention = GenesisQwen36Attention(config, layer_idx=0).eval()
+    attention = IsaacQwen36Attention(config, layer_idx=0).eval()
     hidden_states = torch.randn(1, 4, config.hidden_size)
     rotary_dim = config.head_dim // 2
     position_embeddings = (
@@ -326,7 +326,7 @@ def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> 
         return original_sdpa(query, key, value, **kwargs)
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", recording_sdpa)
-    traces: list[GenesisQwen36AttentionTrace] = []
+    traces: list[IsaacQwen36AttentionTrace] = []
     attention.trace_observer = traces.append
     with torch.no_grad():
         actual, weights = attention(hidden_states, position_embeddings, None)
@@ -358,10 +358,10 @@ def test_text_attention_matches_genesis_explicit_kv_sdpa_oracle(monkeypatch) -> 
     torch.testing.assert_close(trace.token_mixer, actual, rtol=0, atol=0)
 
 
-def test_packed_vision_attention_matches_genesis_sdpa_oracle(monkeypatch) -> None:
+def test_packed_vision_attention_matches_sdpa_oracle(monkeypatch) -> None:
     torch.manual_seed(14)
     config = _vision_config()
-    attention = GenesisQwen36VisionAttention(config).eval()
+    attention = IsaacQwen36VisionAttention(config).eval()
     hidden_states = torch.randn(5, config.hidden_size)
     position_embeddings = (
         torch.ones(5, attention.head_dim),
@@ -408,10 +408,10 @@ def test_packed_vision_attention_matches_genesis_sdpa_oracle(monkeypatch) -> Non
     assert all("enable_gqa" not in call[3] for call in calls)
 
 
-def test_vision_position_interpolation_uses_genesis_bf16_reduction() -> None:
+def test_vision_position_interpolation_uses_one_bf16_reduction() -> None:
     torch.manual_seed(19)
     config = _vision_config(num_position_embeddings=64)
-    model = GenesisQwen36VisionModel(config).to(dtype=torch.bfloat16).eval()
+    model = IsaacQwen36VisionModel(config).to(dtype=torch.bfloat16).eval()
     grid = torch.tensor([[1, 16, 16]], dtype=torch.long)
 
     height_indices = torch.linspace(0, model.num_grid_per_side - 1, 16)
@@ -441,20 +441,20 @@ def test_vision_position_interpolation_uses_genesis_bf16_reduction() -> None:
         ]
     ).to(torch.bfloat16)
     interpolated = model.pos_embed(indices) * weights[:, :, None]
-    genesis_base = interpolated.sum(dim=0)
+    summed_base = interpolated.sum(dim=0)
     chained_base = interpolated[0] + interpolated[1] + interpolated[2] + interpolated[3]
-    expected = genesis_base.view(1, 8, 2, 8, 2, config.hidden_size).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
+    expected = summed_base.view(1, 8, 2, 8, 2, config.hidden_size).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
 
     actual = model.fast_pos_embed_interpolate(grid)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert not torch.equal(genesis_base, chained_base)
+    assert not torch.equal(summed_base, chained_base)
 
 
 def test_vision_position_interpolation_preserves_mixed_grid_order_and_state_abi() -> None:
     config = _vision_config(num_position_embeddings=64)
     stock = qwen35_modeling.Qwen3_5MoeVisionModel(copy.deepcopy(config))
-    custom = GenesisQwen36VisionModel(copy.deepcopy(config))
+    custom = IsaacQwen36VisionModel(copy.deepcopy(config))
     custom.load_state_dict(stock.state_dict())
     mixed_grid = torch.tensor([[1, 4, 6], [2, 8, 4]], dtype=torch.long)
 
@@ -475,22 +475,22 @@ def test_vision_position_interpolation_preserves_mixed_grid_order_and_state_abi(
 def test_multimodal_model_installs_explicit_sdpa_for_text_and_vision() -> None:
     text_config = _text_config(full_attention_interval=1)
     vision_config = _vision_config(depth=2)
-    config = Mk1Qwen36MoeConfig(
+    config = IsaacQwen36MoeConfig(
         text_config=text_config.to_dict(),
         vision_config=vision_config.to_dict(),
         genesis_moe=copy.deepcopy(text_config.genesis_moe),
     )
 
-    model = GenesisQwen36Model(config)
+    model = IsaacQwen36Model(config)
 
-    assert isinstance(model.language_model.layers[0].self_attn, GenesisQwen36Attention)
-    assert isinstance(model.visual, GenesisQwen36VisionModel)
-    assert all(isinstance(block.attn, GenesisQwen36VisionAttention) for block in model.visual.blocks)
+    assert isinstance(model.language_model.layers[0].self_attn, IsaacQwen36Attention)
+    assert isinstance(model.visual, IsaacQwen36VisionModel)
+    assert all(isinstance(block.attn, IsaacQwen36VisionAttention) for block in model.visual.blocks)
     assert DETERMINISTIC_ROUTE_REDUCTION == "stable_token_segment_sum_v1"
 
 
 def test_router_uses_compact_state_and_stable_real_first_ties() -> None:
-    router = GenesisNullTopKRouter(_text_config())
+    router = IsaacNullTopKRouter(_text_config())
 
     assert router.weight.shape == (3, 24)
     assert set(router.state_dict()) == {"weight"}
@@ -503,7 +503,7 @@ def test_router_uses_compact_state_and_stable_real_first_ties() -> None:
 
 
 def test_router_expands_shared_null_logit_and_renormalizes_real_routes() -> None:
-    router = GenesisNullTopKRouter(_text_config())
+    router = IsaacNullTopKRouter(_text_config())
     with torch.no_grad():
         router.weight.zero_()
         router.weight[:, 0] = torch.tensor([2.0, -10.0, 1.0])
@@ -526,7 +526,7 @@ def test_router_expands_shared_null_logit_and_renormalizes_real_routes() -> None
 
 
 def test_production_router_cardinality_is_257_physical_to_512_logical_top8() -> None:
-    router = GenesisNullTopKRouter(_text_config(num_real_experts=256, num_null_experts=256, top_k=8))
+    router = IsaacNullTopKRouter(_text_config(num_real_experts=256, num_null_experts=256, top_k=8))
     assert router.weight.shape == (257, 24)
 
     with torch.no_grad():
@@ -544,7 +544,7 @@ def test_production_router_cardinality_is_257_physical_to_512_logical_top8() -> 
 @pytest.mark.parametrize("case", ["random", "all_tied", "null_dominant", "nan"])
 def test_compact_stable_topk_matches_expanded_oracle(case: str) -> None:
     torch.manual_seed(17)
-    router = GenesisNullTopKRouter(_text_config(num_real_experts=256, num_null_experts=256, top_k=8))
+    router = IsaacNullTopKRouter(_text_config(num_real_experts=256, num_null_experts=256, top_k=8))
     with torch.no_grad():
         if case == "random":
             router.weight.normal_()
@@ -565,7 +565,7 @@ def test_compact_stable_topk_matches_expanded_oracle(case: str) -> None:
 
 def test_shared_null_router_gradient_matches_independent_logical_rows() -> None:
     config = _text_config(num_real_experts=2, num_null_experts=2, top_k=3)
-    router = GenesisNullTopKRouter(config).double()
+    router = IsaacNullTopKRouter(config).double()
     physical_weight = torch.zeros(3, 24, dtype=torch.float64)
     physical_weight[:, :2] = torch.tensor([[1.2, -0.3], [-0.4, 0.9], [0.25, -0.7]], dtype=torch.float64)
     with torch.no_grad():
@@ -613,7 +613,7 @@ def test_shared_null_router_gradient_matches_independent_logical_rows() -> None:
 
 
 def test_all_null_routes_skip_nan_experts_but_keep_shared_expert_active() -> None:
-    block = GenesisNullSparseMoeBlock(_text_config())
+    block = IsaacNullSparseMoeBlock(_text_config())
     with torch.no_grad():
         block.gate.weight.zero_()
         block.gate.weight[2, 0] = 10
@@ -636,7 +636,7 @@ def test_all_null_routes_skip_nan_experts_but_keep_shared_expert_active() -> Non
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_route_score_is_applied_after_swiglu_before_down_projection(dtype: torch.dtype) -> None:
     device = torch.device("cuda" if dtype is torch.bfloat16 and torch.cuda.is_available() else "cpu")
-    block = GenesisNullSparseMoeBlock(_text_config(route_scale=0.5)).to(device=device, dtype=dtype)
+    block = IsaacNullSparseMoeBlock(_text_config(route_scale=0.5)).to(device=device, dtype=dtype)
     with torch.no_grad():
         block.gate.weight.zero_()
         block.gate.weight[:, 0] = torch.tensor([2.0, -10.0, 1.0], device=device, dtype=dtype)
@@ -662,7 +662,7 @@ def test_route_score_is_applied_after_swiglu_before_down_projection(dtype: torch
 
 
 def test_null_moe_backward_has_finite_router_expert_and_shared_gradients() -> None:
-    block = GenesisNullSparseMoeBlock(_text_config(num_real_experts=3, num_null_experts=2, top_k=4))
+    block = IsaacNullSparseMoeBlock(_text_config(num_real_experts=3, num_null_experts=2, top_k=4))
     with torch.no_grad():
         for parameter in block.parameters():
             torch.nn.init.normal_(parameter, std=0.02)
@@ -687,8 +687,8 @@ def test_null_moe_backward_has_finite_router_expert_and_shared_gradients() -> No
     assert all(torch.isfinite(gradient).all() for gradient in gradients if gradient is not None)
 
 
-def test_compact_routes_match_genesis_two_stage_real_renormalization() -> None:
-    block = GenesisNullSparseMoeBlock(
+def test_compact_routes_match_two_stage_real_renormalization() -> None:
+    block = IsaacNullSparseMoeBlock(
         _text_config(
             num_real_experts=3,
             num_null_experts=2,
@@ -726,8 +726,8 @@ def test_compact_routes_match_genesis_two_stage_real_renormalization() -> None:
     torch.testing.assert_close(routes.offsets, expected_offsets)
 
 
-def _cuda_grouped_moe() -> GenesisNullSparseMoeBlock:
-    return GenesisNullSparseMoeBlock(
+def _cuda_grouped_moe() -> IsaacNullSparseMoeBlock:
+    return IsaacNullSparseMoeBlock(
         _text_config(num_real_experts=8, num_null_experts=8, top_k=4, moe_intermediate_size=8)
     ).to(device="cuda", dtype=torch.bfloat16)
 
@@ -811,10 +811,10 @@ def _production_dispatch_fixture(
     gate_up_dtype: torch.dtype = torch.float32,
     down_dtype: torch.dtype = torch.float32,
     expert_device: str = "cuda:0",
-) -> tuple[GenesisNullSparseMoeBlock, torch.Tensor]:
+) -> tuple[IsaacNullSparseMoeBlock, torch.Tensor]:
     # Allocate only fake CPU tensors, then model CUDA metadata without initializing CUDA.
     with FakeTensorMode():
-        block = GenesisNullSparseMoeBlock(
+        block = IsaacNullSparseMoeBlock(
             _text_config(
                 num_real_experts=256,
                 num_null_experts=256,
@@ -941,7 +941,7 @@ def test_production_dispatch_bf16_preserves_grouped_mm(training: bool, capabilit
 def test_fp32_eager_experts_accept_cpu_bf16_autocast_forward(
     activation_dtype: torch.dtype, real_routes: int
 ) -> None:
-    block = GenesisNullSparseMoeBlock(_text_config()).train()
+    block = IsaacNullSparseMoeBlock(_text_config()).train()
     with torch.no_grad():
         for parameter in block.parameters():
             parameter.fill_(0.1)
@@ -994,7 +994,7 @@ def test_fp32_eager_experts_accept_cpu_bf16_autocast_forward(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="production backend guard requires a GPU")
 def test_production_cuda_dispatch_fails_closed_without_bf16_grouped_mm() -> None:
     block = (
-        GenesisNullSparseMoeBlock(
+        IsaacNullSparseMoeBlock(
             _text_config(
                 num_real_experts=256,
                 num_null_experts=256,
@@ -1012,13 +1012,13 @@ def test_production_cuda_dispatch_fails_closed_without_bf16_grouped_mm() -> None
 
 def test_hybrid_text_model_constructs_custom_layers_and_runs_forward() -> None:
     layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
-    model = GenesisQwen36TextModel(_text_config(layer_types=layer_types)).eval()
+    model = IsaacQwen36TextModel(_text_config(layer_types=layer_types)).eval()
 
     assert [layer.layer_type for layer in model.layers] == layer_types
-    assert all(isinstance(layer, GenesisQwen36DecoderLayer) for layer in model.layers)
+    assert all(isinstance(layer, IsaacQwen36DecoderLayer) for layer in model.layers)
     assert hasattr(model.layers[0], "linear_attn") and not hasattr(model.layers[0], "self_attn")
     assert hasattr(model.layers[3], "self_attn") and not hasattr(model.layers[3], "linear_attn")
-    assert isinstance(model.layers[3].self_attn, GenesisQwen36Attention)
+    assert isinstance(model.layers[3].self_attn, IsaacQwen36Attention)
     assert model.layers[0].mlp.gate.weight.shape == (3, 24)
     state_dict = model.state_dict()
     assert "layers.0.mlp.gate.weight" in state_dict
@@ -1031,9 +1031,9 @@ def test_hybrid_text_model_constructs_custom_layers_and_runs_forward() -> None:
     assert torch.isfinite(output.last_hidden_state).all()
 
 
-def test_hybrid_text_model_rejects_non_mk1_layer_pattern() -> None:
+def test_hybrid_text_model_rejects_non_isaac_layer_pattern() -> None:
     with pytest.raises(ValueError, match="full attention every 4 layers"):
-        GenesisQwen36TextModel(
+        IsaacQwen36TextModel(
             _text_config(
                 layer_types=["full_attention", "linear_attention", "linear_attention", "full_attention"]
             )
@@ -1041,7 +1041,7 @@ def test_hybrid_text_model_rejects_non_mk1_layer_pattern() -> None:
 
 
 def test_hybrid_text_model_uses_validated_reduced_attention_interval() -> None:
-    model = GenesisQwen36TextModel(
+    model = IsaacQwen36TextModel(
         _text_config(
             layer_types=["linear_attention", "full_attention"],
             full_attention_interval=2,
@@ -1053,7 +1053,7 @@ def test_hybrid_text_model_uses_validated_reduced_attention_interval() -> None:
 
 def test_hybrid_cache_incremental_token_matches_full_forward() -> None:
     torch.manual_seed(31)
-    model = GenesisQwen36TextModel(
+    model = IsaacQwen36TextModel(
         _text_config(
             layer_types=["linear_attention", "full_attention"],
             full_attention_interval=2,
@@ -1080,7 +1080,7 @@ def test_hybrid_cache_incremental_token_matches_full_forward() -> None:
 
 def test_three_axis_vla_mrope_positions_match_equivalent_four_axis_positions() -> None:
     torch.manual_seed(37)
-    model = GenesisQwen36TextModel(
+    model = IsaacQwen36TextModel(
         _text_config(
             layer_types=["linear_attention", "full_attention"],
             full_attention_interval=2,
@@ -1111,7 +1111,7 @@ def test_three_axis_vla_mrope_positions_match_equivalent_four_axis_positions() -
 
 def test_hybrid_attention_is_causal_and_left_padding_preserves_valid_tokens() -> None:
     torch.manual_seed(41)
-    model = GenesisQwen36TextModel(
+    model = IsaacQwen36TextModel(
         _text_config(
             layer_types=["linear_attention", "full_attention"],
             full_attention_interval=2,
@@ -1148,7 +1148,7 @@ def test_hybrid_attention_is_causal_and_left_padding_preserves_valid_tokens() ->
 def test_hybrid_text_model_constructs_directly_on_meta() -> None:
     layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
     with torch.device("meta"):
-        model = GenesisQwen36TextModel(_text_config(layer_types=layer_types))
+        model = IsaacQwen36TextModel(_text_config(layer_types=layer_types))
 
     assert all(parameter.is_meta for parameter in model.parameters())
     assert all(buffer.is_meta for buffer in model.buffers())
@@ -1161,7 +1161,7 @@ def test_hybrid_text_model_constructs_directly_on_meta() -> None:
 )
 def test_installed_fast_gdn_dependencies_preserve_cpu_and_meta_execution() -> None:
     config = _text_config(layer_types=["linear_attention"])
-    gdn = GenesisQwen36GatedDeltaNet(config, layer_idx=0).eval()
+    gdn = IsaacQwen36GatedDeltaNet(config, layer_idx=0).eval()
     expected_state_keys = {
         "A_log",
         "conv1d.weight",
@@ -1185,7 +1185,7 @@ def test_installed_fast_gdn_dependencies_preserve_cpu_and_meta_execution() -> No
     assert torch.isfinite(output).all()
 
     with torch.device("meta"):
-        meta_gdn = GenesisQwen36GatedDeltaNet(config, layer_idx=0)
+        meta_gdn = IsaacQwen36GatedDeltaNet(config, layer_idx=0)
     assert set(meta_gdn.state_dict()) == expected_state_keys
     assert all(parameter.is_meta for parameter in meta_gdn.parameters())
 
@@ -1196,7 +1196,7 @@ def test_installed_fast_gdn_dependencies_preserve_cpu_and_meta_execution() -> No
 )
 def test_device_aware_gdn_cuda_matches_stock_fast_path() -> None:
     config = _text_config(layer_types=["linear_attention"])
-    custom = GenesisQwen36GatedDeltaNet(config, layer_idx=0).to(device="cuda", dtype=torch.bfloat16).eval()
+    custom = IsaacQwen36GatedDeltaNet(config, layer_idx=0).to(device="cuda", dtype=torch.bfloat16).eval()
     stock = qwen35_modeling.Qwen3_5MoeGatedDeltaNet(config, layer_idx=0).to(
         device="cuda", dtype=torch.bfloat16
     )

@@ -54,7 +54,7 @@ def _native_portable_package(tmp_path: Path) -> tuple[Path, PerceptronIsaacConfi
     import hashlib
 
     from lerobot.policies.perceptron_isaac.mharmony_native import IsaacMharmonyRenderMetadata
-    from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+    from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
         _write_portable_isaac05_checkpoint,
     )
 
@@ -105,12 +105,12 @@ def test_native_policy_loads_with_default_offset_norm(tmp_path: Path) -> None:
     )
 
 
-def test_policy_loads_portable_repo_through_native_mk1(
+def test_policy_loads_portable_repo_through_native_isaac(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from transformers import AutoConfig, AutoProcessor, dynamic_module_utils
 
-    from lerobot.policies.perceptron_isaac.modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
+    from lerobot.policies.perceptron_isaac.modeling_isaac_vla import IsaacQwen36VLAForActionGeneration
     from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import DiTActionExpertHead
 
     monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", _forbid_checkpoint_code)
@@ -126,7 +126,7 @@ def test_policy_loads_portable_repo_through_native_mk1(
     cuda_allocated_before = torch.cuda.memory_allocated() if cuda_initialized_before else 0
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
     model = policy._isaac_model
-    assert isinstance(model, Mk1Qwen36VLAForActionGeneration)
+    assert isinstance(model, IsaacQwen36VLAForActionGeneration)
     assert isinstance(model.action_expert, DiTActionExpertHead)
     assert model.action_expert.args.rtc_max_delay_steps == 12
     assert model.action_expert.args.rtc_probability == 0.5
@@ -151,11 +151,11 @@ def test_policy_loads_portable_repo_through_native_mk1(
 def test_native_portable_public_load_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
 ) -> None:
-    import lerobot.policies.perceptron_isaac.modeling_mk1_vla as native
+    import lerobot.policies.perceptron_isaac.modeling_isaac_vla as native
 
     policy_path, config, _ = _native_portable_package(tmp_path)
     monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", _forbid_checkpoint_code)
-    monkeypatch.setattr(native, "Mk1Qwen36VLAForActionGeneration", _forbid_checkpoint_code)
+    monkeypatch.setattr(native, "IsaacQwen36VLAForActionGeneration", _forbid_checkpoint_code)
     expected = ""
     if defect == "adapter":
         config.deployment_adapter_sha256 = "0" * 64
@@ -486,9 +486,9 @@ def test_fp32_masters_are_materialized_eagerly_without_sharding(tmp_path: Path) 
 
 def _record_backbone_load_device(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record the device `_load_backbone` asks for; really load the tiny model on the CPU host."""
-    import lerobot.policies.perceptron_isaac.modeling_mk1_vla as mk1
+    import lerobot.policies.perceptron_isaac.modeling_isaac_vla as mk1
 
-    real_loader = mk1.load_mk1_vla_from_hf
+    real_loader = mk1.load_isaac_vla_from_hf
     devices: list[str] = []
 
     def recording_loader(model_dir: str | Path, *, device: str, **kwargs: Any):
@@ -496,7 +496,7 @@ def _record_backbone_load_device(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         devices.append(str(device))
         return real_loader(model_dir, device="cpu", **kwargs)
 
-    monkeypatch.setattr(mk1, "load_mk1_vla_from_hf", recording_loader)
+    monkeypatch.setattr(mk1, "load_isaac_vla_from_hf", recording_loader)
     return devices
 
 

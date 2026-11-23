@@ -12,7 +12,7 @@ import torch
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
 from lerobot.policies.perceptron_isaac.mharmony_native import IsaacNativeMharmonyRenderer
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import load_isaac_vla_from_hf
 from lerobot.policies.perceptron_isaac.tensor_stream import (
     ALL_TYPES,
     Event,
@@ -22,7 +22,7 @@ from lerobot.policies.perceptron_isaac.tensor_stream import (
     VisionType,
     create_stream,
 )
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _write_checkpoint
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _write_checkpoint
 
 
 def _native_sample(env: int) -> TensorStream:
@@ -58,7 +58,7 @@ def _native_sample(env: int) -> TensorStream:
 def test_reduced_native_model_runs_batched_multimodal_inference(tmp_path: Path) -> None:
     model_dir = tmp_path / "tiny-mk1"
     _write_checkpoint(model_dir)
-    model, _, _ = load_mk1_vla_from_hf(
+    model, _, _ = load_isaac_vla_from_hf(
         model_dir,
         dtype=torch.float32,
         device="cpu",

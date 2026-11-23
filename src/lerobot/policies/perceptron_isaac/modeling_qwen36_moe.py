@@ -40,16 +40,16 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 from transformers.utils.output_capturing import OutputRecorder
 
-from .moe_auxiliary_losses import GenesisNullRouterAuxiliary
+from .moe_auxiliary_losses import IsaacNullRouterAuxiliary
 
 _NULL_EXPERT_SEMANTICS = "skip_compute_renormalize_real_routes"
 _SIGMOID_GATED_SHARED_EXPERT = "sigmoid_gated_additive"
 _ROUTER_CONTRACT_VERSION = 1
 DETERMINISTIC_ROUTE_REDUCTION: Literal["stable_token_segment_sum_v1"] = "stable_token_segment_sum_v1"
-GENESIS_ROTARY_PRECISION = "checkpoint_bf16_inv_freq_fp32_phase_v1"
+ROTARY_PRECISION = "checkpoint_bf16_inv_freq_fp32_phase_v1"
 
 
-def _genesis_layout_repeat_kv(hidden_states: torch.Tensor, num_repetitions: int) -> torch.Tensor:
+def _repeat_kv_heads(hidden_states: torch.Tensor, num_repetitions: int) -> torch.Tensor:
     """Repeat KV heads in Genesis' [batch, length, heads, dim] layout."""
     batch, sequence_length, num_key_value_heads, head_dim = hidden_states.shape
     if num_repetitions == 1:
@@ -159,7 +159,7 @@ def _required_metadata_value(
 
 
 @dataclass(frozen=True, slots=True)
-class GenesisNullMoeContract:
+class IsaacNullMoeContract:
     """Validated, artifact-owned null-routing geometry and behavior."""
 
     num_real_experts: int
@@ -176,7 +176,7 @@ class GenesisNullMoeContract:
         return self.num_real_experts + self.num_null_experts
 
     @classmethod
-    def from_metadata(cls, metadata: Mapping[str, Any]) -> GenesisNullMoeContract:
+    def from_metadata(cls, metadata: Mapping[str, Any]) -> IsaacNullMoeContract:
         """Parse the versioned Genesis metadata, rejecting unsupported variants."""
 
         version = _required_metadata_value(metadata, "router_contract_version", int)
@@ -221,7 +221,7 @@ class GenesisNullMoeContract:
         return contract
 
     @classmethod
-    def from_text_config(cls, config: Qwen3_5MoeTextConfig) -> GenesisNullMoeContract:
+    def from_text_config(cls, config: Qwen3_5MoeTextConfig) -> IsaacNullMoeContract:
         metadata = getattr(config, "genesis_moe", None)
         if not isinstance(metadata, Mapping):
             raise ValueError("MK1 Qwen3.6 text_config requires a genesis_moe object")
@@ -244,7 +244,7 @@ class GenesisNullMoeContract:
         return contract
 
 
-class Mk1Qwen36MoeConfig(Qwen3_5MoeConfig):
+class IsaacQwen36MoeConfig(Qwen3_5MoeConfig):
     """Qwen3.5-MoE ABI config that requires the complete MK1 null contract."""
 
     def __post_init__(self, **kwargs: Any) -> None:
@@ -255,10 +255,10 @@ class Mk1Qwen36MoeConfig(Qwen3_5MoeConfig):
             raise ValueError("MK1 Qwen3.6 config requires matching root and text_config genesis_moe objects")
         if dict(root_metadata) != dict(text_metadata):
             raise ValueError("MK1 Qwen3.6 root and text_config genesis_moe objects must be identical")
-        GenesisNullMoeContract.from_text_config(self.text_config)
+        IsaacNullMoeContract.from_text_config(self.text_config)
 
 
-class GenesisNullRoutingOutput(NamedTuple):
+class IsaacNullRoutingOutput(NamedTuple):
     """Router values retained for numerical parity tests and compact dispatch."""
 
     physical_logits: torch.Tensor
@@ -267,7 +267,7 @@ class GenesisNullRoutingOutput(NamedTuple):
     real_route_weights: torch.Tensor
 
 
-class GenesisNullTopKRouter(nn.Linear):
+class IsaacNullTopKRouter(nn.Linear):
     """Compact physical projection with deterministic logical null routing.
 
     Subclassing ``nn.Linear`` preserves the exported ``gate.weight`` state key.
@@ -276,7 +276,7 @@ class GenesisNullTopKRouter(nn.Linear):
     """
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
-        contract = GenesisNullMoeContract.from_text_config(config)
+        contract = IsaacNullMoeContract.from_text_config(config)
         super().__init__(
             config.hidden_size,
             contract.physical_router_outputs,
@@ -293,7 +293,7 @@ class GenesisNullTopKRouter(nn.Linear):
             persistent=False,
         )
 
-    def route(self, hidden_states: torch.Tensor) -> GenesisNullRoutingOutput:
+    def route(self, hidden_states: torch.Tensor) -> IsaacNullRoutingOutput:
         hidden_states = hidden_states.reshape(-1, self.in_features)
         physical_logits = functional.linear(hidden_states, self.weight)
         real_logits = physical_logits[:, : self.num_experts]
@@ -324,7 +324,7 @@ class GenesisNullTopKRouter(nn.Linear):
         real_route_weights = selected_real_probabilities / safe_real_mass
         real_route_weights = real_route_weights * self.contract.route_scale
 
-        return GenesisNullRoutingOutput(
+        return IsaacNullRoutingOutput(
             physical_logits=physical_logits,
             logical_probabilities=logical_probabilities,
             selected_experts=selected_experts,
@@ -348,13 +348,13 @@ class GenesisNullTopKRouter(nn.Linear):
         return routing.logical_probabilities, routing.real_route_weights, routing.selected_experts
 
 
-class GenesisNullMoeBranches(NamedTuple):
+class IsaacNullMoeBranches(NamedTuple):
     """Separated routed/shared branches used by the parity ladder."""
 
     output: torch.Tensor
     routed_output: torch.Tensor
     shared_expert_output: torch.Tensor
-    routing: GenesisNullRoutingOutput
+    routing: IsaacNullRoutingOutput
 
 
 class _CompactRealRoutes(NamedTuple):
@@ -364,7 +364,7 @@ class _CompactRealRoutes(NamedTuple):
     offsets: torch.Tensor
 
 
-class GenesisNullDispatchTrace(NamedTuple):
+class IsaacNullDispatchTrace(NamedTuple):
     """Exact route values at the two dispatch normalization boundaries."""
 
     logical_probabilities: torch.Tensor
@@ -375,14 +375,14 @@ class GenesisNullDispatchTrace(NamedTuple):
     dispatch_route_weights: torch.Tensor
 
 
-class GenesisNullSparseMoeBlock(nn.Module):
+class IsaacNullSparseMoeBlock(nn.Module):
     """Qwen fused real experts with Genesis null-route dropping."""
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         super().__init__()
-        self.contract = GenesisNullMoeContract.from_text_config(config)
-        self.gate = GenesisNullTopKRouter(config)
-        self.auxiliary = GenesisNullRouterAuxiliary(
+        self.contract = IsaacNullMoeContract.from_text_config(config)
+        self.gate = IsaacNullTopKRouter(config)
+        self.auxiliary = IsaacNullRouterAuxiliary(
             self.contract.num_real_experts, self.contract.num_null_experts
         )
         self.experts = Qwen3_5MoeExperts(config)
@@ -391,13 +391,13 @@ class GenesisNullSparseMoeBlock(nn.Module):
             intermediate_size=config.shared_expert_intermediate_size,
         )
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
-        route_reduction = getattr(config, "_mk1_route_reduction", DETERMINISTIC_ROUTE_REDUCTION)
+        route_reduction = getattr(config, "_isaac_route_reduction", DETERMINISTIC_ROUTE_REDUCTION)
         if route_reduction != DETERMINISTIC_ROUTE_REDUCTION:
             raise ValueError(
                 f"Unsupported MK1 route reduction {route_reduction!r}; "
                 f"expected {DETERMINISTIC_ROUTE_REDUCTION!r}."
             )
-        self.dispatch_trace_observer: Callable[[GenesisNullDispatchTrace], None] | None = None
+        self.dispatch_trace_observer: Callable[[IsaacNullDispatchTrace], None] | None = None
 
     @property
     def _is_production_geometry(self) -> bool:
@@ -467,7 +467,7 @@ class GenesisNullSparseMoeBlock(nn.Module):
     def _compact_real_routes(
         self,
         hidden_states: torch.Tensor,
-        routing: GenesisNullRoutingOutput,
+        routing: IsaacNullRoutingOutput,
     ) -> _CompactRealRoutes:
         num_tokens, top_k = routing.selected_experts.shape
         token_indices = torch.arange(num_tokens, device=hidden_states.device).unsqueeze(1).expand(-1, top_k)
@@ -503,7 +503,7 @@ class GenesisNullSparseMoeBlock(nn.Module):
         routes = _CompactRealRoutes(token_indices, expert_indices, expert_scores, offsets)
         if self.dispatch_trace_observer is not None:
             self.dispatch_trace_observer(
-                GenesisNullDispatchTrace(
+                IsaacNullDispatchTrace(
                     logical_probabilities=routing.logical_probabilities,
                     selected_experts=routing.selected_experts,
                     selected_route_weights=selected_scores,
@@ -590,7 +590,7 @@ class GenesisNullSparseMoeBlock(nn.Module):
     def _dispatch_real_experts(
         self,
         hidden_states: torch.Tensor,
-        routing: GenesisNullRoutingOutput,
+        routing: IsaacNullRoutingOutput,
         shared_output: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         routes = self._compact_real_routes(hidden_states, routing)
@@ -604,7 +604,7 @@ class GenesisNullSparseMoeBlock(nn.Module):
         shared_gate = torch.sigmoid(self.shared_expert_gate(gate_input).float())
         return shared_output * shared_gate.to(shared_output.dtype)
 
-    def forward_with_branches(self, hidden_states: torch.Tensor) -> GenesisNullMoeBranches:
+    def forward_with_branches(self, hidden_states: torch.Tensor) -> IsaacNullMoeBranches:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flattened = hidden_states.reshape(-1, hidden_dim)
         routing = self.gate.route(flattened)
@@ -612,7 +612,7 @@ class GenesisNullSparseMoeBlock(nn.Module):
         shared_output = self._shared_expert_output(flattened)
         routed_output, combined_output = self._dispatch_real_experts(flattened, routing, shared_output)
         output = combined_output.reshape(batch_size, sequence_length, hidden_dim)
-        return GenesisNullMoeBranches(
+        return IsaacNullMoeBranches(
             output=output,
             routed_output=routed_output.reshape(batch_size, sequence_length, hidden_dim),
             shared_expert_output=shared_output.reshape(batch_size, sequence_length, hidden_dim),
@@ -643,7 +643,7 @@ class _DeviceAwareRMSNormGated(qwen35_modeling.Qwen3_5MoeRMSNormGated):
         return super().forward(hidden_states, gate)
 
 
-class GenesisQwen36GatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
+class IsaacQwen36GatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
     """Stock GatedDeltaNet ABI with input-device-aware kernel dispatch.
 
     Transformers selects optional FLA and causal-conv kernels at import and
@@ -775,7 +775,7 @@ class GenesisQwen36GatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
         return qwen35_modeling.torch_recurrent_gated_delta_rule(query, key, value, **kwargs)
 
 
-class GenesisQwen36AttentionTrace(NamedTuple):
+class IsaacQwen36AttentionTrace(NamedTuple):
     """Non-mutating component boundaries for cross-runtime attention parity."""
 
     query_projection: torch.Tensor
@@ -795,12 +795,12 @@ class GenesisQwen36AttentionTrace(NamedTuple):
     token_mixer: torch.Tensor
 
 
-class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
+class IsaacQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
     """Qwen3.6 text attention using the Genesis-qualified explicit-KV SDPA path."""
 
     def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
-        self.trace_observer: Callable[[GenesisQwen36AttentionTrace], None] | None = None
+        self.trace_observer: Callable[[IsaacQwen36AttentionTrace], None] | None = None
 
     def forward(
         self,
@@ -844,11 +844,11 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
             repeated_key = qwen35_modeling.repeat_kv(cached_key, self.num_key_value_groups)
             repeated_value = qwen35_modeling.repeat_kv(cached_value, self.num_key_value_groups)
         else:
-            repeated_key = _genesis_layout_repeat_kv(
+            repeated_key = _repeat_kv_heads(
                 rotary_key,
                 self.num_key_value_groups,
             ).transpose(1, 2)
-            repeated_value = _genesis_layout_repeat_kv(
+            repeated_value = _repeat_kv_heads(
                 value_projection,
                 self.num_key_value_groups,
             ).transpose(1, 2)
@@ -868,7 +868,7 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
         token_mixer = self.o_proj(gated_output)
         if self.trace_observer is not None:
             self.trace_observer(
-                GenesisQwen36AttentionTrace(
+                IsaacQwen36AttentionTrace(
                     query_projection=query_projection,
                     query_gate=gate,
                     query_norm=query_norm,
@@ -889,7 +889,7 @@ class GenesisQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
         return token_mixer, None
 
 
-class GenesisQwen36TextRotaryEmbedding(nn.Module):
+class IsaacQwen36TextRotaryEmbedding(nn.Module):
     """Genesis mRoPE with intent-specific derived inverse frequencies.
 
     Serving promotes the released BF16 frequency table to F32 for phase math.
@@ -898,7 +898,7 @@ class GenesisQwen36TextRotaryEmbedding(nn.Module):
     persistent checkpoint tensors or changes parameter ownership.
     """
 
-    precision_contract = GENESIS_ROTARY_PRECISION
+    precision_contract = ROTARY_PRECISION
     inv_freq: torch.Tensor
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
@@ -959,7 +959,7 @@ class GenesisQwen36TextRotaryEmbedding(nn.Module):
         return embedding.cos().to(hidden_states.dtype), embedding.sin().to(hidden_states.dtype)
 
 
-class GenesisQwen36VisionAttention(qwen35_modeling.Qwen3_5MoeVisionAttention):
+class IsaacQwen36VisionAttention(qwen35_modeling.Qwen3_5MoeVisionAttention):
     """Packed vision attention using the same explicit-KV SDPA primitive."""
 
     def forward(
@@ -1012,7 +1012,7 @@ class GenesisQwen36VisionAttention(qwen35_modeling.Qwen3_5MoeVisionAttention):
         return self.proj(attention_output.reshape(sequence_length, -1).contiguous())
 
 
-class GenesisQwen36VisionModel(Qwen3_5MoeVisionModel):
+class IsaacQwen36VisionModel(Qwen3_5MoeVisionModel):
     """Qwen3.5 vision stack with Genesis-order positional interpolation."""
 
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
@@ -1092,38 +1092,38 @@ class GenesisQwen36VisionModel(Qwen3_5MoeVisionModel):
         return torch.cat(permuted)
 
 
-class GenesisQwen36DecoderLayer(Qwen3_5MoeDecoderLayer):
+class IsaacQwen36DecoderLayer(Qwen3_5MoeDecoderLayer):
     """Stock Qwen hybrid token mixer with the Genesis null-MoE block."""
 
     def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
         # Avoid constructing and then discarding a stock sparse-MoE block.
         GradientCheckpointingLayer.__init__(self)
-        GenesisNullMoeContract.from_text_config(config)
+        IsaacNullMoeContract.from_text_config(config)
         self.hidden_size = config.hidden_size
         self.layer_type = config.layer_types[layer_idx]
         if self.layer_type == "linear_attention":
-            self.linear_attn = GenesisQwen36GatedDeltaNet(config, layer_idx)
+            self.linear_attn = IsaacQwen36GatedDeltaNet(config, layer_idx)
         elif self.layer_type == "full_attention":
-            self.self_attn = GenesisQwen36Attention(config, layer_idx)
+            self.self_attn = IsaacQwen36Attention(config, layer_idx)
         else:
             raise ValueError(f"Unsupported MK1 layer type {self.layer_type!r} at index {layer_idx}")
-        self.mlp = GenesisNullSparseMoeBlock(config)
+        self.mlp = IsaacNullSparseMoeBlock(config)
         self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
-class GenesisQwen36TextModel(Qwen3_5MoeTextModel):
+class IsaacQwen36TextModel(Qwen3_5MoeTextModel):
     """Qwen3.6 hybrid text stack constructed directly with null-aware layers."""
 
-    _no_split_modules = ["GenesisQwen36DecoderLayer"]
+    _no_split_modules = ["IsaacQwen36DecoderLayer"]
     _can_record_outputs = {
         **Qwen3_5MoeTextModel._can_record_outputs,
-        "router_auxiliaries": OutputRecorder(GenesisNullRouterAuxiliary),
+        "router_auxiliaries": OutputRecorder(IsaacNullRouterAuxiliary),
     }
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         Qwen3_5MoePreTrainedModel.__init__(self, config)
-        GenesisNullMoeContract.from_text_config(config)
+        IsaacNullMoeContract.from_text_config(config)
         full_attention_interval = getattr(config, "full_attention_interval", 4)
         if isinstance(full_attention_interval, bool) or not isinstance(full_attention_interval, int):
             raise ValueError("MK1 Qwen3.6 full_attention_interval must be an integer")
@@ -1140,48 +1140,48 @@ class GenesisQwen36TextModel(Qwen3_5MoeTextModel):
             )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList(
-            [GenesisQwen36DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [IsaacQwen36DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = GenesisQwen36TextRotaryEmbedding(config)
+        self.rotary_emb = IsaacQwen36TextRotaryEmbedding(config)
         self.gradient_checkpointing = False
         self.post_init()
 
 
-class GenesisQwen36Model(Qwen3_5MoeModel):
+class IsaacQwen36Model(Qwen3_5MoeModel):
     """Multimodal Qwen3.6 backbone exposing the existing Qwen VLA interface."""
 
-    _no_split_modules = ["GenesisQwen36DecoderLayer", "Qwen3_5MoeVisionBlock"]
+    _no_split_modules = ["IsaacQwen36DecoderLayer", "Qwen3_5MoeVisionBlock"]
 
-    def __init__(self, config: Mk1Qwen36MoeConfig) -> None:
+    def __init__(self, config: IsaacQwen36MoeConfig) -> None:
         Qwen3_5MoePreTrainedModel.__init__(self, config)
-        GenesisNullMoeContract.from_text_config(config.text_config)
-        self.visual = GenesisQwen36VisionModel._from_config(config.vision_config)
+        IsaacNullMoeContract.from_text_config(config.text_config)
+        self.visual = IsaacQwen36VisionModel._from_config(config.vision_config)
         for block in self.visual.blocks:
-            block.attn = GenesisQwen36VisionAttention(config.vision_config)
-        self.language_model = GenesisQwen36TextModel._from_config(config.text_config)
+            block.attn = IsaacQwen36VisionAttention(config.vision_config)
+        self.language_model = IsaacQwen36TextModel._from_config(config.text_config)
         self.rope_deltas = None
         self.post_init()
 
 
 __all__ = [
-    "GenesisNullMoeBranches",
-    "GenesisNullMoeContract",
-    "GenesisNullDispatchTrace",
-    "GenesisNullRoutingOutput",
-    "GenesisNullSparseMoeBlock",
-    "GenesisNullTopKRouter",
-    "GenesisQwen36DecoderLayer",
-    "GenesisQwen36Attention",
-    "GenesisQwen36AttentionTrace",
-    "GenesisQwen36GatedDeltaNet",
-    "GenesisQwen36Model",
-    "GenesisQwen36TextModel",
-    "GenesisQwen36TextRotaryEmbedding",
-    "GenesisQwen36VisionAttention",
-    "GenesisQwen36VisionModel",
-    "Mk1Qwen36MoeConfig",
-    "GENESIS_ROTARY_PRECISION",
+    "IsaacNullMoeBranches",
+    "IsaacNullMoeContract",
+    "IsaacNullDispatchTrace",
+    "IsaacNullRoutingOutput",
+    "IsaacNullSparseMoeBlock",
+    "IsaacNullTopKRouter",
+    "IsaacQwen36DecoderLayer",
+    "IsaacQwen36Attention",
+    "IsaacQwen36AttentionTrace",
+    "IsaacQwen36GatedDeltaNet",
+    "IsaacQwen36Model",
+    "IsaacQwen36TextModel",
+    "IsaacQwen36TextRotaryEmbedding",
+    "IsaacQwen36VisionAttention",
+    "IsaacQwen36VisionModel",
+    "IsaacQwen36MoeConfig",
+    "ROTARY_PRECISION",
     "deterministic_token_segment_sum",
     "explicit_repeat_kv_sdpa",
 ]

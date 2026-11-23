@@ -16,20 +16,20 @@ from .checkpoint_integrity import (
     load_json_object,
     require_sha256,
 )
-from .mk1_checkpoint_contract import SafetensorsInventory, read_and_validate_safetensors_index
+from .isaac_checkpoint_contract import SafetensorsInventory, read_and_validate_safetensors_index
 
 if TYPE_CHECKING:
     from .configuration_perceptron_isaac import PerceptronIsaacConfig
 
 TRAINED_PACKAGE_INERT_HUB_METADATA = frozenset({".gitattributes", "README.md"})
-MK1_TRAINED_PACKAGE_MANIFEST_FILENAME = "mk1_trained_package_manifest.json"
-MK1_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_trained_package_manifest_v1"
-MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD = "mk1_trained_package_manifest_sha256"
-MK1_MODEL_IMPORT_FILENAME = "mk1_model_import.json"
-MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2 = (
+ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME = "mk1_trained_package_manifest.json"
+ISAAC_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_trained_package_manifest_v1"
+ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD = "mk1_trained_package_manifest_sha256"
+ISAAC_MODEL_IMPORT_FILENAME = "mk1_model_import.json"
+ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2 = (
     "perceptron_isaac_mk1_canonical_trained_package_manifest_v2"
 )
-MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_canonical_trained_package_manifest_v3"
+ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_canonical_trained_package_manifest_v3"
 CANONICAL_INNER_MODEL_STORAGE = "canonical_inner"
 
 PackageFilePredicate = Callable[[Path, Path], bool]
@@ -433,9 +433,9 @@ def finalize_canonical_trained_package(
     digest = write_trained_package_manifest(
         root,
         label="MK1 canonical trained package",
-        manifest_filename=MK1_TRAINED_PACKAGE_MANIFEST_FILENAME,
-        manifest_schema=MK1_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
-        digest_field=MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
+        manifest_filename=ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
+        manifest_schema=ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+        digest_field=ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
         identity={
             "artifact_kind": config.artifact_kind,
             "mk1_source_model_import_sha256": mk1_source_model_import_sha256,
@@ -448,14 +448,14 @@ def finalize_canonical_trained_package(
 
     try:
         raw_config = load_json_object(root / "config.json")
-        manifest = load_json_object(root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME)
+        manifest = load_json_object(root / ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME)
     except ValueError as exc:
         raise RuntimeError(f"Cannot re-read finalized MK1 canonical trained package: {exc}") from exc
     canonical_config = dict(raw_config)
-    canonical_config[MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD] = None
+    canonical_config[ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD] = None
     if (
-        raw_config.get(MK1_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD) != digest
-        or file_sha256(root / MK1_TRAINED_PACKAGE_MANIFEST_FILENAME) != digest
+        raw_config.get(ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD) != digest
+        or file_sha256(root / ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME) != digest
         or manifest.get("config_sha256") != canonical_json_sha256(canonical_config)
     ):
         raise RuntimeError(

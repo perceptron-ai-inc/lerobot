@@ -60,6 +60,6 @@ def test_fsdp2_wrap_units_are_the_trained_set_and_name_real_classes() -> None:
     """Upstream resolves `_fsdp_wrap_modules` by class name; the names must track the code."""
     from lerobot.policies.perceptron_isaac import modeling_qwen35_vla, modeling_qwen36_moe
 
-    assert PerceptronIsaacPolicy._fsdp_wrap_modules == ["GenesisQwen36DecoderLayer", "ActionExpertBlock"]
-    assert isinstance(modeling_qwen36_moe.GenesisQwen36DecoderLayer, type)
+    assert PerceptronIsaacPolicy._fsdp_wrap_modules == ["IsaacQwen36DecoderLayer", "ActionExpertBlock"]
+    assert isinstance(modeling_qwen36_moe.IsaacQwen36DecoderLayer, type)
     assert isinstance(modeling_qwen35_vla.ActionExpertBlock, type)

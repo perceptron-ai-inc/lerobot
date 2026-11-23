@@ -20,9 +20,9 @@ from torch.nn import functional
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[perceptron_isaac])")
 
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAForActionGeneration,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContract
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAForActionGeneration,
     _build_config,
     _configure_attention_backend,
     _select_gdn_backend,
@@ -40,7 +40,7 @@ from lerobot.policies.perceptron_isaac.tensor_stream import (
     create_stream,
 )
 from tests.policies.perceptron_isaac._layerwise_fixtures import layerwise_action_config
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config
 
 
 def _tiny_head(*, layerwise: bool) -> DiTActionExpertHead:
@@ -259,7 +259,7 @@ def _history_stream() -> TensorStream:
 
 def _tiny_backbone(
     *, serialization: Literal["schema1", "action-schema2", "vla-schema2"], hidden_norm: str
-) -> Mk1Qwen36VLAForActionGeneration:
+) -> IsaacQwen36VLAForActionGeneration:
     raw = _config(test_geometry=True, mtp_present=False)
     raw["text_config"].update(
         num_hidden_layers=4,
@@ -267,7 +267,7 @@ def _tiny_backbone(
     )
     # Parse the existing geometry independently; the constructor receives the new
     # declaration without requiring a future loader/fixture API to exist first.
-    geometry = Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+    geometry = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
     action = layerwise_action_config(
         layers=(1, 3) if hidden_norm == "final_norm" else (0, 2), hidden_norm=hidden_norm
     )
@@ -287,7 +287,7 @@ def _tiny_backbone(
         raw["genesis_vla"]["action_expert"] = action
     config = _build_config(raw, geometry)
     _configure_attention_backend(config, "torch_sdpa_v1")
-    model = Mk1Qwen36VLAForActionGeneration(config)
+    model = IsaacQwen36VLAForActionGeneration(config)
     _select_gdn_backend(model, "cpu")
     model.float().eval()
     with torch.no_grad():

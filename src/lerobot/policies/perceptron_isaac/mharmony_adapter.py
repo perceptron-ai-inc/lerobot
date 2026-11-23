@@ -37,7 +37,7 @@ _ISAAC_PRIORITY = [
     VisionType.P,
 ]
 _CONTROL_MODALITIES = frozenset({"control", "special_token", "role_marker", "modality_tag"})
-_TEXT_TYPE_TAG = "genesis_text_type"
+_TEXT_TYPE_TAG = "text_type"
 _TEXT_TYPES = {
     "text": TextType.text,
     "timestamp": TextType.timestamp,

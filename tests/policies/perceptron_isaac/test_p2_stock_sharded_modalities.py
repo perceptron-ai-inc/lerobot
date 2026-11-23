@@ -43,10 +43,10 @@ from accelerate.utils import FullyShardedDataParallelPlugin, TorchDynamoPlugin
 from accelerate.utils.fsdp_utils import fsdp2_prepare_model
 
 from lerobot.configs.accelerator import FSDPConfig
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContract
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
     TORCH_SDPA_ATTENTION_BACKEND,
-    Mk1Qwen36VLAForActionGeneration,
+    IsaacQwen36VLAForActionGeneration,
     _build_config,
     _configure_attention_backend,
 )
@@ -55,8 +55,8 @@ from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import (
     inspect_fsdp2_trainable_masters,
 )
 from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import (
-    GenesisQwen36GatedDeltaNet,
-    GenesisQwen36VisionModel,
+    IsaacQwen36GatedDeltaNet,
+    IsaacQwen36VisionModel,
 )
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     PERCEPTRON_ISAAC_KEPT_SAMPLE_INDICES_KEY,
@@ -72,7 +72,7 @@ from lerobot.policies.perceptron_isaac.tensor_stream import (
 )
 from lerobot.scripts.lerobot_train import update_policy
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config as _native_config
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config as _native_config
 from tests.policies.perceptron_isaac.test_modeling_training import _config as _policy_config
 
 
@@ -157,15 +157,15 @@ class ModalityTrace:
 
 def _tiny_native_policy(
     wrapping: ModalityWrap,
-) -> tuple[PerceptronIsaacPolicy, Mk1Qwen36VLAForActionGeneration]:
+) -> tuple[PerceptronIsaacPolicy, IsaacQwen36VLAForActionGeneration]:
     raw = _native_config(test_geometry=True, mtp_present=False)
     raw["genesis_vla"]["action_expert"].update(action_dim=2, action_horizon=2)
-    contract = Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+    contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
     native_config = _build_config(raw, contract)
     _configure_attention_backend(native_config, TORCH_SDPA_ATTENTION_BACKEND)
-    model = Mk1Qwen36VLAForActionGeneration(native_config).float()
+    model = IsaacQwen36VLAForActionGeneration(native_config).float()
     assert native_config.text_config.layer_types == ["linear_attention", "full_attention"]
-    assert isinstance(model.model.language_model.layers[0].linear_attn, GenesisQwen36GatedDeltaNet)
+    assert isinstance(model.model.language_model.layers[0].linear_attn, IsaacQwen36GatedDeltaNet)
     config = _policy_config()
     config.push_to_hub = False
     policy = PerceptronIsaacPolicy(config)
@@ -203,16 +203,14 @@ def _measured_modality_stream(wrapping: ModalityWrap) -> TensorStream:
     return TensorStream([create_stream(events, ALL_TYPES)])
 
 
-def _supported_wrap_config(wrapping: ModalityWrap, model: Mk1Qwen36VLAForActionGeneration) -> FSDPConfig:
+def _supported_wrap_config(wrapping: ModalityWrap, model: IsaacQwen36VLAForActionGeneration) -> FSDPConfig:
     if wrapping == ModalityWrap.VISION_CONTAINER:
         # The old vision-size profile hit a helper/container limitation, not the modality defect.
-        assert isinstance(model.model.visual, GenesisQwen36VisionModel)
+        assert isinstance(model.model.visual, IsaacQwen36VisionModel)
         return FSDPConfig(
-            wrap_modules=["GenesisQwen36VisionModel", "GenesisQwen36DecoderLayer", "ActionExpertBlock"]
+            wrap_modules=["IsaacQwen36VisionModel", "IsaacQwen36DecoderLayer", "ActionExpertBlock"]
         )
-    return FSDPConfig(
-        wrap_modules=["Qwen3_5MoeVisionBlock", "GenesisQwen36DecoderLayer", "ActionExpertBlock"]
-    )
+    return FSDPConfig(wrap_modules=["Qwen3_5MoeVisionBlock", "IsaacQwen36DecoderLayer", "ActionExpertBlock"])
 
 
 def _local_tensor(value: Tensor) -> Tensor:

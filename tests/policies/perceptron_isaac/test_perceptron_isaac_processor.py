@@ -1867,13 +1867,13 @@ def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
     calls: list[dict[str, object]] = []
     model = FakeIsaacModel()
 
-    def fake_load_mk1_vla_from_hf(
+    def fake_load_isaac_vla_from_hf(
         model_dir: Path, **kwargs: object
     ) -> tuple[FakeIsaacModel, SimpleNamespace, SimpleNamespace]:
         calls.append({"model_dir": model_dir, **kwargs})
         return model, SimpleNamespace(), contract
 
-    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
+    contract = _patch_isaac_checkpoint_load(monkeypatch, fake_load_isaac_vla_from_hf)
     cfg = PerceptronIsaacConfig(
         device="cpu",
         hf_model_path=str(tmp_path / "hf"),
@@ -1917,36 +1917,36 @@ def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
     assert len(calls) == 1
 
 
-def _patch_mk1_checkpoint_load(monkeypatch, loader):
+def _patch_isaac_checkpoint_load(monkeypatch, loader):
     contract = SimpleNamespace(
         artifact=SimpleNamespace(artifact_kind="trained_policy"),
         vector_encoder=SimpleNamespace(max_states=128),
         action_expert=SimpleNamespace(action_dim=64, action_horizon=64),
         validate_coord_reserved_token_groups=lambda groups: None,
     )
-    import lerobot.policies.perceptron_isaac.mk1_checkpoint_contract as checkpoint_contract
-    import lerobot.policies.perceptron_isaac.modeling_mk1_vla as mk1_vla
+    import lerobot.policies.perceptron_isaac.isaac_checkpoint_contract as checkpoint_contract
+    import lerobot.policies.perceptron_isaac.modeling_isaac_vla as isaac_vla
 
     monkeypatch.setattr(
         checkpoint_contract,
-        "validate_mk1_checkpoint",
+        "validate_isaac_checkpoint",
         lambda model_dir, **kwargs: (contract, SimpleNamespace()),
     )
-    monkeypatch.setattr(mk1_vla, "load_mk1_vla_from_hf", loader)
+    monkeypatch.setattr(isaac_vla, "load_isaac_vla_from_hf", loader)
     return contract
 
 
-def test_native_policy_mk1_loader_is_checkpoint_driven(tmp_path, monkeypatch):
+def test_native_policy_isaac_loader_is_checkpoint_driven(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     hf_dir = tmp_path / "hf"
     calls = []
 
-    def fake_load_mk1_vla_from_hf(model_dir, **kwargs):
+    def fake_load_isaac_vla_from_hf(model_dir, **kwargs):
         calls.append({"model_dir": model_dir, **kwargs})
         return FakeIsaacModel(), SimpleNamespace(), contract
 
-    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
+    contract = _patch_isaac_checkpoint_load(monkeypatch, fake_load_isaac_vla_from_hf)
     cfg = PerceptronIsaacConfig(
         device="cpu",
         hf_model_path=str(hf_dir),
@@ -2008,7 +2008,7 @@ def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(tmp_p
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     load_calls = []
-    _patch_mk1_checkpoint_load(monkeypatch, lambda *args, **kwargs: load_calls.append((args, kwargs)))
+    _patch_isaac_checkpoint_load(monkeypatch, lambda *args, **kwargs: load_calls.append((args, kwargs)))
 
     with pytest.raises(RuntimeError, match="artifact identity mismatch"):
         PerceptronIsaacPolicy(
@@ -2038,14 +2038,14 @@ def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(tmp_p
         ("apply_offset_norm", True, "forbid"),
     ],
 )
-def test_native_policy_mk1_rejects_outer_contract_drift_before_load(
+def test_native_policy_isaac_rejects_outer_contract_drift_before_load(
     tmp_path, monkeypatch, field, value, message
 ):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     hf_dir = tmp_path / "hf"
     load_calls = []
-    _patch_mk1_checkpoint_load(
+    _patch_isaac_checkpoint_load(
         monkeypatch,
         lambda *args, **kwargs: load_calls.append((args, kwargs)),
     )
@@ -2098,13 +2098,13 @@ def test_training_parameter_freeze_is_applied_once(
 
     import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as qwen35_vla
 
-    def fake_load_mk1_vla_from_hf(
+    def fake_load_isaac_vla_from_hf(
         model_dir: Path, **kwargs: object
     ) -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
         load_calls.append({"model_dir": model_dir, **kwargs})
         return MagicMock(), SimpleNamespace(), contract
 
-    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
+    contract = _patch_isaac_checkpoint_load(monkeypatch, fake_load_isaac_vla_from_hf)
     monkeypatch.setattr(qwen35_vla, "setup_qwen35_vla_for_training", lambda *a, **k: calls.append("setup"))
     cfg = PerceptronIsaacConfig(
         device="cpu",
@@ -2153,13 +2153,13 @@ def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(
 
     import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as qwen35_vla
 
-    def fake_load_mk1_vla_from_hf(
+    def fake_load_isaac_vla_from_hf(
         model_dir: Path, **kwargs: object
     ) -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
         calls.append({"model_dir": model_dir, **kwargs})
         return MagicMock(), SimpleNamespace(), contract
 
-    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
+    contract = _patch_isaac_checkpoint_load(monkeypatch, fake_load_isaac_vla_from_hf)
     monkeypatch.setattr(qwen35_vla, "setup_qwen35_vla_for_training", lambda *a, **k: None)
     cfg = PerceptronIsaacConfig(
         device="cpu",
@@ -2186,17 +2186,17 @@ def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(
     assert calls[0]["runtime_device"] == "cpu"
 
 
-def test_native_mk1_dense_training_is_rejected_before_checkpoint_or_model_allocation(tmp_path, monkeypatch):
+def test_native_isaac_dense_training_is_rejected_before_checkpoint_or_model_allocation(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
     hf_dir = tmp_path / "hf"
     calls = []
 
-    def fake_load_mk1_vla_from_hf(model_dir, **kwargs):
+    def fake_load_isaac_vla_from_hf(model_dir, **kwargs):
         calls.append({"model_dir": model_dir, **kwargs})
         return MagicMock(), SimpleNamespace(), contract
 
-    contract = _patch_mk1_checkpoint_load(monkeypatch, fake_load_mk1_vla_from_hf)
+    contract = _patch_isaac_checkpoint_load(monkeypatch, fake_load_isaac_vla_from_hf)
     cfg = PerceptronIsaacConfig(
         device="cpu",
         hf_model_path=str(hf_dir),
@@ -2223,16 +2223,16 @@ def test_native_mk1_dense_training_is_rejected_before_checkpoint_or_model_alloca
 
 
 @pytest.mark.parametrize(("train_expert_only", "use_peft"), [(True, False), (False, True)])
-def test_native_mk1_bounded_training_config_is_rejected_before_allocation(
+def test_native_isaac_bounded_training_config_is_rejected_before_allocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, train_expert_only: bool, use_peft: bool
 ) -> None:
     """Deferred training modes must fail before checkpoint validation or model allocation."""
     preflight = MagicMock(side_effect=AssertionError("checkpoint validation must not run"))
     loader = MagicMock(side_effect=AssertionError("checkpoint allocation must not run"))
     monkeypatch.setattr(
-        "lerobot.policies.perceptron_isaac.mk1_checkpoint_contract.validate_mk1_checkpoint", preflight
+        "lerobot.policies.perceptron_isaac.isaac_checkpoint_contract.validate_isaac_checkpoint", preflight
     )
-    monkeypatch.setattr("lerobot.policies.perceptron_isaac.modeling_mk1_vla.load_mk1_vla_from_hf", loader)
+    monkeypatch.setattr("lerobot.policies.perceptron_isaac.modeling_isaac_vla.load_isaac_vla_from_hf", loader)
 
     with pytest.raises(ValueError, match="PEFT and expert-only training are unsupported"):
         PerceptronIsaacPolicy(
@@ -2253,16 +2253,16 @@ def test_native_mk1_bounded_training_config_is_rejected_before_allocation(
 
 
 @pytest.mark.parametrize(("train_expert_only", "use_peft"), [(True, False), (False, True)])
-def test_native_mk1_bounded_training_is_rejected_at_training_boundary(
+def test_native_isaac_bounded_training_is_rejected_at_training_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, train_expert_only: bool, use_peft: bool
 ) -> None:
     """Reject post-construction flag changes too, before loading or using an injected model."""
     preflight = MagicMock(side_effect=AssertionError("checkpoint validation must not run"))
     loader = MagicMock(side_effect=AssertionError("checkpoint allocation must not run"))
     monkeypatch.setattr(
-        "lerobot.policies.perceptron_isaac.mk1_checkpoint_contract.validate_mk1_checkpoint", preflight
+        "lerobot.policies.perceptron_isaac.isaac_checkpoint_contract.validate_isaac_checkpoint", preflight
     )
-    monkeypatch.setattr("lerobot.policies.perceptron_isaac.modeling_mk1_vla.load_mk1_vla_from_hf", loader)
+    monkeypatch.setattr("lerobot.policies.perceptron_isaac.modeling_isaac_vla.load_isaac_vla_from_hf", loader)
     cfg = PerceptronIsaacConfig(
         device="cpu",
         hf_model_path=str(tmp_path / "hf"),
@@ -2685,7 +2685,7 @@ def test_native_mharmony_content_plan_matches_libero_prompt_contract(tmp_path):
     np.testing.assert_allclose(vector_item["values"], np.zeros(8), atol=1e-5)
     action_tags = plan.assistant_content[0]["tags"]
     assert action_tags["token_group"] == "flow_action"
-    assert action_tags["genesis_text_type"] == "action_c"
+    assert action_tags["text_type"] == "action_c"
     assert action_tags["obs_window"] == [0, 2]
     assert action_tags["action_window"] == [2, 31]
     assert action_tags["action_indices"][0] == 2

@@ -12,7 +12,7 @@ pytest.importorskip("accelerate", reason="accelerate is required (install lerobo
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import perceptron_isaac_training_loss
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import Mk1Qwen36VLAForActionGeneration
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import IsaacQwen36VLAForActionGeneration
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
     ModelOutput,
     Qwen35VLAForActionGeneration,
@@ -31,7 +31,7 @@ from tests.policies.perceptron_isaac.test_layerwise_native_context import (
 
 def _training_model(
     *, draws: int = 1, serialization: Literal["schema1", "action-schema2"] = "action-schema2"
-) -> Mk1Qwen36VLAForActionGeneration:
+) -> IsaacQwen36VLAForActionGeneration:
     model = _tiny_backbone(serialization=serialization, hidden_norm="final_norm")
     setup_qwen35_vla_for_training(cast(Qwen35VLAForActionGeneration, model), train_samples_per_chunk=draws)
     for parameter in model.get_input_embeddings().parameters():

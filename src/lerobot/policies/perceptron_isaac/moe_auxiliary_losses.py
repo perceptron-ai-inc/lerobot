@@ -24,7 +24,7 @@ class RouterAuxiliaryStatistics:
     num_null_experts: int
 
 
-class GenesisNullRouterAuxiliary(nn.Module):
+class IsaacNullRouterAuxiliary(nn.Module):
     """Parameter-free output for Transformers' maintained per-forward output recorder.
 
     Serving does no auxiliary tensor work and keeps no references between calls.

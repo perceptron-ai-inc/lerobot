@@ -12,27 +12,27 @@ from safetensors.torch import save_file
 
 pytest.importorskip("transformers", reason="install lerobot[perceptron_isaac]")
 
-import lerobot.policies.perceptron_isaac.modeling_mk1_vla as modeling_mk1_vla
+import lerobot.policies.perceptron_isaac.modeling_isaac_vla as modeling_isaac_vla
 import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as modeling_qwen35_vla
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContract,
-    Mk1CheckpointContractError,
-    finalize_mk1_runtime_checkpoint_layout,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContract,
+    IsaacCheckpointContractError,
+    finalize_isaac_runtime_checkpoint_layout,
     read_and_validate_safetensors_index,
-    read_mk1_config_data,
-    validate_mk1_checkpoint,
+    read_isaac_config_data,
+    validate_isaac_checkpoint,
 )
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
     QUALIFIED_TORCH_CUDA_ABI,
     QUALIFIED_TRANSFORMERS_VERSION,
     TORCH_SDPA_ATTENTION_BACKEND,
-    load_mk1_vla_from_hf,
+    load_isaac_vla_from_hf,
 )
 from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import (
     DETERMINISTIC_ROUTE_REDUCTION,
-    GenesisQwen36Attention,
-    GenesisQwen36TextRotaryEmbedding,
-    GenesisQwen36VisionAttention,
+    IsaacQwen36Attention,
+    IsaacQwen36TextRotaryEmbedding,
+    IsaacQwen36VisionAttention,
 )
 from lerobot.policies.perceptron_isaac.tensor_stream import (
     ALL_TYPES,
@@ -42,8 +42,8 @@ from lerobot.policies.perceptron_isaac.tensor_stream import (
     VectorType,
     create_stream,
 )
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
-    _config as _mk1_config,
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
+    _config as _isaac_config,
     _write_checkpoint,
 )
 
@@ -86,15 +86,15 @@ def _replace_with_same_bytes(path: Path, replacement: Path) -> None:
     replacement.replace(path)
 
 
-def _reduced_mk1_contract(raw: dict | None = None) -> Mk1CheckpointContract:
-    return Mk1CheckpointContract.parse_allowlisted(
-        raw if raw is not None else _mk1_config(test_geometry=True),
+def _reduced_isaac_contract(raw: dict | None = None) -> IsaacCheckpointContract:
+    return IsaacCheckpointContract.parse_allowlisted(
+        raw if raw is not None else _isaac_config(test_geometry=True),
         allow_test_only_reduced_geometry=True,
     )
 
 
-def _production_mk1_contract(raw: dict | None = None) -> Mk1CheckpointContract:
-    return replace(_reduced_mk1_contract(raw), test_only_reduced_geometry=False)
+def _production_isaac_contract(raw: dict | None = None) -> IsaacCheckpointContract:
+    return replace(_reduced_isaac_contract(raw), test_only_reduced_geometry=False)
 
 
 def _qualify_cuda_runtime(
@@ -119,26 +119,26 @@ def _qualify_cuda_runtime(
         )
 
 
-def test_mk1_reuses_pr3154_embedding_and_inference_shell_descriptors_verbatim() -> None:
+def test_isaac_reuses_pr3154_embedding_and_inference_shell_descriptors_verbatim() -> None:
     for name in ("_embed_text", "_embed_vector", "_embed_vision", "embed_stream", "forward"):
         assert (
-            modeling_mk1_vla.Mk1Qwen36VLAModel.__dict__[name]
+            modeling_isaac_vla.IsaacQwen36VLAModel.__dict__[name]
             is modeling_qwen35_vla.Qwen35VLAModel.__dict__[name]
         )
     # Native train_forward now owns the approved router-auxiliary capture; its
     # real scalar, gradient and count contract is tested in the MoE suites.
     for name in ("get_input_embeddings", "action_expert", "sample_action"):
         assert (
-            modeling_mk1_vla.Mk1Qwen36VLAForActionGeneration.__dict__[name]
+            modeling_isaac_vla.IsaacQwen36VLAForActionGeneration.__dict__[name]
             is modeling_qwen35_vla.Qwen35VLAForActionGeneration.__dict__[name]
         )
 
 
-def test_mk1_loader_constructs_only_from_checkpoint_and_leaves_no_meta_tensors(tmp_path) -> None:
+def test_isaac_loader_constructs_only_from_checkpoint_and_leaves_no_meta_tensors(tmp_path) -> None:
     model_dir = tmp_path / "mk1"
     expected_contract = _write_checkpoint(model_dir)
 
-    model, config, contract = load_mk1_vla_from_hf(
+    model, config, contract = load_isaac_vla_from_hf(
         model_dir,
         dtype=torch.bfloat16,
         device="cpu",
@@ -158,19 +158,19 @@ def test_mk1_loader_constructs_only_from_checkpoint_and_leaves_no_meta_tensors(t
     assert not any(key.startswith("mtp.") for key in model.state_dict())
     assert config.text_config._attn_implementation == "sdpa"
     assert config.vision_config._attn_implementation == "sdpa"
-    assert config.text_config._mk1_route_reduction == DETERMINISTIC_ROUTE_REDUCTION
-    assert isinstance(model.model.language_model.rotary_emb, GenesisQwen36TextRotaryEmbedding)
+    assert config.text_config._isaac_route_reduction == DETERMINISTIC_ROUTE_REDUCTION
+    assert isinstance(model.model.language_model.rotary_emb, IsaacQwen36TextRotaryEmbedding)
     assert model.model.language_model.rotary_emb.inv_freq.dtype == torch.bfloat16
     assert model.model.visual.rotary_pos_emb.inv_freq.dtype == torch.float32
     assert not any("rotary_emb.inv_freq" in key for key in model.state_dict())
 
 
-def test_mk1_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> None:
+def test_isaac_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> None:
     source = tmp_path / "source-mk1"
     source_contract = _write_checkpoint(source)
     assert source_contract.mtp.present
 
-    model, _, _ = load_mk1_vla_from_hf(
+    model, _, _ = load_isaac_vla_from_hf(
         source,
         dtype=torch.bfloat16,
         device="cpu",
@@ -186,7 +186,7 @@ def test_mk1_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> No
     shutil.copy2(source / "tokenizer.json", runtime / "tokenizer.json")
     save_file(runtime_state, runtime / "model.safetensors")
 
-    finalize_mk1_runtime_checkpoint_layout(runtime)
+    finalize_isaac_runtime_checkpoint_layout(runtime)
 
     assert not (runtime / "model.safetensors").exists()
     index_path = runtime / "model.safetensors.index.json"
@@ -211,14 +211,14 @@ def test_mk1_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> No
     runtime.rename(moved)
     source.rename(tmp_path / "retired-source-mk1")
 
-    moved_contract, inventory = validate_mk1_checkpoint(
+    moved_contract, inventory = validate_isaac_checkpoint(
         moved,
         allow_test_only_reduced_geometry=True,
     )
     assert not moved_contract.mtp.present
     assert set(inventory.tensors) == set(runtime_state)
 
-    reloaded, _, loaded_contract = load_mk1_vla_from_hf(
+    reloaded, _, loaded_contract = load_isaac_vla_from_hf(
         moved,
         dtype=torch.bfloat16,
         device="cpu",
@@ -231,8 +231,8 @@ def test_mk1_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> No
         torch.testing.assert_close(reloaded_state[key], expected)
 
 
-def test_mk1_config_normalizes_real_export_omissions_to_qualified_runtime_defaults() -> None:
-    raw = _mk1_config(test_geometry=True)
+def test_isaac_config_normalizes_real_export_omissions_to_qualified_runtime_defaults() -> None:
+    raw = _isaac_config(test_geometry=True)
     common = {
         "output_attentions": False,
         "output_hidden_states": False,
@@ -247,11 +247,11 @@ def test_mk1_config_normalizes_real_export_omissions_to_qualified_runtime_defaul
     for key in ("output_router_logits", "norm_topk_prob"):
         assert key not in raw["text_config"]
 
-    contract = Mk1CheckpointContract.parse_allowlisted(
+    contract = IsaacCheckpointContract.parse_allowlisted(
         raw,
         allow_test_only_reduced_geometry=True,
     )
-    config = modeling_mk1_vla._build_config(raw, contract)
+    config = modeling_isaac_vla._build_config(raw, contract)
 
     for key, expected in common.items():
         assert getattr(config, key) == expected
@@ -266,11 +266,11 @@ def test_mk1_config_normalizes_real_export_omissions_to_qualified_runtime_defaul
     assert "norm_topk_prob" not in raw["text_config"]
 
 
-def test_mk1_loader_can_cast_checkpoint_storage_for_training(tmp_path) -> None:
+def test_isaac_loader_can_cast_checkpoint_storage_for_training(tmp_path) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
 
-    model, _, _ = load_mk1_vla_from_hf(
+    model, _, _ = load_isaac_vla_from_hf(
         model_dir,
         dtype=torch.float32,
         device="cpu",
@@ -280,11 +280,11 @@ def test_mk1_loader_can_cast_checkpoint_storage_for_training(tmp_path) -> None:
     assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
 
 
-def test_mk1_loader_applies_explicit_runtime_sdpa_to_text_and_vision(tmp_path) -> None:
+def test_isaac_loader_applies_explicit_runtime_sdpa_to_text_and_vision(tmp_path) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
 
-    model, config, _ = load_mk1_vla_from_hf(
+    model, config, _ = load_isaac_vla_from_hf(
         model_dir,
         dtype=torch.float32,
         device="cpu",
@@ -298,14 +298,14 @@ def test_mk1_loader_applies_explicit_runtime_sdpa_to_text_and_vision(tmp_path) -
     assert model.model.language_model.config._attn_implementation == "sdpa"
     assert model.model.visual.config._attn_implementation == "sdpa"
     assert all(
-        isinstance(layer.self_attn, GenesisQwen36Attention)
+        isinstance(layer.self_attn, IsaacQwen36Attention)
         for layer in model.model.language_model.layers
         if layer.layer_type == "full_attention"
     )
-    assert all(isinstance(block.attn, GenesisQwen36VisionAttention) for block in model.model.visual.blocks)
+    assert all(isinstance(block.attn, IsaacQwen36VisionAttention) for block in model.model.visual.blocks)
 
 
-def test_mk1_loader_rejects_unqualified_transformers_abi_before_checkpoint_read(
+def test_isaac_loader_rejects_unqualified_transformers_abi_before_checkpoint_read(
     tmp_path, monkeypatch
 ) -> None:
     reads = 0
@@ -316,10 +316,10 @@ def test_mk1_loader_rejects_unqualified_transformers_abi_before_checkpoint_read(
         raise AssertionError("checkpoint must not be read before the Transformers ABI gate")
 
     monkeypatch.setattr(pytest.importorskip("transformers"), "__version__", "5.5.5")
-    monkeypatch.setattr(modeling_mk1_vla, "read_mk1_config_data", unexpected_read)
+    monkeypatch.setattr(modeling_isaac_vla, "read_isaac_config_data", unexpected_read)
 
     with pytest.raises(RuntimeError, match=rf"requires.*{QUALIFIED_TRANSFORMERS_VERSION}.*5\.5\.5"):
-        load_mk1_vla_from_hf(tmp_path / "missing")
+        load_isaac_vla_from_hf(tmp_path / "missing")
 
     assert reads == 0
 
@@ -336,8 +336,8 @@ def test_mk1_loader_rejects_unqualified_transformers_abi_before_checkpoint_read(
 def test_trained_cuda_loader_rejects_unqualified_torch_abi_before_safetensor_read_or_allocation(
     tmp_path, monkeypatch, torch_version, cuda_version
 ) -> None:
-    raw = _mk1_config(test_geometry=True)
-    full_contract = _production_mk1_contract(raw)
+    raw = _isaac_config(test_geometry=True)
+    full_contract = _production_isaac_contract(raw)
     safetensor_reads = []
     allocations = []
 
@@ -350,25 +350,25 @@ def test_trained_cuda_loader_rejects_unqualified_torch_abi_before_safetensor_rea
         raise AssertionError("model allocation must not run before the qualified Torch ABI gate")
 
     monkeypatch.setattr(
-        modeling_mk1_vla,
-        "read_mk1_config_data",
+        modeling_isaac_vla,
+        "read_isaac_config_data",
         lambda *args, **kwargs: (raw, full_contract),
     )
     monkeypatch.setattr(
-        modeling_mk1_vla,
+        modeling_isaac_vla,
         "read_and_validate_safetensors_index",
         unexpected_safetensor_read,
     )
     monkeypatch.setattr(
-        modeling_mk1_vla,
-        "Mk1Qwen36VLAForActionGeneration",
+        modeling_isaac_vla,
+        "IsaacQwen36VLAForActionGeneration",
         unexpected_allocation,
     )
     monkeypatch.setattr(torch, "__version__", torch_version)
     monkeypatch.setattr(torch.version, "cuda", cuda_version)
 
     with pytest.raises(RuntimeError, match="requires.*parity-qualified") as error:
-        load_mk1_vla_from_hf(tmp_path / "config-is-mocked", device="cuda")
+        load_isaac_vla_from_hf(tmp_path / "config-is-mocked", device="cuda")
 
     assert QUALIFIED_TORCH_CUDA_ABI in str(error.value)
     assert safetensor_reads == []
@@ -376,8 +376,8 @@ def test_trained_cuda_loader_rejects_unqualified_torch_abi_before_safetensor_rea
 
 
 def test_qualified_torch_cuda_gate_exempts_only_nonproduction_execution(monkeypatch) -> None:
-    reduced_contract = _reduced_mk1_contract()
-    full_contract = _production_mk1_contract()
+    reduced_contract = _reduced_isaac_contract()
+    full_contract = _production_isaac_contract()
     neutral_contract = replace(
         full_contract,
         artifact=replace(
@@ -388,20 +388,20 @@ def test_qualified_torch_cuda_gate_exempts_only_nonproduction_execution(monkeypa
     monkeypatch.setattr(torch, "__version__", "2.11.0+cu128")
     monkeypatch.setattr(torch.version, "cuda", "12.8")
 
-    modeling_mk1_vla._require_qualified_torch_cuda_abi(reduced_contract, "cuda")
-    modeling_mk1_vla._require_qualified_torch_cuda_abi(neutral_contract, "cuda")
-    modeling_mk1_vla._require_qualified_torch_cuda_abi(full_contract, "cpu")
+    modeling_isaac_vla._require_qualified_torch_cuda_abi(reduced_contract, "cuda")
+    modeling_isaac_vla._require_qualified_torch_cuda_abi(neutral_contract, "cuda")
+    modeling_isaac_vla._require_qualified_torch_cuda_abi(full_contract, "cpu")
 
 
 def test_qualified_torch_cuda_gate_accepts_exact_parity_abi(monkeypatch) -> None:
-    contract = _production_mk1_contract()
+    contract = _production_isaac_contract()
     _qualify_cuda_runtime(
         monkeypatch,
         capability=(9, 0),
         device_name="NVIDIA H100 80GB HBM3",
     )
 
-    modeling_mk1_vla._require_qualified_torch_cuda_abi(contract, "cuda:0")
+    modeling_isaac_vla._require_qualified_torch_cuda_abi(contract, "cuda:0")
 
 
 @pytest.mark.parametrize(
@@ -427,7 +427,7 @@ def test_qualified_torch_cuda_gate_rejects_unqualified_hardware(
     device_name: str,
     message: str,
 ) -> None:
-    contract = _production_mk1_contract()
+    contract = _production_isaac_contract()
     _qualify_cuda_runtime(
         monkeypatch,
         capability=capability,
@@ -435,15 +435,15 @@ def test_qualified_torch_cuda_gate_rejects_unqualified_hardware(
     )
 
     with pytest.raises(RuntimeError, match=message):
-        modeling_mk1_vla._require_qualified_torch_cuda_abi(contract, "cuda:0")
+        modeling_isaac_vla._require_qualified_torch_cuda_abi(contract, "cuda:0")
 
 
-def test_mk1_loader_rejects_unknown_runtime_attention_backend(tmp_path) -> None:
+def test_isaac_loader_rejects_unknown_runtime_attention_backend(tmp_path) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
 
     with pytest.raises(ValueError, match="Unsupported MK1 attention backend"):
-        load_mk1_vla_from_hf(
+        load_isaac_vla_from_hf(
             model_dir,
             dtype=torch.float32,
             device="cpu",
@@ -453,19 +453,19 @@ def test_mk1_loader_rejects_unknown_runtime_attention_backend(tmp_path) -> None:
         )
 
 
-def test_mk1_loader_builds_from_the_same_config_object_it_validated(tmp_path, monkeypatch) -> None:
+def test_isaac_loader_builds_from_the_same_config_object_it_validated(tmp_path, monkeypatch) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
     reads = 0
-    original = read_mk1_config_data
+    original = read_isaac_config_data
 
     def counted_read(*args, **kwargs):
         nonlocal reads
         reads += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(modeling_mk1_vla, "read_mk1_config_data", counted_read)
-    modeling_mk1_vla.load_mk1_vla_from_hf(
+    monkeypatch.setattr(modeling_isaac_vla, "read_isaac_config_data", counted_read)
+    modeling_isaac_vla.load_isaac_vla_from_hf(
         model_dir,
         dtype=torch.bfloat16,
         device="cpu",
@@ -475,7 +475,7 @@ def test_mk1_loader_builds_from_the_same_config_object_it_validated(tmp_path, mo
     assert reads == 1
 
 
-def test_mk1_loader_rejects_shard_replaced_after_header_validation(tmp_path, monkeypatch) -> None:
+def test_isaac_loader_rejects_shard_replaced_after_header_validation(tmp_path, monkeypatch) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
     original_read = read_and_validate_safetensors_index
@@ -493,11 +493,11 @@ def test_mk1_loader_rejects_shard_replaced_after_header_validation(tmp_path, mon
         stream_opens.append(args[0])
         return original_safe_open(*args, **kwargs)
 
-    monkeypatch.setattr(modeling_mk1_vla, "read_and_validate_safetensors_index", read_then_replace)
-    monkeypatch.setattr(modeling_mk1_vla, "safe_open", opening_spy)
+    monkeypatch.setattr(modeling_isaac_vla, "read_and_validate_safetensors_index", read_then_replace)
+    monkeypatch.setattr(modeling_isaac_vla, "safe_open", opening_spy)
 
-    with pytest.raises(Mk1CheckpointContractError, match="changed after validation"):
-        load_mk1_vla_from_hf(
+    with pytest.raises(IsaacCheckpointContractError, match="changed after validation"):
+        load_isaac_vla_from_hf(
             model_dir,
             dtype=torch.bfloat16,
             device="cpu",
@@ -507,7 +507,7 @@ def test_mk1_loader_rejects_shard_replaced_after_header_validation(tmp_path, mon
     assert stream_opens == []
 
 
-def test_mk1_loader_rejects_shard_replaced_during_stream(tmp_path, monkeypatch) -> None:
+def test_isaac_loader_rejects_shard_replaced_during_stream(tmp_path, monkeypatch) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
     original_safe_open = safe_open
@@ -540,10 +540,10 @@ def test_mk1_loader_rejects_shard_replaced_during_stream(tmp_path, monkeypatch) 
         def __exit__(self, *args):
             return self.context.__exit__(*args)
 
-    monkeypatch.setattr(modeling_mk1_vla, "safe_open", ReplacingContext)
+    monkeypatch.setattr(modeling_isaac_vla, "safe_open", ReplacingContext)
 
-    with pytest.raises(Mk1CheckpointContractError, match="changed after validation"):
-        load_mk1_vla_from_hf(
+    with pytest.raises(IsaacCheckpointContractError, match="changed after validation"):
+        load_isaac_vla_from_hf(
             model_dir,
             dtype=torch.bfloat16,
             device="cpu",
@@ -553,7 +553,7 @@ def test_mk1_loader_rejects_shard_replaced_during_stream(tmp_path, monkeypatch) 
     assert replaced
 
 
-def test_mk1_loader_accepts_hf_snapshot_blob_symlinks(tmp_path) -> None:
+def test_isaac_loader_accepts_hf_snapshot_blob_symlinks(tmp_path) -> None:
     source = tmp_path / "source"
     _write_checkpoint(source)
     repository = tmp_path / "cache" / "models--org--mk1"
@@ -566,7 +566,7 @@ def test_mk1_loader_accepts_hf_snapshot_blob_symlinks(tmp_path) -> None:
         shutil.copy2(source_file, blob)
         (model_dir / source_file.name).symlink_to(blob)
 
-    model, _, _ = load_mk1_vla_from_hf(
+    model, _, _ = load_isaac_vla_from_hf(
         model_dir,
         dtype=torch.bfloat16,
         device="cpu",
@@ -576,7 +576,7 @@ def test_mk1_loader_accepts_hf_snapshot_blob_symlinks(tmp_path) -> None:
     assert all(parameter.device.type == "cpu" for parameter in model.parameters())
 
 
-def test_mk1_loader_rejects_tokenizer_mutation_before_model_allocation(tmp_path, monkeypatch) -> None:
+def test_isaac_loader_rejects_tokenizer_mutation_before_model_allocation(tmp_path, monkeypatch) -> None:
     model_dir = tmp_path / "mk1"
     _write_checkpoint(model_dir)
     tokenizer_path = model_dir / "tokenizer.json"
@@ -589,10 +589,10 @@ def test_mk1_loader_rejects_tokenizer_mutation_before_model_allocation(tmp_path,
         allocations.append((args, kwargs))
         raise AssertionError("model allocation must not run for an invalid tokenizer")
 
-    monkeypatch.setattr(modeling_mk1_vla, "Mk1Qwen36VLAForActionGeneration", allocation_spy)
+    monkeypatch.setattr(modeling_isaac_vla, "IsaacQwen36VLAForActionGeneration", allocation_spy)
 
     with pytest.raises(ValueError, match="image_pad.*expected 4"):
-        load_mk1_vla_from_hf(
+        load_isaac_vla_from_hf(
             model_dir,
             dtype=torch.bfloat16,
             device="cpu",
@@ -605,7 +605,7 @@ def test_mk1_loader_rejects_tokenizer_mutation_before_model_allocation(tmp_path,
 def test_reduced_checkpoint_runs_existing_vla_action_path_deterministically(tmp_path) -> None:
     model_dir = tmp_path / "mk1"
     contract = _write_checkpoint(model_dir)
-    model, _, _ = load_mk1_vla_from_hf(
+    model, _, _ = load_isaac_vla_from_hf(
         model_dir,
         dtype=torch.float32,
         device="cpu",

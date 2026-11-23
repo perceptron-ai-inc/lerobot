@@ -481,11 +481,11 @@ def test_recipe_groups_stay_subject_to_the_checkpoint_cross_check(tmp_path: Path
     The reserved groups are reused from the canonical MK1 contract test rather than
     rebuilt, because the cross-check being exercised is that contract's own rule.
     """
-    from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-        Mk1CheckpointContract,
-        Mk1CheckpointContractError,
+    from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+        IsaacCheckpointContract,
+        IsaacCheckpointContractError,
     )
-    from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config as _mk1_config
+    from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config as _isaac_config
 
     root = tmp_path / "isaac_0_5-export"
     policy_dir = _write_raw_isaac05_export(root)
@@ -495,12 +495,12 @@ def test_recipe_groups_stay_subject_to_the_checkpoint_cross_check(tmp_path: Path
     ]
     _write_inference_recipe(root, wrong_coord_range)
     config = _config(policy_dir)
-    contract = Mk1CheckpointContract.parse_allowlisted(_mk1_config(test_geometry=False))
+    contract = IsaacCheckpointContract.parse_allowlisted(_isaac_config(test_geometry=False))
 
     metadata = load_native_render_metadata(config)
 
     assert metadata.mharmony_reserved_token_groups == wrong_coord_range
-    with pytest.raises(Mk1CheckpointContractError, match="disagrees"):
+    with pytest.raises(IsaacCheckpointContractError, match="disagrees"):
         contract.validate_coord_reserved_token_groups(metadata.mharmony_reserved_token_groups)
 
     good_root = tmp_path / "good-export"

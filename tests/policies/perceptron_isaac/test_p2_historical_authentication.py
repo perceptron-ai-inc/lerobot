@@ -17,16 +17,16 @@ import pytest
 pytest.importorskip("transformers", reason="requires the parent-owned offline ISAAC CPU environment")
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.policies.perceptron_isaac import mk1_checkpoint_contract
+from lerobot.policies.perceptron_isaac import isaac_checkpoint_contract
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import canonical_json_sha256, file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContract,
-    validate_mk1_checkpoint,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContract,
+    validate_isaac_checkpoint,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _config as _policy_config
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config, _write_checkpoint
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config, _write_checkpoint
 from tests.policies.perceptron_isaac.test_trained_storage_contract import _render_metadata
 
 HistoricalFormat = Literal["v1", "import", "neutral"]
@@ -73,7 +73,7 @@ class ImportRecord(TypedDict):
 @dataclass(frozen=True)
 class HistoricalPackage:
     root: Path
-    expected_contract: Mk1CheckpointContract
+    expected_contract: IsaacCheckpointContract
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -100,14 +100,14 @@ def isolate_vocab_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def reduced_import_geometry(monkeypatch: pytest.MonkeyPatch) -> None:
-    read = mk1_checkpoint_contract.read_mk1_config
+    read = isaac_checkpoint_contract.read_isaac_config
 
     def read_reduced(
         model_dir: str | Path, *, allow_test_only_reduced_geometry: bool = False
-    ) -> Mk1CheckpointContract:
+    ) -> IsaacCheckpointContract:
         return read(model_dir, allow_test_only_reduced_geometry=True)
 
-    monkeypatch.setattr(mk1_checkpoint_contract, "read_mk1_config", read_reduced)
+    monkeypatch.setattr(isaac_checkpoint_contract, "read_isaac_config", read_reduced)
 
 
 def _stamp_v1(root: Path) -> None:
@@ -251,7 +251,7 @@ def _read_config(root: Path) -> PerceptronIsaacConfig:
 def _read_actual(format: HistoricalFormat, root: Path) -> PerceptronIsaacConfig:
     if format == "import":
         loaded = _read_config(root)
-        PerceptronIsaacPolicy._verify_mk1_model_import(loaded, root)
+        PerceptronIsaacPolicy._verify_isaac_model_import(loaded, root)
         return loaded
     policy = PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
     assert policy._isaac_model is None, "historical metadata validation must not allocate weights"
@@ -269,7 +269,7 @@ def test_complete_historical_readers_preserve_bytes_identity_geometry_and_invent
     before = _bytes(root)
 
     loaded = _read_actual(format, root)
-    contract, inventory = validate_mk1_checkpoint(root / "hf_model", allow_test_only_reduced_geometry=True)
+    contract, inventory = validate_isaac_checkpoint(root / "hf_model", allow_test_only_reduced_geometry=True)
 
     assert contract == package.expected_contract
     assert contract.artifact.artifact_kind == loaded.artifact_kind

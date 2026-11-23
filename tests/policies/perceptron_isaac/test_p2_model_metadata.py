@@ -15,10 +15,10 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TRAIN_CONFIG_NAME, TrainPipelineConfig
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import canonical_json_sha256, file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContract,
-    Mk1CheckpointContractError,
-    validate_mk1_checkpoint,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContract,
+    IsaacCheckpointContractError,
+    validate_isaac_checkpoint,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.trained_package import (
@@ -26,7 +26,7 @@ from lerobot.policies.perceptron_isaac.trained_package import (
     finalize_canonical_trained_package,
 )
 from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _source_package
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _config,
     _write_checkpoint,
     _write_portable_isaac05_checkpoint,
@@ -36,7 +36,7 @@ from tests.policies.perceptron_isaac.test_trained_storage_contract import (
     reduced_loader,  # noqa: F401 -- shared fixture changes geometry permission only
 )
 
-Family = Literal["isaac05", "legacy_mk1"]
+Family = Literal["isaac05", "legacy"]
 MANIFEST = "mk1_trained_package_manifest.json"
 DIGEST_FIELD = "mk1_trained_package_manifest_sha256"
 
@@ -82,7 +82,7 @@ def _legacy_authenticated_package(root: Path, *, version: Literal[2, 3] = 3) -> 
     return loaded
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy_mk1"])
+@pytest.mark.parametrize("family", ["isaac05", "legacy"])
 def test_missing_model_count_is_the_only_relaxed_source_gate(tmp_path: Path, family: Family) -> None:
     root = tmp_path / "model"
     if family == "isaac05":
@@ -100,7 +100,7 @@ def test_missing_model_count_is_the_only_relaxed_source_gate(tmp_path: Path, fam
     original_bytes = _files(root)
     assert {name for name in before if before[name] != original_bytes[name]} == {"config.json"}
 
-    contract, inventory = validate_mk1_checkpoint(
+    contract, inventory = validate_isaac_checkpoint(
         root, allow_test_only_reduced_geometry=True, allowed_storage_dtypes=allowed_dtypes
     )
 
@@ -130,8 +130,8 @@ def test_count_removal_does_not_accept_unsupported_architecture_or_identity(
     else:
         raw["genesis_artifact"]["schema_version"] = 2
         message = "schema_version"
-    with pytest.raises(Mk1CheckpointContractError, match=message):
-        Mk1CheckpointContract.parse_allowlisted(raw)
+    with pytest.raises(IsaacCheckpointContractError, match=message):
+        IsaacCheckpointContract.parse_allowlisted(raw)
 
 
 def test_unsaved_config_does_not_invent_one_model_step() -> None:

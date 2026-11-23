@@ -21,14 +21,14 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     torch_recurrent_gated_delta_rule,
 )
 
-from .loss_perceptron_isaac import _global_sum_detached
-from .mk1_checkpoint_contract import (
-    Mk1CheckpointContract,
+from .isaac_checkpoint_contract import (
+    IsaacCheckpointContract,
     SafetensorsInventory,
     read_and_validate_safetensors_index,
-    read_mk1_config_data,
-    validate_mk1_tokenizer,
+    read_isaac_config_data,
+    validate_isaac_tokenizer,
 )
+from .loss_perceptron_isaac import _global_sum_detached
 from .modeling_qwen35_vla import (
     ModelOutput,
     Qwen35VLAForActionGeneration,
@@ -38,8 +38,8 @@ from .modeling_qwen35_vla import (
 )
 from .modeling_qwen36_moe import (
     DETERMINISTIC_ROUTE_REDUCTION,
-    GenesisQwen36Model,
-    Mk1Qwen36MoeConfig,
+    IsaacQwen36Model,
+    IsaacQwen36MoeConfig,
 )
 from .moe_auxiliary_losses import materialize_router_auxiliaries
 from .tensor_stream import TensorStream
@@ -68,7 +68,7 @@ _QUALIFIED_TEXT_EXECUTION_DEFAULTS: dict[str, Any] = {
 }
 
 
-class Mk1Qwen36VLAConfig(Mk1Qwen36MoeConfig):
+class IsaacQwen36VLAConfig(IsaacQwen36MoeConfig):
     """MK1 backbone config with the two already-reviewed PR #3154 attachments."""
 
     def __init__(
@@ -87,12 +87,12 @@ class Mk1Qwen36VLAConfig(Mk1Qwen36MoeConfig):
         self.action_context_schema_version = action_context_schema_version
 
 
-class Mk1Qwen36VLAModel(GenesisQwen36Model):
+class IsaacQwen36VLAModel(IsaacQwen36Model):
     """The existing VLA modality shell around the null-aware MK1 backbone."""
 
-    config_class = Mk1Qwen36VLAConfig
+    config_class = IsaacQwen36VLAConfig
 
-    def __init__(self, config: Mk1Qwen36VLAConfig) -> None:
+    def __init__(self, config: IsaacQwen36VLAConfig) -> None:
         super().__init__(config)
         hidden = int(config.text_config.hidden_size)
         self.vector_embedding = build_vector_encoder(config.vector_max_states, hidden)
@@ -114,15 +114,15 @@ class Mk1Qwen36VLAModel(GenesisQwen36Model):
     forward = Qwen35VLAModel.forward
 
 
-class Mk1Qwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
+class IsaacQwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
     """MK1 backbone plus the unchanged vector encoder, lm head, and MolmoAct2 DiT."""
 
-    config_class = Mk1Qwen36VLAConfig
-    _no_split_modules = ["GenesisQwen36DecoderLayer", "Qwen3_5MoeVisionBlock", "ActionExpertBlock"]
+    config_class = IsaacQwen36VLAConfig
+    _no_split_modules = ["IsaacQwen36DecoderLayer", "Qwen3_5MoeVisionBlock", "ActionExpertBlock"]
 
-    def __init__(self, config: Mk1Qwen36VLAConfig) -> None:
+    def __init__(self, config: IsaacQwen36VLAConfig) -> None:
         super().__init__(config)
-        self.model = Mk1Qwen36VLAModel(config)
+        self.model = IsaacQwen36VLAModel(config)
         self.lm_head = nn.Linear(
             config.text_config.hidden_size,
             config.text_config.vocab_size,
@@ -182,8 +182,8 @@ class Mk1Qwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
 
 def _build_config(
     raw: dict[str, Any],
-    contract: Mk1CheckpointContract,
-) -> Mk1Qwen36VLAConfig:
+    contract: IsaacCheckpointContract,
+) -> IsaacQwen36VLAConfig:
     normalized = copy.deepcopy(raw)
     for key, value in _QUALIFIED_COMMON_EXECUTION_DEFAULTS.items():
         normalized.setdefault(key, value)
@@ -202,7 +202,7 @@ def _build_config(
         action_expert.pop("num_inference_steps", None)
     normalized.pop("action_expert", None)
     normalized.pop("vector_max_states", None)
-    config = Mk1Qwen36VLAConfig(
+    config = IsaacQwen36VLAConfig(
         vector_max_states=contract.vector_encoder.max_states,
         action_expert=action_expert,
         action_context_schema_version=normalized["genesis_vla"]["schema_version"],
@@ -213,7 +213,7 @@ def _build_config(
     return config
 
 
-def _runtime_expected_keys(contract: Mk1CheckpointContract) -> set[str]:
+def _runtime_expected_keys(contract: IsaacCheckpointContract) -> set[str]:
     excluded = contract.excluded_runtime_prefixes
     return {
         key
@@ -222,7 +222,7 @@ def _runtime_expected_keys(contract: Mk1CheckpointContract) -> set[str]:
     }
 
 
-def _configure_attention_backend(config: Mk1Qwen36VLAConfig, attention_backend: str) -> None:
+def _configure_attention_backend(config: IsaacQwen36VLAConfig, attention_backend: str) -> None:
     if attention_backend != TORCH_SDPA_ATTENTION_BACKEND:
         raise ValueError(
             f"Unsupported MK1 attention backend {attention_backend!r}; "
@@ -235,13 +235,13 @@ def _configure_attention_backend(config: Mk1Qwen36VLAConfig, attention_backend: 
     config.vision_config._attn_implementation = "sdpa"
 
 
-def _configure_route_reduction(config: Mk1Qwen36VLAConfig, route_reduction: str) -> None:
+def _configure_route_reduction(config: IsaacQwen36VLAConfig, route_reduction: str) -> None:
     if route_reduction != DETERMINISTIC_ROUTE_REDUCTION:
         raise ValueError(
             f"Unsupported MK1 route reduction {route_reduction!r}; "
             f"expected {DETERMINISTIC_ROUTE_REDUCTION!r}."
         )
-    config.text_config._mk1_route_reduction = route_reduction
+    config.text_config._isaac_route_reduction = route_reduction
 
 
 def _require_qualified_transformers_abi() -> None:
@@ -253,7 +253,7 @@ def _require_qualified_transformers_abi() -> None:
 
 
 def _require_qualified_torch_cuda_abi(
-    contract: Mk1CheckpointContract,
+    contract: IsaacCheckpointContract,
     device: str | torch.device,
 ) -> None:
     """Fail closed on the CUDA ABI used for production parity qualification."""
@@ -354,7 +354,7 @@ def _select_gdn_backend(model: nn.Module, device: str | torch.device) -> None:
         module.norm = Qwen3_5MoeRMSNormGated(module.head_v_dim, eps=module.layer_norm_epsilon)
 
 
-def load_mk1_vla_from_hf(
+def load_isaac_vla_from_hf(
     model_dir: str | Path,
     *,
     dtype: torch.dtype = torch.bfloat16,
@@ -366,7 +366,7 @@ def load_mk1_vla_from_hf(
     allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
     load_intent: Literal["inference", "training"] = "inference",
     verified_tensor_storage: VerifiedTrainedTensorStorage | None = None,
-) -> tuple[Mk1Qwen36VLAForActionGeneration, Mk1Qwen36VLAConfig, Mk1CheckpointContract]:
+) -> tuple[IsaacQwen36VLAForActionGeneration, IsaacQwen36VLAConfig, IsaacCheckpointContract]:
     """Validate, construct once on meta, and stream an MK1 VLA using the qualified SDPA backend.
 
     ``device`` is where the weights are materialized. ``runtime_device`` (default: ``device``) is
@@ -392,7 +392,7 @@ def load_mk1_vla_from_hf(
         ):
             raise ValueError("training load requires lossless F32 storage and runtime")
     _require_qualified_transformers_abi()
-    raw, contract = read_mk1_config_data(
+    raw, contract = read_isaac_config_data(
         root,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
@@ -404,7 +404,7 @@ def load_mk1_vla_from_hf(
     contract.validate_tensor_inventory(inventory, allowed_storage_dtypes=allowed_storage_dtypes)
     if verified_tensor_storage is not None:
         verified_tensor_storage.require_header_dtypes(inventory)
-    validate_mk1_tokenizer(root, contract)
+    validate_isaac_tokenizer(root, contract)
     if verified_tensor_storage is not None:
         # Bind every loader-read metadata file through its final read, before allocation.
         verified_tensor_storage.verify_for_materialization()
@@ -413,7 +413,7 @@ def load_mk1_vla_from_hf(
     _configure_route_reduction(config, route_reduction)
 
     with init_empty_weights(include_buffers=False):
-        model = Mk1Qwen36VLAForActionGeneration(config)
+        model = IsaacQwen36VLAForActionGeneration(config)
         _select_gdn_backend(model, run_device)
     expected_keys = _runtime_expected_keys(contract)
     model_keys = set(model.state_dict())
@@ -450,11 +450,11 @@ def load_mk1_vla_from_hf(
 
 
 __all__ = [
-    "Mk1Qwen36VLAConfig",
-    "Mk1Qwen36VLAForActionGeneration",
-    "Mk1Qwen36VLAModel",
+    "IsaacQwen36VLAConfig",
+    "IsaacQwen36VLAForActionGeneration",
+    "IsaacQwen36VLAModel",
     "QUALIFIED_TORCH_CUDA_ABI",
     "QUALIFIED_TRANSFORMERS_VERSION",
     "TORCH_SDPA_ATTENTION_BACKEND",
-    "load_mk1_vla_from_hf",
+    "load_isaac_vla_from_hf",
 ]

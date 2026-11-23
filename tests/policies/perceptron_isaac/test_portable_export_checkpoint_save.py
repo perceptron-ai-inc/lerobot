@@ -14,9 +14,9 @@ pytest.importorskip("transformers", reason="transformers is required (install le
 
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContractError,
-    finalize_mk1_runtime_checkpoint_layout,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContractError,
+    finalize_isaac_runtime_checkpoint_layout,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import (
     PerceptronIsaacPolicy,
@@ -136,7 +136,7 @@ def test_embedded_model_assets_keep_the_export_storage_contract(tmp_path: Path) 
     assert _package_storage_dtypes(checkpoint) == frozenset({"BF16"})
 
 
-def test_plain_mk1_model_directory_is_bf16_storage(tmp_path: Path) -> None:
+def test_plain_isaac_model_directory_is_bf16_storage(tmp_path: Path) -> None:
     model_root = tmp_path / "hf_model"
     model_root.mkdir()
     (model_root / "config.json").write_text('{"model_type": "qwen3_5_moe"}\n')
@@ -157,18 +157,18 @@ def test_finalize_reads_the_vla_namespace_the_saved_config_uses(tmp_path: Path, 
         )
     )
     (model_root / "model.safetensors.index.json").write_text('{"weight_map": {}}\n')
-    finalize_mk1_runtime_checkpoint_layout(model_root)
+    finalize_isaac_runtime_checkpoint_layout(model_root)
 
 
 def test_finalize_still_refuses_a_config_with_no_vla_block(tmp_path: Path) -> None:
     model_root = tmp_path / "no_vla"
     model_root.mkdir()
     (model_root / "config.json").write_text('{"model_type": "isaac_0_5", "text_config": {}}\n')
-    with pytest.raises(Mk1CheckpointContractError, match="missing its MTP contract"):
-        finalize_mk1_runtime_checkpoint_layout(model_root)
+    with pytest.raises(IsaacCheckpointContractError, match="missing its MTP contract"):
+        finalize_isaac_runtime_checkpoint_layout(model_root)
 
 
-def test_finalize_still_refuses_an_mk1_package_without_source_identity(tmp_path: Path) -> None:
+def test_finalize_still_refuses_an_isaac_package_without_source_identity(tmp_path: Path) -> None:
     checkpoint = tmp_path / "checkpoint"
     model_root = checkpoint / "hf_model"
     model_root.mkdir(parents=True)

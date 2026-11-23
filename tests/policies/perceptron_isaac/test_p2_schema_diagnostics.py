@@ -16,16 +16,16 @@ import pytest
 pytest.importorskip("transformers", reason="requires the parent-owned ISAAC CPU environment")
 
 from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContract,
-    Mk1CheckpointContractError,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContract,
+    IsaacCheckpointContractError,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import _validate_action_expert_contract
 from lerobot.policies.perceptron_isaac.trained_package import finalize_canonical_trained_package
 from tests.policies.perceptron_isaac.test_action_expert_contract import _dit_contract
 from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _source_package
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _write_portable_isaac05_checkpoint
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _write_portable_isaac05_checkpoint
 from tests.policies.perceptron_isaac.test_portable_model_repo import _native_portable_package
 
 
@@ -49,7 +49,7 @@ def test_hf_validator_names_malformed_layerwise_semantics(schema: int) -> None:
 
 
 @pytest.mark.parametrize("schema", [1, 2])
-def test_mk1_validator_names_malformed_layerwise_semantics(tmp_path: Path, schema: int) -> None:
+def test_isaac_validator_names_malformed_layerwise_semantics(tmp_path: Path, schema: int) -> None:
     _, raw, _ = _write_portable_isaac05_checkpoint(tmp_path / "model")
     raw["action_expert"].update(
         schema_version=schema,
@@ -58,8 +58,8 @@ def test_mk1_validator_names_malformed_layerwise_semantics(tmp_path: Path, schem
         context_hidden_norm="final_norm",
     )
     raw["isaac05_vla"]["action_expert"] = copy.deepcopy(raw["action_expert"])
-    with pytest.raises(Mk1CheckpointContractError) as caught:
-        Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+    with pytest.raises(IsaacCheckpointContractError) as caught:
+        IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
     _assert_invalid_layerwise(str(caught.value))
 
 
@@ -67,7 +67,7 @@ def test_mk1_validator_names_malformed_layerwise_semantics(tmp_path: Path, schem
 def test_public_load_refuses_out_of_range_schema2_before_model_allocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lazy: bool
 ) -> None:
-    import lerobot.policies.perceptron_isaac.modeling_mk1_vla as native
+    import lerobot.policies.perceptron_isaac.modeling_isaac_vla as native
 
     policy_path, config, _ = _native_portable_package(tmp_path)
     config.train_storage_fp32 = lazy
@@ -86,7 +86,7 @@ def test_public_load_refuses_out_of_range_schema2_before_model_allocation(
     def forbid_model(*args: object, **kwargs: object) -> None:
         raise AssertionError("out-of-range schema2 reached model allocation")
 
-    monkeypatch.setattr(native, "Mk1Qwen36VLAForActionGeneration", forbid_model)
+    monkeypatch.setattr(native, "IsaacQwen36VLAForActionGeneration", forbid_model)
     with pytest.raises((ValueError, RuntimeError)) as caught:
         PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
     assert "context_layers" in str(caught.value)
@@ -96,7 +96,7 @@ def test_public_load_refuses_out_of_range_schema2_before_model_allocation(
 def test_schema1_control_is_accepted_by_both_real_validators(tmp_path: Path) -> None:
     _validate_action_expert_contract(_dit_contract())
     _, raw, _ = _write_portable_isaac05_checkpoint(tmp_path / "model")
-    contract = Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+    contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
     assert contract.action_expert.num_layers == 2
 
 
@@ -143,10 +143,10 @@ def _forbid_construction(*args: object, **kwargs: object) -> NoReturn:
 
 
 def _construction_tripwires(monkeypatch: pytest.MonkeyPatch) -> None:
-    import lerobot.policies.perceptron_isaac.modeling_mk1_vla as native
+    import lerobot.policies.perceptron_isaac.modeling_isaac_vla as native
 
     monkeypatch.setattr(PerceptronIsaacPolicy, "__init__", _forbid_construction)
-    monkeypatch.setattr(native, "Mk1Qwen36VLAForActionGeneration", _forbid_construction)
+    monkeypatch.setattr(native, "IsaacQwen36VLAForActionGeneration", _forbid_construction)
 
 
 @pytest.mark.parametrize("schema", [1, 2], ids=["schema1-per-layer", "schema2-per-layer"])
