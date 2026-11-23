@@ -34,6 +34,10 @@ NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
 # checkpoint's own declaration of the mHarmony reserved-token layout it was trained with.
 NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
 
+# Fields that the runtime config no longer has. Authenticated packages still carry them, so they are
+# dropped when a config is read and their files are never rewritten.
+RETIRED_CONFIG_FIELDS = frozenset({"trained_steps", "action_expert_type"})
+
 
 def reject_legacy_action_conditioning(enabled: bool) -> None:
     """Reject historical executed-action conditioning without removing FAST targets."""
@@ -112,9 +116,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # --- expert / inference ---
     # Native eval/serving backend. No Genesis bridge backend is supported.
     inference_backend: str = "native_mharmony"
-    # Compatibility label only: released packages serialize "molmoact". The head is always the
-    # native DiT built from the checkpoint's action_expert metadata; this value selects nothing.
-    action_expert_type: str = "molmoact"
     num_inference_steps: int = 10
     # Flow-sample averaging: sample the flow ODE `num_flow_samples` times (fresh noise each) and
     # mean the normalized chunks before unnormalize. 1 = single sample (no averaging).
@@ -334,8 +335,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
 
     @classmethod
     def migrate_config(cls, config: dict[str, Any]) -> dict[str, Any]:
-        """Retire the model count only in memory; authenticated files stay byte-exact."""
-        return {key: value for key, value in config.items() if key != "trained_steps"}
+        """Retire fields only in memory; authenticated files stay byte-exact."""
+        return {key: value for key, value in config.items() if key not in RETIRED_CONFIG_FIELDS}
 
     def raw_export_saving_unsupported(self, package_root: Path | None = None) -> bool:
         """Recognize raw layouts without allocating a policy or changing relative paths."""
@@ -425,12 +426,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
             raise ValueError(
                 "Perceptron Isaac artifact_kind must be 'trained_policy' or 'neutral_debug', "
                 f"got {self.artifact_kind!r}."
-            )
-        # Both labels describe the native DiT head (see the field comment).
-        if self.action_expert_type not in {"molmoact", "dit"}:
-            raise ValueError(
-                "Perceptron Isaac action_expert_type must be 'molmoact' or 'dit'; "
-                f"got {self.action_expert_type!r}."
             )
         if self.n_obs_steps not in (1, 3):
             raise ValueError(

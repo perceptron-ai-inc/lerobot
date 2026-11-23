@@ -131,7 +131,6 @@ def test_policy_loads_portable_repo_through_native_mk1(
     assert model.action_expert.args.rtc_max_delay_steps == 12
     assert model.action_expert.args.rtc_probability == 0.5
     assert model.config.action_expert["type"] == "dit"
-    assert policy.config.action_expert_type == "molmoact"
     assert policy.config.artifact_kind == "neutral_debug"
     assert all(parameter.dtype == torch.bfloat16 for parameter in model.parameters())
     assert all(parameter.device.type == "cpu" for parameter in model.parameters())

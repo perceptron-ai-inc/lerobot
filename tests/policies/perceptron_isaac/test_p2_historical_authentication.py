@@ -193,6 +193,8 @@ def _historical_package(root: Path, format: HistoricalFormat, *, count_present: 
     payload = _json(root / "config.json")
     if count_present:
         payload["trained_steps"] = artifact["trained_steps"]
+    # Every historical policy config serialized this label, which the runtime config no longer has.
+    payload["action_expert_type"] = "molmoact"
     _write_json(root / "config.json", payload)
     if format == "neutral":
         files = {name: file_sha256(root / name) for name in _bytes(root)}
@@ -278,6 +280,11 @@ def test_complete_historical_readers_preserve_bytes_identity_geometry_and_invent
     for shard in inventory.shards:
         inventory.verify_shard_identity(shard)
     assert "trained_steps" not in loaded.to_dict()
+    # The retired label is dropped when the config is read, while its authenticated file keeps it.
+    assert "action_expert_type" not in loaded.to_dict()
+    assert not hasattr(loaded, "action_expert_type")
+    assert _json(root / "config.json")["action_expert_type"] == "molmoact"
+    assert _bytes(root) == before
     source_artifact = _json(root / "hf_model/config.json")["genesis_artifact"]
     assert ("trained_steps" in source_artifact) == count_present
     if format == "neutral":
