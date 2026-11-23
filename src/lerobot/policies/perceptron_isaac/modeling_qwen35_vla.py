@@ -991,9 +991,8 @@ class ActionExpert(nn.Module):
 # ---------------------------------------------------------------------------
 # Native Isaac DiT action-expert head. The vendored ActionExpert (above) is driven from
 # schema-1 FINAL-layer activations as a shared context or schema-2 ordered
-# post-residual layer contexts (clean-at-1), ported from genesis DiTActionExpert. Geometry comes
-# from IsaacConfig.action_expert; weights nest as action_expert.action_expert.*
-# (mirrors genesis flow_matching_expert.action_expert.* -> pure converter prefix swap).
+# post-residual layer contexts (clean-at-1). Geometry comes from IsaacConfig.action_expert;
+# weights nest as action_expert.action_expert.*.
 # ---------------------------------------------------------------------------
 
 
@@ -1147,8 +1146,7 @@ def _validate_action_expert_contract(action_expert_cfg: dict[str, Any]) -> DiTAc
 class DiTActionExpertHead(nn.Module):
     """The native Isaac05 DiT action expert, the only supported action head.
 
-    Bounded port of Genesis ``DiTActionExpert`` (a MolmoAct2-derived DiT): the same
-    parameter names, shapes and clean-at-1 flow convention. ``context_k/v_proj`` project
+    A MolmoAct2-derived DiT with the clean-at-1 flow convention. ``context_k/v_proj`` project
     vlm_dim->hidden; every weight loads verbatim. RTC prefix sampling is inference-only.
     """
 
@@ -1329,9 +1327,9 @@ class DiTActionExpertHead(nn.Module):
         horizon_emb: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Differentiable single-step velocity prediction (training). Mirrors genesis
-        ``DiTActionExpert.forward``: build the declared contexts once, run the expert at the
-        clean-at-1 flow time ``1 - tau`` (Genesis ``tau`` is the noise level). ``x_tau`` is ``[B,H,D]`` or ``[K,B,H,D]`` (K MC samples looped against the
+        """Differentiable single-step velocity prediction (training): build the declared
+        contexts once, run the expert at the clean-at-1 flow time ``1 - tau`` (``tau`` is the noise
+        level). ``x_tau`` is ``[B,H,D]`` or ``[K,B,H,D]`` (K MC samples looped against the
         shared context to bound memory). ``horizon_emb`` is ignored (positions come from RoPE)."""
         del horizon_emb
         if x_tau.dim() == 4:
@@ -1501,8 +1499,8 @@ class DiTActionExpertHead(nn.Module):
         return x.reshape(sample_count, batch_size, horizon, full_dim).mean(dim=0)
 
 
-# Geometry fields a legacy MK1 action block may carry; it never declares a recipe or RTC support.
-_LEGACY_MK1_ACTION_FIELDS = frozenset(
+# Geometry fields a legacy action block may carry; it never declares a recipe or RTC support.
+_LEGACY_ACTION_FIELDS = frozenset(
     {
         "type",
         "clean_at_0",
@@ -1524,17 +1522,17 @@ _LEGACY_MK1_ACTION_FIELDS = frozenset(
 )
 
 
-def _dit_metadata_from_legacy_mk1(cfg: dict[str, Any], *, schema_version: int) -> dict[str, Any]:
-    """Express a legacy MK1 action block as native DiT metadata.
+def _dit_metadata_from_legacy_block(cfg: dict[str, Any], *, schema_version: int) -> dict[str, Any]:
+    """Express a legacy action block as native DiT metadata.
 
-    Legacy MK1 checkpoints store the same clean-at-1 network under ``type="molmoact"``
+    Legacy checkpoints store the same clean-at-1 network under ``type="molmoact"``
     without the native recipe fields. Their missing fields take the DiT defaults, which
     equal the legacy sampling and training defaults; RTC stays off.
     """
     if cfg.get("clean_at_0", False) is not False:
         raise ValueError("clean-at-0 action experts are unsupported; Isaac uses the clean-at-1 DiT.")
     native = asdict(DiTActionExpertArgs())
-    unexpected = sorted(set(cfg) - _LEGACY_MK1_ACTION_FIELDS - set(DIT_CONTEXT_CONDITIONING_FIELDS))
+    unexpected = sorted(set(cfg) - _LEGACY_ACTION_FIELDS - set(DIT_CONTEXT_CONDITIONING_FIELDS))
     if unexpected:
         raise ValueError(f"legacy action_expert metadata has unexpected fields: {unexpected}.")
     native.update({key: value for key, value in cfg.items() if key in native})
@@ -1553,7 +1551,7 @@ def build_action_expert_head(
 ) -> DiTActionExpertHead | None:
     """Construct the native DiT action-expert head.
 
-    DiT schemas 1 and 2 share the native clean-at-one head and weight ABI. Legacy MK1
+    DiT schemas 1 and 2 share the native clean-at-one head and weight ABI. Legacy
     ``type="molmoact"`` blocks hold the same network and load as DiT metadata with RTC
     off; their conditioning schema comes from the VLA envelope, not the action block.
     Prefix RTC inference is gated by the checkpoint's declared RTC support.
@@ -1571,7 +1569,7 @@ def build_action_expert_head(
         validate_action_context(
             cfg, schema_version=context_schema_version, backbone_num_layers=backbone_num_layers
         )
-        cfg = _dit_metadata_from_legacy_mk1(cfg, schema_version=context_schema_version)
+        cfg = _dit_metadata_from_legacy_block(cfg, schema_version=context_schema_version)
     elif head_type != "dit":
         raise ValueError(f"unknown action_expert type {head_type!r}; only 'dit' is supported.")
     conditioning = validate_dit_action_metadata(cfg, backbone_num_layers=backbone_num_layers)

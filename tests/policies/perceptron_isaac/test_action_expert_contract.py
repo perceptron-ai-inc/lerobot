@@ -72,7 +72,7 @@ def test_genesis_dit_contract_builds_the_vendored_head():
     assert head.args.rtc_max_delay_steps == 0
 
 
-def test_legacy_mk1_action_block_loads_as_dit_without_rtc():
+def test_legacy_action_block_loads_as_dit_without_rtc():
     head = build_action_expert_head(_molmoact_cfg(), vlm_dim=_VLM_DIM)
     assert type(head).__name__ == "DiTActionExpertHead"
     assert head.args.rtc_max_delay_steps == 0
@@ -100,7 +100,7 @@ def test_unknown_expert_type_still_fails_loud():
         build_action_expert_head({"type": "genesis-flow-v2"}, vlm_dim=_VLM_DIM)
 
 
-def test_legacy_mk1_action_block_rejects_rtc_prefix():
+def test_legacy_action_block_rejects_rtc_prefix():
     head = build_action_expert_head(_molmoact_cfg(), vlm_dim=_VLM_DIM)
     with pytest.raises(ValueError, match="maximum supported RTC prefix 0"):
         head.sample(torch.zeros(1, 3, _VLM_DIM), action_prefix=torch.zeros(1, 2, 4), prefix_length=2)

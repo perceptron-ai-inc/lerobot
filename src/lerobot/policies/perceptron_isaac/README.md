@@ -1,7 +1,7 @@
 # Perceptron ISAAC native runtime (draft)
 
-In-tree `perceptron_isaac` policy and processors for preconverted native MK1
-and Isaac-0.5 packages. The offline checkpoint producer is not included.
+In-tree `perceptron_isaac` policy and processors for preconverted native
+Isaac-0.5 packages. The offline checkpoint producer is not included.
 Generic Qwen checkpoint packages, PEFT, expert-only training and FSDP1 training
 are unsupported and fail explicitly. Developer parity artifact tooling is not included.
 
@@ -71,7 +71,7 @@ torchrun --standalone --nproc_per_node="$GPUS" -m lerobot.scripts.lerobot_train 
 Native FP32 initialization requires training, F32 package storage, live FSDP2,
 FP32 master storage, no PEFT and no expert-only training. It fails closed on
 unsupported private Torch interfaces, missing/root-uncovered trainables or
-non-FP32 masters. Other load paths retain BF16 behavior. Production MK1's
+non-FP32 masters. Other load paths retain BF16 behavior. The
 qualified hardware/ABI is H100 SM90 / CUDA 12.8. Budget for the 143 GB package,
 full model host materialization and optimizer state; the mechanics proof used
 16 H100s over two hosts, not a laptop or single-GPU recipe.
@@ -114,7 +114,7 @@ RoPE frequencies in F32 from the original formula, including BF16-source trainin
 They do not replace parameters or widen a rounded BF16 table. Inference retains
 the released BF16 frequency table and phase behavior.
 
-The action expert is always the native DiT. Legacy MK1 checkpoints, whose action
+The action expert is always the native DiT. Legacy checkpoints, whose action
 block says `type="molmoact"`, hold the same network and load into it with RTC off.
 
 Prompts carry an episode-time item before each observation only when the
@@ -171,7 +171,7 @@ modules. That proof was on HF base `8c920c4` plus runtime `9c315c1` and CUT
 not this updated HF base `ae2b57f`.
 
 Raw/portable-export saving is deferred and fails before gathering weights or writing
-package assets. Source-bound native MK1 saves remain implemented. Focused CPU tests
+package assets. Source-bound native saves remain implemented. Focused CPU tests
 cover reduced native save/finalize/moved reload, exact FP32 values and signed zero;
 that is not production-scale checkpoint qualification.
 
