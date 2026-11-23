@@ -33,6 +33,7 @@ from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
 )
 from lerobot.policies.perceptron_isaac.tensor_stream import VectorType
 from lerobot.policies.perceptron_isaac.trained_package import (
+    ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
     finalize_canonical_trained_package,
     rewrite_trained_processor_paths,
 )
@@ -247,7 +248,7 @@ def test_authenticated_render_profile_survives_retire_save_move_restore(
 
 
 @pytest.mark.parametrize(
-    "asset", ["policy_inference_recipe.json", "isaac_stats.json", "mk1_trained_package_manifest.json"]
+    "asset", ["policy_inference_recipe.json", "isaac_stats.json", ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME]
 )
 def test_authenticated_render_source_rejects_byte_tamper(tmp_path: Path, asset: str) -> None:
     source = tmp_path / "source"
@@ -258,6 +259,10 @@ def test_authenticated_render_source_rejects_byte_tamper(tmp_path: Path, asset: 
     assert admitted._verified_runtime_assets is not None
     changed = source / asset
     changed.write_bytes(changed.read_bytes() + b"\n")
-    expected = "manifest digest mismatch" if asset.startswith("mk1_") else f"digest mismatch for {asset}"
+    expected = (
+        "manifest digest mismatch"
+        if asset == ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME
+        else f"digest mismatch for {asset}"
+    )
     with pytest.raises(RuntimeError, match=expected):
         PerceptronIsaacPolicy.from_pretrained(source, local_files_only=True, strict=True)

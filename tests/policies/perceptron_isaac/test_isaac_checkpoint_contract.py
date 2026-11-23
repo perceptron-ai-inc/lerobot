@@ -526,7 +526,7 @@ def test_reduced_geometry_requires_serialized_and_call_site_opt_in() -> None:
         IsaacCheckpointContract.parse_allowlisted(config)
 
     del config[ISAAC_TEST_GEOMETRY_MARKER]
-    with pytest.raises(IsaacCheckpointContractError, match="production MK1"):
+    with pytest.raises(IsaacCheckpointContractError, match="production Isaac"):
         IsaacCheckpointContract.parse_allowlisted(config, allow_test_only_reduced_geometry=True)
 
 
@@ -686,7 +686,7 @@ def test_validated_inventory_rejects_same_shape_shard_replacement(tmp_path: Path
 def test_contract_validation_accepts_hf_snapshot_blob_symlinks(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _write_checkpoint(source)
-    repository = tmp_path / "cache" / "models--org--mk1"
+    repository = tmp_path / "cache" / "models--org--isaac"
     blobs = repository / "blobs"
     model_dir = repository / "snapshots" / "revision" / "hf_model"
     blobs.mkdir(parents=True)

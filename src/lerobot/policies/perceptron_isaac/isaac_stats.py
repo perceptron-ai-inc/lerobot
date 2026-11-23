@@ -17,8 +17,8 @@ from typing import Any
 import numpy as np
 import torch
 
-# The native quantile math is hardcoded to this epsilon, matching Genesis's
-# quantile_normalization default. Checkpoints declaring a different value cannot be served
+# The native quantile math is hardcoded to this epsilon, the value the bases were trained
+# with. Checkpoints declaring a different value cannot be served
 # faithfully, so the importer rejects them rather than silently substituting this one.
 NATIVE_NORMALIZATION_EPS = 1e-6
 
@@ -43,7 +43,7 @@ def _effective_quantile_bounds(
     upper = np.asarray(q99, dtype=np.float32)
     if lower.shape != upper.shape:
         raise ValueError(f"{error_prefix}: lower shape {lower.shape} != upper shape {upper.shape}.")
-    # Match Genesis _coerce_quantile_stats: corrupt stats must fail loudly rather than
+    # Corrupt stats must fail loudly rather than
     # silently sign-flipping or NaN-ing a normalized dimension.
     if lower.size == 0:
         raise ValueError(f"{error_prefix}: stats must be non-empty.")
@@ -51,7 +51,7 @@ def _effective_quantile_bounds(
         raise ValueError(f"{error_prefix}: stats must be finite.")
     if bool(np.any(upper < lower)):
         raise ValueError(f"{error_prefix}: stats must satisfy q99 >= q01.")
-    # Genesis has no identity/collapsed special case: it normalizes a collapsed dim through
+    # There is no identity/collapsed special case: a collapsed dim is normalized through
     # the eps denominator, so a raw value equal to q01 maps to -1.0 rather than 0.0.
     collapsed = upper - lower <= eps
     if minimum is None or maximum is None:
@@ -100,8 +100,7 @@ def _unnormalize_quantile(
     arr = np.asarray(x_norm, dtype=np.float32)
     if arr.shape[-1] != lower.shape[0]:
         raise ValueError(f"{error_prefix}: last dim {arr.shape[-1]} != stats dim {lower.shape[0]}.")
-    # Include +eps so this is the exact inverse of _normalize_quantile, matching Genesis
-    # unnormalize_quantile.
+    # Include +eps so this is the exact inverse of _normalize_quantile.
     return lower + (arr + 1.0) * 0.5 * (upper - lower + eps)
 
 
@@ -136,8 +135,7 @@ class IsaacStatsBlock:
 
     ``mask`` mirrors MolmoAct2's stat key of the same name: True normalizes the dimension,
     False passes the raw physical value straight through. None (the default) normalizes
-    every dimension, which is Genesis's own behaviour and what every checkpoint imported
-    before the mask existed encodes.
+    every dimension, which is what every checkpoint imported before the mask existed encodes.
     """
 
     q01: np.ndarray
@@ -270,7 +268,7 @@ def apply_gripper_passthrough(
 ) -> IsaacNormalizationStats:
     """Return `stats` with gripper dimensions marked passthrough on both blocks.
 
-    Genesis normalizes every dimension including the grippers; MolmoAct2 masks its gripper
+    The ISAAC bases normalize every dimension including the grippers; MolmoAct2 masks its gripper
     dimensions out and feeds them in physical units. This is the ISAAC-side switch for the
     latter. It is a change to the representation the base checkpoint was pretrained on, so
     callers opt in explicitly rather than getting it by default.
@@ -312,7 +310,7 @@ def load_isaac_stats(path: str | Path) -> IsaacNormalizationStats:
 def load_isaac_suite_stats(path: str | Path) -> dict[str, IsaacNormalizationStats]:
     """Load one normalization block per dataset scope, keyed by scope name.
 
-    Multi-suite LIBERO training needs this because Genesis normalizes every LIBERO suite by its
+    Multi-suite LIBERO training needs this because every LIBERO suite is normalized by its
     own quantiles and the suites are genuinely not interchangeable -- end-effector height spans
     [0.916, 1.286] in ``libero_spatial`` but [0.010, 0.337] in ``libero_object``. Those ranges do
     not overlap, so normalizing one suite with another's stats drives proprio far outside

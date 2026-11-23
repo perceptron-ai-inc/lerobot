@@ -180,7 +180,7 @@ class _LoaderStoppedError(Exception):
 
 
 def _record_loader_calls(monkeypatch: pytest.MonkeyPatch, *, stop: bool = False) -> list[dict]:
-    """Record the keyword arguments the policy passes to the MK1 loader (then load, or stop)."""
+    """Record the keyword arguments the policy passes to the Isaac loader (then load, or stop)."""
     real_loader = modeling_isaac_vla.load_isaac_vla_from_hf
     calls: list[dict] = []
 
@@ -347,7 +347,7 @@ def test_the_f32_streaming_primitive_adds_no_anonymous_copy_in_a_fresh_process(t
     """R2 (isolated characterization of the unchanged loader primitive, with a copying control).
 
     A fresh process per measurement, warmed up through the same primitive. The F32 stream must add
-    under 10% of the tensor bytes; the BF16 stream -- the pre-candidate MK1 call -- must add at least
+    under 10% of the tensor bytes; the BF16 stream -- the pre-candidate Isaac call -- must add at least
     40% (a BF16 copy is 50%), proving the measurement detects a copy.
     """
     numel = 16 * 1024 * 1024  # 64 MiB of F32: well above allocator noise
@@ -902,7 +902,7 @@ def test_fsdp1_training_refuses_before_backbone_load(tmp_path, monkeypatch) -> N
 
 
 def test_bf16_storage_package_fsdp2_training_load_is_unchanged(tmp_path, monkeypatch) -> None:
-    """Control: a BF16-storage MK1 package keeps the BF16 load (no lossless F32 source exists).
+    """Control: a BF16-storage Isaac package keeps the BF16 load (no lossless F32 source exists).
 
     Only the storage classification the load decision reads is stubbed to BF16; the preflight still
     validates the fixture's real F32 bytes. The loader call is recorded and stopped.

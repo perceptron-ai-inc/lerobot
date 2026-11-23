@@ -164,7 +164,7 @@ def test_null_moe_defaults_to_qualified_stable_route_reduction() -> None:
     IsaacNullSparseMoeBlock(config)
 
     config._isaac_route_reduction = "repeated_index_add"
-    with pytest.raises(ValueError, match="Unsupported MK1 route reduction"):
+    with pytest.raises(ValueError, match="Unsupported Isaac route reduction"):
         IsaacNullSparseMoeBlock(config)
 
 

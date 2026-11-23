@@ -273,7 +273,7 @@ def _tiny_backbone(
     )
     raw = copy.deepcopy(raw)
     if serialization == "vla-schema2":
-        # Archived migrated MK1 uses the VLA envelope's schema 2 with the legacy
+        # The archived migrated layout uses the VLA envelope's schema 2 with the legacy
         # MolmoAct weight ABI; it must not silently ignore the conditioning triple.
         canonical_action = raw["genesis_vla"]["action_expert"]
         for field in ("context_source", "context_layers", "context_hidden_norm"):

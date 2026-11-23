@@ -47,7 +47,7 @@ def parse_trained_tensor_storage_dtypes(metadata: object) -> frozenset[str]:
     """Read the exact v3 storage declaration, never infer a missing declaration."""
     if not isinstance(metadata, dict) or set(metadata) != {"tensor_storage_dtypes"}:
         raise RuntimeError(
-            "MK1 trained storage declaration metadata must contain only tensor_storage_dtypes."
+            "Isaac trained storage declaration metadata must contain only tensor_storage_dtypes."
         )
     values = metadata["tensor_storage_dtypes"]
     if (
@@ -56,7 +56,7 @@ def parse_trained_tensor_storage_dtypes(metadata: object) -> frozenset[str]:
         or any(not isinstance(value, str) or value not in {"BF16", "F32"} for value in values)
         or values != sorted(set(values))
     ):
-        raise RuntimeError("MK1 tensor_storage_dtypes must be a sorted distinct nonempty BF16/F32 list.")
+        raise RuntimeError("Isaac tensor_storage_dtypes must be a sorted distinct nonempty BF16/F32 list.")
     return frozenset(values)
 
 
@@ -81,7 +81,7 @@ class VerifiedTrainedTensorStorage:
 
     def for_model(self, model_root: Path) -> frozenset[str]:
         if model_root.resolve(strict=True) != self.model_root:
-            raise RuntimeError("Verified MK1 tensor storage belongs to a different model directory.")
+            raise RuntimeError("Verified Isaac tensor storage belongs to a different model directory.")
         self.verify_source_unchanged()
         return self.dtypes
 
@@ -94,9 +94,9 @@ class VerifiedTrainedTensorStorage:
             try:
                 actual = file_sha256(path)
             except (OSError, ValueError) as exc:
-                raise RuntimeError(f"Authenticated MK1 model metadata changed: {path.name}") from exc
+                raise RuntimeError(f"Authenticated Isaac model metadata changed: {path.name}") from exc
             if not hmac.compare_digest(actual, expected):
-                raise RuntimeError(f"Authenticated MK1 model metadata changed: {path.name}")
+                raise RuntimeError(f"Authenticated Isaac model metadata changed: {path.name}")
 
     def verify_for_materialization(self) -> None:
         """Rehash second-resolution shards; their timestamps can hide same-second writes.
@@ -109,9 +109,9 @@ class VerifiedTrainedTensorStorage:
             try:
                 actual = file_sha256(shard)
             except (OSError, ValueError) as exc:
-                raise RuntimeError(f"Authenticated MK1 shard changed: {shard.name}") from exc
+                raise RuntimeError(f"Authenticated Isaac shard changed: {shard.name}") from exc
             if not hmac.compare_digest(actual, expected):
-                raise RuntimeError(f"Authenticated MK1 shard digest mismatch: {shard.name}")
+                raise RuntimeError(f"Authenticated Isaac shard digest mismatch: {shard.name}")
         if self.coarse_shard_digests:
             # Metadata must remain bound through the potentially long payload read.
             self.verify_source_unchanged()
@@ -121,7 +121,7 @@ class VerifiedTrainedTensorStorage:
         actual = frozenset(header.dtype for header in inventory.tensors.values())
         if actual != self.dtypes:
             raise RuntimeError(
-                "MK1 trained storage declaration disagrees with tensor header dtype set: "
+                "Isaac trained storage declaration disagrees with tensor header dtype set: "
                 f"declared={sorted(self.dtypes)}, headers={sorted(actual)}."
             )
 
@@ -423,7 +423,7 @@ def finalize_canonical_trained_package(
 ) -> str:
     """Bind native inner weights to their source identity and close the config digest cycle."""
     if not mk1_source_model_import_sha256:
-        raise RuntimeError("Cannot finalize an MK1 package without source model-import identity.")
+        raise RuntimeError("Cannot finalize an Isaac package without source model-import identity.")
     root = Path(package_root).resolve(strict=True)
     inventory = read_and_validate_safetensors_index(root / "hf_model")
     storage_metadata = {"tensor_storage_dtypes": sorted({h.dtype for h in inventory.tensors.values()})}
@@ -432,7 +432,7 @@ def finalize_canonical_trained_package(
     config._save_pretrained(root)
     digest = write_trained_package_manifest(
         root,
-        label="MK1 canonical trained package",
+        label="Isaac canonical trained package",
         manifest_filename=ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
         manifest_schema=ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
         digest_field=ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
@@ -450,7 +450,7 @@ def finalize_canonical_trained_package(
         raw_config = load_json_object(root / "config.json")
         manifest = load_json_object(root / ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME)
     except ValueError as exc:
-        raise RuntimeError(f"Cannot re-read finalized MK1 canonical trained package: {exc}") from exc
+        raise RuntimeError(f"Cannot re-read finalized Isaac canonical trained package: {exc}") from exc
     canonical_config = dict(raw_config)
     canonical_config[ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD] = None
     if (
@@ -459,6 +459,6 @@ def finalize_canonical_trained_package(
         or manifest.get("config_sha256") != canonical_json_sha256(canonical_config)
     ):
         raise RuntimeError(
-            "MK1 canonical trained package config/manifest binding changed before publication."
+            "Isaac canonical trained package config/manifest binding changed before publication."
         )
     return digest

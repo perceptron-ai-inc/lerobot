@@ -135,7 +135,7 @@ def test_isaac_reuses_pr3154_embedding_and_inference_shell_descriptors_verbatim(
 
 
 def test_isaac_loader_constructs_only_from_checkpoint_and_leaves_no_meta_tensors(tmp_path) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     expected_contract = _write_checkpoint(model_dir)
 
     model, config, contract = load_isaac_vla_from_hf(
@@ -166,7 +166,7 @@ def test_isaac_loader_constructs_only_from_checkpoint_and_leaves_no_meta_tensors
 
 
 def test_isaac_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> None:
-    source = tmp_path / "source-mk1"
+    source = tmp_path / "source-isaac"
     source_contract = _write_checkpoint(source)
     assert source_contract.mtp.present
 
@@ -180,7 +180,7 @@ def test_isaac_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> 
     assert runtime_state
     assert not any(key.startswith("mtp.") for key in runtime_state)
 
-    runtime = tmp_path / "runtime-mk1"
+    runtime = tmp_path / "runtime-isaac"
     runtime.mkdir()
     shutil.copy2(source / "config.json", runtime / "config.json")
     shutil.copy2(source / "tokenizer.json", runtime / "tokenizer.json")
@@ -207,9 +207,9 @@ def test_isaac_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> 
     }
     assert runtime_config["text_config"]["mtp_num_hidden_layers"] == 0
 
-    moved = tmp_path / "moved-runtime-mk1"
+    moved = tmp_path / "moved-runtime-isaac"
     runtime.rename(moved)
-    source.rename(tmp_path / "retired-source-mk1")
+    source.rename(tmp_path / "retired-source-isaac")
 
     moved_contract, inventory = validate_isaac_checkpoint(
         moved,
@@ -267,7 +267,7 @@ def test_isaac_config_normalizes_real_export_omissions_to_qualified_runtime_defa
 
 
 def test_isaac_loader_can_cast_checkpoint_storage_for_training(tmp_path) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     _write_checkpoint(model_dir)
 
     model, _, _ = load_isaac_vla_from_hf(
@@ -281,7 +281,7 @@ def test_isaac_loader_can_cast_checkpoint_storage_for_training(tmp_path) -> None
 
 
 def test_isaac_loader_applies_explicit_runtime_sdpa_to_text_and_vision(tmp_path) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     _write_checkpoint(model_dir)
 
     model, config, _ = load_isaac_vla_from_hf(
@@ -439,10 +439,10 @@ def test_qualified_torch_cuda_gate_rejects_unqualified_hardware(
 
 
 def test_isaac_loader_rejects_unknown_runtime_attention_backend(tmp_path) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     _write_checkpoint(model_dir)
 
-    with pytest.raises(ValueError, match="Unsupported MK1 attention backend"):
+    with pytest.raises(ValueError, match="Unsupported Isaac attention backend"):
         load_isaac_vla_from_hf(
             model_dir,
             dtype=torch.float32,
@@ -454,7 +454,7 @@ def test_isaac_loader_rejects_unknown_runtime_attention_backend(tmp_path) -> Non
 
 
 def test_isaac_loader_builds_from_the_same_config_object_it_validated(tmp_path, monkeypatch) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     _write_checkpoint(model_dir)
     reads = 0
     original = read_isaac_config_data
@@ -476,7 +476,7 @@ def test_isaac_loader_builds_from_the_same_config_object_it_validated(tmp_path, 
 
 
 def test_isaac_loader_rejects_shard_replaced_after_header_validation(tmp_path, monkeypatch) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     _write_checkpoint(model_dir)
     original_read = read_and_validate_safetensors_index
     stream_opens = []
@@ -508,7 +508,7 @@ def test_isaac_loader_rejects_shard_replaced_after_header_validation(tmp_path, m
 
 
 def test_isaac_loader_rejects_shard_replaced_during_stream(tmp_path, monkeypatch) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     _write_checkpoint(model_dir)
     original_safe_open = safe_open
     replaced = False
@@ -556,7 +556,7 @@ def test_isaac_loader_rejects_shard_replaced_during_stream(tmp_path, monkeypatch
 def test_isaac_loader_accepts_hf_snapshot_blob_symlinks(tmp_path) -> None:
     source = tmp_path / "source"
     _write_checkpoint(source)
-    repository = tmp_path / "cache" / "models--org--mk1"
+    repository = tmp_path / "cache" / "models--org--isaac"
     blobs = repository / "blobs"
     model_dir = repository / "snapshots" / "revision" / "hf_model"
     blobs.mkdir(parents=True)
@@ -577,7 +577,7 @@ def test_isaac_loader_accepts_hf_snapshot_blob_symlinks(tmp_path) -> None:
 
 
 def test_isaac_loader_rejects_tokenizer_mutation_before_model_allocation(tmp_path, monkeypatch) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     _write_checkpoint(model_dir)
     tokenizer_path = model_dir / "tokenizer.json"
     tokenizer = json.loads(tokenizer_path.read_text())
@@ -603,7 +603,7 @@ def test_isaac_loader_rejects_tokenizer_mutation_before_model_allocation(tmp_pat
 
 
 def test_reduced_checkpoint_runs_existing_vla_action_path_deterministically(tmp_path) -> None:
-    model_dir = tmp_path / "mk1"
+    model_dir = tmp_path / "isaac"
     contract = _write_checkpoint(model_dir)
     model, _, _ = load_isaac_vla_from_hf(
         model_dir,

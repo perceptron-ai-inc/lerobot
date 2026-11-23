@@ -44,8 +44,7 @@ DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS = (
         "size": 2048,
     },
 )
-# Genesis names the coordinate block by this exact marker
-# (genesis/data/mharmony/encoding_cache.py::COORD_GROUP_NAME).
+# The coordinate block is named by this exact marker.
 COORD_TOKEN_GROUP_NAME = "coord"  # nosec B105 - reserved-token group label, not a credential
 TEXT_TYPE_TAG = "text_type"
 TEXT_TYPE_TIMESTAMP = "timestamp"
@@ -364,7 +363,7 @@ def build_isaac_training_proprio_contract(
     contract_version: int,
     contract_hash: str,
 ) -> dict[str, Any]:
-    """Compile the supported Genesis policy-state ABI into movable render metadata."""
+    """Compile the supported policy-state ABI into movable render metadata."""
     profile_components: dict[str, tuple[int, list[tuple[str, int, int]]]] = {
         "bi_yam": (
             14,
@@ -825,9 +824,8 @@ def build_isaac_mharmony_content_plan(
 ) -> IsaacMharmonyContentPlan:
     """Build the native LIBERO no-scene mharmony content plan.
 
-    This mirrors the Genesis ``trajectory_flow_matching_pipeline`` inference
-    contract for the supported native eval surface: Flow actions, explicit deltas,
-    RGB images, last-state-only proprio, and no scene description. Episode-time
+    This is the inference contract for the supported native eval surface: Flow actions,
+    explicit deltas, RGB images, last-state-only proprio, and no scene description. Episode-time
     items precede each observation only when the checkpoint's recipe emits them
     (``emit_observation_timestamps``); the plan records the timestamps either way.
     """
@@ -1000,16 +998,16 @@ class IsaacNativeMharmonyRenderer:
         terminal: bool = False,
         stats: IsaacNormalizationStats | None = None,
     ):
-        """Render one joint FAST+Flow training sample without Genesis transforms.
+        """Render one joint FAST+Flow training sample.
 
-        ``terminal`` mirrors Genesis's ``_action_completion_metadata``: a chunk whose last
+        ``terminal``: a chunk whose last
         action step is the trajectory's terminal step keeps the ``<|end|>`` footer, while every
         non-terminal chunk is supervised with ``<|return|>``. The dataset processor supplies
         terminality from the last real action and its authoritative episode endpoint.
         Without that metadata, non-terminal remains the conservative default.
 
         ``stats`` overrides the builder's normalization for this one sample, which is what
-        multi-suite LIBERO training needs: Genesis normalizes each LIBERO suite by its own
+        multi-suite LIBERO training needs: each LIBERO suite is normalized by its own
         quantiles, and the suites are not interchangeable -- end-effector height spans
         [0.916, 1.286] in libero_spatial but [0.010, 0.337] in libero_object, disjoint ranges
         that would push cross-normalized proprio far outside [-1, 1]. Defaults to the builder's
@@ -1029,9 +1027,9 @@ class IsaacNativeMharmonyRenderer:
                 f"ISAAC normalized action max {max_abs:.6g} exceeds skip threshold "
                 f"{skip_outlier_threshold:.6g}."
             )
-        # Genesis clips the two objectives independently: the FAST tokenizer transform and the
+        # The two objectives are clipped independently: the FAST tokenizer transform and the
         # flow-target transform each carry their own cap. Sharing one clipped array would feed
-        # the tokenizer an action distribution Genesis never trains it on.
+        # the tokenizer an action distribution it was never trained on.
         if clip_normalized_actions:
             fast_cap = clip_normalized_max if fast_clip_normalized_max is None else fast_clip_normalized_max
             fast_normalized = np.clip(normalized, -fast_cap, fast_cap)
@@ -1075,9 +1073,9 @@ class IsaacNativeMharmonyRenderer:
             min_num_patches=min_num_patches,
             pixel_shuffle_scale=pixel_shuffle_scale,
             temporal_patch_size=temporal_patch_size,
-            # Genesis sets message_stop_token="return" for any chunk whose last action step is
-            # not the trajectory terminal step (core/datasets/augment/trajectory.py), and
-            # render_document_to_stream swaps the rendered <|end|> for <|return|> accordingly.
+            # message_stop_token is "return" for any chunk whose last action step is not the
+            # trajectory terminal step, and the rendered <|end|> is swapped for <|return|>
+            # accordingly.
             # Terminal chunks keep <|end|>.
             rewrite_final_assistant_footer=not bool(terminal),
         )
@@ -1509,7 +1507,7 @@ def _flow_action_tags(
         "action_index": anchor_idx,
         "obs_window": [0, anchor_idx],
         "action_window": [anchor_idx, emitted_action_indices[-1]],
-        # Genesis drops message_stop_token from terminal chunks, which is what makes their
+        # Terminal chunks carry no message_stop_token, which is what makes their
         # footer <|end|> rather than <|return|>.
         "terminal": bool(terminal),
         "message_stop_token": None if terminal else metadata.message_stop_token,
@@ -1563,7 +1561,7 @@ _TRAINING_ACTION_TAG_KEYS = (
 
 
 def _project_training_action_tags(tags: dict[str, Any]) -> dict[str, Any]:
-    """Match Genesis conversation._collect_token_tags at the final TensorStream boundary."""
+    """Keep only the tags that reach the final TensorStream boundary."""
     return {key: tags[key] for key in _TRAINING_ACTION_TAG_KEYS if key in tags}
 
 

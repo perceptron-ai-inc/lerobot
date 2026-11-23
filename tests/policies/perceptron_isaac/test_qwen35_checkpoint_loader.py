@@ -31,7 +31,7 @@ def test_policy_rejects_generic_qwen_packages_before_model_loading(
     )
     config.save_pretrained(tmp_path)
     # No model tensors exist: rejection must occur before model construction or weight reads.
-    with pytest.raises(RuntimeError, match="supports only native MK1/Isaac-0.5 checkpoints"):
+    with pytest.raises(RuntimeError, match="supports only native Isaac-0.5 checkpoints"):
         if entry_point == "from_pretrained":
             PerceptronIsaacPolicy.from_pretrained(tmp_path, config=config, local_files_only=True)
         else:

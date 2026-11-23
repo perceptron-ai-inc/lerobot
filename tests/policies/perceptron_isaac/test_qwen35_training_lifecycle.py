@@ -1,4 +1,4 @@
-"""Reduced native MK1 training fixtures; no pretrained weights or robot data."""
+"""Reduced native Isaac training fixtures; no pretrained weights or robot data."""
 
 from dataclasses import replace
 from pathlib import Path
@@ -64,7 +64,7 @@ def test_dense_optimizer_preserves_serializable_trainable_set(tmp_path: Path) ->
     policy = reduced_native_policy(tmp_path)
     policy.config.freeze_input_embeddings = True
     cfg = TrainPipelineConfig(
-        dataset=DatasetConfig(repo_id="synthetic/native-mk1"),
+        dataset=DatasetConfig(repo_id="synthetic/native-isaac"),
         policy=policy.config,
         optimizer=AdamWConfig(lr=0.002),
     )

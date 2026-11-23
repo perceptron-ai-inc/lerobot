@@ -310,7 +310,7 @@ def _record_config_stats_export(config: PerceptronIsaacConfig, preprocessor) -> 
 
 
 def normalize_perceptron_isaac_task_text(text: str) -> str:
-    """Normalize task text before Genesis prompt assembly."""
+    """Normalize task text before prompt assembly."""
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     if not normalized:
         return ""
@@ -331,7 +331,7 @@ def build_perceptron_isaac_observation_window(
     states: Any,
     camera_order: tuple[str, ...],
 ) -> list[dict[str, Any]]:
-    """Convert stacked image/state tensors to Genesis ObservationFrame dictionaries."""
+    """Convert stacked image/state tensors to ObservationFrame dictionaries."""
     image_arr = _to_numpy(images)
     state_arr = _to_numpy(states).astype(np.float32, copy=False)
     if image_arr.ndim != 5:
@@ -453,7 +453,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
     inference_clip_normalized_proprio: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     train_clip_normalized_actions: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     clip_normalized_max: float = field(default=10.0, metadata=_PACK_CONFIG_METADATA)
-    # FAST tokenizer input cap; Genesis lowers FAST and Flow with independent caps.
+    # FAST tokenizer input cap; FAST and Flow are lowered with independent caps.
     fast_clip_normalized_max: float = field(default=1.0, metadata=_PACK_CONFIG_METADATA)
     train_skip_outlier_threshold: float = field(default=20.0, metadata=_PACK_CONFIG_METADATA)
     train_max_sequence_length: int = field(default=4096, metadata=_PACK_CONFIG_METADATA)
@@ -2039,7 +2039,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
             if not normalization_path.is_file():
                 raise FileNotFoundError(
                     "Existing ISAAC package needs policy_normalization.json to hydrate its "
-                    "Genesis-compatible training prompt contract."
+                    "training prompt contract."
                 )
             metadata = hydrate_isaac_training_proprio_contract(
                 IsaacMharmonyRenderMetadata(**step.render_metadata),

@@ -378,7 +378,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             raise RuntimeError("Perceptron ISAAC PEFT saving is unsupported.")
         if self.config.raw_export_saving_unsupported(self._local_checkpoint_source_root()):
             raise RuntimeError(
-                "Raw/portable-export saving is unsupported; use a source-bound native MK1 package."
+                "Raw/portable-export saving is unsupported; use a source-bound native Isaac package."
             )
 
     def _save_pretrained(self, save_directory: Path, state_dict: dict[str, Tensor] | None = None) -> None:
@@ -598,7 +598,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     allowed_storage_dtypes=inner_state.storage_dtypes,
                 )
             except (ValueError, IsaacCheckpointContractError) as exc:
-                raise RuntimeError(f"Saved MK1 runtime checkpoint is invalid: {exc}") from exc
+                raise RuntimeError(f"Saved Isaac runtime checkpoint is invalid: {exc}") from exc
             lineage = (
                 (
                     save_directory / "isaac_import_provenance.json",
@@ -607,7 +607,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 (model_root / "mk1_model_import.json", model_root / "source_mk1_model_import.json"),
             )
         else:
-            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
+            raise RuntimeError("Perceptron ISAAC supports only native Isaac-0.5 checkpoints.")
         for source, destination in lineage:
             if source.is_file():
                 destination.unlink(missing_ok=True)
@@ -651,7 +651,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 mk1_source_model_import_sha256=model_import_digest,
             )
             return
-        raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
+        raise RuntimeError("Perceptron ISAAC supports only native Isaac-0.5 checkpoints.")
 
     @staticmethod
     def _copy_checkpoint_package(source_root: Path, destination: Path) -> None:
@@ -858,7 +858,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
     @staticmethod
     def _config_declares_isaac(config: PerceptronIsaacConfig) -> bool:
-        """Select MK1 from authenticated metadata or the inner checkpoint config."""
+        """Whether authenticated metadata or the inner checkpoint config declares a native package."""
         if (
             config.artifact_kind == "neutral_debug"
             or config.mk1_model_import_sha256 is not None
@@ -891,7 +891,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if not self.config.hf_model_path:
             raise RuntimeError("PerceptronIsaacConfig.hf_model_path is required to load the Isaac HF VLA.")
         if not self._config_declares_isaac(self.config):
-            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
+            raise RuntimeError("Perceptron ISAAC supports only native Isaac-0.5 checkpoints.")
 
         if training:
             self._require_native_training_supported()
@@ -923,7 +923,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 allowed_storage_dtypes=storage_dtypes,
             )
         except IsaacCheckpointContractError as exc:
-            raise RuntimeError(f"ISAAC requires a valid MK1 composite checkpoint: {exc}") from exc
+            raise RuntimeError(f"ISAAC requires a valid composite checkpoint: {exc}") from exc
         if verified_storage is not None:
             verified_storage.require_header_dtypes(inventory)
         if self.config.artifact_kind != contract.artifact.artifact_kind:
@@ -961,7 +961,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             render_metadata = load_native_render_metadata(self.config)
             contract.validate_coord_reserved_token_groups(render_metadata.mharmony_reserved_token_groups)
         except (ValueError, IsaacCheckpointContractError) as exc:
-            raise RuntimeError(f"ISAAC MK1 coordinate/rendering contract mismatch: {exc}") from exc
+            raise RuntimeError(f"ISAAC coordinate/rendering contract mismatch: {exc}") from exc
         model, _, loaded_contract = load_isaac_vla_from_hf(
             model_dir,
             dtype=model_dtype,
@@ -975,7 +975,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             verified_tensor_storage=verified_storage,
         )
         if loaded_contract != contract:
-            raise RuntimeError("MK1 checkpoint contract changed between preflight and model loading.")
+            raise RuntimeError("Isaac checkpoint contract changed between preflight and model loading.")
         self._isaac_model = model
         self._native_render_metadata = render_metadata
         if training:
@@ -1155,7 +1155,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         fps = float(fps) if float(fps) > 0.0 else 20.0
         if self._frame_index < 0:
             raise RuntimeError("Perceptron Isaac model time requested before the first episode frame.")
-        # Floor the anchor at (k-1)/fps like Genesis does, so the k rendered observation
+        # Floor the anchor at (k-1)/fps so the k rendered observation
         # timestamps stay distinct instead of collapsing to duplicates at episode start.
         n_obs_steps = int(getattr(self._native_render_metadata, "n_obs_steps", 1) or 1)
         min_anchor_steps = max(0, n_obs_steps - 1)
@@ -1492,8 +1492,9 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             batch_size = self._ensure_online_render_step()._infer_batch_size(batch, None)
         # Reject changed ownership before clocks advance or queued actions drain.
         self._bind_rollout_batch_size(batch_size)
-        # Genesis settles inside the environment reset and counts only executed post-settle
-        # steps in its model clock, so idle settle frames must not advance the episode clock.
+        # The bases were evaluated with settling inside the environment reset and a model clock
+        # that counts only executed post-settle steps, so idle settle frames must not advance
+        # the episode clock.
         if self._settle_index < settle:
             self._settle_index += 1
             # Idle settle frames must not enter the model observation window. The first
@@ -1668,7 +1669,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     ) -> VerifiedTrainedTensorStorage | None:
         """Verify native checkpoint integrity before model allocation."""
         if not PerceptronIsaacPolicy._config_declares_isaac(config):
-            raise RuntimeError("Perceptron ISAAC supports only native MK1/Isaac-0.5 checkpoints.")
+            raise RuntimeError("Perceptron ISAAC supports only native Isaac-0.5 checkpoints.")
         if checkpoint_root is None:
             return None
         root = Path(checkpoint_root).resolve()
@@ -1751,7 +1752,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         config: PerceptronIsaacConfig, root: Path
     ) -> str | VerifiedTrainedTensorStorage | None:
         """Authenticate trained assets, returning v3 storage only after full verification."""
-        context = "MK1 trained package"
+        context = "Isaac trained package"
         manifest_path = root / ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME
         try:
             raw_manifest = load_json_object(manifest_path)
@@ -1773,14 +1774,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
                 metadata["metadata"] = raw_manifest.get("metadata")
                 model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(
-                    config, root, context="MK1"
+                    config, root, context="Isaac"
                 )
                 # Bind the header identities before authenticating payload bytes, then
                 # check them again afterward. A replacement cannot inherit an old hash.
                 source_inventory = read_and_validate_safetensors_index(model_root)
             manifest = verify_trained_package_manifest(
                 root,
-                label="MK1 canonical trained package",
+                label="Isaac canonical trained package",
                 manifest_filename=ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
                 manifest_schema=manifest_schema,
                 digest_field=ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
@@ -1803,7 +1804,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 f"{context} deployment_adapter_sha256",
                 adapter_path,
             )
-            model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(config, root, context="MK1")
+            model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(config, root, context="Isaac")
             if manifest_schema == ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA:
                 from types import MappingProxyType
 
@@ -1838,26 +1839,25 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             return None
 
         if not config.deployment_adapter_sha256:
-            raise RuntimeError("A trained MK1 Perceptron Isaac package requires deployment_adapter_sha256.")
+            raise RuntimeError("A trained Perceptron Isaac package requires deployment_adapter_sha256.")
         expected_adapter_digest = _verify_sha256(
             config.deployment_adapter_sha256, f"{context} deployment_adapter_sha256"
         )
         adapter_path = root / "isaac_deployment_adapter.json"
         if not PerceptronIsaacPolicy._is_package_file(root, adapter_path):
             raise RuntimeError(
-                "A trained MK1 Perceptron Isaac package is missing its local deployment adapter: "
-                f"{adapter_path}."
+                f"A trained Perceptron Isaac package is missing its local deployment adapter: {adapter_path}."
             )
         expected_model_import_digest = _verify_sha256(
             getattr(config, "mk1_model_import_sha256", None),
             f"{context} mk1_model_import_sha256",
         )
         expected_model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(
-            config, root, context="MK1"
+            config, root, context="Isaac"
         )
         model_import_path = expected_model_root / ISAAC_MODEL_IMPORT_FILENAME
         if not PerceptronIsaacPolicy._is_package_file(root, model_import_path):
-            raise RuntimeError(f"A trained MK1 package is missing {ISAAC_MODEL_IMPORT_FILENAME}.")
+            raise RuntimeError(f"A trained Isaac package is missing {ISAAC_MODEL_IMPORT_FILENAME}.")
         verified_model_import_digest = file_sha256(model_import_path)
         _verify_sha256(
             expected_model_import_digest,
@@ -1865,7 +1865,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             verified_model_import_digest,
         )
         if config.artifact_kind != "trained_policy":
-            raise RuntimeError("MK1 trained package manifest identity disagrees with the policy config.")
+            raise RuntimeError("Isaac trained package manifest identity disagrees with the policy config.")
 
         manifest = verify_trained_package_manifest(
             root,
@@ -1883,7 +1883,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         )
         raw_files = manifest["files_sha256"]
         if not raw_files:
-            raise RuntimeError("MK1 trained package files_sha256 must be a non-empty object.")
+            raise RuntimeError("Isaac trained package files_sha256 must be a non-empty object.")
 
         def adapter_mismatch(expected: str, actual: str) -> str:
             return (
@@ -1913,14 +1913,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         verified_record_digest: str | None = None,
         root_weights_bound: bool = False,
     ) -> None:
-        """Verify the exhaustive MK1 model import record before allocating weights."""
+        """Verify the exhaustive Isaac model import record before allocating weights."""
         from .isaac_checkpoint_contract import (
             IsaacCheckpointContractError,
             read_isaac_config,
             validate_isaac_tokenizer,
         )
 
-        context = "MK1 model import"
+        context = "Isaac model import"
         record_name = "mk1_model_import.json"
         model_path = getattr(config, "hf_model_path", None)
         if not model_path:
@@ -1934,16 +1934,16 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         }
         if root_weight_overrides and not root_weights_bound:
             raise RuntimeError(
-                "Trained MK1 packages forbid unbound root-level weight overrides; "
+                "Trained Isaac packages forbid unbound root-level weight overrides; "
                 f"found {sorted(root_weight_overrides)}. Re-import them into the hashed hf_model inventory."
             )
         model_root = Path(str(model_path))
         record_path = model_root / record_name
         if not PerceptronIsaacPolicy._is_package_file(root, record_path):
-            raise RuntimeError(f"A trained MK1 package is missing {record_name}.")
+            raise RuntimeError(f"A trained Isaac package is missing {record_name}.")
         expected_record_digest = getattr(config, "mk1_model_import_sha256", None)
         if not expected_record_digest:
-            raise RuntimeError("A trained MK1 package requires mk1_model_import_sha256.")
+            raise RuntimeError("A trained Isaac package requires mk1_model_import_sha256.")
         if verified_record_digest is None:
             verified_record_digest = file_sha256(record_path)
         _verify_sha256(expected_record_digest, f"{context} record digest", verified_record_digest)
@@ -1961,18 +1961,18 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             "shards",
         }
         if set(record) != record_keys:
-            raise RuntimeError("MK1 model import record fields do not match schema version 2.")
+            raise RuntimeError("Isaac model import record fields do not match schema version 2.")
         if (
             record["schema"] != "perceptron_isaac_mk1_model_import_v2"
             or record["algorithm"] != "byte_for_byte_safetensors_copy"
             or record["backbone_family"] != "mk1_qwen3_6_moe"
             or record["rmsnorm_weight_convention"] != "zero_centered_1_plus_weight"
         ):
-            raise RuntimeError("MK1 model import record identity is unsupported.")
+            raise RuntimeError("Isaac model import record identity is unsupported.")
 
         def digest_map(value: Any, *, label: str) -> dict[str, str]:
             if not isinstance(value, dict) or not value:
-                raise RuntimeError(f"MK1 model import {label} must be a non-empty object.")
+                raise RuntimeError(f"Isaac model import {label} must be a non-empty object.")
             result: dict[str, str] = {}
             for filename, digest in value.items():
                 path = Path(filename) if isinstance(filename, str) else Path()
@@ -1984,23 +1984,23 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     or path.as_posix() != filename
                     or ".." in path.parts
                 ):
-                    raise RuntimeError(f"MK1 model import {label} contains an invalid filename.")
+                    raise RuntimeError(f"Isaac model import {label} contains an invalid filename.")
                 result[filename] = _verify_sha256(digest, f"{context} {label}[{filename!r}]")
             return result
 
         files = digest_map(record["files_sha256"], label="files_sha256")
         source_files = digest_map(record["source_files_sha256"], label="source_files_sha256")
         if record_name in files or record_name in source_files:
-            raise RuntimeError("MK1 model import record must not include itself in a digest map.")
+            raise RuntimeError("Isaac model import record must not include itself in a digest map.")
 
         actual_files: set[str] = set()
         for candidate in model_root.iterdir():
             if candidate.is_dir() or not PerceptronIsaacPolicy._is_package_file(root, candidate):
-                raise RuntimeError(f"MK1 model directory contains a non-package file: {candidate}.")
+                raise RuntimeError(f"Isaac model directory contains a non-package file: {candidate}.")
             actual_files.add(candidate.name)
         if actual_files != set(files) | {record_name}:
             raise RuntimeError(
-                "MK1 model file inventory disagrees with its import record: "
+                "Isaac model file inventory disagrees with its import record: "
                 f"missing={sorted(set(files) - actual_files)}, "
                 f"unlisted={sorted(actual_files - set(files) - {record_name})}."
             )
@@ -2022,27 +2022,27 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         missing_source = (required_files - {"vocab.json"}) - set(source_files)
         if missing_required or missing_source:
             raise RuntimeError(
-                "MK1 model import record does not bind all required assets: "
+                "Isaac model import record does not bind all required assets: "
                 f"packaged_missing={sorted(missing_required)}, source_missing={sorted(missing_source)}."
             )
 
         index = _load_json_object(model_root / "model.safetensors.index.json", "model.safetensors.index.json")
         weight_map = index.get("weight_map")
         if not isinstance(weight_map, dict) or not weight_map:
-            raise RuntimeError("MK1 model index must contain a non-empty weight_map.")
+            raise RuntimeError("Isaac model index must contain a non-empty weight_map.")
         shard_counts: dict[str, int] = {}
         for tensor_name, shard_name in weight_map.items():
             if not isinstance(tensor_name, str) or not isinstance(shard_name, str):
-                raise RuntimeError("MK1 model index contains an invalid weight_map entry.")
+                raise RuntimeError("Isaac model index contains an invalid weight_map entry.")
             shard_counts[shard_name] = shard_counts.get(shard_name, 0) + 1
         indexed_shards = set(shard_counts)
         recorded_shards = record["shards"]
         if not isinstance(recorded_shards, list) or not recorded_shards:
-            raise RuntimeError("MK1 model import shards must be a non-empty list.")
+            raise RuntimeError("Isaac model import shards must be a non-empty list.")
         if [item.get("filename") for item in recorded_shards if isinstance(item, dict)] != sorted(
             indexed_shards
         ):
-            raise RuntimeError("MK1 model import shard ordering or coverage disagrees with the index.")
+            raise RuntimeError("Isaac model import shard ordering or coverage disagrees with the index.")
         for item in recorded_shards:
             if not isinstance(item, dict) or set(item) != {
                 "filename",
@@ -2050,7 +2050,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 "output_sha256",
                 "tensor_count",
             }:
-                raise RuntimeError("MK1 model import contains a malformed shard record.")
+                raise RuntimeError("Isaac model import contains a malformed shard record.")
             filename = item["filename"]
             count = item["tensor_count"]
             if (
@@ -2062,14 +2062,14 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 or source_files.get(filename)
                 != _verify_sha256(item["source_sha256"], f"{context} shard source")
             ):
-                raise RuntimeError(f"MK1 model import shard record disagrees for {filename!r}.")
+                raise RuntimeError(f"Isaac model import shard record disagrees for {filename!r}.")
         packaged_safetensors = {name for name in files if name.endswith(".safetensors")}
         if packaged_safetensors != indexed_shards:
-            raise RuntimeError("MK1 model import safetensors files disagree with the index.")
+            raise RuntimeError("Isaac model import safetensors files disagree with the index.")
 
         for filename in {"config.json", "tokenizer.json", "model.safetensors.index.json"} | indexed_shards:
             if source_files.get(filename) != files[filename]:
-                raise RuntimeError(f"MK1 byte-copy provenance disagrees for {filename}.")
+                raise RuntimeError(f"Isaac byte-copy provenance disagrees for {filename}.")
 
         vocab = record["qwen35_vocab"]
         if not isinstance(vocab, dict) or set(vocab) != {
@@ -2079,7 +2079,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             "tokenizer_sha256",
             "vocab_sha256",
         }:
-            raise RuntimeError("MK1 qwen35_vocab record is malformed.")
+            raise RuntimeError("Isaac qwen35_vocab record is malformed.")
         if (
             vocab["schema"] != "perceptron_isaac_qwen35_vocab_v1"
             or vocab["algorithm"] != "extract_tokenizer_json_model_vocab"
@@ -2088,7 +2088,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             != files["tokenizer.json"]
             or _verify_sha256(vocab["vocab_sha256"], f"{context} qwen35 vocab") != files["vocab.json"]
         ):
-            raise RuntimeError("MK1 qwen35_vocab record disagrees with packaged tokenizer assets.")
+            raise RuntimeError("Isaac qwen35_vocab record disagrees with packaged tokenizer assets.")
 
         artifact = record["artifact"]
         expected_artifact = {
@@ -2100,28 +2100,28 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             or {key: value for key, value in artifact.items() if key != "trained_steps"} != expected_artifact
             or config.artifact_kind != "trained_policy"
         ):
-            raise RuntimeError("MK1 model import artifact identity disagrees with the package config.")
-        raw_config = _load_json_object(model_root / "config.json", "MK1 config.json")
+            raise RuntimeError("Isaac model import artifact identity disagrees with the package config.")
+        raw_config = _load_json_object(model_root / "config.json", "Isaac config.json")
         if raw_config.get("genesis_artifact") != artifact:
-            raise RuntimeError("MK1 inner config artifact identity disagrees with its import record.")
+            raise RuntimeError("Isaac inner config artifact identity disagrees with its import record.")
 
         try:
             contract = read_isaac_config(model_root)
             validate_isaac_tokenizer(model_root, contract)
         except IsaacCheckpointContractError as exc:
-            raise RuntimeError(f"MK1 inner config contract validation failed: {exc}") from exc
+            raise RuntimeError(f"Isaac inner config contract validation failed: {exc}") from exc
         if (
             config.vector_max_states != contract.vector_encoder.max_states
             or config.max_action_dim != contract.action_expert.action_dim
             or config.max_action_horizon != contract.action_expert.action_horizon
         ):
-            raise RuntimeError("MK1 outer checkpoint maxima disagree with the inner model contract.")
+            raise RuntimeError("Isaac outer checkpoint maxima disagree with the inner model contract.")
         if (
             config.action_dim > config.max_action_dim
             or config.chunk_size > config.max_action_horizon
             or config.proprio_dim > config.vector_max_states
         ):
-            raise RuntimeError("MK1 served policy geometry exceeds the checkpoint-owned maxima.")
+            raise RuntimeError("Isaac served policy geometry exceeds the checkpoint-owned maxima.")
 
     @staticmethod
     def _verify_neutral_debug_manifest(config: PerceptronIsaacConfig, root: Path) -> None:

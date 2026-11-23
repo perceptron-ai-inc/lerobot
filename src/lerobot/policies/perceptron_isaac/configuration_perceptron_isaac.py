@@ -2,8 +2,7 @@
 
 Processors own mharmony packing, FAST target construction, stats
 normalization, and action unnormalization. The policy owns inference state and
-the joint text/FAST/flow training loss. Genesis bridge rendering and loss paths
-are intentionally unsupported.
+the joint text/FAST/flow training loss.
 """
 
 import json
@@ -30,7 +29,7 @@ from .rtc import RtcCapability, resolve_rtc_capability
 # Checkpoint-local stats sidecar, saved relative to keep native packages relocatable.
 NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
 
-# The inference recipe a Genesis export ships at its root. Its rendering block is the
+# The inference recipe an export ships at its root. Its rendering block is the
 # checkpoint's own declaration of the mHarmony reserved-token layout it was trained with.
 NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
 
@@ -98,7 +97,7 @@ def _ensure_vla_feature_contract(
 @PreTrainedConfig.register_subclass("perceptron_isaac")
 @dataclass
 class PerceptronIsaacConfig(PreTrainedConfig):
-    """Native MK1/Isaac-0.5 policy geometry, rendering, inference and dense-training configuration."""
+    """Native Isaac-0.5 policy geometry, rendering, inference and dense-training configuration."""
 
     # --- observation / action geometry ---
     # Released ISAAC checkpoints use either one observation (post3279) or a
@@ -114,7 +113,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     max_state_dim: int = 128
 
     # --- expert / inference ---
-    # Native eval/serving backend. No Genesis bridge backend is supported.
+    # Native eval/serving backend.
     inference_backend: str = "native_mharmony"
     num_inference_steps: int = 10
     # Flow-sample averaging: sample the flow ODE `num_flow_samples` times (fresh noise each) and
@@ -127,14 +126,14 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # Flow-target clip. This is the checkpoint-owned value: the inference recipe carries it on
     # the ``flow_action`` wire, and the importer copies it from there.
     clip_normalized_max: float = 10.0
-    # FAST-target clip, applied only to the tokenizer input. Genesis lowers the two objectives
+    # FAST-target clip, applied only to the tokenizer input. Pretraining lowers the two objectives
     # through separate transforms with independent caps, so a single shared cap trains FAST on
-    # a different action distribution than Genesis does.
+    # a different action distribution than the base saw.
     #
     # This default is NOT universal -- it must match the base recipe's
     # ``dataset.transforms.strategies.overrides.action.clip_normalized_max``, which each
     # pretraining run sets independently of the ``fast_tokenizer`` library default of 1.0:
-    #   LIBERO/Genesis lineage (hf-genesis-ft10, hf-genesis-ft40k):        FAST 1.0,  Flow 10.0
+    #   LIBERO lineage:                                                    FAST 1.0,  Flow 10.0
     #   bi-YAM lineage (hf-midtrain-step80000, hf-r4-step-200000):         FAST 10.0, Flow 10.0
     # Check the base's config.toml before finetuning, and set this deliberately rather than
     # inheriting the default. The caps are not interchangeable: q01/q99 normalization puts real
@@ -150,8 +149,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # start of each episode before the policy controls, so the sim stabilizes from the init state.
     # 0 disables.
     #
-    # This is NOT the right lever for matching Genesis's LIBERO settling. Genesis waits
-    # NUM_STEPS_WAIT=50 inside its adapter's reset, stepping the simulator directly, so that
+    # This is NOT the right lever for LIBERO settling. The bases were evaluated with a wait of
+    # NUM_STEPS_WAIT=50 inside the environment reset, stepping the simulator directly, so that
     # wait is free and the policy still gets the full 280-step episode budget. These idle
     # actions instead come out of `select_action` and are consumed from that same budget.
     # LeRobot's LiberoEnv has the equivalent free wait (`num_steps_wait`, applied in reset);
@@ -181,7 +180,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     allow_image_key_fallback: bool = True  # compatibility only; authenticated imports set false
     # False passes gripper dimensions through in physical units instead of q01/q99-normalizing
     # them, matching MolmoAct2's `normalize_gripper: false` and its saved per-dim stat mask.
-    # Genesis normalizes every dimension, so True is what the ISAAC bases were pretrained with;
+    # The ISAAC bases were pretrained with every dimension normalized, which is True here;
     # setting False changes the representation the base saw and is an opt-in experiment.
     # The gripper dimensions are found by name from action_feature_names/state_feature_names,
     # as MolmoAct2's _default_feature_mask does, and the resulting mask is serialized into the
@@ -214,7 +213,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     training_action_frame_contract_version: int = 2
 
     # --- model / checkpoint paths (filled by the user / launcher) ---
-    hf_model_path: str | None = None  # native MK1 composite model directory
+    hf_model_path: str | None = None  # native Isaac composite model directory
     # Zero-step packages exercise checkpoint/model plumbing but are never deployable.
     artifact_kind: str = "trained_policy"
     # Read existing native configs that serialized false; native norms need no conversion.
@@ -264,7 +263,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     native_render_metadata_path: str | None = None
     native_stats_path: str | None = None
     # Per-suite training normalization. Multi-suite LIBERO training (all four suites in one
-    # dataset, as Genesis's cloud/libero:1.0 does) must normalize each sample by its own suite:
+    # dataset) must normalize each sample by its own suite:
     # end-effector height spans [0.916, 1.286] in libero_spatial but [0.010, 0.337] in
     # libero_object, so cross-normalizing pushes proprio far outside [-1, 1]. Set both together;
     # inference is single-scope by contract and leaves them unset.
@@ -371,7 +370,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         ):
             raise ValueError(
                 "Raw/portable-export save, publish and EMA training intents are unsupported; "
-                "disable checkpoint saving, Hub publishing and EMA, or use a source-bound native MK1 package."
+                "disable checkpoint saving, Hub publishing and EMA, or use a source-bound native Isaac package."
             )
 
     def __post_init__(self) -> None:
@@ -380,7 +379,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         if not isinstance(self.inference_clip_normalized_proprio, bool):
             raise ValueError("inference_clip_normalized_proprio must be a boolean.")
         if self.apply_offset_norm is not False:
-            raise ValueError("Native MK1 checkpoints forbid apply_offset_norm=True.")
+            raise ValueError("Native Isaac checkpoints forbid apply_offset_norm=True.")
         if self.use_peft or self.train_expert_only:
             raise ValueError(
                 "Perceptron ISAAC supports only dense training; PEFT and expert-only training are unsupported."

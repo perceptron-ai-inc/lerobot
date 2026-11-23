@@ -56,7 +56,7 @@ def _native_sample(env: int) -> TensorStream:
 
 
 def test_reduced_native_model_runs_batched_multimodal_inference(tmp_path: Path) -> None:
-    model_dir = tmp_path / "tiny-mk1"
+    model_dir = tmp_path / "tiny-isaac"
     _write_checkpoint(model_dir)
     model, _, _ = load_isaac_vla_from_hf(
         model_dir,

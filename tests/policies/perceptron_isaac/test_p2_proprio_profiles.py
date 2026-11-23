@@ -35,7 +35,7 @@ from tests.policies.perceptron_isaac._p2_data_fixtures import (
 
 
 def _profile_payload(payload: StatsPayload, cap: float) -> ProfilePayload:
-    """Synthetic post-authentication metadata with all six Genesis profile fields.
+    """Synthetic post-authentication metadata with all six profile fields.
 
     This exercises retention/consumption, not whole-export SHA authentication.
     """

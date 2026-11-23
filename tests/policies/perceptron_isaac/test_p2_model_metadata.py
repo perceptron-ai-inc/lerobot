@@ -126,7 +126,7 @@ def test_count_removal_does_not_accept_unsupported_architecture_or_identity(
         message = "artifact_kind"
     elif defect == "geometry":
         raw["text_config"]["hidden_size"] = 17
-        message = "production MK1|hidden_size"
+        message = "production Isaac|hidden_size"
     else:
         raw["genesis_artifact"]["schema_version"] = 2
         message = "schema_version"

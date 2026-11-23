@@ -1,7 +1,7 @@
-"""Native Qwen3.6 null-MoE components for the MK1 Fast backbone.
+"""Native Qwen3.6 null-MoE components for the Isaac backbone.
 
-Qwen3.6 uses the Hugging Face Qwen3.5-MoE weight ABI, but Genesis extends its
-router with logical null experts.  A checkpoint stores one physical null row
+Qwen3.6 uses the Hugging Face Qwen3.5-MoE weight ABI, but its router is
+extended with logical null experts.  A checkpoint stores one physical null row
 and expands it to many equal logical routes at runtime.  Selected null routes
 skip expert compute; the remaining real routes are renormalized before the
 independently gated shared expert is added.
@@ -50,7 +50,7 @@ ROTARY_PRECISION = "checkpoint_bf16_inv_freq_fp32_phase_v1"
 
 
 def _repeat_kv_heads(hidden_states: torch.Tensor, num_repetitions: int) -> torch.Tensor:
-    """Repeat KV heads in Genesis' [batch, length, heads, dim] layout."""
+    """Repeat KV heads in the [batch, length, heads, dim] layout."""
     batch, sequence_length, num_key_value_heads, head_dim = hidden_states.shape
     if num_repetitions == 1:
         return hidden_states
@@ -98,10 +98,10 @@ def explicit_repeat_kv_sdpa(
     scaling: float | None = None,
     is_causal: bool | None = None,
 ) -> torch.Tensor:
-    """Run the qualified MK1 SDPA path after materializing grouped KV heads."""
+    """Run the qualified SDPA path after materializing grouped KV heads."""
     num_key_value_groups = getattr(module, "num_key_value_groups", None)
     if not isinstance(num_key_value_groups, int) or num_key_value_groups <= 0:
-        raise ValueError("MK1 SDPA requires a positive integer num_key_value_groups")
+        raise ValueError("Isaac SDPA requires a positive integer num_key_value_groups")
     repeated_key = qwen35_modeling.repeat_kv(key, num_key_value_groups)
     repeated_value = qwen35_modeling.repeat_kv(value, num_key_value_groups)
     return (
@@ -177,7 +177,7 @@ class IsaacNullMoeContract:
 
     @classmethod
     def from_metadata(cls, metadata: Mapping[str, Any]) -> IsaacNullMoeContract:
-        """Parse the versioned Genesis metadata, rejecting unsupported variants."""
+        """Parse the versioned metadata, rejecting unsupported variants."""
 
         version = _required_metadata_value(metadata, "router_contract_version", int)
         if version != _ROUTER_CONTRACT_VERSION:
@@ -224,7 +224,7 @@ class IsaacNullMoeContract:
     def from_text_config(cls, config: Qwen3_5MoeTextConfig) -> IsaacNullMoeContract:
         metadata = getattr(config, "genesis_moe", None)
         if not isinstance(metadata, Mapping):
-            raise ValueError("MK1 Qwen3.6 text_config requires a genesis_moe object")
+            raise ValueError("Isaac Qwen3.6 text_config requires a genesis_moe object")
         contract = cls.from_metadata(metadata)
         if config.num_experts != contract.num_real_experts:
             raise ValueError(
@@ -238,23 +238,25 @@ class IsaacNullMoeContract:
             )
         if config.shared_expert_intermediate_size != config.moe_intermediate_size:
             raise ValueError(
-                "MK1 Qwen3.6 requires exactly one shared expert: "
+                "Isaac Qwen3.6 requires exactly one shared expert: "
                 "shared_expert_intermediate_size must equal moe_intermediate_size"
             )
         return contract
 
 
 class IsaacQwen36MoeConfig(Qwen3_5MoeConfig):
-    """Qwen3.5-MoE ABI config that requires the complete MK1 null contract."""
+    """Qwen3.5-MoE ABI config that requires the complete null contract."""
 
     def __post_init__(self, **kwargs: Any) -> None:
         super().__post_init__(**kwargs)
         root_metadata = getattr(self, "genesis_moe", None)
         text_metadata = getattr(self.text_config, "genesis_moe", None)
         if not isinstance(root_metadata, Mapping) or not isinstance(text_metadata, Mapping):
-            raise ValueError("MK1 Qwen3.6 config requires matching root and text_config genesis_moe objects")
+            raise ValueError(
+                "Isaac Qwen3.6 config requires matching root and text_config genesis_moe objects"
+            )
         if dict(root_metadata) != dict(text_metadata):
-            raise ValueError("MK1 Qwen3.6 root and text_config genesis_moe objects must be identical")
+            raise ValueError("Isaac Qwen3.6 root and text_config genesis_moe objects must be identical")
         IsaacNullMoeContract.from_text_config(self.text_config)
 
 
@@ -271,7 +273,7 @@ class IsaacNullTopKRouter(nn.Linear):
     """Compact physical projection with deterministic logical null routing.
 
     Subclassing ``nn.Linear`` preserves the exported ``gate.weight`` state key.
-    ``_router_contract`` is nonpersistent because the Genesis exporter consumes
+    ``_router_contract`` is nonpersistent because the exporter consumes
     the DCP buffer and records it in ``config.json`` instead of the HF shards.
     """
 
@@ -303,12 +305,12 @@ class IsaacNullTopKRouter(nn.Linear):
             dim=-1,
         )
 
-        # Genesis performs scoring in fp32.
+        # Scoring runs in fp32.
         logical_probabilities = functional.softmax(logical_logits, dtype=torch.float32, dim=-1)
         # The logical tensor already exists for the router ABI and auxiliary
         # outputs.  One stable sort is faster than two candidate sorts at the
-        # production 256-real/256-null geometry while retaining exact Genesis
-        # tie behavior.
+        # production 256-real/256-null geometry while retaining exact tie
+        # behavior.
         selected_experts = self._expanded_stable_topk(logical_probabilities)
         selected_probabilities = logical_probabilities.gather(-1, selected_experts)
 
@@ -376,7 +378,7 @@ class IsaacNullDispatchTrace(NamedTuple):
 
 
 class IsaacNullSparseMoeBlock(nn.Module):
-    """Qwen fused real experts with Genesis null-route dropping."""
+    """Qwen fused real experts with null-route dropping."""
 
     def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
         super().__init__()
@@ -394,7 +396,7 @@ class IsaacNullSparseMoeBlock(nn.Module):
         route_reduction = getattr(config, "_isaac_route_reduction", DETERMINISTIC_ROUTE_REDUCTION)
         if route_reduction != DETERMINISTIC_ROUTE_REDUCTION:
             raise ValueError(
-                f"Unsupported MK1 route reduction {route_reduction!r}; "
+                f"Unsupported Isaac route reduction {route_reduction!r}; "
                 f"expected {DETERMINISTIC_ROUTE_REDUCTION!r}."
             )
         self.dispatch_trace_observer: Callable[[IsaacNullDispatchTrace], None] | None = None
@@ -459,7 +461,7 @@ class IsaacNullSparseMoeBlock(nn.Module):
             ):
                 return "eager"
             raise RuntimeError(
-                "Production MK1 null-MoE CUDA inference requires BF16 torch grouped_mm on SM80 or newer; "
+                "Production Isaac null-MoE CUDA inference requires BF16 torch grouped_mm on SM80 or newer; "
                 f"got dtype={hidden_states.dtype}, capability={torch.cuda.get_device_capability(hidden_states.device)}"
             )
         return "eager"
@@ -475,7 +477,7 @@ class IsaacNullSparseMoeBlock(nn.Module):
         expert_indices = routing.selected_experts[real_mask]
         token_indices = token_indices[real_mask]
 
-        # Reproduce Genesis's two normalization stages and their operation
+        # Keep the two normalization stages and their operation
         # order.  The first normalizes all selected logical routes; after null
         # routes are removed, the second renormalizes the real-route prefix.
         selected_probabilities = routing.logical_probabilities.gather(-1, routing.selected_experts)
@@ -537,7 +539,7 @@ class IsaacNullSparseMoeBlock(nn.Module):
             )
             swiglu = self.experts.act_fn(gate) * up
 
-            # Match Genesis BF16 operation order: score after SwiGLU and before
+            # BF16 operation order: score after SwiGLU and before
             # this expert's down projection.
             expert_scores = routes.expert_scores[start:end]
             weighted_swiglu = (swiglu.float() * expert_scores[:, None]).to(swiglu.dtype)
@@ -634,7 +636,7 @@ class _DeviceAwareRMSNormGated(qwen35_modeling.Qwen3_5MoeRMSNormGated):
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
         if gate is None:
-            raise ValueError("MK1 GatedDeltaNet normalization requires a gate tensor")
+            raise ValueError("Isaac GatedDeltaNet normalization requires a gate tensor")
         if hidden_states.device.type == "cuda" and qwen35_modeling.FusedRMSNormGated is not None:
             # The FLA module's forward only depends on the attributes defined
             # above. Calling it unbound keeps one norm.weight state key while
@@ -796,7 +798,7 @@ class IsaacQwen36AttentionTrace(NamedTuple):
 
 
 class IsaacQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
-    """Qwen3.6 text attention using the Genesis-qualified explicit-KV SDPA path."""
+    """Qwen3.6 text attention using the qualified explicit-KV SDPA path."""
 
     def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
@@ -890,7 +892,7 @@ class IsaacQwen36Attention(qwen35_modeling.Qwen3_5MoeAttention):
 
 
 class IsaacQwen36TextRotaryEmbedding(nn.Module):
-    """Genesis mRoPE with intent-specific derived inverse frequencies.
+    """mRoPE with intent-specific derived inverse frequencies.
 
     Serving promotes the released BF16 frequency table to F32 for phase math.
     The training loader instead recomputes the original F32 formula before
@@ -905,11 +907,11 @@ class IsaacQwen36TextRotaryEmbedding(nn.Module):
         super().__init__()
         rope_parameters = config.rope_parameters
         if rope_parameters.get("rope_type") != "default":
-            raise ValueError("MK1 Genesis rotary precision only supports default RoPE")
+            raise ValueError("Isaac rotary precision only supports default RoPE")
         head_dim = config.head_dim or config.hidden_size // config.num_attention_heads
         rotary_dim = int(head_dim * rope_parameters.get("partial_rotary_factor", 1.0))
         if rotary_dim <= 0 or rotary_dim % 2 != 0:
-            raise ValueError(f"MK1 rotary dimension must be positive and even, got {rotary_dim}")
+            raise ValueError(f"Isaac rotary dimension must be positive and even, got {rotary_dim}")
         self.theta = float(rope_parameters["rope_theta"])
         self.rotary_dim = rotary_dim
         inv_freq = self._training_inv_freq(None)
@@ -919,7 +921,7 @@ class IsaacQwen36TextRotaryEmbedding(nn.Module):
         self.mrope_section = list(rope_parameters.get("mrope_section", [11, 11, 10]))
         if sum(self.mrope_section) != rotary_dim // 2:
             raise ValueError(
-                "MK1 mrope_section must sum to half the rotary dimension: "
+                "Isaac mrope_section must sum to half the rotary dimension: "
                 f"sum={sum(self.mrope_section)}, rotary_dim={rotary_dim}"
             )
 
@@ -943,10 +945,10 @@ class IsaacQwen36TextRotaryEmbedding(nn.Module):
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
         if position_ids.ndim != 3 or position_ids.shape[0] != 3:
             raise ValueError(
-                f"MK1 position_ids must have shape [3, batch, length], got {tuple(position_ids.shape)}"
+                f"Isaac position_ids must have shape [3, batch, length], got {tuple(position_ids.shape)}"
             )
 
-        # Match Genesis precompute_cos_sin_3d exactly: the model-dtype table is
+        # The model-dtype table is
         # promoted to FP32 before phase construction, then trig results are cast
         # back to the activation dtype before rotary multiplication.
         inv_freq = self.inv_freq.to(device=position_ids.device, dtype=torch.float32)
@@ -972,7 +974,7 @@ class IsaacQwen36VisionAttention(qwen35_modeling.Qwen3_5MoeVisionAttention):
     ) -> torch.Tensor:
         del rotary_pos_emb, kwargs
         if position_embeddings is None:
-            raise ValueError("MK1 vision attention requires precomputed position embeddings")
+            raise ValueError("Isaac vision attention requires precomputed position embeddings")
         sequence_length = hidden_states.shape[0]
         query_states, key_states, value_states = (
             self.qkv(hidden_states)
@@ -993,7 +995,7 @@ class IsaacQwen36VisionAttention(qwen35_modeling.Qwen3_5MoeVisionAttention):
 
         lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         if not lengths or any(length <= 0 for length in lengths) or sum(lengths) != sequence_length:
-            raise ValueError("MK1 vision cu_seqlens must describe positive chunks covering every token")
+            raise ValueError("Isaac vision cu_seqlens must describe positive chunks covering every token")
         splits = [torch.split(tensor, lengths, dim=2) for tensor in (query_states, key_states, value_states)]
         outputs = [
             explicit_repeat_kv_sdpa(
@@ -1013,7 +1015,7 @@ class IsaacQwen36VisionAttention(qwen35_modeling.Qwen3_5MoeVisionAttention):
 
 
 class IsaacQwen36VisionModel(Qwen3_5MoeVisionModel):
-    """Qwen3.5 vision stack with Genesis-order positional interpolation."""
+    """Qwen3.5 vision stack with single-reduction positional interpolation."""
 
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
         grid_thw_list = grid_thw.tolist()
@@ -1059,7 +1061,7 @@ class IsaacQwen36VisionModel(Qwen3_5MoeVisionModel):
             device=device,
         )
         interpolated = self.pos_embed(index_tensor).to(device) * weight_tensor[:, :, None]
-        # Genesis performs one BF16 reduction; chained additions round at three
+        # Use one BF16 reduction; chained additions round at three
         # different boundaries and diverge at production image resolutions.
         patch_pos_embeds = interpolated.sum(dim=0)
         patch_pos_embeds = patch_pos_embeds.split(
@@ -1093,7 +1095,7 @@ class IsaacQwen36VisionModel(Qwen3_5MoeVisionModel):
 
 
 class IsaacQwen36DecoderLayer(Qwen3_5MoeDecoderLayer):
-    """Stock Qwen hybrid token mixer with the Genesis null-MoE block."""
+    """Stock Qwen hybrid token mixer with the null-MoE block."""
 
     def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
         # Avoid constructing and then discarding a stock sparse-MoE block.
@@ -1106,7 +1108,7 @@ class IsaacQwen36DecoderLayer(Qwen3_5MoeDecoderLayer):
         elif self.layer_type == "full_attention":
             self.self_attn = IsaacQwen36Attention(config, layer_idx)
         else:
-            raise ValueError(f"Unsupported MK1 layer type {self.layer_type!r} at index {layer_idx}")
+            raise ValueError(f"Unsupported Isaac layer type {self.layer_type!r} at index {layer_idx}")
         self.mlp = IsaacNullSparseMoeBlock(config)
         self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1126,16 +1128,16 @@ class IsaacQwen36TextModel(Qwen3_5MoeTextModel):
         IsaacNullMoeContract.from_text_config(config)
         full_attention_interval = getattr(config, "full_attention_interval", 4)
         if isinstance(full_attention_interval, bool) or not isinstance(full_attention_interval, int):
-            raise ValueError("MK1 Qwen3.6 full_attention_interval must be an integer")
+            raise ValueError("Isaac Qwen3.6 full_attention_interval must be an integer")
         if full_attention_interval <= 0:
-            raise ValueError("MK1 Qwen3.6 full_attention_interval must be positive")
+            raise ValueError("Isaac Qwen3.6 full_attention_interval must be positive")
         expected_layer_types = [
             "full_attention" if (layer_index + 1) % full_attention_interval == 0 else "linear_attention"
             for layer_index in range(config.num_hidden_layers)
         ]
         if config.layer_types != expected_layer_types:
             raise ValueError(
-                f"MK1 Qwen3.6 requires full attention every {full_attention_interval} layers "
+                f"Isaac Qwen3.6 requires full attention every {full_attention_interval} layers "
                 "and linear attention elsewhere"
             )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)

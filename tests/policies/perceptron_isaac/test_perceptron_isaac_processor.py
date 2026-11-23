@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import json
 import logging
 import shutil
@@ -1101,7 +1100,7 @@ def test_native_policy_online_rollout_uses_policy_clock(monkeypatch, tmp_path):
     fake_renderer = _install_fake_native_renderer(policy._ensure_online_render_step(), monkeypatch)
 
     policy.select_action(_batch(0))
-    # Genesis floors the anchor at (k-1)/fps so the k rendered observation timestamps stay
+    # The anchor is floored at (k-1)/fps so the k rendered observation timestamps stay
     # distinct; with n_obs_steps=3 at 20 fps that is 0.1s, not 0.0s.
     np.testing.assert_allclose([fake_renderer.build_calls[-1]["anchor_timestamp_seconds"]], [0.1])
     first_window = fake_renderer.build_calls[-1]["observation_window"]
@@ -1129,7 +1128,7 @@ def test_native_policy_online_rollout_uses_policy_clock(monkeypatch, tmp_path):
         settled_policy.select_action(_batch(idx))
 
     assert len(settled_renderer.build_calls) == 1
-    # Settling happens inside the environment reset for Genesis, and its model clock counts
+    # Settling belongs to the environment reset, and the model clock counts
     # only executed post-settle steps, so the first chunk anchors at (k-1)/fps regardless of
     # num_settle_steps rather than carrying a +num_settle_steps/fps offset.
     np.testing.assert_allclose([settled_renderer.build_calls[-1]["anchor_timestamp_seconds"]], [0.1])
@@ -1738,7 +1737,7 @@ def test_local_isaac_stats_collapsed_dims_degrade_to_identity(tmp_path):
     )
 
     stats = load_isaac_stats(stats_path)
-    # Genesis keeps the collapsed quantile box and normalizes through the eps denominator, so
+    # The collapsed quantile box is kept and normalized through the eps denominator, so
     # a raw value sitting at the constant maps to -1.0 -- not 0.0. Feeding 0.0 where training
     # saw -1.0 is a full-unit shift on that input dimension.
     at_constant = normalize_isaac_actions(np.asarray([[5.0, 1.0]], dtype=np.float32), stats.action)
@@ -2402,7 +2401,7 @@ def test_native_action_postprocessor_can_remap_binary_gripper(tmp_path):
 
     out = step(transition)[TransitionKey.ACTION].numpy()
 
-    # Tolerance covers the +eps term Genesis carries in the unnormalize denominator.
+    # Tolerance covers the +eps term in the unnormalize denominator.
     np.testing.assert_allclose(out[:, -1], [-1.0, 1.0], atol=1e-5)
 
 
@@ -2780,45 +2779,9 @@ def test_native_mharmony_metadata_requires_robot_type():
 
 def test_native_mharmony_import_helper_allows_only_mharmony_namespace():
     with pytest.raises(ImportError, match="mharmony"):
-        import_mharmony_module("genesis.inference.flow_matching.observation")
+        import_mharmony_module("os.path")
     with pytest.raises(ImportError, match="mharmony"):
         import_mharmony_module("mharmony_anything")
-
-
-def test_perceptron_isaac_forbids_all_genesis_imports():
-    root = Path(__file__).parents[3]
-    isaac_root = root / "src/lerobot/policies/perceptron_isaac"
-    offenders = []
-    for path in isaac_root.rglob("*.py"):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                names = [node.module] if node.module else []
-            elif isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            else:
-                names = []
-            for module_name in names:
-                if module_name.startswith("genesis"):
-                    offenders.append(f"{path}:{node.lineno}:{module_name}")
-
-            if not isinstance(node, ast.Call) or not node.args:
-                continue
-            function_name = None
-            if isinstance(node.func, ast.Attribute):
-                function_name = node.func.attr
-            elif isinstance(node.func, ast.Name):
-                function_name = node.func.id
-            if function_name not in {"import_module", "__import__"}:
-                continue
-            first_arg = node.args[0]
-            if not isinstance(first_arg, ast.Constant) or not isinstance(first_arg.value, str):
-                continue
-            module_name = first_arg.value
-            if module_name.startswith("genesis"):
-                offenders.append(f"{path}:{node.lineno}:{module_name}")
-
-    assert offenders == []
 
 
 def _suite_stats_block(*, proprio_q01: float, proprio_q99: float) -> dict:

@@ -1,4 +1,4 @@
-"""Genesis logical-null router statistics and global training auxiliaries.
+"""Logical-null router statistics and global training auxiliaries.
 
 Dispatch counts sum top-k lanes. One physical null row represents multiple
 logical slots. Only forwarded positions matter, not text or action loss masks.

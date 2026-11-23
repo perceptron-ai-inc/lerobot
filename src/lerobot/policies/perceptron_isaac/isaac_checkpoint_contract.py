@@ -1,8 +1,8 @@
-"""Allocation-free validation for the MK1 Fast VLA checkpoint contract.
+"""Allocation-free validation for the Isaac VLA checkpoint contract.
 
 This module treats ``hf_model/config.json`` and the safetensors index as data.
 It does not import Transformers, construct a model, or read tensor payloads.
-Only the single MK1/PR-3154 export ABI is accepted for production. A reduced
+Only a single export ABI is accepted for production. A reduced
 geometry is available solely for explicitly marked CPU test fixtures.
 """
 
@@ -101,7 +101,7 @@ _ARTIFACT_IDENTITY_KEYS = {"schema_version", "artifact_kind"}
 
 
 class IsaacCheckpointContractError(ValueError):
-    """The checkpoint cannot be interpreted as the allowlisted MK1 VLA ABI."""
+    """The checkpoint cannot be interpreted as the allowlisted Isaac VLA ABI."""
 
 
 def validate_checkpoint_action_expert_semantics(raw: Mapping[str, Any]) -> None:
@@ -334,7 +334,7 @@ class IsaacCheckpointContract:
         if native_format:
             root = _normalize_isaac05(root)
         elif _object_field(_object_field(root, "genesis_vla"), "action_expert").get("type") == "dit":
-            _fail("legacy MK1 requires the molmoact action ABI")
+            _fail("the legacy layout requires the molmoact action ABI")
         test_marker = root.get(ISAAC_TEST_GEOMETRY_MARKER, False)
         if test_marker is not False and test_marker is not True:
             _fail(f"{ISAAC_TEST_GEOMETRY_MARKER} must be a boolean")
@@ -343,7 +343,7 @@ class IsaacCheckpointContract:
         test_geometry = bool(test_marker)
 
         if "apply_offset_norm" in root:
-            _fail("MK1 config must not contain the legacy apply_offset_norm override")
+            _fail("Isaac config must not contain the legacy apply_offset_norm override")
         if root.get("model_type") != ISAAC_MODEL_TYPE:
             _fail(f"model_type must be {ISAAC_MODEL_TYPE!r}")
         if root.get("architectures") != [ISAAC_ARCHITECTURE]:
@@ -393,7 +393,7 @@ class IsaacCheckpointContract:
 
         def add(key: str, *shape: int) -> None:
             if key in shapes:  # pragma: no cover - programmer invariant
-                raise AssertionError(f"duplicate expected MK1 tensor {key}")
+                raise AssertionError(f"duplicate expected Isaac tensor {key}")
             shapes[key] = tuple(shape)
 
         text = self.text
@@ -512,7 +512,7 @@ class IsaacCheckpointContract:
     def validate_coord_reserved_token_groups(self, groups: Any) -> None:
         """Cross-check the checkpoint coordinate range against mHarmony metadata.
 
-        Genesis identifies this reserved block by the exact ``name="coord"``
+        This reserved block is identified by the exact ``name="coord"``
         marker.  A tokenizer label is neither required nor sufficient: changing
         the name disables the coordinate-token render path even if the numeric
         range happens to match.
@@ -547,7 +547,7 @@ class IsaacCheckpointContract:
             fast = fast_groups[0]
             if (fast.get("offset"), fast.get("size")) != (ISAAC_FAST_TOKEN_OFFSET, ISAAC_FAST_TOKEN_SIZE):
                 _fail(
-                    "production MK1 FAST reserved-token range must be "
+                    "production Isaac FAST reserved-token range must be "
                     f"offset {ISAAC_FAST_TOKEN_OFFSET} with size {ISAAC_FAST_TOKEN_SIZE}"
                 )
 
@@ -653,7 +653,7 @@ def validate_isaac_tokenizer(
         "<|video_pad|>": special.video_token_id,
     }
     if special.bos_token_id != special.eos_token_id:
-        _fail("MK1 bos_token_id and eos_token_id must share <|endoftext|>")
+        _fail("Isaac bos_token_id and eos_token_id must share <|endoftext|>")
     for token, expected_id in required.items():
         if by_token.get(token) != expected_id:
             _fail(f"tokenizer special token {token!r} has ID {by_token.get(token)!r}, expected {expected_id}")
@@ -830,7 +830,7 @@ def finalize_isaac_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     text_config = raw.get("text_config")
     mtp = vla.get("mtp") if isinstance(vla, dict) else None
     if not isinstance(mtp, dict) or not isinstance(text_config, dict):
-        _fail("MK1 runtime checkpoint config is missing its MTP contract")
+        _fail("Isaac runtime checkpoint config is missing its MTP contract")
     if mtp.get("present") is True:
         mtp.update({"present": False, "physical_layers": 0, "rollout_steps": 0})
         text_config["mtp_num_hidden_layers"] = 0
@@ -844,7 +844,7 @@ def finalize_isaac_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     if index_path.is_file():
         return
     if not single_path.is_file():
-        _fail("MK1 runtime checkpoint save produced neither an index nor model.safetensors")
+        _fail("Isaac runtime checkpoint save produced neither an index nor model.safetensors")
     shard_name = "model-00001-of-00001.safetensors"
     shard_path = root / shard_name
     weight_map: dict[str, str] = {}
@@ -861,7 +861,7 @@ def finalize_isaac_runtime_checkpoint_layout(model_dir: str | Path) -> None:
             total_size += _tensor_payload_size(header)
             weight_map[key] = shard_name
     if not weight_map:
-        _fail("MK1 runtime checkpoint save produced no model tensors")
+        _fail("Isaac runtime checkpoint save produced no model tensors")
     single_path.replace(shard_path)
     temporary_index = index_path.with_suffix(".json.tmp")
     temporary_index.write_text(
@@ -1002,7 +1002,7 @@ def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> IsaacMoeContra
     if route_scale != 1.0:
         _fail("genesis_moe.route_scale must be 1.0")
     if not test_geometry and (real, null, physical, logical, top_k) != (256, 256, 257, 512, 8):
-        _fail("production MK1 requires the 256-real/256-null compact router and top-k 8")
+        _fail("production Isaac requires the 256-real/256-null compact router and top-k 8")
     return IsaacMoeContract(real, null, physical, logical, top_k, route_scale)
 
 
@@ -1054,7 +1054,7 @@ def _validate_standard_runtime_fields(raw: Mapping[str, Any], *, path: str) -> N
             _fail(f"{path}.{key} must be {wanted!r}, got {raw[key]!r}")
     for forbidden in ("use_return_dict", "_attn_implementation", "attn_implementation"):
         if forbidden in raw:
-            _fail(f"{path}.{forbidden} must not be serialized in an MK1 checkpoint")
+            _fail(f"{path}.{forbidden} must not be serialized in an Isaac checkpoint")
 
 
 def _parse_text(
@@ -1165,7 +1165,7 @@ def _parse_text(
     if not test_geometry:
         _require_values(raw, production, "text_config")
         if mrope != [11, 11, 10] or rope_theta != 10_000_000:
-            _fail("production MK1 requires mRoPE [11, 11, 10] and rope theta 10000000")
+            _fail("production Isaac requires mRoPE [11, 11, 10] and rope theta 10000000")
     elif (
         min(
             hidden,
@@ -1270,7 +1270,7 @@ def _parse_coord(
     if offset < 0 or size <= 0 or offset + size > text.vocab_size:
         _fail("coordinate token range lies outside the exported vocabulary")
     if not test_geometry and (offset, size) != (248320, 1001):
-        _fail("production MK1 coordinate range must be offset 248320 with size 1001")
+        _fail("production Isaac coordinate range must be offset 248320 with size 1001")
     return IsaacCoordTokenContract(enabled=True, offset=offset, size=size)
 
 
@@ -1304,7 +1304,7 @@ def _parse_special_tokens(
         }
         for key, wanted in expected.items():
             if values[key] != wanted:
-                _fail(f"production MK1 {key} must be {wanted}, got {values[key]}")
+                _fail(f"production Isaac {key} must be {wanted}, got {values[key]}")
     return IsaacSpecialTokenContract(**values)
 
 
@@ -1363,7 +1363,7 @@ def _parse_vla(
     if hidden_dim != text.hidden_size or output_dim != text.hidden_size:
         _fail("vector encoder hidden/output widths must equal the backbone hidden size")
     if not test_geometry and max_states != 128:
-        _fail("production MK1 vector encoder max_states must be 128")
+        _fail("production Isaac vector encoder max_states must be 128")
     vector = IsaacVectorEncoderContract(max_states, hidden_dim, output_dim)
 
     action_raw = _object_field(raw, "action_expert", "genesis_vla")
@@ -1430,7 +1430,7 @@ def _parse_vla(
     if action.hidden_dim % action.num_heads:
         _fail("action expert hidden_dim must be divisible by num_heads")
     if not test_geometry and action != IsaacActionExpertContract(64, 64, 36, 768, 8, 4.0, 256, 256):
-        _fail("production MK1 action expert geometry does not match the 36-layer MolmoAct contract")
+        _fail("production Isaac action expert geometry does not match the 36-layer MolmoAct contract")
     action = replace(action, native_metadata=metadata, conditioning=conditioning)
     return vector, action
 
@@ -1446,7 +1446,7 @@ def _parse_mtp(raw: Mapping[str, Any]) -> IsaacMtpContract:
     expected = (1, 3) if present else (0, 0)
     if (physical, rollout) != expected:
         state = "present=true" if present else "present=false"
-        _fail(f"MK1 MTP {state} requires physical_layers/rollout_steps={expected}")
+        _fail(f"Isaac MTP {state} requires physical_layers/rollout_steps={expected}")
     return IsaacMtpContract(present, physical, rollout)
 
 
@@ -1495,7 +1495,7 @@ def _add_decoder_layer_shapes(add, prefix: str, *, text, moe, layer_type: str) -
         add(f"{prefix}.linear_attn.norm.weight", text.linear_value_head_dim)
         add(f"{prefix}.linear_attn.out_proj.weight", hidden, value_width)
     else:  # pragma: no cover - config parser prevents this
-        raise AssertionError(f"unknown MK1 layer type {layer_type}")
+        raise AssertionError(f"unknown Isaac layer type {layer_type}")
 
 
 def _add_action_expert_shapes(add, action: IsaacActionExpertContract, *, context_dim: int) -> None:

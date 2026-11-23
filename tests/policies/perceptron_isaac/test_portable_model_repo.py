@@ -486,9 +486,9 @@ def test_fp32_masters_are_materialized_eagerly_without_sharding(tmp_path: Path) 
 
 def _record_backbone_load_device(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record the device `_load_backbone` asks for; really load the tiny model on the CPU host."""
-    import lerobot.policies.perceptron_isaac.modeling_isaac_vla as mk1
+    import lerobot.policies.perceptron_isaac.modeling_isaac_vla as isaac_vla
 
-    real_loader = mk1.load_isaac_vla_from_hf
+    real_loader = isaac_vla.load_isaac_vla_from_hf
     devices: list[str] = []
 
     def recording_loader(model_dir: str | Path, *, device: str, **kwargs: Any):
@@ -496,7 +496,7 @@ def _record_backbone_load_device(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         devices.append(str(device))
         return real_loader(model_dir, device="cpu", **kwargs)
 
-    monkeypatch.setattr(mk1, "load_isaac_vla_from_hf", recording_loader)
+    monkeypatch.setattr(isaac_vla, "load_isaac_vla_from_hf", recording_loader)
     return devices
 
 

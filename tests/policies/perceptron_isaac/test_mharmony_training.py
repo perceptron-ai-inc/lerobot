@@ -155,12 +155,12 @@ class _StubFastProcessor:
 
 
 def test_fast_and_flow_targets_are_clipped_independently():
-    """Genesis lowers FAST and Flow through separate transforms with independent caps.
+    """FAST and Flow are lowered through separate transforms with independent caps.
 
     ``fast_tokenizer`` defaults to ``clip_normalized_max=1.0`` while
     ``attach_flow_matching_action_target`` takes the recipe's value (10.0 for the shipped
     LIBERO identity) — the ``fastcap1_flowcap10`` run naming. Sharing a single clipped array
-    feeds the tokenizer an action distribution Genesis never trains it on: on
+    feeds the tokenizer an action distribution it was never trained on: on
     lerobot/libero_spatial_image, |normalized| reaches 1.99, so the 1.0 cap binds on ~1.4% of
     values across ~9.4% of frames while the 10.0 cap never binds at all.
     """
@@ -197,12 +197,11 @@ def test_fast_and_flow_targets_are_clipped_independently():
 
 
 def test_non_terminal_training_chunks_supervise_the_return_footer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Genesis sets message_stop_token="return" for every chunk short of the terminal step.
+    """message_stop_token is "return" for every chunk short of the terminal step.
 
-    ``_action_completion_metadata`` (core/datasets/augment/trajectory.py) attaches the token
-    whenever the chunk is non-terminal, and ``render_document_to_stream`` then swaps the
-    rendered ``<|end|>`` footer for ``<|return|>``. Genesis's LeRobot-native training builder
-    emits a window that never reaches the terminal step, so this is the default.
+    The token is attached whenever the chunk is non-terminal, and the rendered ``<|end|>``
+    footer is then swapped for ``<|return|>``. The default training window never reaches the
+    terminal step, so this is the default.
     """
     assert _footer_rewrite_for(None, monkeypatch) is True
     assert _footer_rewrite_for(False, monkeypatch) is True
@@ -943,8 +942,8 @@ def test_real_cached_fast_and_mharmony_render_joint_training_stream(
         assert controls
         return controls[-1]
 
-    # Genesis supervises <|return|> for any chunk short of the trajectory's terminal step, and
-    # its LeRobot-native builder never reaches that step, so the default render carries
+    # <|return|> is supervised for any chunk short of the trajectory's terminal step, and
+    # the default training window never reaches that step, so the default render carries
     # <|return|>. Only an explicitly terminal chunk keeps <|end|>.
     assert final_control_id(stream) == return_id
 

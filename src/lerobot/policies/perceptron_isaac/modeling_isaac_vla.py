@@ -1,4 +1,4 @@
-"""Config-driven MK1 Qwen3.6 null-MoE composition for the existing ISAAC VLA shell."""
+"""Config-driven Qwen3.6 null-MoE composition for the existing ISAAC VLA shell."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ _QUALIFIED_COMMON_EXECUTION_DEFAULTS: dict[str, Any] = {
 _QUALIFIED_TEXT_EXECUTION_DEFAULTS: dict[str, Any] = {
     "use_cache": True,
     "output_router_logits": False,
-    # Genesis Qwen3 routing normalizes selected top-k probabilities. The
+    # Routing normalizes selected top-k probabilities. The
     # custom null router owns this behavior, but retain the exported semantic
     # explicitly for config inspection and any inherited Transformers path.
     "norm_topk_prob": True,
@@ -69,7 +69,7 @@ _QUALIFIED_TEXT_EXECUTION_DEFAULTS: dict[str, Any] = {
 
 
 class IsaacQwen36VLAConfig(IsaacQwen36MoeConfig):
-    """MK1 backbone config with the two already-reviewed PR #3154 attachments."""
+    """Backbone config plus the vector-encoder width and the action-expert block."""
 
     def __init__(
         self,
@@ -88,7 +88,7 @@ class IsaacQwen36VLAConfig(IsaacQwen36MoeConfig):
 
 
 class IsaacQwen36VLAModel(IsaacQwen36Model):
-    """The existing VLA modality shell around the null-aware MK1 backbone."""
+    """The existing VLA modality shell around the null-aware backbone."""
 
     config_class = IsaacQwen36VLAConfig
 
@@ -115,7 +115,7 @@ class IsaacQwen36VLAModel(IsaacQwen36Model):
 
 
 class IsaacQwen36VLAForActionGeneration(Qwen3_5MoePreTrainedModel):
-    """MK1 backbone plus the unchanged vector encoder, lm head, and MolmoAct2 DiT."""
+    """Backbone plus the unchanged vector encoder, lm head, and MolmoAct2 DiT."""
 
     config_class = IsaacQwen36VLAConfig
     _no_split_modules = ["IsaacQwen36DecoderLayer", "Qwen3_5MoeVisionBlock", "ActionExpertBlock"]
@@ -190,7 +190,7 @@ def _build_config(
     for section_name in ("text_config", "vision_config"):
         section = normalized.get(section_name)
         if not isinstance(section, dict):
-            raise ValueError(f"MK1 VLA {section_name} must be a JSON object.")
+            raise ValueError(f"Isaac VLA {section_name} must be a JSON object.")
         for key, value in _QUALIFIED_COMMON_EXECUTION_DEFAULTS.items():
             section.setdefault(key, value)
     for key, value in _QUALIFIED_TEXT_EXECUTION_DEFAULTS.items():
@@ -209,7 +209,7 @@ def _build_config(
         **normalized,
     )
     if config.tie_word_embeddings or config.text_config.tie_word_embeddings:
-        raise ValueError("MK1 VLA requires untied input embeddings and lm_head.")
+        raise ValueError("Isaac VLA requires untied input embeddings and lm_head.")
     return config
 
 
@@ -225,7 +225,7 @@ def _runtime_expected_keys(contract: IsaacCheckpointContract) -> set[str]:
 def _configure_attention_backend(config: IsaacQwen36VLAConfig, attention_backend: str) -> None:
     if attention_backend != TORCH_SDPA_ATTENTION_BACKEND:
         raise ValueError(
-            f"Unsupported MK1 attention backend {attention_backend!r}; "
+            f"Unsupported Isaac attention backend {attention_backend!r}; "
             f"expected {TORCH_SDPA_ATTENTION_BACKEND!r}."
         )
     # This is a runtime-only selection made after the checkpoint-owned config
@@ -238,7 +238,7 @@ def _configure_attention_backend(config: IsaacQwen36VLAConfig, attention_backend
 def _configure_route_reduction(config: IsaacQwen36VLAConfig, route_reduction: str) -> None:
     if route_reduction != DETERMINISTIC_ROUTE_REDUCTION:
         raise ValueError(
-            f"Unsupported MK1 route reduction {route_reduction!r}; "
+            f"Unsupported Isaac route reduction {route_reduction!r}; "
             f"expected {DETERMINISTIC_ROUTE_REDUCTION!r}."
         )
     config.text_config._isaac_route_reduction = route_reduction
@@ -247,7 +247,7 @@ def _configure_route_reduction(config: IsaacQwen36VLAConfig, route_reduction: st
 def _require_qualified_transformers_abi() -> None:
     if transformers.__version__ != QUALIFIED_TRANSFORMERS_VERSION:
         raise RuntimeError(
-            "MK1 native inference requires the parity-qualified Transformers ABI "
+            "Isaac native inference requires the parity-qualified Transformers ABI "
             f"{QUALIFIED_TRANSFORMERS_VERSION}, got {transformers.__version__}."
         )
 
@@ -269,23 +269,23 @@ def _require_qualified_torch_cuda_abi(
     if torch_version != QUALIFIED_TORCH_CUDA_ABI or cuda_version != _QUALIFIED_CUDA_VERSION:
         installed_abi = f"{torch_version} (CUDA {cuda_version or 'unavailable'})"
         raise RuntimeError(
-            "MK1 trained_policy CUDA inference requires the parity-qualified PyTorch ABI "
+            "Isaac trained_policy CUDA inference requires the parity-qualified PyTorch ABI "
             f"{QUALIFIED_TORCH_CUDA_ABI}, got {installed_abi}. Neutral debug artifacts and "
             "explicit test-only reduced geometry are not production qualification."
         )
     try:
         capability = torch.cuda.get_device_capability(device)
     except (AssertionError, RuntimeError, ValueError) as exc:
-        raise RuntimeError("Cannot inspect the CUDA device for MK1 runtime qualification.") from exc
+        raise RuntimeError("Cannot inspect the CUDA device for Isaac runtime qualification.") from exc
     if capability != _QUALIFIED_CUDA_CAPABILITY:
         raise RuntimeError(
-            "MK1 trained_policy CUDA inference requires the parity-qualified Hopper SM90 device, "
+            "Isaac trained_policy CUDA inference requires the parity-qualified Hopper SM90 device, "
             f"got compute capability {capability[0]}.{capability[1]}."
         )
     device_name = torch.cuda.get_device_name(device)
     if not device_name.startswith(_QUALIFIED_CUDA_DEVICE_PREFIX):
         raise RuntimeError(
-            "MK1 trained_policy CUDA inference requires the parity-qualified NVIDIA H100 family, "
+            "Isaac trained_policy CUDA inference requires the parity-qualified NVIDIA H100 family, "
             f"got {device_name!r}."
         )
 
@@ -321,14 +321,14 @@ def _stream_checkpoint_tensors(
         inventory.verify_shard_identity(shard)
     missing = sorted(expected_keys - loaded)
     if missing:
-        raise RuntimeError(f"MK1 streamed load missed {len(missing)} tensors; first={missing[:10]}.")
+        raise RuntimeError(f"Isaac streamed load missed {len(missing)} tensors; first={missing[:10]}.")
 
 
 def _place_config_buffers(model: nn.Module, device: str | torch.device) -> None:
     """Move nonpersistent, config-derived buffers after empty-weight construction."""
     for name, buffer in list(model.named_buffers()):
         if buffer.device.type == "meta":
-            raise RuntimeError(f"MK1 config-derived buffer {name!r} remained on meta.")
+            raise RuntimeError(f"Isaac config-derived buffer {name!r} remained on meta.")
         if buffer.device != torch.device(device):
             set_module_tensor_to_device(
                 model,
@@ -367,7 +367,7 @@ def load_isaac_vla_from_hf(
     load_intent: Literal["inference", "training"] = "inference",
     verified_tensor_storage: VerifiedTrainedTensorStorage | None = None,
 ) -> tuple[IsaacQwen36VLAForActionGeneration, IsaacQwen36VLAConfig, IsaacCheckpointContract]:
-    """Validate, construct once on meta, and stream an MK1 VLA using the qualified SDPA backend.
+    """Validate, construct once on meta, and stream an Isaac VLA using the qualified SDPA backend.
 
     ``device`` is where the weights are materialized. ``runtime_device`` (default: ``device``) is
     where the model will run: it selects the GDN kernels and gates the production CUDA ABI, so a
@@ -421,11 +421,11 @@ def load_isaac_vla_from_hf(
         missing = sorted(expected_keys - model_keys)
         unexpected = sorted(model_keys - expected_keys)
         raise RuntimeError(
-            "MK1 model/checkpoint ABI mismatch before loading: "
+            "Isaac model/checkpoint ABI mismatch before loading: "
             f"missing_model_keys={missing[:10]}, unexpected_model_keys={unexpected[:10]}."
         )
     if model.lm_head.weight is model.get_input_embeddings().weight:
-        raise RuntimeError("MK1 VLA checkpoint requires untied lm_head and input embeddings.")
+        raise RuntimeError("Isaac VLA checkpoint requires untied lm_head and input embeddings.")
 
     _stream_checkpoint_tensors(
         model,
@@ -443,7 +443,7 @@ def load_isaac_vla_from_hf(
     meta_buffers = [name for name, buffer in model.named_buffers() if buffer.device.type == "meta"]
     if meta_parameters or meta_buffers:
         raise RuntimeError(
-            f"MK1 load left tensors on meta: parameters={meta_parameters[:10]}, buffers={meta_buffers[:10]}."
+            f"Isaac load left tensors on meta: parameters={meta_parameters[:10]}, buffers={meta_buffers[:10]}."
         )
     model.eval()
     return model, config, contract

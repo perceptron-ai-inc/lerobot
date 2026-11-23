@@ -11,7 +11,7 @@ _VLM_DIM = 16
 
 
 def _dit_contract(**overrides):
-    """A genesis-stamped DiT contract (schema v1, all 27 payload fields), tiny geometry."""
+    """A DiT contract (schema v1, all 27 payload fields), tiny geometry."""
     contract = {
         "type": "dit",
         "schema_version": 1,
@@ -97,7 +97,7 @@ def test_non_dit_config_with_schema_version_is_rejected():
 
 def test_unknown_expert_type_still_fails_loud():
     with pytest.raises(ValueError, match="unknown action_expert type"):
-        build_action_expert_head({"type": "genesis-flow-v2"}, vlm_dim=_VLM_DIM)
+        build_action_expert_head({"type": "flow-v2"}, vlm_dim=_VLM_DIM)
 
 
 def test_legacy_action_block_rejects_rtc_prefix():
