@@ -933,6 +933,10 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         native mharmony packer pads/normalizes the proprio vector for the model.
         """
         self._validate_declared_feature_widths()
+        if self.input_features is None or self.output_features is None:
+            raise ValueError(
+                "`input_features` and `output_features` must be resolved before validating them."
+            )
         _ensure_vla_feature_contract(
             self.input_features,
             self.output_features,

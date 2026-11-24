@@ -567,8 +567,8 @@ def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
     a wrong group set is not a cosmetic problem. The config-derived default
     (``DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS``) carries no coord block and no offset, so
     mHarmony bump-allocates its FAST pool to id 248087 while an Isaac-0.5 checkpoint is
-    trained with that pool at 249321 -- a 1234-id shift that would silently mis-encode
-    every FAST action token if it were ever used in place of the real declaration.
+    trained with that pool at 249321 -- a 1234-id shift that would silently encode every
+    FAST action token to the wrong id if it were ever used in place of the real declaration.
 
     Ordering is deliberately not constrained here: mHarmony resolves explicit offsets
     order-independently, and the shipped export lists its FAST group before its coord

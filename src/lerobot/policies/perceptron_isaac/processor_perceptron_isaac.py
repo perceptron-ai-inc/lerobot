@@ -9,8 +9,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, fields as dataclass_fields
-from dataclasses import replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -186,6 +185,7 @@ def _dataset_stats_to_isaac_stats(
     base_profile_id = config.normalization_profile_id
     if base_profile_id is None and source_profile is not None:
         base_profile_id = source_profile.profile_id
+    profile_id: str | None
     if base_profile_id and not str(base_profile_id).endswith("#finetune_dataset"):
         profile_id = f"{base_profile_id}#finetune_dataset"
     else:
@@ -1484,7 +1484,7 @@ class PerceptronIsaacActionUnnormalizeProcessorStep(ProcessorStep):
         action = transition.get(TransitionKey.ACTION)
         if action is None:
             return transition
-        if not torch.is_tensor(action):
+        if not isinstance(action, torch.Tensor):
             raise ValueError(
                 f"Perceptron Isaac action postprocessor expected a tensor, got {type(action).__name__}."
             )
@@ -1534,7 +1534,7 @@ class _PerceptronIsaacJointFrameTransformStep(ProcessorStep):
         if self.joint_signs is None or self.joint_offsets is None:
             return transition
 
-        container = transition
+        container: Any = transition
         if self._container_key is not None:
             container = transition.get(self._container_key)
             if not isinstance(container, dict) or self._value_key not in container:
@@ -2140,7 +2140,9 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                 or stats.action_horizon != config.chunk_size
                 or stats.target_fps != config.target_fps
             ):
-                raise ValueError(f"LIBERO stats for {config.libero_suite!r} disagree with the policy contract.")
+                raise ValueError(
+                    f"LIBERO stats for {config.libero_suite!r} disagree with the policy contract."
+                )
             stats = _maybe_passthrough_grippers(config, stats)
             require_closed_loop_safe_isaac_stats(stats)
             _install_normalization_stats(preprocessor, postprocessor, stats)

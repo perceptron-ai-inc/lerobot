@@ -156,7 +156,9 @@ def test_per_suite_normalization_survives_loading_from_a_package(tmp_path):
 
 
 @pytest.mark.parametrize(("cap", "restore_from_package"), [(1.0, True), (10.0, False)])
-def test_finetune_keeps_proprio_clip_with_new_stats_through_save_and_reload(tmp_path, cap, restore_from_package):
+def test_finetune_keeps_proprio_clip_with_new_stats_through_save_and_reload(
+    tmp_path, cap, restore_from_package
+):
     config = _saved_processor_config(tmp_path)
     source = Path(config.native_stats_path)
     payload = json.loads(source.read_text())
@@ -202,7 +204,9 @@ def test_finetune_keeps_proprio_clip_with_new_stats_through_save_and_reload(tmp_
     loaded_cfg = PerceptronIsaacConfig.from_pretrained(output)
     loaded_cfg.native_stats_path = str(saved_stats_path)
     loaded_pre, _ = make_pre_post_processors(loaded_cfg, pretrained_path=str(output))
-    packed = next(step for step in loaded_pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep))
+    packed = next(
+        step for step in loaded_pre.steps if isinstance(step, PerceptronIsaacMharmonyPackProcessorStep)
+    )
     assert packed._stats.profile == saved_stats.profile
     normed = normalize_isaac_proprio(np.full(8, 20.0), packed._stats.proprio, profile=packed._stats.profile)
     np.testing.assert_allclose(normed, cap)

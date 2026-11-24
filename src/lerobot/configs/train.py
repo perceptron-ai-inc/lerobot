@@ -191,8 +191,8 @@ class TrainPipelineConfig(HubMixin):
     def trainable_config(self) -> PreTrainedConfig | RewardModelConfig:
         """Return whichever config (policy or reward_model) is active."""
         if self.is_reward_model_training:
-            return self.reward_model
-        return self.policy
+            return self.reward_model  # type: ignore[return-value]
+        return self.policy  # type: ignore[return-value]
 
     def _resolve_pretrained_from_cli(self) -> None:
         """Resolve the pretrained source passed on the CLI into a loaded config.

@@ -23,7 +23,7 @@ import torch
 from huggingface_hub import save_torch_state_dict
 from torch import Tensor
 
-from lerobot.lerobot_types import TransitionKey
+from lerobot.lerobot_types import EnvTransition, TransitionKey
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.import_utils import require_package
 
@@ -1102,7 +1102,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
             ]
             * int(state_window.shape[0]),
         }
-        transition = {
+        transition: EnvTransition = {
             TransitionKey.OBSERVATION: observation,
             TransitionKey.ACTION: None,
             TransitionKey.REWARD: 0.0,
@@ -1113,6 +1113,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         }
         rendered = render_step(transition)
         rendered_complementary = rendered[TransitionKey.COMPLEMENTARY_DATA]
+        assert rendered_complementary is not None
         out = dict(batch)
         out[PERCEPTRON_ISAAC_STREAM_KEY] = rendered_complementary[PERCEPTRON_ISAAC_STREAM_KEY]
         out[PERCEPTRON_ISAAC_RENDER_META_KEY] = rendered_complementary[PERCEPTRON_ISAAC_RENDER_META_KEY]
