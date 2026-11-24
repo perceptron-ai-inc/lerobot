@@ -58,27 +58,6 @@ def test_native_schema2_contract_preserves_metadata_and_schema1_tensor_geometry(
     assert (fixture.root / "config.json").read_bytes() == before
 
 
-def test_migrated_schema2_preserves_full_40_layer_production_declaration_without_new_weights() -> None:
-    # The archived migrated form versions genesis_vla, not the legacy MolmoAct
-    # action block. Native Isaac05 instead versions its duplicated DiT action block.
-    raw = _config(test_geometry=False, mtp_present=False, coord_enabled=False)
-    schema1 = IsaacCheckpointContract.parse_allowlisted(raw)
-    raw["genesis_vla"]["schema_version"] = 2
-    raw["genesis_vla"]["action_expert"].update(
-        context_source="layer_hidden",
-        context_layers=list(range(4, 40)),
-        context_hidden_norm="final_norm",
-    )
-    before = copy.deepcopy(raw)
-
-    contract = IsaacCheckpointContract.parse_allowlisted(raw)
-
-    assert contract.text.num_hidden_layers == 40
-    assert contract.action_expert.num_layers == 36
-    assert contract.expected_tensor_shapes() == schema1.expected_tensor_shapes()
-    assert raw == before
-
-
 @pytest.mark.parametrize("field", ["context_source", "context_layers", "context_hidden_norm"])
 def test_schema2_requires_every_conditioning_field(tmp_path: Path, field: str) -> None:
     fixture = write_layerwise_checkpoint(tmp_path / "model")
@@ -269,13 +248,13 @@ def test_public_portable_schema2_loads_in_tree_without_rewriting_source(tmp_path
     assert {path: path.read_bytes() for path in policy_path.parent.rglob("*") if path.is_file()} == before
 
 
-def test_legacy_production_schema1_geometry_remains_allowlisted() -> None:
+def test_production_schema1_geometry_remains_allowlisted() -> None:
     raw: dict[str, Any] = _config(test_geometry=False, mtp_present=False, coord_enabled=False)
     before = copy.deepcopy(raw)
     contract = IsaacCheckpointContract.parse_allowlisted(raw)
     assert contract.text.num_hidden_layers == 40
     assert contract.action_expert.num_layers == 36
-    assert contract.action_expert.native_metadata == ()
+    assert dict(contract.action_expert.native_metadata) == raw["action_expert"]
     assert raw == before
 
 

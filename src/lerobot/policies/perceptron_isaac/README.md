@@ -114,8 +114,7 @@ RoPE frequencies in F32 from the original formula, including BF16-source trainin
 They do not replace parameters or widen a rounded BF16 table. Inference retains
 the released BF16 frequency table and phase behavior.
 
-The action expert is always the native DiT. Legacy checkpoints, whose action
-block says `type="molmoact"`, hold the same network and load into it with RTC off.
+The action expert is always the native DiT.
 
 Prompts carry an episode-time item before each observation only when the
 checkpoint's selected recipe sets `emit_observation_timestamps`. The released YAM

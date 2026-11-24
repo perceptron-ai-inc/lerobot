@@ -167,7 +167,6 @@ def test_save_checkpoint_nested_policy_uses_portable_asset_paths(
     _assert_portable_asset_paths(nested)
     assert standalone["type"] == nested["type"] == "perceptron_isaac"
     assert standalone["pretrained_path"] == nested["pretrained_path"] == str(native_run.source)
-    assert standalone["mk1_model_import_sha256"] is nested["mk1_model_import_sha256"] is None
     assert standalone["mk1_source_model_import_sha256"] == nested["mk1_source_model_import_sha256"]
     assert nested["mk1_source_model_import_sha256"] == source_identity
     manifest_path = package / "mk1_trained_package_manifest.json"
@@ -308,11 +307,9 @@ def test_policy_and_nested_config_share_export_overrides_without_live_changes(tm
         device="cpu",
         native_stats_path="/runtime/base-stats.json",
         stats_path="/runtime/legacy-stats.json",
-        mk1_model_import_sha256="1" * 64,
+        mk1_source_model_import_sha256="1" * 64,
         normalization_profile_id="base",
     )
-    config._export_mk1_model_import_sha256 = None
-    config._export_mk1_source_model_import_sha256 = "1" * 64
     config._export_native_stats = IsaacNormalizationStats(
         action=IsaacStatsBlock(q01=np.full(7, -1.0), q99=np.full(7, 1.0)),
         proprio=IsaacStatsBlock(q01=np.full(8, -1.0), q99=np.full(8, 1.0)),
@@ -329,7 +326,7 @@ def test_policy_and_nested_config_share_export_overrides_without_live_changes(tm
     portable = config.to_dict()
     assert train.to_dict()["policy"] == portable
     assert not list(tmp_path.iterdir()), "to_dict must not export sidecars"
-    assert portable["mk1_model_import_sha256"] is None
+    assert "mk1_model_import_sha256" not in portable
     assert portable["mk1_source_model_import_sha256"] == "1" * 64
     assert portable["native_stats_path"] == "isaac_stats.json"
     assert portable["stats_path"] is None

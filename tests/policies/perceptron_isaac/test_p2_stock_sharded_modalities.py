@@ -72,7 +72,10 @@ from lerobot.policies.perceptron_isaac.tensor_stream import (
 )
 from lerobot.scripts.lerobot_train import update_policy
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
-from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config as _native_config
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
+    _config as _native_config,
+    _update_action_expert,
+)
 from tests.policies.perceptron_isaac.test_modeling_training import _config as _policy_config
 
 
@@ -159,7 +162,7 @@ def _tiny_native_policy(
     wrapping: ModalityWrap,
 ) -> tuple[PerceptronIsaacPolicy, IsaacQwen36VLAForActionGeneration]:
     raw = _native_config(test_geometry=True, mtp_present=False)
-    raw["genesis_vla"]["action_expert"].update(action_dim=2, action_horizon=2)
+    _update_action_expert(raw, action_dim=2, action_horizon=2)
     contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
     native_config = _build_config(raw, contract)
     _configure_attention_backend(native_config, TORCH_SDPA_ATTENTION_BACKEND)

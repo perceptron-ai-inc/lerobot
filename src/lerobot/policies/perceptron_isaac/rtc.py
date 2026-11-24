@@ -194,8 +194,8 @@ def resolve_rtc_capability(
 ) -> RtcCapability:
     """Read an action-expert recipe's RTC fields with the final training stage's RTC record.
 
-    ``action`` is the checkpoint's ``action_expert`` metadata. A missing recipe, or a legacy
-    block without RTC fields, declares no budget, so trained prefixes stay rejected.
+    ``action`` is the checkpoint's ``action_expert`` metadata. A missing recipe, or one without
+    RTC fields, declares no budget, so trained prefixes stay rejected.
     """
     return RtcCapability(
         declared_max_delay_steps=0 if action is None else action.get("rtc_max_delay_steps", 0),

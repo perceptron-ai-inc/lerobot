@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from numbers import Real
 from typing import Any, Literal, Optional, TypeAlias
 from collections.abc import Sequence
@@ -30,7 +30,6 @@ from lerobot.utils.random_utils import deserialize_rng_state, serialize_rng_stat
 # --- TensorStream layout / mrope / context-mask utilities ---
 from .rtc import (
     DIT_ACTION_EXPERT_CONFIG_V1_FIELDS,
-    DIT_CONTEXT_CONDITIONING_FIELDS,
     ActionExpertConditioning,
     ActionExpertStepModulation,
     LayerHiddenContext,
@@ -40,7 +39,6 @@ from .rtc import (
     prepare_rtc_conditioning,
     project_rtc_modulation,
     resolve_rtc_action_prefix,
-    validate_action_context,
     validate_dit_action_metadata,
 )
 from .tensor_stream import ModalityType, TensorStream, TextType, VectorType, VisionType, group_streams
@@ -1510,49 +1508,6 @@ class DiTActionExpertHead(nn.Module):
         return averaged
 
 
-# Geometry fields a legacy action block may carry; it never declares a recipe or RTC support.
-_LEGACY_ACTION_FIELDS = frozenset(
-    {
-        "type",
-        "clean_at_0",
-        "action_dim",
-        "action_horizon",
-        "num_layers",
-        "hidden_dim",
-        "num_heads",
-        "mlp_ratio",
-        "num_inference_steps",
-        "timestep_embed_dim",
-        "ffn_multiple_of",
-        "qk_norm",
-        "qk_norm_eps",
-        "rope",
-        "context_layer_norm",
-        "causal_attn",
-    }
-)
-
-
-def _dit_metadata_from_legacy_block(cfg: dict[str, Any], *, schema_version: int) -> dict[str, Any]:
-    """Express a legacy action block as native DiT metadata.
-
-    Legacy checkpoints store the same clean-at-1 network under ``type="molmoact"``
-    without the native recipe fields. Their missing fields take the DiT defaults, which
-    equal the legacy sampling and training defaults; RTC stays off.
-    """
-    if cfg.get("clean_at_0", False) is not False:
-        raise ValueError("clean-at-0 action experts are unsupported; Isaac uses the clean-at-1 DiT.")
-    native = asdict(DiTActionExpertArgs())
-    unexpected = sorted(set(cfg) - _LEGACY_ACTION_FIELDS - set(DIT_CONTEXT_CONDITIONING_FIELDS))
-    if unexpected:
-        raise ValueError(f"legacy action_expert metadata has unexpected fields: {unexpected}.")
-    native.update({key: value for key, value in cfg.items() if key in native})
-    native.update({key: cfg[key] for key in DIT_CONTEXT_CONDITIONING_FIELDS if key in cfg})
-    native["type"] = "dit"
-    native["schema_version"] = schema_version
-    return native
-
-
 def build_action_expert_head(
     action_expert_cfg: dict[str, Any] | None,
     vlm_dim: int,
@@ -1562,26 +1517,14 @@ def build_action_expert_head(
 ) -> DiTActionExpertHead | None:
     """Construct the native DiT action-expert head.
 
-    DiT schemas 1 and 2 share the native clean-at-one head and weight ABI. Legacy
-    ``type="molmoact"`` blocks hold the same network and load as DiT metadata with RTC
-    off; their conditioning schema comes from the VLA envelope, not the action block.
-    Prefix RTC inference is gated by the checkpoint's declared RTC support.
+    DiT schemas 1 and 2 share the native clean-at-one head and weight ABI. Prefix RTC
+    inference is gated by the checkpoint's declared RTC support.
     """
     if action_expert_cfg is None:
         return None
     cfg = dict(action_expert_cfg)
-    head_type = cfg.get("type", "molmoact")
-    if head_type == "molmoact":
-        if "schema_version" in cfg:
-            raise ValueError(
-                "legacy action_expert type 'molmoact' does not define a schema_version "
-                f"contract; got schema_version={cfg['schema_version']!r}."
-            )
-        validate_action_context(
-            cfg, schema_version=context_schema_version, backbone_num_layers=backbone_num_layers
-        )
-        cfg = _dit_metadata_from_legacy_block(cfg, schema_version=context_schema_version)
-    elif head_type != "dit":
+    head_type = cfg.get("type")
+    if head_type != "dit":
         raise ValueError(f"unknown action_expert type {head_type!r}; only 'dit' is supported.")
     conditioning = validate_dit_action_metadata(cfg, backbone_num_layers=backbone_num_layers)
     return DiTActionExpertHead(cfg, vlm_dim=vlm_dim, conditioning=conditioning)

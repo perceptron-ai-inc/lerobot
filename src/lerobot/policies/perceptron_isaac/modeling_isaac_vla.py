@@ -22,11 +22,11 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from .isaac_checkpoint_contract import (
+    ISAAC_MODEL_TYPE,
     IsaacCheckpointContract,
     SafetensorsInventory,
     read_and_validate_safetensors_index,
     read_isaac_config_data,
-    rename_legacy_blocks,
     validate_isaac_tokenizer,
 )
 from .loss_perceptron_isaac import _global_sum_detached
@@ -185,8 +185,9 @@ def _build_config(
     raw: dict[str, Any],
     contract: IsaacCheckpointContract,
 ) -> IsaacQwen36VLAConfig:
-    # Config data read directly from a pre-release file still carries its own block names.
-    normalized = rename_legacy_blocks(copy.deepcopy(raw))
+    normalized = copy.deepcopy(raw)
+    # The config class is the Qwen3.5-MoE one; the package's own model type names the layout.
+    normalized["model_type"] = ISAAC_MODEL_TYPE
     for key, value in _QUALIFIED_COMMON_EXECUTION_DEFAULTS.items():
         normalized.setdefault(key, value)
     for section_name in ("text_config", "vision_config"):
@@ -199,9 +200,6 @@ def _build_config(
         normalized["text_config"].setdefault(key, value)
 
     action_expert = dict(normalized["isaac05_vla"]["action_expert"])
-    # Sampler steps are runtime input to sample_action(), not module geometry.
-    if action_expert.get("type") != "dit":
-        action_expert.pop("num_inference_steps", None)
     normalized.pop("action_expert", None)
     normalized.pop("vector_max_states", None)
     config = IsaacQwen36VLAConfig(

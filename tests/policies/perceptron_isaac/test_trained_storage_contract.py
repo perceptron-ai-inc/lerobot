@@ -42,7 +42,6 @@ from lerobot.policies.perceptron_isaac.trained_package import (
 from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _config, _source_package
 from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _config as _isaac_config,
-    _write_checkpoint,
     _write_portable_isaac05_checkpoint,
 )
 from tests.policies.perceptron_isaac.test_portable_model_repo import (
@@ -51,7 +50,6 @@ from tests.policies.perceptron_isaac.test_portable_model_repo import (
     _StubFsdpPlugin,
 )
 
-SourceFamily = Literal["isaac05", "legacy"]
 StorageProfile = Literal["all_bf16", "all_f32", "mixed"]
 SaveDefect = Literal["unsupported_dtype", "missing_key", "extra_key", "wrong_shape", "mixed_prefix"]
 LoadIntent = Literal["inference", "training"]
@@ -123,12 +121,12 @@ def _render_metadata(config: PerceptronIsaacConfig, path: Path) -> None:
     path.write_text(json.dumps(metadata) + "\n")
 
 
-def _source_policy(root: Path, family: SourceFamily, *, mtp_present: bool = False) -> PerceptronIsaacPolicy:
+def _source_policy(root: Path, *, mtp_present: bool = False) -> PerceptronIsaacPolicy:
     config = _source_package(root)
-    if family == "legacy":
+    if mtp_present:
         shutil.rmtree(root / "hf_model")
-        _write_checkpoint(
-            root / "hf_model", config=_isaac_config(test_geometry=True, mtp_present=mtp_present)
+        _write_portable_isaac05_checkpoint(
+            root / "hf_model", config=_isaac_config(test_geometry=True, mtp_present=True)
         )
         source_identity = root / "hf_model" / "source_mk1_model_import.json"
         source_identity.write_text('{"fixture": "native-source-identity"}\n')
@@ -223,17 +221,15 @@ def _live_fsdp2(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy"])
 @pytest.mark.parametrize("profile", ["all_bf16", "all_f32", "mixed"])
 def test_public_trained_save_move_resume_preserves_storage_and_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     reduced_loader: list[LoadCall],
-    family: SourceFamily,
     profile: StorageProfile,
 ) -> None:
     source = tmp_path / "source"
-    policy = _source_policy(source, family)
+    policy = _source_policy(source)
     source_files = _files(source)
     source_model_config = (source / "hf_model" / "config.json").read_bytes()
     source_identity = policy.config.mk1_source_model_import_sha256
@@ -310,7 +306,6 @@ def test_public_trained_save_move_resume_preserves_storage_and_values(
     assert _files(moved) == before_reload, "Loading/training setup must not write the saved package"
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy"])
 @pytest.mark.parametrize(
     "defect", ["unsupported_dtype", "missing_key", "extra_key", "wrong_shape", "mixed_prefix"]
 )
@@ -318,10 +313,9 @@ def test_invalid_gathered_save_fails_before_destination_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     reduced_loader: list[LoadCall],
-    family: SourceFamily,
     defect: SaveDefect,
 ) -> None:
-    policy = _source_policy(tmp_path / "source", family)
+    policy = _source_policy(tmp_path / "source")
     state = dict(policy.state_dict())
     key = "_isaac_model.lm_head.weight"
     if defect == "unsupported_dtype":
@@ -367,7 +361,7 @@ def test_invalid_gathered_save_fails_before_destination_changes(
 
 
 def test_runtime_save_omits_only_source_mtp_tensors(tmp_path: Path, reduced_loader: list[LoadCall]) -> None:
-    policy = _source_policy(tmp_path / "source", "legacy", mtp_present=True)
+    policy = _source_policy(tmp_path / "source", mtp_present=True)
     expected = _set_trained_values(policy, "mixed")
     assert not any(name.startswith("mtp.") for name in expected)
     destination = tmp_path / "saved"
@@ -377,14 +371,14 @@ def test_runtime_save_omits_only_source_mtp_tensors(tmp_path: Path, reduced_load
     for name, value in expected.items():
         _assert_bits(actual[name], value)
     config = json.loads((destination / "hf_model" / "config.json").read_text())
-    assert config["genesis_vla"]["mtp"]["present"] is False
+    assert config["isaac05_vla"]["mtp"]["present"] is False
     assert config["text_config"]["mtp_num_hidden_layers"] == 0
 
 
 def test_non_main_save_gathers_then_returns_without_validating_empty_state_or_writing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reduced_loader: list[LoadCall]
 ) -> None:
-    policy = _source_policy(tmp_path / "source", "isaac05")
+    policy = _source_policy(tmp_path / "source")
     destination = tmp_path / "destination"
     destination.mkdir()
     (destination / "sentinel").write_bytes(b"untouched")
@@ -407,15 +401,13 @@ def test_non_main_save_gathers_then_returns_without_validating_empty_state_or_wr
     assert _files(destination) == before
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy"])
 @pytest.mark.parametrize("tamper", ["weight_bytes", "unlisted_file", "missing_file", "source_identity"])
 def test_public_trained_reload_authenticates_the_entire_payload_before_loading(
     tmp_path: Path,
     reduced_loader: list[LoadCall],
-    family: SourceFamily,
     tamper: Literal["weight_bytes", "unlisted_file", "missing_file", "source_identity"],
 ) -> None:
-    policy = _source_policy(tmp_path / "source", family)
+    policy = _source_policy(tmp_path / "source")
     _set_trained_values(policy, "mixed")
     saved = tmp_path / "saved"
     policy.save_pretrained(saved)
@@ -440,18 +432,13 @@ def test_public_trained_reload_authenticates_the_entire_payload_before_loading(
     assert _files(saved) == before
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy"])
-def test_original_source_still_rejects_wrong_family_storage_dtype(
-    tmp_path: Path, reduced_loader: list[LoadCall], family: SourceFamily
+def test_original_source_still_rejects_wrong_storage_dtype(
+    tmp_path: Path, reduced_loader: list[LoadCall]
 ) -> None:
     """Without a trained outer payload declaration, source profile rules remain strict."""
     model_root = tmp_path / "original"
-    if family == "isaac05":
-        _write_portable_isaac05_checkpoint(model_root)
-        wrong_dtype = torch.bfloat16
-    else:
-        _write_checkpoint(model_root, config=_isaac_config(test_geometry=True, mtp_present=False))
-        wrong_dtype = torch.float32
+    _write_portable_isaac05_checkpoint(model_root)
+    wrong_dtype = torch.bfloat16
     # Update actual index sizes, but keep the original F32 source export profile unchanged.
     total_bytes = 0
     for shard in model_root.glob("model-*.safetensors"):
@@ -472,7 +459,7 @@ def test_original_source_still_rejects_wrong_family_storage_dtype(
     before = _files(model_root)
     with pytest.raises(RuntimeError, match="dtype"):
         PerceptronIsaacPolicy(config)
-    assert reduced_loader == [], "Original wrong-family source must fail before model materialization"
+    assert reduced_loader == [], "A wrong-dtype source must fail before model materialization"
     assert _files(model_root) == before
 
 
@@ -624,26 +611,6 @@ def test_v3_rebound_manifest_cannot_change_source_import_identity(
     with pytest.raises(RuntimeError, match="source model-import identity.*mismatch"):
         PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
     assert reduced_loader == []
-
-
-@pytest.mark.parametrize("profile", ["all_f32", "mixed", "all_bf16"])
-def test_v2_missing_declaration_retains_original_source_family_rules(
-    tmp_path: Path, reduced_loader: list[LoadCall], profile: StorageProfile
-) -> None:
-    root = tmp_path / "package"
-    _storage_package(root, profile)
-    manifest = json.loads((root / "mk1_trained_package_manifest.json").read_text())
-    manifest["schema"] = "perceptron_isaac_mk1_canonical_trained_package_manifest_v2"
-    del manifest["metadata"]
-    _bind_manifest(root, manifest)
-    policy = PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
-    if profile == "all_f32":
-        policy._load_backbone()
-        assert reduced_loader == [LoadCall(torch.bfloat16, frozenset({"F32"}), "inference")]
-    else:
-        with pytest.raises(RuntimeError, match="dtype"):
-            policy._load_backbone()
-        assert reduced_loader == []
 
 
 @pytest.mark.parametrize("read_boundary", ["config", "tokenizer"])

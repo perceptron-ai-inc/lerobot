@@ -46,7 +46,7 @@ reduced_loader = _reduced_loader
         pytest.param({"rtc_max_delay_steps": 30, "rtc_probability": 0.5}, 8, 0, 7, True, id="short_chunk"),
         pytest.param({"rtc_max_delay_steps": 30, "rtc_probability": 0.0}, 60, 0, 0, False, id="zero_prob"),
         pytest.param({"rtc_max_delay_steps": 0, "rtc_probability": None}, 60, 0, 0, False, id="no_budget"),
-        pytest.param({"type": "molmoact"}, 60, None, 0, False, id="legacy_block"),
+        pytest.param({"type": "dit"}, 60, None, 0, False, id="no_rtc_fields"),
         pytest.param(None, 60, 0, 0, False, id="no_recipe"),
     ],
 )

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
@@ -28,7 +27,6 @@ from lerobot.policies.perceptron_isaac.trained_package import (
 from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _source_package
 from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _config,
-    _write_checkpoint,
     _write_portable_isaac05_checkpoint,
 )
 from tests.policies.perceptron_isaac.test_trained_storage_contract import (
@@ -36,7 +34,6 @@ from tests.policies.perceptron_isaac.test_trained_storage_contract import (
     reduced_loader,  # noqa: F401 -- shared fixture changes geometry permission only
 )
 
-Family = Literal["isaac05", "legacy"]
 MANIFEST = "mk1_trained_package_manifest.json"
 DIGEST_FIELD = "mk1_trained_package_manifest_sha256"
 
@@ -47,8 +44,8 @@ def _files(root: Path) -> dict[str, bytes]:
     }
 
 
-def _legacy_authenticated_package(root: Path, *, version: Literal[2, 3] = 3) -> PerceptronIsaacConfig:
-    """Stamp historical v2/v3 formats independently of the evolving production writer.
+def _legacy_authenticated_package(root: Path) -> PerceptronIsaacConfig:
+    """Stamp the count-bearing manifest form independently of the evolving production writer.
 
     The count is present in both original policy JSON and manifest. Their full hashes,
     including that count, must be verified before any runtime compatibility projection.
@@ -60,12 +57,12 @@ def _legacy_authenticated_package(root: Path, *, version: Literal[2, 3] = 3) -> 
     payload["trained_steps"] = 100_000
     payload[DIGEST_FIELD] = None
     manifest = {
-        "schema": f"perceptron_isaac_mk1_canonical_trained_package_manifest_v{version}",
+        "schema": "perceptron_isaac_mk1_canonical_trained_package_manifest_v3",
         "artifact_kind": payload["artifact_kind"],
         "trained_steps": 100_000,
         "mk1_source_model_import_sha256": payload["mk1_source_model_import_sha256"],
         "model_storage": "canonical_inner",
-        **({"metadata": {"tensor_storage_dtypes": ["F32"]}} if version == 3 else {}),
+        "metadata": {"tensor_storage_dtypes": ["F32"]},
         "config_sha256": canonical_json_sha256(payload),
         "files_sha256": {
             name: hashlib.sha256(value).hexdigest()
@@ -82,20 +79,12 @@ def _legacy_authenticated_package(root: Path, *, version: Literal[2, 3] = 3) -> 
     return loaded
 
 
-@pytest.mark.parametrize("family", ["isaac05", "legacy"])
-def test_missing_model_count_is_the_only_relaxed_source_gate(tmp_path: Path, family: Family) -> None:
+def test_missing_model_count_is_the_only_relaxed_source_gate(tmp_path: Path) -> None:
     root = tmp_path / "model"
-    if family == "isaac05":
-        expected, raw, _ = _write_portable_isaac05_checkpoint(root)
-        artifact_key = "isaac05_artifact"
-        allowed_dtypes = frozenset({"F32"})
-    else:
-        raw = _config(test_geometry=True, mtp_present=False)
-        expected = _write_checkpoint(root, config=raw)
-        artifact_key = "genesis_artifact"
-        allowed_dtypes = frozenset({"BF16"})
+    expected, raw, _ = _write_portable_isaac05_checkpoint(root)
+    allowed_dtypes = frozenset({"F32"})
     before = _files(root)
-    assert raw[artifact_key].pop("trained_steps") == 100_000
+    assert raw["isaac05_artifact"].pop("trained_steps") == 100_000
     (root / "config.json").write_text(json.dumps(raw, indent=2) + "\n")
     original_bytes = _files(root)
     assert {name for name in before if before[name] != original_bytes[name]} == {"config.json"}
@@ -120,15 +109,15 @@ def test_count_removal_does_not_accept_unsupported_architecture_or_identity(
 ) -> None:
     raw = _config(test_geometry=False)
     if omit_count:
-        del raw["genesis_artifact"]["trained_steps"]
+        del raw["isaac05_artifact"]["trained_steps"]
     if defect == "kind":
-        raw["genesis_artifact"]["artifact_kind"] = "unknown"
+        raw["isaac05_artifact"]["artifact_kind"] = "unknown"
         message = "artifact_kind"
     elif defect == "geometry":
         raw["text_config"]["hidden_size"] = 17
         message = "production Isaac|hidden_size"
     else:
-        raw["genesis_artifact"]["schema_version"] = 2
+        raw["isaac05_artifact"]["schema_version"] = 2
         message = "schema_version"
     with pytest.raises(IsaacCheckpointContractError, match=message):
         IsaacCheckpointContract.parse_allowlisted(raw)
@@ -214,31 +203,22 @@ def test_new_package_writer_needs_no_model_step_count(tmp_path: Path) -> None:
     )
 
 
-@pytest.mark.parametrize("version", [2, 3])
-def test_historical_count_bearing_manifest_verifies_without_rewriting(
-    tmp_path: Path, version: Literal[2, 3]
-) -> None:
+def test_historical_count_bearing_manifest_verifies_without_rewriting(tmp_path: Path) -> None:
     root = tmp_path / "package"
-    loaded = _legacy_authenticated_package(root, version=version)
+    loaded = _legacy_authenticated_package(root)
     original_bytes = _files(root)
 
     storage = PerceptronIsaacPolicy._verify_trained_package_manifest(loaded, root)
 
-    if version == 3:
-        assert isinstance(storage, VerifiedTrainedTensorStorage)
-        assert storage.dtypes == frozenset({"F32"})
-    else:
-        assert storage is None, "v2 must not gain authenticated-v3 storage privileges"
+    assert isinstance(storage, VerifiedTrainedTensorStorage)
+    assert storage.dtypes == frozenset({"F32"})
     assert _files(root) == original_bytes
 
 
-@pytest.mark.parametrize("version", [2, 3])
 @pytest.mark.parametrize("target", ["policy_count", "manifest_count", "source_count", "source_identity"])
-def test_historical_count_bytes_are_not_excluded_from_authentication(
-    tmp_path: Path, target: str, version: Literal[2, 3]
-) -> None:
+def test_historical_count_bytes_are_not_excluded_from_authentication(tmp_path: Path, target: str) -> None:
     root = tmp_path / "package"
-    loaded = _legacy_authenticated_package(root, version=version)
+    loaded = _legacy_authenticated_package(root)
     PerceptronIsaacPolicy._verify_trained_package_manifest(loaded, root)
     if target == "policy_count":
         path = root / "config.json"

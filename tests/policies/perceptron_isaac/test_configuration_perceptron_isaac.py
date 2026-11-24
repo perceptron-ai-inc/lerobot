@@ -55,21 +55,24 @@ def test_native_config_rejects_saved_true_offset_norm(tmp_path) -> None:
         PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
 
 
-@pytest.mark.parametrize("label", ["molmoact", "dit"])
-def test_retired_action_expert_label_is_dropped_on_read_and_not_saved(tmp_path, label: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("action_expert_type", "molmoact"), ("action_expert_type", "dit"), ("mk1_model_import_sha256", None)],
+)
+def test_retired_fields_are_dropped_on_read_and_not_saved(tmp_path, field: str, value: str | None) -> None:
     PerceptronIsaacConfig(device="cpu").save_pretrained(tmp_path)
     config_path = tmp_path / "config.json"
     payload = json.loads(config_path.read_text())
-    assert "action_expert_type" not in payload
+    assert field not in payload
     # Packages saved before the field was retired still carry it.
-    payload["action_expert_type"] = label
+    payload[field] = value
     config_path.write_text(json.dumps(payload))
 
     loaded = PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
 
-    assert not hasattr(loaded, "action_expert_type")
-    assert "action_expert_type" not in loaded.to_dict()
-    assert json.loads(config_path.read_text())["action_expert_type"] == label, "the file is not rewritten"
+    assert not hasattr(loaded, field)
+    assert field not in loaded.to_dict()
+    assert json.loads(config_path.read_text())[field] == value, "the file is not rewritten"
 
 
 def test_unknown_config_fields_are_still_rejected(tmp_path) -> None:
@@ -79,13 +82,6 @@ def test_unknown_config_fields_are_still_rejected(tmp_path) -> None:
 
     with pytest.raises(DecodingError, match="not_a_field"):
         PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
-
-
-def test_legacy_mharmony_marker_is_explicitly_upgraded() -> None:
-    with pytest.warns(FutureWarning, match="genesis-in-tree"):
-        config = PerceptronIsaacConfig(mharmony_version="genesis-in-tree")
-
-    assert config.mharmony_version == SUPPORTED_MHARMONY_VERSION
 
 
 def test_unknown_mharmony_version_is_rejected() -> None:
@@ -151,7 +147,6 @@ def test_config_rejects_nonpositive_action_steps(n_action_steps) -> None:
         "fast_processor_tree_sha256",
         "deployment_adapter_sha256",
         "qwen35_trained_package_manifest_sha256",
-        "mk1_model_import_sha256",
         "mk1_source_model_import_sha256",
         "mk1_trained_package_manifest_sha256",
     ],

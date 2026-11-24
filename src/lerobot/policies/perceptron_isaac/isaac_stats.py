@@ -19,7 +19,7 @@ import torch
 
 # The native quantile math is hardcoded to this epsilon, the value the bases were trained
 # with. Checkpoints declaring a different value cannot be served
-# faithfully, so the importer rejects them rather than silently substituting this one.
+# faithfully, so a package must not be built from them.
 NATIVE_NORMALIZATION_EPS = 1e-6
 
 

@@ -71,12 +71,9 @@ from .rtc import RtcCapability
 from .trained_package import (
     CANONICAL_INNER_MODEL_STORAGE,
     ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
-    ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2,
-    ISAAC_MODEL_IMPORT_FILENAME,
     ISAAC_SOURCE_MODEL_IMPORT_FILENAME,
     ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
     ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
-    ISAAC_TRAINED_PACKAGE_MANIFEST_SCHEMA,
     VerifiedTrainedTensorStorage,
     finalize_canonical_trained_package,
     parse_trained_tensor_storage_dtypes,
@@ -90,14 +87,6 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound="PerceptronIsaacPolicy")
 logger = logging.getLogger(__name__)
 _ISAAC_BASE_VOCAB_SIZE = 248_044
-
-
-def _load_json_object(path: Path, label: str) -> dict[str, Any]:
-    """Keep the package context and original JSON failure without parsing error text."""
-    try:
-        return load_json_object(path)
-    except ValueError as exc:
-        raise RuntimeError(f"Cannot read {label}: {exc}") from exc
 
 
 def _verify_sha256(
@@ -312,7 +301,7 @@ def read_accelerate_mixed_precision() -> str:
 def _package_storage_dtypes(
     model_dir: Path, *, verified_tensor_storage: VerifiedTrainedTensorStorage | None = None
 ) -> frozenset[str]:
-    """Use authenticated v3 storage, otherwise retain original/v2 source-family rules."""
+    """Use authenticated storage when present; otherwise an Isaac-0.5 model directory stores F32."""
     if verified_tensor_storage is not None:
         return verified_tensor_storage.for_model(model_dir)
     return frozenset({"F32" if is_portable_isaac05_repository(model_dir) else "BF16"})
@@ -408,11 +397,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         with self._verified_checkpoint_source(source_root) as verified_source:
             inner_state = self._preflight_canonical_inner_state(state_dict, verified_source / "hf_model")
             self._copy_checkpoint_package(verified_source, save_directory)
-        if self._config_declares_isaac(self.config):
-            self.config._export_mk1_source_model_import_sha256 = (
-                self.config.mk1_model_import_sha256 or self.config.mk1_source_model_import_sha256
-            )
-            self.config._export_mk1_model_import_sha256 = None
         self.config._save_pretrained(save_directory)
         self._save_canonical_inner_weights(save_directory, inner_state)
         self._canonical_inner_save_root = str(save_directory.resolve())
@@ -582,7 +566,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if self._config_declares_isaac(self.config):
             from .isaac_checkpoint_contract import (
                 ISAAC_TEST_GEOMETRY_MARKER,
-                LEGACY_TEST_GEOMETRY_MARKER,
                 IsaacCheckpointContractError,
                 finalize_isaac_runtime_checkpoint_layout,
                 validate_isaac_checkpoint,
@@ -595,28 +578,13 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                     model_root,
                     allow_test_only_reduced_geometry=bool(
                         inner_config.get(ISAAC_TEST_GEOMETRY_MARKER, False)
-                        or inner_config.get(LEGACY_TEST_GEOMETRY_MARKER, False)
                     ),
                     allowed_storage_dtypes=inner_state.storage_dtypes,
                 )
             except (ValueError, IsaacCheckpointContractError) as exc:
                 raise RuntimeError(f"Saved Isaac runtime checkpoint is invalid: {exc}") from exc
-            lineage = (
-                (
-                    save_directory / "isaac_import_provenance.json",
-                    save_directory / "source_isaac_import_provenance.json",
-                ),
-                (
-                    model_root / ISAAC_MODEL_IMPORT_FILENAME,
-                    model_root / ISAAC_SOURCE_MODEL_IMPORT_FILENAME,
-                ),
-            )
         else:
             raise RuntimeError("Perceptron ISAAC supports only native Isaac-0.5 checkpoints.")
-        for source, destination in lineage:
-            if source.is_file():
-                destination.unlink(missing_ok=True)
-                source.replace(destination)
 
     @classmethod
     def _verify_saved_package(cls, root: str | Path) -> PerceptronIsaacConfig:
@@ -645,15 +613,10 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         if getattr(self, "_canonical_inner_save_root", None) != str(root.resolve()):
             return
         if self._config_declares_isaac(self.config):
-            model_import_digest = getattr(
-                self.config,
-                "_export_mk1_source_model_import_sha256",
-                self.config.mk1_source_model_import_sha256,
-            )
             finalize_canonical_trained_package(
                 self.config,
                 root,
-                mk1_source_model_import_sha256=model_import_digest,
+                mk1_source_model_import_sha256=self.config.mk1_source_model_import_sha256,
             )
             return
         raise RuntimeError("Perceptron ISAAC supports only native Isaac-0.5 checkpoints.")
@@ -866,7 +829,6 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
         """Whether authenticated metadata or the inner checkpoint config declares a native package."""
         if (
             config.artifact_kind == "neutral_debug"
-            or config.mk1_model_import_sha256 is not None
             or config.mk1_source_model_import_sha256 is not None
             or config.mk1_trained_package_manifest_sha256 is not None
         ):
@@ -881,9 +843,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 return False
             if not isinstance(raw, dict):
                 return False
-            from .isaac_checkpoint_contract import declares_legacy_layout
-
-            return raw.get("model_type") == "isaac_0_5" or declares_legacy_layout(raw)
+            return raw.get("model_type") == "isaac_0_5"
 
         return False
 
@@ -1701,26 +1661,7 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
                 ),
             )
             return None
-        is_isaac_package = PerceptronIsaacPolicy._config_declares_isaac(config)
-        if is_isaac_package:
-            if config.artifact_kind == "neutral_debug" and not declares_trained_package:
-                PerceptronIsaacPolicy._verify_neutral_debug_manifest(config, root)
-                return None
-
-            verified_model_import_digest = PerceptronIsaacPolicy._verify_trained_package_manifest(
-                config, root
-            )
-            if isinstance(verified_model_import_digest, VerifiedTrainedTensorStorage):
-                return verified_model_import_digest
-            if verified_model_import_digest is not None:
-                PerceptronIsaacPolicy._verify_isaac_model_import(
-                    config,
-                    root,
-                    verified_record_digest=verified_model_import_digest,
-                    root_weights_bound=True,
-                )
-            return None
-        return None
+        return PerceptronIsaacPolicy._verify_trained_package_manifest(config, root)
 
     @staticmethod
     def _require_canonical_hf_model_path(
@@ -1750,467 +1691,80 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
     @staticmethod
     def _verify_trained_package_manifest(
         config: PerceptronIsaacConfig, root: Path
-    ) -> str | VerifiedTrainedTensorStorage | None:
-        """Authenticate trained assets, returning v3 storage only after full verification."""
+    ) -> VerifiedTrainedTensorStorage:
+        """Authenticate trained assets and return their tensor storage after full verification."""
+        from types import MappingProxyType
+
+        from .isaac_checkpoint_contract import read_and_validate_safetensors_index
+
         context = "Isaac trained package"
         manifest_path = root / ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME
         try:
             raw_manifest = load_json_object(manifest_path)
         except ValueError as exc:
             raise RuntimeError(f"Cannot read {context} manifest: {exc}") from exc
-        manifest_schema = raw_manifest.get("schema")
-        if manifest_schema in (
-            ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
-            ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2,
-        ):
-            model_import_digest = _verify_sha256(
-                config.mk1_source_model_import_sha256,
-                f"{context} mk1_source_model_import_sha256",
-            )
-            metadata: dict[str, Any] = {"model_storage": CANONICAL_INNER_MODEL_STORAGE}
-            source_inventory = None
-            if manifest_schema == ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA:
-                from .isaac_checkpoint_contract import read_and_validate_safetensors_index
-
-                metadata["metadata"] = raw_manifest.get("metadata")
-                model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(
-                    config, root, context="Isaac"
-                )
-                # Bind the header identities before authenticating payload bytes, then
-                # check them again afterward. A replacement cannot inherit an old hash.
-                source_inventory = read_and_validate_safetensors_index(model_root)
-            manifest = verify_trained_package_manifest(
-                root,
-                label="Isaac canonical trained package",
-                manifest_filename=ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
-                manifest_schema=manifest_schema,
-                digest_field=ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
-                manifest_digest=config.mk1_trained_package_manifest_sha256,
-                identity={
-                    "artifact_kind": config.artifact_kind,
-                    "mk1_source_model_import_sha256": model_import_digest,
-                },
-                metadata=metadata,
-                is_package_file=PerceptronIsaacPolicy._is_package_file,
-                delegated_directory=None,
-            )
-            expected_adapter_digest = _verify_sha256(
-                config.deployment_adapter_sha256,
-                f"{context} deployment_adapter_sha256",
-            )
-            adapter_path = root / "isaac_deployment_adapter.json"
-            _verify_sha256(
-                expected_adapter_digest,
-                f"{context} deployment_adapter_sha256",
-                adapter_path,
-            )
-            model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(config, root, context="Isaac")
-            if manifest_schema == ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA:
-                from types import MappingProxyType
-
-                assert source_inventory is not None
-                _verify_sha256(
-                    model_import_digest,
-                    f"{context} source model-import identity",
-                    model_root / ISAAC_SOURCE_MODEL_IMPORT_FILENAME,
-                )
-                shard_paths = frozenset(source_inventory.shards)
-                metadata_digests = {
-                    root / relative: digest
-                    for relative, digest in manifest["files_sha256"].items()
-                    if (root / relative).is_relative_to(model_root) and root / relative not in shard_paths
-                }
-                nanoseconds_per_second = 1_000_000_000
-                coarse_shard_digests = {
-                    shard: manifest["files_sha256"][shard.relative_to(root).as_posix()]
-                    for shard, identity in source_inventory.shard_identities.items()
-                    if identity.mtime_ns % nanoseconds_per_second == 0
-                    and identity.ctime_ns % nanoseconds_per_second == 0
-                }
-                verified_storage = VerifiedTrainedTensorStorage(
-                    model_root=model_root.resolve(strict=True),
-                    dtypes=parse_trained_tensor_storage_dtypes(manifest["metadata"]),
-                    source_inventory=source_inventory,
-                    metadata_digests=MappingProxyType(metadata_digests),
-                    coarse_shard_digests=MappingProxyType(coarse_shard_digests),
-                )
-                verified_storage.require_header_dtypes(source_inventory)
-                return verified_storage
-            return None
-
-        if not config.deployment_adapter_sha256:
-            raise RuntimeError("A trained Perceptron Isaac package requires deployment_adapter_sha256.")
-        expected_adapter_digest = _verify_sha256(
-            config.deployment_adapter_sha256, f"{context} deployment_adapter_sha256"
+        model_import_digest = _verify_sha256(
+            config.mk1_source_model_import_sha256,
+            f"{context} mk1_source_model_import_sha256",
         )
-        adapter_path = root / "isaac_deployment_adapter.json"
-        if not PerceptronIsaacPolicy._is_package_file(root, adapter_path):
-            raise RuntimeError(
-                f"A trained Perceptron Isaac package is missing its local deployment adapter: {adapter_path}."
-            )
-        expected_model_import_digest = _verify_sha256(
-            getattr(config, "mk1_model_import_sha256", None),
-            f"{context} mk1_model_import_sha256",
-        )
-        expected_model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(
-            config, root, context="Isaac"
-        )
-        model_import_path = expected_model_root / ISAAC_MODEL_IMPORT_FILENAME
-        if not PerceptronIsaacPolicy._is_package_file(root, model_import_path):
-            raise RuntimeError(f"A trained Isaac package is missing {ISAAC_MODEL_IMPORT_FILENAME}.")
-        verified_model_import_digest = file_sha256(model_import_path)
-        _verify_sha256(
-            expected_model_import_digest,
-            f"{context} model-import record digest",
-            verified_model_import_digest,
-        )
-        if config.artifact_kind != "trained_policy":
-            raise RuntimeError("Isaac trained package manifest identity disagrees with the policy config.")
-
+        model_root = PerceptronIsaacPolicy._require_canonical_hf_model_path(config, root, context="Isaac")
+        # Bind the header identities before authenticating payload bytes, then
+        # check them again afterward. A replacement cannot inherit an old hash.
+        source_inventory = read_and_validate_safetensors_index(model_root)
         manifest = verify_trained_package_manifest(
             root,
-            label=context,
+            label="Isaac canonical trained package",
             manifest_filename=ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
-            manifest_schema=ISAAC_TRAINED_PACKAGE_MANIFEST_SCHEMA,
+            manifest_schema=ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA,
             digest_field=ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD,
-            manifest_digest=getattr(config, ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD, None),
+            manifest_digest=config.mk1_trained_package_manifest_sha256,
             identity={
-                "artifact_kind": "trained_policy",
-                "mk1_model_import_sha256": expected_model_import_digest,
+                "artifact_kind": config.artifact_kind,
+                "mk1_source_model_import_sha256": model_import_digest,
+            },
+            metadata={
+                "model_storage": CANONICAL_INNER_MODEL_STORAGE,
+                "metadata": raw_manifest.get("metadata"),
             },
             is_package_file=PerceptronIsaacPolicy._is_package_file,
-            delegated_directory="hf_model",
+            delegated_directory=None,
         )
-        raw_files = manifest["files_sha256"]
-        if not raw_files:
-            raise RuntimeError("Isaac trained package files_sha256 must be a non-empty object.")
-
-        def adapter_mismatch(expected: str, actual: str) -> str:
-            return (
-                f"Perceptron Isaac deployment adapter digest mismatch at {adapter_path}: "
-                f"expected {expected}, found {actual}. The package was modified after import."
-            )
-
-        _verify_sha256(
-            expected_adapter_digest,
+        expected_adapter_digest = _verify_sha256(
+            config.deployment_adapter_sha256,
             f"{context} deployment_adapter_sha256",
-            adapter_path,
-            mismatch_error=adapter_mismatch,
         )
         _verify_sha256(
             expected_adapter_digest,
             f"{context} deployment_adapter_sha256",
-            raw_files[adapter_path.name],
-            mismatch_error=adapter_mismatch,
+            root / "isaac_deployment_adapter.json",
         )
-        return verified_model_import_digest
-
-    @staticmethod
-    def _verify_isaac_model_import(
-        config: PerceptronIsaacConfig,
-        root: Path,
-        *,
-        verified_record_digest: str | None = None,
-        root_weights_bound: bool = False,
-    ) -> None:
-        """Verify the exhaustive Isaac model import record before allocating weights."""
-        from .isaac_checkpoint_contract import (
-            LEGACY_BACKBONE_FAMILY,
-            LEGACY_KEY_PREFIX,
-            IsaacCheckpointContractError,
-            read_isaac_config,
-            validate_isaac_tokenizer,
+        _verify_sha256(
+            model_import_digest,
+            f"{context} source model-import identity",
+            model_root / ISAAC_SOURCE_MODEL_IMPORT_FILENAME,
         )
-
-        context = "Isaac model import"
-        record_name = ISAAC_MODEL_IMPORT_FILENAME
-        model_path = getattr(config, "hf_model_path", None)
-        if not model_path:
-            raise RuntimeError("A trained Perceptron Isaac package requires hf_model_path.")
-        root_weight_overrides = {
-            candidate.name
-            for candidate in root.iterdir()
-            if candidate.name == "model.safetensors"
-            or candidate.name == "model.safetensors.index.json"
-            or (candidate.name.startswith("model-") and candidate.name.endswith(".safetensors"))
+        shard_paths = frozenset(source_inventory.shards)
+        metadata_digests = {
+            root / relative: digest
+            for relative, digest in manifest["files_sha256"].items()
+            if (root / relative).is_relative_to(model_root) and root / relative not in shard_paths
         }
-        if root_weight_overrides and not root_weights_bound:
-            raise RuntimeError(
-                "Trained Isaac packages forbid unbound root-level weight overrides; "
-                f"found {sorted(root_weight_overrides)}. Re-import them into the hashed hf_model inventory."
-            )
-        model_root = Path(str(model_path))
-        record_path = model_root / record_name
-        if not PerceptronIsaacPolicy._is_package_file(root, record_path):
-            raise RuntimeError(f"A trained Isaac package is missing {record_name}.")
-        expected_record_digest = getattr(config, "mk1_model_import_sha256", None)
-        if not expected_record_digest:
-            raise RuntimeError("A trained Isaac package requires mk1_model_import_sha256.")
-        if verified_record_digest is None:
-            verified_record_digest = file_sha256(record_path)
-        _verify_sha256(expected_record_digest, f"{context} record digest", verified_record_digest)
-
-        record = _load_json_object(record_path, record_name)
-        record_keys = {
-            "schema",
-            "algorithm",
-            "backbone_family",
-            "rmsnorm_weight_convention",
-            "artifact",
-            "source_files_sha256",
-            "files_sha256",
-            "qwen35_vocab",
-            "shards",
+        nanoseconds_per_second = 1_000_000_000
+        coarse_shard_digests = {
+            shard: manifest["files_sha256"][shard.relative_to(root).as_posix()]
+            for shard, identity in source_inventory.shard_identities.items()
+            if identity.mtime_ns % nanoseconds_per_second == 0
+            and identity.ctime_ns % nanoseconds_per_second == 0
         }
-        if set(record) != record_keys:
-            raise RuntimeError("Isaac model import record fields do not match schema version 2.")
-        if (
-            record["schema"] != "perceptron_isaac_mk1_model_import_v2"
-            or record["algorithm"] != "byte_for_byte_safetensors_copy"
-            or record["backbone_family"] != LEGACY_BACKBONE_FAMILY
-            or record["rmsnorm_weight_convention"] != "zero_centered_1_plus_weight"
-        ):
-            raise RuntimeError("Isaac model import record identity is unsupported.")
-
-        def digest_map(value: Any, *, label: str) -> dict[str, str]:
-            if not isinstance(value, dict) or not value:
-                raise RuntimeError(f"Isaac model import {label} must be a non-empty object.")
-            result: dict[str, str] = {}
-            for filename, digest in value.items():
-                path = Path(filename) if isinstance(filename, str) else Path()
-                if (
-                    not isinstance(filename, str)
-                    or not filename
-                    or path.is_absolute()
-                    or path.name != filename
-                    or path.as_posix() != filename
-                    or ".." in path.parts
-                ):
-                    raise RuntimeError(f"Isaac model import {label} contains an invalid filename.")
-                result[filename] = _verify_sha256(digest, f"{context} {label}[{filename!r}]")
-            return result
-
-        files = digest_map(record["files_sha256"], label="files_sha256")
-        source_files = digest_map(record["source_files_sha256"], label="source_files_sha256")
-        if record_name in files or record_name in source_files:
-            raise RuntimeError("Isaac model import record must not include itself in a digest map.")
-
-        actual_files: set[str] = set()
-        for candidate in model_root.iterdir():
-            if candidate.is_dir() or not PerceptronIsaacPolicy._is_package_file(root, candidate):
-                raise RuntimeError(f"Isaac model directory contains a non-package file: {candidate}.")
-            actual_files.add(candidate.name)
-        if actual_files != set(files) | {record_name}:
-            raise RuntimeError(
-                "Isaac model file inventory disagrees with its import record: "
-                f"missing={sorted(set(files) - actual_files)}, "
-                f"unlisted={sorted(actual_files - set(files) - {record_name})}."
-            )
-        for filename, expected in files.items():
-            _verify_sha256(
-                expected,
-                f"{context} files_sha256[{filename!r}]",
-                model_root / filename,
-                f"{context} digest mismatch for {filename}.",
-            )
-
-        required_files = {
-            "config.json",
-            "tokenizer.json",
-            "vocab.json",
-            "model.safetensors.index.json",
-        }
-        missing_required = required_files - set(files)
-        missing_source = (required_files - {"vocab.json"}) - set(source_files)
-        if missing_required or missing_source:
-            raise RuntimeError(
-                "Isaac model import record does not bind all required assets: "
-                f"packaged_missing={sorted(missing_required)}, source_missing={sorted(missing_source)}."
-            )
-
-        index = _load_json_object(model_root / "model.safetensors.index.json", "model.safetensors.index.json")
-        weight_map = index.get("weight_map")
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise RuntimeError("Isaac model index must contain a non-empty weight_map.")
-        shard_counts: dict[str, int] = {}
-        for tensor_name, shard_name in weight_map.items():
-            if not isinstance(tensor_name, str) or not isinstance(shard_name, str):
-                raise RuntimeError("Isaac model index contains an invalid weight_map entry.")
-            shard_counts[shard_name] = shard_counts.get(shard_name, 0) + 1
-        indexed_shards = set(shard_counts)
-        recorded_shards = record["shards"]
-        if not isinstance(recorded_shards, list) or not recorded_shards:
-            raise RuntimeError("Isaac model import shards must be a non-empty list.")
-        if [item.get("filename") for item in recorded_shards if isinstance(item, dict)] != sorted(
-            indexed_shards
-        ):
-            raise RuntimeError("Isaac model import shard ordering or coverage disagrees with the index.")
-        for item in recorded_shards:
-            if not isinstance(item, dict) or set(item) != {
-                "filename",
-                "source_sha256",
-                "output_sha256",
-                "tensor_count",
-            }:
-                raise RuntimeError("Isaac model import contains a malformed shard record.")
-            filename = item["filename"]
-            count = item["tensor_count"]
-            if (
-                filename not in indexed_shards
-                or isinstance(count, bool)
-                or not isinstance(count, int)
-                or count != shard_counts[filename]
-                or files.get(filename) != _verify_sha256(item["output_sha256"], f"{context} shard output")
-                or source_files.get(filename)
-                != _verify_sha256(item["source_sha256"], f"{context} shard source")
-            ):
-                raise RuntimeError(f"Isaac model import shard record disagrees for {filename!r}.")
-        packaged_safetensors = {name for name in files if name.endswith(".safetensors")}
-        if packaged_safetensors != indexed_shards:
-            raise RuntimeError("Isaac model import safetensors files disagree with the index.")
-
-        for filename in {"config.json", "tokenizer.json", "model.safetensors.index.json"} | indexed_shards:
-            if source_files.get(filename) != files[filename]:
-                raise RuntimeError(f"Isaac byte-copy provenance disagrees for {filename}.")
-
-        vocab = record["qwen35_vocab"]
-        if not isinstance(vocab, dict) or set(vocab) != {
-            "schema",
-            "algorithm",
-            "token_count",
-            "tokenizer_sha256",
-            "vocab_sha256",
-        }:
-            raise RuntimeError("Isaac qwen35_vocab record is malformed.")
-        if (
-            vocab["schema"] != "perceptron_isaac_qwen35_vocab_v1"
-            or vocab["algorithm"] != "extract_tokenizer_json_model_vocab"
-            or vocab["token_count"] != _ISAAC_BASE_VOCAB_SIZE
-            or _verify_sha256(vocab["tokenizer_sha256"], f"{context} qwen35 tokenizer")
-            != files["tokenizer.json"]
-            or _verify_sha256(vocab["vocab_sha256"], f"{context} qwen35 vocab") != files["vocab.json"]
-        ):
-            raise RuntimeError("Isaac qwen35_vocab record disagrees with packaged tokenizer assets.")
-
-        artifact = record["artifact"]
-        expected_artifact = {
-            "schema_version": 1,
-            "artifact_kind": "trained_policy",
-        }
-        if (
-            not isinstance(artifact, dict)
-            or {key: value for key, value in artifact.items() if key != "trained_steps"} != expected_artifact
-            or config.artifact_kind != "trained_policy"
-        ):
-            raise RuntimeError("Isaac model import artifact identity disagrees with the package config.")
-        raw_config = _load_json_object(model_root / "config.json", "Isaac config.json")
-        if raw_config.get(f"{LEGACY_KEY_PREFIX}artifact") != artifact:
-            raise RuntimeError("Isaac inner config artifact identity disagrees with its import record.")
-
-        try:
-            contract = read_isaac_config(model_root)
-            validate_isaac_tokenizer(model_root, contract)
-        except IsaacCheckpointContractError as exc:
-            raise RuntimeError(f"Isaac inner config contract validation failed: {exc}") from exc
-        if (
-            config.vector_max_states != contract.vector_encoder.max_states
-            or config.max_action_dim != contract.action_expert.action_dim
-            or config.max_action_horizon != contract.action_expert.action_horizon
-        ):
-            raise RuntimeError("Isaac outer checkpoint maxima disagree with the inner model contract.")
-        if (
-            config.action_dim > config.max_action_dim
-            or config.chunk_size > config.max_action_horizon
-            or config.proprio_dim > config.vector_max_states
-        ):
-            raise RuntimeError("Isaac served policy geometry exceeds the checkpoint-owned maxima.")
-
-    @staticmethod
-    def _verify_neutral_debug_manifest(config: PerceptronIsaacConfig, root: Path) -> None:
-        context = "Neutral-debug manifest"
-        manifest_name = "mk1_neutral_debug_manifest.json"
-        manifest_path = root / manifest_name
-        if not PerceptronIsaacPolicy._is_package_file(root, manifest_path):
-            raise RuntimeError(f"Neutral-debug package is missing {manifest_name}.")
-
-        manifest = _load_json_object(manifest_path, context.lower())
-        expected_keys = {
-            "schema_version",
-            "artifact_kind",
-            "source_config_sha256",
-            "source_index_sha256",
-            "model_materialization",
-            "files_sha256",
-        }
-        if not isinstance(manifest, dict) or set(manifest) - {"trained_steps"} != expected_keys:
-            raise RuntimeError("Neutral-debug manifest fields do not match schema version 1.")
-        if (
-            manifest["schema_version"] != 1
-            or manifest["artifact_kind"] != "neutral_debug"
-            or config.artifact_kind != "neutral_debug"
-        ):
-            raise RuntimeError("Neutral-debug manifest identity disagrees with the package config.")
-
-        files = manifest["files_sha256"]
-        if not isinstance(files, dict) or not files:
-            raise RuntimeError("Neutral-debug manifest files_sha256 must be a non-empty object.")
-        expected_files: dict[str, str] = {}
-        for relative, expected_digest in files.items():
-            if not isinstance(relative, str) or not relative:
-                raise RuntimeError("Neutral-debug manifest contains an invalid file path.")
-            raw_path = Path(relative)
-            if raw_path.is_absolute() or raw_path.as_posix() != relative or ".." in raw_path.parts:
-                raise RuntimeError(f"Neutral-debug manifest path is not canonical and local: {relative!r}.")
-            expected_files[relative] = _verify_sha256(
-                expected_digest,
-                f"{context} files_sha256[{relative!r}]",
-            )
-        if manifest_name in expected_files:
-            raise RuntimeError("Neutral-debug manifest must not hash itself.")
-
-        actual_files: set[str] = set()
-        for candidate in root.rglob("*"):
-            if candidate.is_symlink():
-                if not PerceptronIsaacPolicy._is_package_file(root, candidate):
-                    raise RuntimeError(f"Neutral-debug package contains an escaping symlink: {candidate}.")
-                actual_files.add(candidate.relative_to(root).as_posix())
-                continue
-            if candidate.is_dir():
-                continue
-            if not candidate.is_file():
-                raise RuntimeError(f"Neutral-debug package contains a non-regular entry: {candidate}.")
-            actual_files.add(candidate.relative_to(root).as_posix())
-        if actual_files != set(expected_files) | {manifest_name}:
-            raise RuntimeError(
-                "Neutral-debug package file inventory disagrees with its manifest: "
-                f"missing={sorted(set(expected_files) - actual_files)}, "
-                f"unlisted={sorted(actual_files - set(expected_files) - {manifest_name})}."
-            )
-        for relative, expected_digest in expected_files.items():
-            _verify_sha256(
-                expected_digest,
-                f"{context} files_sha256[{relative!r}]",
-                root / relative,
-                f"Neutral-debug package digest mismatch for {relative}.",
-            )
-
-        source_config = _verify_sha256(manifest["source_config_sha256"], f"{context} source_config_sha256")
-        source_index = _verify_sha256(manifest["source_index_sha256"], f"{context} source_index_sha256")
-        if expected_files.get("hf_model/config.json") != source_config:
-            raise RuntimeError("Neutral-debug source config digest disagrees with the packaged model config.")
-        if expected_files.get("hf_model/model.safetensors.index.json") != source_index:
-            raise RuntimeError("Neutral-debug source index digest disagrees with the packaged model index.")
-
-        materialization = manifest["model_materialization"]
-        model_files = {
-            Path(relative).name for relative in expected_files if Path(relative).parent == Path("hf_model")
-        }
-        if (
-            not isinstance(materialization, dict)
-            or set(materialization) != model_files
-            or any(method not in {"copy", "hardlink"} for method in materialization.values())
-        ):
-            raise RuntimeError("Neutral-debug model materialization inventory is malformed.")
+        verified_storage = VerifiedTrainedTensorStorage(
+            model_root=model_root.resolve(strict=True),
+            dtypes=parse_trained_tensor_storage_dtypes(manifest["metadata"]),
+            source_inventory=source_inventory,
+            metadata_digests=MappingProxyType(metadata_digests),
+            coarse_shard_digests=MappingProxyType(coarse_shard_digests),
+        )
+        verified_storage.require_header_dtypes(source_inventory)
+        return verified_storage
 
     @staticmethod
     def _is_package_file(root: Path, path: Path) -> bool:

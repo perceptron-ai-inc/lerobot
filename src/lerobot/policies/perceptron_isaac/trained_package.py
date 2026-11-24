@@ -23,13 +23,8 @@ if TYPE_CHECKING:
 
 TRAINED_PACKAGE_INERT_HUB_METADATA = frozenset({".gitattributes", "README.md"})
 ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME = "mk1_trained_package_manifest.json"
-ISAAC_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_trained_package_manifest_v1"
 ISAAC_TRAINED_PACKAGE_MANIFEST_DIGEST_FIELD = "mk1_trained_package_manifest_sha256"
-ISAAC_MODEL_IMPORT_FILENAME = "mk1_model_import.json"
 ISAAC_SOURCE_MODEL_IMPORT_FILENAME = "source_mk1_model_import.json"
-ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA_V2 = (
-    "perceptron_isaac_mk1_canonical_trained_package_manifest_v2"
-)
 ISAAC_CANONICAL_TRAINED_PACKAGE_MANIFEST_SCHEMA = "perceptron_isaac_mk1_canonical_trained_package_manifest_v3"
 CANONICAL_INNER_MODEL_STORAGE = "canonical_inner"
 

@@ -734,13 +734,6 @@ def test_native_backend_factory_uses_mharmony_pack_step(tmp_path):
     assert action_step.gripper_binary_to_signed is False
 
 
-def test_legacy_processor_mharmony_marker_is_upgraded() -> None:
-    with pytest.warns(FutureWarning, match="genesis-in-tree"):
-        step = PerceptronIsaacMharmonyPackProcessorStep(mharmony_version="genesis-in-tree")
-
-    assert step.mharmony_version == SUPPORTED_MHARMONY_VERSION
-
-
 def test_unsafe_normalization_profile_fails_closed_in_config_and_processor(tmp_path):
     with pytest.raises(ValueError, match="unsafe for closed-loop"):
         PerceptronIsaacConfig(
@@ -1882,7 +1875,7 @@ def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
         num_inference_steps=12,
         num_flow_samples=4,
         apply_offset_norm=False,
-        mk1_model_import_sha256="0" * 64,
+        mk1_source_model_import_sha256="0" * 64,
         # fp32 storage defers the load, so pin bf16 storage to exercise the eager path.
         train_storage_fp32=False,
         input_features=_features(),
@@ -1954,7 +1947,7 @@ def test_native_policy_isaac_loader_is_checkpoint_driven(tmp_path, monkeypatch):
         n_action_steps=30,
         num_inference_steps=12,
         apply_offset_norm=False,
-        mk1_model_import_sha256="0" * 64,
+        mk1_source_model_import_sha256="0" * 64,
         train_storage_fp32=False,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2016,7 +2009,7 @@ def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(tmp_p
                 hf_model_path=str(tmp_path / "hf"),
                 native_stats_path=str(stats_path),
                 artifact_kind="neutral_debug",
-                mk1_model_import_sha256="0" * 64,
+                mk1_source_model_import_sha256="0" * 64,
                 train_storage_fp32=False,
                 input_features=_features(),
                 output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2057,7 +2050,7 @@ def test_native_policy_isaac_rejects_outer_contract_drift_before_load(
         "action_dim": 7,
         "vector_max_states": 128,
         "apply_offset_norm": False,
-        "mk1_model_import_sha256": "0" * 64,
+        "mk1_source_model_import_sha256": "0" * 64,
         "train_storage_fp32": False,
         "input_features": _features(),
         "output_features": {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2110,7 +2103,7 @@ def test_training_parameter_freeze_is_applied_once(
         hf_model_path=str(tmp_path / "hf"),
         native_stats_path=str(stats_path),
         apply_offset_norm=False,
-        mk1_model_import_sha256="0" * 64,
+        mk1_source_model_import_sha256="0" * 64,
         freeze_input_embeddings=False,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2165,7 +2158,7 @@ def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(
         hf_model_path=str(hf_dir),
         native_stats_path=str(stats_path),
         apply_offset_norm=False,
-        mk1_model_import_sha256="0" * 64,
+        mk1_source_model_import_sha256="0" * 64,
         freeze_input_embeddings=False,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2201,7 +2194,7 @@ def test_native_isaac_dense_training_is_rejected_before_checkpoint_or_model_allo
         hf_model_path=str(hf_dir),
         native_stats_path=str(stats_path),
         apply_offset_norm=False,
-        mk1_model_import_sha256="0" * 64,
+        mk1_source_model_import_sha256="0" * 64,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
@@ -2239,7 +2232,7 @@ def test_native_isaac_bounded_training_config_is_rejected_before_allocation(
                 device="cpu",
                 hf_model_path=str(tmp_path / "hf"),
                 apply_offset_norm=False,
-                mk1_model_import_sha256="0" * 64,
+                mk1_source_model_import_sha256="0" * 64,
                 train_expert_only=train_expert_only,
                 use_peft=use_peft,
                 input_features=_features(),
@@ -2266,7 +2259,7 @@ def test_native_isaac_bounded_training_is_rejected_at_training_boundary(
         device="cpu",
         hf_model_path=str(tmp_path / "hf"),
         apply_offset_norm=False,
-        mk1_model_import_sha256="0" * 64,
+        mk1_source_model_import_sha256="0" * 64,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )

@@ -22,7 +22,7 @@ from lerobot.policies.perceptron_isaac.tensor_stream import (
     VisionType,
     create_stream,
 )
-from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _write_checkpoint
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _write_portable_isaac05_checkpoint
 
 
 def _native_sample(env: int) -> TensorStream:
@@ -57,12 +57,15 @@ def _native_sample(env: int) -> TensorStream:
 
 def test_reduced_native_model_runs_batched_multimodal_inference(tmp_path: Path) -> None:
     model_dir = tmp_path / "tiny-isaac"
-    _write_checkpoint(model_dir)
+    _write_portable_isaac05_checkpoint(model_dir)
+    # An F32 runtime is only available to the training load path.
     model, _, _ = load_isaac_vla_from_hf(
         model_dir,
         dtype=torch.float32,
         device="cpu",
         allow_test_only_reduced_geometry=True,
+        allowed_storage_dtypes=frozenset({"F32"}),
+        load_intent="training",
     )
     model.eval()
     stream = IsaacNativeMharmonyRenderer.collate([_native_sample(env) for env in range(2)])

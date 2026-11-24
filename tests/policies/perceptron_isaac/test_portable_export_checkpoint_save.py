@@ -22,6 +22,7 @@ from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import (
     PerceptronIsaacPolicy,
     _package_storage_dtypes,
 )
+from lerobot.policies.perceptron_isaac.trained_package import finalize_canonical_trained_package
 
 PACKAGE_DIRECTORY_NAME = "lerobot_policy"
 
@@ -136,22 +137,14 @@ def test_embedded_model_assets_keep_the_export_storage_contract(tmp_path: Path) 
     assert _package_storage_dtypes(checkpoint) == frozenset({"BF16"})
 
 
-def test_plain_isaac_model_directory_is_bf16_storage(tmp_path: Path) -> None:
-    model_root = tmp_path / "hf_model"
-    model_root.mkdir()
-    (model_root / "config.json").write_text('{"model_type": "qwen3_5_moe"}\n')
-    assert _package_storage_dtypes(model_root) == frozenset({"BF16"})
-
-
-@pytest.mark.parametrize("vla_namespace", ["genesis_vla", "isaac05_vla"])
-def test_finalize_reads_the_vla_namespace_the_saved_config_uses(tmp_path: Path, vla_namespace: str) -> None:
-    model_root = tmp_path / vla_namespace
+def test_finalize_reads_the_vla_block_of_the_saved_config(tmp_path: Path) -> None:
+    model_root = tmp_path / "model"
     model_root.mkdir()
     (model_root / "config.json").write_text(
         json.dumps(
             {
                 "model_type": "isaac_0_5",
-                vla_namespace: {"mtp": {"present": False, "physical_layers": 0, "rollout_steps": 0}},
+                "isaac05_vla": {"mtp": {"present": False, "physical_layers": 0, "rollout_steps": 0}},
                 "text_config": {"mtp_num_hidden_layers": 0},
             }
         )
@@ -172,10 +165,6 @@ def test_finalize_still_refuses_an_isaac_package_without_source_identity(tmp_pat
     checkpoint = tmp_path / "checkpoint"
     model_root = checkpoint / "hf_model"
     model_root.mkdir(parents=True)
-    (model_root / "config.json").write_text(
-        json.dumps({"model_type": "qwen3_5_moe", "genesis_vla": {"backbone_family": "mk1_qwen3_6_moe"}})
-    )
     config = _config(hf_model_path=str(model_root))
-    policy = _unstarted_policy(config, checkpoint)
     with pytest.raises(RuntimeError, match="without source model-import identity"):
-        policy.finalize_pretrained_package(checkpoint)
+        finalize_canonical_trained_package(config, checkpoint, mk1_source_model_import_sha256=None)

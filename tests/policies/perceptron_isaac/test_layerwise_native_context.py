@@ -258,7 +258,7 @@ def _history_stream() -> TensorStream:
 
 
 def _tiny_backbone(
-    *, serialization: Literal["schema1", "action-schema2", "vla-schema2"], hidden_norm: str
+    *, serialization: Literal["schema1", "action-schema2"], hidden_norm: str
 ) -> IsaacQwen36VLAForActionGeneration:
     raw = _config(test_geometry=True, mtp_present=False)
     raw["text_config"].update(
@@ -272,19 +272,11 @@ def _tiny_backbone(
         layers=(1, 3) if hidden_norm == "final_norm" else (0, 2), hidden_norm=hidden_norm
     )
     raw = copy.deepcopy(raw)
-    if serialization == "vla-schema2":
-        # The archived migrated layout uses the VLA envelope's schema 2 with the legacy
-        # MolmoAct weight ABI; it must not silently ignore the conditioning triple.
-        canonical_action = raw["genesis_vla"]["action_expert"]
+    if serialization == "schema1":
+        action["schema_version"] = 1
         for field in ("context_source", "context_layers", "context_hidden_norm"):
-            canonical_action[field] = action[field]
-        raw["genesis_vla"]["schema_version"] = 2
-    else:
-        if serialization == "schema1":
-            action["schema_version"] = 1
-            for field in ("context_source", "context_layers", "context_hidden_norm"):
-                del action[field]
-        raw["genesis_vla"]["action_expert"] = action
+            del action[field]
+    raw["isaac05_vla"]["action_expert"] = action
     config = _build_config(raw, geometry)
     _configure_attention_backend(config, "torch_sdpa_v1")
     model = IsaacQwen36VLAForActionGeneration(config)
@@ -305,19 +297,15 @@ def _tiny_backbone(
         ("schema1", "final_norm"),
         ("action-schema2", "final_norm"),
         ("action-schema2", "none"),
-        ("vla-schema2", "final_norm"),
-        ("vla-schema2", "none"),
     ],
     ids=[
         "schema1-control",
         "action-schema2-final-norm",
         "action-schema2-raw-intermediate",
-        "vla-schema2-final-norm",
-        "vla-schema2-raw-intermediate",
     ],
 )
 def test_real_native_sample_action_uses_selected_post_residual_layers_in_batch_history_order(
-    serialization: Literal["schema1", "action-schema2", "vla-schema2"], hidden_norm: str
+    serialization: Literal["schema1", "action-schema2"], hidden_norm: str
 ) -> None:
     with torch.random.fork_rng(), torch.no_grad():
         torch.manual_seed(2026)
