@@ -41,13 +41,7 @@ tokenizers 0.22.2 and Accelerate 1.15.0. The SDK source remains pinned to
 
 ## Preconverted package and training entry point
 
-The qualified package is already published; do not run a converter:
-
-```text
-s3://perceptron-checkpoints/phil/isaac_0_5-step-100000-fp32-native-lerobot-vocabfix-113238
-69 files; 142,967,074,649 bytes
-SHA256SUMS: 85d9743e3f46d19cd5291a00607cfe0abc54eb56d1a40a4fbcd20493e293cc9b
-```
+The qualified package is already published; do not run a converter.
 
 Stage that complete package without changing its layout or authenticated assets.
 Set `NATIVE_POLICY_DIR` to its `lerobot_policy` directory, `DATASET_REPO_ID`
