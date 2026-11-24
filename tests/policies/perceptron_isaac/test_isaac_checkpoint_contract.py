@@ -172,7 +172,6 @@ def _config(*, test_geometry: bool, mtp_present: bool = True, coord_enabled: boo
         "isaac05_artifact": {
             "schema_version": 1,
             "artifact_kind": "trained_policy",
-            "trained_steps": 100_000,
         },
         "image_token_id": 4 if test_geometry else 248056,
         "video_token_id": 5 if test_geometry else 248057,
@@ -405,8 +404,6 @@ def test_production_contract_parses_exact_documented_geometry() -> None:
 
 def test_production_contract_accepts_actual_non_mtp_coord_disabled_variant() -> None:
     config = _config(test_geometry=False, mtp_present=False, coord_enabled=False)
-    config["isaac05_artifact"]["trained_steps"] = 10_000
-
     contract = IsaacCheckpointContract.parse_allowlisted(config)
     shapes = contract.expected_tensor_shapes()
 
@@ -580,7 +577,6 @@ def test_reduced_geometry_permission_accepts_unmarked_production_geometry() -> N
     config["isaac05_artifact"] = {
         "schema_version": 1,
         "artifact_kind": "neutral_debug",
-        "trained_steps": 0,
     }
 
     contract = IsaacCheckpointContract.parse_allowlisted(
@@ -594,16 +590,19 @@ def test_reduced_geometry_permission_accepts_unmarked_production_geometry() -> N
 @pytest.mark.parametrize(
     ("artifact", "message"),
     [
-        ({"artifact_kind": "trained_policy", "trained_steps": 1}, "missing required"),
-        ({"schema_version": 2, "artifact_kind": "trained_policy", "trained_steps": 1}, "schema_version"),
-        ({"schema_version": 1, "artifact_kind": "other", "trained_steps": 1}, "artifact_kind"),
+        ({"artifact_kind": "trained_policy"}, "missing required"),
+        ({"schema_version": 2, "artifact_kind": "trained_policy"}, "schema_version"),
+        ({"schema_version": 1, "artifact_kind": "other"}, "artifact_kind"),
         (
             {
                 "schema_version": 1,
                 "artifact_kind": "trained_policy",
-                "trained_steps": 1,
                 "unbound_provenance": "x",
             },
+            "fields do not match",
+        ),
+        (
+            {"schema_version": 1, "artifact_kind": "trained_policy", "trained_steps": 1},
             "fields do not match",
         ),
     ],
@@ -621,7 +620,6 @@ def test_neutral_artifact_accepts_inert_exporter_provenance() -> None:
     config["isaac05_artifact"] = {
         "schema_version": 1,
         "artifact_kind": "neutral_debug",
-        "trained_steps": 0,
         "provenance_sha256": "0" * 64,
     }
 

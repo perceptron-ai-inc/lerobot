@@ -1990,12 +1990,6 @@ def test_neutral_debug_package_loads_but_cannot_emit_actions(tmp_path):
         policy.select_action({})
 
 
-@pytest.mark.parametrize("artifact_kind", ["trained_policy", "neutral_debug"])
-def test_artifact_kind_requires_no_model_count(artifact_kind):
-    config = PerceptronIsaacConfig(artifact_kind=artifact_kind, device="cpu")
-    assert "trained_steps" not in config.to_dict()
-
-
 def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)

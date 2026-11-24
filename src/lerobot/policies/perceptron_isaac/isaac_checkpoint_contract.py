@@ -974,7 +974,7 @@ def _parse_artifact(raw: Mapping[str, Any]) -> IsaacArtifactContract:
     artifact_kind = raw.get("artifact_kind")
     if artifact_kind not in {"trained_policy", "neutral_debug"}:
         _fail("isaac05_artifact.artifact_kind must be 'trained_policy' or 'neutral_debug'")
-    if artifact_kind == "trained_policy" and set(raw) - {"trained_steps"} != _ARTIFACT_IDENTITY_KEYS:
+    if artifact_kind == "trained_policy" and set(raw) != _ARTIFACT_IDENTITY_KEYS:
         _fail("trained isaac05_artifact fields do not match schema version 1")
     return IsaacArtifactContract(schema_version, artifact_kind)
 

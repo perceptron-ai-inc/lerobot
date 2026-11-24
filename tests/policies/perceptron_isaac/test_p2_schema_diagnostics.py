@@ -113,7 +113,7 @@ def test_schema2_without_layer_fields_is_not_treated_as_convertible_schema1() ->
     )
 
 
-Corruption = Literal["policy-count", "manifest", "source-config", "unlisted"]
+Corruption = Literal["policy-config", "manifest", "source-config", "unlisted"]
 
 
 def _authenticated_layerwise_package(root: Path, *, schema: int, lazy: bool, malformed: bool = False) -> None:
@@ -168,16 +168,17 @@ def test_authenticated_malformed_layerwise_refusal_precedes_policy_and_native_co
 
 @pytest.mark.parametrize("schema", [1, 2], ids=["schema1-per-layer", "schema2-per-layer"])
 @pytest.mark.parametrize("lazy", [True, False], ids=["fp32-lazy", "bf16-eager"])
-@pytest.mark.parametrize("corruption", ["policy-count", "manifest", "source-config", "unlisted"])
+@pytest.mark.parametrize("corruption", ["policy-config", "manifest", "source-config", "unlisted"])
 def test_authenticated_integrity_error_wins_over_layerwise_semantics_before_both_constructors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, schema: int, lazy: bool, corruption: Corruption
 ) -> None:
     root = tmp_path / "package"
     _authenticated_layerwise_package(root, schema=schema, lazy=lazy)
-    if corruption == "policy-count":
+    if corruption == "policy-config":
         path = root / "config.json"
         raw = json.loads(path.read_text())
-        raw["trained_steps"] = 100_001
+        # A retired field is dropped when the config is read, but it still changes the hashed file.
+        raw["action_expert_type"] = "dit"
         path.write_text(json.dumps(raw))
         message = "canonical config digest mismatch"
     elif corruption == "manifest":

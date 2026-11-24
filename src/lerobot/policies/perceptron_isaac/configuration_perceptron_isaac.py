@@ -35,7 +35,7 @@ NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
 
 # Fields that the runtime config no longer has. Authenticated packages still carry them, so they are
 # dropped when a config is read and their files are never rewritten.
-RETIRED_CONFIG_FIELDS = frozenset({"trained_steps", "action_expert_type", "mk1_model_import_sha256"})
+RETIRED_CONFIG_FIELDS = frozenset({"action_expert_type", "mk1_model_import_sha256"})
 
 
 def reject_legacy_action_conditioning(enabled: bool) -> None:

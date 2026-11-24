@@ -57,7 +57,7 @@ def _authenticated_source(root: Path, *, fixed_resize: bool, profiled: bool) -> 
     # Use the public neutral-debug geometry permission, never a patched validator/loader.
     model_config = root / "hf_model" / "config.json"
     raw = json.loads(model_config.read_text())
-    raw["isaac05_artifact"].update(artifact_kind="neutral_debug", trained_steps=0)
+    raw["isaac05_artifact"].update(artifact_kind="neutral_debug")
     model_config.write_text(json.dumps(raw))
     config.artifact_kind = "neutral_debug"
     config.pretrained_path = root

@@ -61,7 +61,7 @@ def _native_portable_package(tmp_path: Path) -> tuple[Path, PerceptronIsaacConfi
     model_path = tmp_path / "model"
     _, raw, value = _write_portable_isaac05_checkpoint(model_path)
     # Public tiny geometry keeps the existing neutral-debug opt-in, never a production bypass.
-    raw["isaac05_artifact"].update(artifact_kind="neutral_debug", trained_steps=0)
+    raw["isaac05_artifact"].update(artifact_kind="neutral_debug")
     (model_path / "config.json").write_text(json.dumps(raw))
     policy_path = model_path / "lerobot_policy"
     policy_path.mkdir()
@@ -166,7 +166,7 @@ def test_native_portable_public_load_fails_closed(
     elif defect == "identity":
         raw_path = policy_path.parent / "config.json"
         raw = json.loads(raw_path.read_text())
-        raw["isaac05_artifact"].update(artifact_kind="trained_policy", trained_steps=100000)
+        raw["isaac05_artifact"].update(artifact_kind="trained_policy")
         raw_path.write_text(json.dumps(raw))
         expected = "artifact identity mismatch"
     elif defect == "metadata":
