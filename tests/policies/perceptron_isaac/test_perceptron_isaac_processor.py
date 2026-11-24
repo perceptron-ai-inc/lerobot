@@ -2007,7 +2007,7 @@ def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(tmp_p
         PerceptronIsaacPolicy(
             PerceptronIsaacConfig(
                 device="cpu",
-                hf_model_path=str(tmp_path / "hf"),
+                hf_model_path=str(_isaac_model_dir(tmp_path / "hf")),
                 native_stats_path=str(stats_path),
                 artifact_kind="neutral_debug",
                 train_storage_fp32=False,

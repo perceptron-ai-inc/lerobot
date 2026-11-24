@@ -9,7 +9,6 @@ native mharmony streams, and returns normalized action chunks.
 from __future__ import annotations
 
 import builtins
-import json
 import logging
 import shutil
 from collections import deque
@@ -757,22 +756,11 @@ class PerceptronIsaacPolicy(PreTrainedPolicy):
 
     @staticmethod
     def _config_declares_isaac(config: PerceptronIsaacConfig) -> bool:
-        """Whether the policy config or the inner checkpoint config declares a native package."""
-        if config.artifact_kind == "neutral_debug":
-            return True
-
+        """Whether the model config is native Isaac-0.5; a debug policy may have no model at all."""
         model_path = getattr(config, "hf_model_path", None)
-        config_path = Path(str(model_path)) / "config.json" if model_path else None
-        if config_path is not None and config_path.is_file():
-            try:
-                raw = json.loads(config_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                return False
-            if not isinstance(raw, dict):
-                return False
-            return raw.get("model_type") == "isaac_0_5"
-
-        return False
+        if not model_path:
+            return config.artifact_kind == "neutral_debug"
+        return is_portable_isaac05_repository(Path(str(model_path)))
 
     def _load_backbone(self, *, training: bool = False) -> None:
         if not self.config.hf_model_path:

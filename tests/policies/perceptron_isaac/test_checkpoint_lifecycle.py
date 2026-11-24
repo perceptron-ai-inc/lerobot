@@ -466,6 +466,26 @@ def test_public_load_rejects_unsupported_outer_weights(tmp_path, layout, has_inn
         PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
 
 
+@pytest.mark.parametrize("train_storage_fp32", [True, False], ids=["lazy", "eager"])
+@pytest.mark.parametrize("artifact_kind", ["trained_policy", "neutral_debug"])
+def test_from_pretrained_rejects_another_model_type_when_the_package_is_opened(
+    tmp_path: Path, train_storage_fp32: bool, artifact_kind: str
+) -> None:
+    source = tmp_path / "source"
+    config = _source_package(source)
+    config.train_storage_fp32 = train_storage_fp32
+    config.artifact_kind = artifact_kind
+    config._save_pretrained(source)
+    model_config = source / "hf_model" / "config.json"
+    raw = json.loads(model_config.read_text())
+    raw["model_type"] = "qwen3_5_moe"
+    model_config.write_text(json.dumps(raw))
+
+    # A deferred weight load must not turn this into a late failure at first use.
+    with pytest.raises(RuntimeError, match="supports only native Isaac-0.5 checkpoints"):
+        PerceptronIsaacPolicy.from_pretrained(source, local_files_only=True)
+
+
 def test_original_package_processors_bind_retained_instance(tmp_path) -> None:
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.perceptron_isaac.mharmony_native import IsaacMharmonyRenderMetadata
