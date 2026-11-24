@@ -219,8 +219,8 @@ class TrainPipelineConfig(HubMixin):
         elif self.resume:
             self._resolve_resume_checkpoint()
             if self.policy is not None and self.checkpoint_path is not None:
-                # The run config precedes finalization. Reload the component's final
-                # identities instead of treating a stale nested manifest as a new pin.
+                # Reload the policy config from the checkpoint's own package rather than the
+                # copy nested in the run config.
                 parent_path = self.policy.pretrained_path
                 overrides = parser.get_yaml_overrides("policy") + (parser.get_cli_overrides("policy") or [])
                 self.policy = PreTrainedConfig.from_pretrained(

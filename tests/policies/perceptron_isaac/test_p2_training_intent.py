@@ -118,7 +118,7 @@ def test_raw_explicit_no_save_training_preflight_and_inference_remain_supported(
 @pytest.mark.parametrize(
     "intent", ["periodic_save", "final_save_only", "publish_final", "publish_checkpoint"]
 )
-def test_source_bound_native_save_intents_remain_valid(
+def test_native_package_save_intents_remain_valid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intent: Intent
 ) -> None:
     source = tmp_path / "source"

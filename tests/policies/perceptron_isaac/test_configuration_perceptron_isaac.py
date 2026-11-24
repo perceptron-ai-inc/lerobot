@@ -1,5 +1,4 @@
 import json
-from typing import Any
 
 import pytest
 from draccus.utils import DecodingError
@@ -57,7 +56,12 @@ def test_native_config_rejects_saved_true_offset_norm(tmp_path) -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("action_expert_type", "molmoact"), ("action_expert_type", "dit"), ("mk1_model_import_sha256", None)],
+    [
+        ("action_expert_type", "molmoact"),
+        ("action_expert_type", "dit"),
+        ("deployment_adapter_sha256", "0" * 64),
+        ("package_manifest_sha256", None),
+    ],
 )
 def test_retired_fields_are_dropped_on_read_and_not_saved(tmp_path, field: str, value: str | None) -> None:
     PerceptronIsaacConfig(device="cpu").save_pretrained(tmp_path)
@@ -141,23 +145,15 @@ def test_config_rejects_nonpositive_action_steps(n_action_steps) -> None:
         PerceptronIsaacConfig(device="cpu", n_action_steps=n_action_steps)
 
 
-@pytest.mark.parametrize(
-    "field_name",
-    [
-        "fast_processor_tree_sha256",
-        "deployment_adapter_sha256",
-        "qwen35_trained_package_manifest_sha256",
-        "mk1_source_model_import_sha256",
-        "mk1_trained_package_manifest_sha256",
-    ],
-)
-def test_config_rejects_noncanonical_checkpoint_digests(field_name) -> None:
-    values: dict[str, Any] = {field_name: "A" * 64}
-    if field_name == "fast_processor_tree_sha256":
-        values["fast_processor_path"] = "FAST"
+def test_config_rejects_noncanonical_fast_processor_digest() -> None:
+    with pytest.raises(ValueError, match="fast_processor_tree_sha256 must be a lowercase SHA-256 digest"):
+        PerceptronIsaacConfig(device="cpu", fast_processor_path="FAST", fast_processor_tree_sha256="A" * 64)
 
-    with pytest.raises(ValueError, match=rf"{field_name} must be a lowercase SHA-256 digest"):
-        PerceptronIsaacConfig(device="cpu", **values)
+
+def test_reading_a_config_keeps_the_digest_fields_it_still_has() -> None:
+    stored = {"fast_processor_tree_sha256": "0" * 64, "deployment_adapter_sha256": "1" * 64}
+
+    assert PerceptronIsaacConfig.migrate_config(stored) == {"fast_processor_tree_sha256": "0" * 64}
 
 
 def test_config_rejects_proprio_wider_than_vector_encoder() -> None:

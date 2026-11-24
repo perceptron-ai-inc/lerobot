@@ -43,7 +43,7 @@ tokenizers 0.22.2 and Accelerate 1.15.0. The SDK source remains pinned to
 
 The qualified package is already published; do not run a converter.
 
-Stage that complete package without changing its layout or authenticated assets.
+Stage that complete package without changing its layout.
 Set `NATIVE_POLICY_DIR` to its `lerobot_policy` directory, `DATASET_REPO_ID`
 to a compatible dataset, and `GPUS` to the number of GPUs on the training node.
 Use `torchrun` and set FSDP2 through LeRobot's CLI flags. Set `STEPS` to the
@@ -165,9 +165,9 @@ modules. That proof was on HF base `8c920c4` plus runtime `9c315c1` and CUT
 not this updated HF base `ae2b57f`.
 
 Raw/portable-export saving is deferred and fails before gathering weights or writing
-package assets. Source-bound native saves remain implemented. Focused CPU tests
-cover reduced native save/finalize/moved reload, exact FP32 values and signed zero;
-that is not production-scale checkpoint qualification.
+package assets. Saving from a package that holds its own `hf_model/` remains
+implemented. Focused CPU tests cover reduced native save/finalize/moved reload, exact
+FP32 values and signed zero; that is not production-scale checkpoint qualification.
 
 Trained RTC ran through `lerobot-rollout` on one H100 against the published 60-step
 YAM and SO-100/101 packages on 2026-11-21, with a virtual robot replaying each

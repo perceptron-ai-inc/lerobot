@@ -300,8 +300,8 @@ def _matches_source_bound_libero_prompt(
 ) -> bool:
     """Reconcile an admitted source prompt, never weaken the physical LIBERO ABI.
 
-    Artifact admission authenticates the checkpoint-local recipe. This check
-    requires its selected source profile; a bare robot-name alias is insufficient.
+    This check requires the selected source profile of the checkpoint-local recipe; a bare
+    robot-name alias is insufficient.
     """
     if not (
         config.strict_environment_feature_contract is True

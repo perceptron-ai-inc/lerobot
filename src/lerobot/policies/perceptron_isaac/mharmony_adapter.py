@@ -146,7 +146,7 @@ def _load_mharmony_encoding_cached(
     _qwen35_vocab_path: str | None,
 ):
     # qwen35_vocab_path is deliberately part of the cache identity. The native
-    # loader reads QWEN35_VOCAB_PATH itself, but two authenticated checkpoints
+    # loader reads QWEN35_VOCAB_PATH itself, but two checkpoints
     # can provide different checkpoint-local vocabularies in one process.
     groups = json.loads(reserved_groups_key)
     return load_mharmony().load_harmony_encoding(

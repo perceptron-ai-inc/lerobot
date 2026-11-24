@@ -1,8 +1,8 @@
-"""P2.03/.04 authenticated render assets survive source retirement and native saves.
+"""P2.03/.04 render assets survive source retirement and native saves.
 
 Only the external SDK token-serialization leaf is substituted: the tiny native
-vocabulary is not a Qwen tokenizer. Package authentication, native weights,
-retention, processor state, recipe admission and PNG image admission stay real.
+vocabulary is not a Qwen tokenizer. Native weights, retention, processor state,
+recipe admission and PNG image admission stay real.
 """
 
 from __future__ import annotations
@@ -32,11 +32,7 @@ from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import (
     PerceptronIsaacMharmonyPackProcessorStep,
 )
 from lerobot.policies.perceptron_isaac.tensor_stream import VectorType
-from lerobot.policies.perceptron_isaac.trained_package import (
-    ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME,
-    finalize_canonical_trained_package,
-    rewrite_trained_processor_paths,
-)
+from lerobot.policies.perceptron_isaac.trained_package import rewrite_trained_processor_paths
 from lerobot.processor.converters import batch_to_transition
 from lerobot.utils.constants import ACTION, OBS_STATE
 from tests.policies.perceptron_isaac._p2_data_fixtures import data_batch, data_stats_payload
@@ -52,7 +48,7 @@ from tests.policies.perceptron_isaac.test_p2_recipe_images import _image_recipe
 sdk_plans = _sdk_plans
 
 
-def _authenticated_source(root: Path, *, fixed_resize: bool, profiled: bool) -> None:
+def _render_source(root: Path, *, fixed_resize: bool, profiled: bool) -> None:
     config = _source_package(root)
     # Use the public neutral-debug geometry permission, never a patched validator/loader.
     model_config = root / "hf_model" / "config.json"
@@ -75,7 +71,7 @@ def _authenticated_source(root: Path, *, fixed_resize: bool, profiled: bool) -> 
     (root / "isaac_stats.json").write_text(json.dumps(payload))
 
     # Maintained factory contract for older serialized pipelines without inlined
-    # render metadata. Recipe discovery must happen after authenticated retention.
+    # render metadata. Recipe discovery must happen after retention.
     pre, post = make_pre_post_processors(config)
     pre.save_pretrained(root)
     post.save_pretrained(root)
@@ -89,7 +85,7 @@ def _authenticated_source(root: Path, *, fixed_resize: bool, profiled: bool) -> 
                     {
                         "rendering": {
                             "mharmony_encoding": "QWEN35_HARMONY",
-                            # Descending offsets match this tiny checkpoint's authenticated pools.
+                            # Descending offsets match this tiny checkpoint's pools.
                             "reserved_token_groups": [
                                 {
                                     "name": None,
@@ -107,9 +103,7 @@ def _authenticated_source(root: Path, *, fixed_resize: bool, profiled: bool) -> 
             }
         )
     )
-    finalize_canonical_trained_package(
-        config, root, mk1_source_model_import_sha256=config.mk1_source_model_import_sha256
-    )
+    config._save_pretrained(root)
 
 
 def _files(root: Path) -> dict[str, bytes]:
@@ -172,8 +166,8 @@ def _assert_restored_render(
 
 
 @pytest.mark.parametrize("fixed_resize", [True, False], ids=["fixed-448", "patch-bounds-only"])
-@pytest.mark.parametrize("profiled", [True, False], ids=["authenticated-profile", "unprofiled-control"])
-def test_authenticated_render_profile_survives_retire_save_move_restore(
+@pytest.mark.parametrize("profiled", [True, False], ids=["profile", "unprofiled-control"])
+def test_render_profile_survives_retire_save_move_restore(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     sdk_plans: list[IsaacMharmonyContentPlan],
@@ -182,12 +176,11 @@ def test_authenticated_render_profile_survives_retire_save_move_restore(
 ) -> None:
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     source = tmp_path / "source"
-    _authenticated_source(source, fixed_resize=fixed_resize, profiled=profiled)
+    _render_source(source, fixed_resize=fixed_resize, profiled=profiled)
     original = _files(source)
     policy = PerceptronIsaacPolicy.from_pretrained(source, local_files_only=True, strict=True)
-    assert policy._verified_tensor_storage is not None
-    assert policy._verified_runtime_assets is not None
-    retained = policy._verified_runtime_assets.root
+    assert policy._runtime_assets is not None
+    retained = policy._runtime_assets.root
     assert retained != source
     # Processor tensor state is required metadata, not a copied model payload.
     assert list(retained.glob("policy_*_step_*.safetensors"))
@@ -202,7 +195,7 @@ def test_authenticated_render_profile_survives_retire_save_move_restore(
         policy._isaac_model.lm_head.weight.fill_(1.2500001192092896)
         policy._isaac_model.model.vector_embedding[0].weight.fill_(-0.0)
     expected = {name: tensor.detach().clone() for name, tensor in policy._isaac_model.state_dict().items()}
-    assert _files(source) == original, "Loading must not rewrite authenticated source bytes."
+    assert _files(source) == original, "Loading must not rewrite source bytes."
     retired = tmp_path / "retired-source"
     source.rename(retired)
     assert not source.exists()
@@ -216,7 +209,6 @@ def test_authenticated_render_profile_survives_retire_save_move_restore(
         "policy_inference_recipe.json",
         "hf_model/tokenizer.json",
         "hf_model/config.json",
-        "hf_model/source_mk1_model_import.json",
         "fast_processor/processing_action_tokenizer.py",
     ):
         assert (saved / relative).read_bytes() == original[relative]
@@ -228,41 +220,18 @@ def test_authenticated_render_profile_survives_retire_save_move_restore(
     saved.rename(moved)
     before_reload = _files(moved)
     reloaded = PerceptronIsaacPolicy.from_pretrained(moved, local_files_only=True, strict=True)
-    assert reloaded._verified_tensor_storage is not None
-    assert reloaded.config.mk1_source_model_import_sha256 == policy.config.mk1_source_model_import_sha256
     reloaded._load_backbone()
     assert reloaded._isaac_model is not None
     for name, tensor in reloaded._isaac_model.state_dict().items():
         _assert_tensor_bits(tensor, expected[name].bfloat16(), name)
-    assert reloaded._verified_runtime_assets is not None
+    assert reloaded._runtime_assets is not None
     moved.rename(tmp_path / "retired-reload-source")
     _assert_restored_render(
         reloaded,
-        reloaded._verified_runtime_assets.root,
+        reloaded._runtime_assets.root,
         sdk_plans,
         fixed_resize=fixed_resize,
         profiled=profiled,
     )
     assert _files(tmp_path / "retired-reload-source") == before_reload
     assert _files(retired) == original
-
-
-@pytest.mark.parametrize(
-    "asset", ["policy_inference_recipe.json", "isaac_stats.json", ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME]
-)
-def test_authenticated_render_source_rejects_byte_tamper(tmp_path: Path, asset: str) -> None:
-    source = tmp_path / "source"
-    _authenticated_source(source, fixed_resize=True, profiled=True)
-    # Positive control: this exact fixture authenticates before a byte-only change.
-    admitted = PerceptronIsaacPolicy.from_pretrained(source, local_files_only=True, strict=True)
-    assert admitted._verified_tensor_storage is not None
-    assert admitted._verified_runtime_assets is not None
-    changed = source / asset
-    changed.write_bytes(changed.read_bytes() + b"\n")
-    expected = (
-        "manifest digest mismatch"
-        if asset == ISAAC_TRAINED_PACKAGE_MANIFEST_FILENAME
-        else f"digest mismatch for {asset}"
-    )
-    with pytest.raises(RuntimeError, match=expected):
-        PerceptronIsaacPolicy.from_pretrained(source, local_files_only=True, strict=True)

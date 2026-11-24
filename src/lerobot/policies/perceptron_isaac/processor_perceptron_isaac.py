@@ -1959,7 +1959,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     render metadata into the pack-step config. Relative paths are retained as
     a compatibility fallback for older serialized pipelines only.
 
-    When the policy loader has retained a verified snapshot of the processor assets it
+    When the policy loader has retained a snapshot of the processor assets it
     records the snapshot root on the config, and the pipelines are restored from that
     immutable local directory (so no Hub revision applies) instead of the caller's source.
     """

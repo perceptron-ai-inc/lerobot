@@ -1868,14 +1868,13 @@ def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
     contract = _patch_isaac_checkpoint_load(monkeypatch, fake_load_isaac_vla_from_hf)
     cfg = PerceptronIsaacConfig(
         device="cpu",
-        hf_model_path=str(tmp_path / "hf"),
+        hf_model_path=str(_isaac_model_dir(tmp_path / "hf")),
         native_stats_path=str(stats_path),
         chunk_size=50,
         n_action_steps=30,
         num_inference_steps=12,
         num_flow_samples=4,
         apply_offset_norm=False,
-        mk1_source_model_import_sha256="0" * 64,
         # fp32 storage defers the load, so pin bf16 storage to exercise the eager path.
         train_storage_fp32=False,
         input_features=_features(),
@@ -1909,7 +1908,14 @@ def test_native_policy_passes_serving_knobs_to_sampler_not_loader(
     assert len(calls) == 1
 
 
-def _patch_isaac_checkpoint_load(monkeypatch, loader):
+def _isaac_model_dir(path: Path) -> Path:
+    """Declare an Isaac-0.5 model directory; the patched loader never reads weights from it."""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(json.dumps({"model_type": "isaac_0_5"}))
+    return path
+
+
+def _patch_isaac_checkpoint_load(monkeypatch, loader, *, storage_dtype: str = "BF16"):
     contract = SimpleNamespace(
         artifact=SimpleNamespace(artifact_kind="trained_policy"),
         vector_encoder=SimpleNamespace(max_states=128),
@@ -1922,7 +1928,10 @@ def _patch_isaac_checkpoint_load(monkeypatch, loader):
     monkeypatch.setattr(
         checkpoint_contract,
         "validate_isaac_checkpoint",
-        lambda model_dir, **kwargs: (contract, SimpleNamespace()),
+        lambda model_dir, **kwargs: (
+            contract,
+            SimpleNamespace(tensors={"weight": SimpleNamespace(dtype=storage_dtype)}),
+        ),
     )
     monkeypatch.setattr(isaac_vla, "load_isaac_vla_from_hf", loader)
     return contract
@@ -1931,7 +1940,7 @@ def _patch_isaac_checkpoint_load(monkeypatch, loader):
 def test_native_policy_isaac_loader_is_checkpoint_driven(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    hf_dir = tmp_path / "hf"
+    hf_dir = _isaac_model_dir(tmp_path / "hf")
     calls = []
 
     def fake_load_isaac_vla_from_hf(model_dir, **kwargs):
@@ -1947,7 +1956,6 @@ def test_native_policy_isaac_loader_is_checkpoint_driven(tmp_path, monkeypatch):
         n_action_steps=30,
         num_inference_steps=12,
         apply_offset_norm=False,
-        mk1_source_model_import_sha256="0" * 64,
         train_storage_fp32=False,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -1967,7 +1975,6 @@ def test_native_policy_isaac_loader_is_checkpoint_driven(tmp_path, monkeypatch):
             "route_reduction": "stable_token_segment_sum_v1",
             "allowed_storage_dtypes": frozenset({"BF16"}),
             "load_intent": "inference",
-            "verified_tensor_storage": None,
         }
     ]
 
@@ -2003,7 +2010,6 @@ def test_native_policy_rejects_spoofed_outer_artifact_identity_before_load(tmp_p
                 hf_model_path=str(tmp_path / "hf"),
                 native_stats_path=str(stats_path),
                 artifact_kind="neutral_debug",
-                mk1_source_model_import_sha256="0" * 64,
                 train_storage_fp32=False,
                 input_features=_features(),
                 output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2029,7 +2035,7 @@ def test_native_policy_isaac_rejects_outer_contract_drift_before_load(
 ):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    hf_dir = tmp_path / "hf"
+    hf_dir = _isaac_model_dir(tmp_path / "hf")
     load_calls = []
     _patch_isaac_checkpoint_load(
         monkeypatch,
@@ -2044,7 +2050,6 @@ def test_native_policy_isaac_rejects_outer_contract_drift_before_load(
         "action_dim": 7,
         "vector_max_states": 128,
         "apply_offset_norm": False,
-        "mk1_source_model_import_sha256": "0" * 64,
         "train_storage_fp32": False,
         "input_features": _features(),
         "output_features": {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2094,10 +2099,9 @@ def test_training_parameter_freeze_is_applied_once(
     monkeypatch.setattr(qwen35_vla, "setup_qwen35_vla_for_training", lambda *a, **k: calls.append("setup"))
     cfg = PerceptronIsaacConfig(
         device="cpu",
-        hf_model_path=str(tmp_path / "hf"),
+        hf_model_path=str(_isaac_model_dir(tmp_path / "hf")),
         native_stats_path=str(stats_path),
         apply_offset_norm=False,
-        mk1_source_model_import_sha256="0" * 64,
         freeze_input_embeddings=False,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2131,10 +2135,7 @@ def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(
     """FSDP2 preserves native F32 sources; legacy BF16 sources keep the BF16 load path."""
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    hf_dir = tmp_path / "hf"
-    if native_f32_source:
-        hf_dir.mkdir()
-        (hf_dir / "config.json").write_text(json.dumps({"model_type": "isaac_0_5"}))
+    hf_dir = _isaac_model_dir(tmp_path / "hf")
     calls: list[dict[str, object]] = []
 
     import lerobot.policies.perceptron_isaac.modeling_qwen35_vla as qwen35_vla
@@ -2145,14 +2146,17 @@ def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(
         calls.append({"model_dir": model_dir, **kwargs})
         return MagicMock(), SimpleNamespace(), contract
 
-    contract = _patch_isaac_checkpoint_load(monkeypatch, fake_load_isaac_vla_from_hf)
+    contract = _patch_isaac_checkpoint_load(
+        monkeypatch,
+        fake_load_isaac_vla_from_hf,
+        storage_dtype="F32" if native_f32_source else "BF16",
+    )
     monkeypatch.setattr(qwen35_vla, "setup_qwen35_vla_for_training", lambda *a, **k: None)
     cfg = PerceptronIsaacConfig(
         device="cpu",
         hf_model_path=str(hf_dir),
         native_stats_path=str(stats_path),
         apply_offset_norm=False,
-        mk1_source_model_import_sha256="0" * 64,
         freeze_input_embeddings=False,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
@@ -2175,7 +2179,7 @@ def test_fp32_training_storage_defers_backbone_load_then_loads_lazily(
 def test_native_isaac_dense_training_is_rejected_before_checkpoint_or_model_allocation(tmp_path, monkeypatch):
     stats_path = tmp_path / "stats.json"
     _write_native_stats(stats_path)
-    hf_dir = tmp_path / "hf"
+    hf_dir = _isaac_model_dir(tmp_path / "hf")
     calls = []
 
     def fake_load_isaac_vla_from_hf(model_dir, **kwargs):
@@ -2188,7 +2192,6 @@ def test_native_isaac_dense_training_is_rejected_before_checkpoint_or_model_allo
         hf_model_path=str(hf_dir),
         native_stats_path=str(stats_path),
         apply_offset_norm=False,
-        mk1_source_model_import_sha256="0" * 64,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
@@ -2226,7 +2229,6 @@ def test_native_isaac_bounded_training_config_is_rejected_before_allocation(
                 device="cpu",
                 hf_model_path=str(tmp_path / "hf"),
                 apply_offset_norm=False,
-                mk1_source_model_import_sha256="0" * 64,
                 train_expert_only=train_expert_only,
                 use_peft=use_peft,
                 input_features=_features(),
@@ -2251,9 +2253,8 @@ def test_native_isaac_bounded_training_is_rejected_at_training_boundary(
     monkeypatch.setattr("lerobot.policies.perceptron_isaac.modeling_isaac_vla.load_isaac_vla_from_hf", loader)
     cfg = PerceptronIsaacConfig(
         device="cpu",
-        hf_model_path=str(tmp_path / "hf"),
+        hf_model_path=str(_isaac_model_dir(tmp_path / "hf")),
         apply_offset_norm=False,
-        mk1_source_model_import_sha256="0" * 64,
         input_features=_features(),
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,))},
     )
