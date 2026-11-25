@@ -13,12 +13,12 @@ import torch
 
 pytest.importorskip("transformers", reason="requires lerobot[perceptron_isaac]")
 
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContract,
-    Mk1CheckpointContractError,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContract,
+    IsaacCheckpointContractError,
 )
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import load_mk1_vla_from_hf
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import load_isaac_vla_from_hf
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _write_portable_isaac05_checkpoint,
 )
 from tests.policies.perceptron_isaac.test_p2_native_regressions import _checkpoint_bytes
@@ -56,7 +56,7 @@ def test_native_rtc_root_copy_rejects_equal_but_invalid_types_without_rewriting(
         action[mutation.field] = mutation.nested
     valid = copy.deepcopy(raw)
     # This unpinned, inactive recipe must remain accepted before the root-only mutation.
-    contract = Mk1CheckpointContract.parse_allowlisted(valid, allow_test_only_reduced_geometry=True)
+    contract = IsaacCheckpointContract.parse_allowlisted(valid, allow_test_only_reduced_geometry=True)
     metadata = dict(contract.action_expert.native_metadata)
     assert type(metadata["rtc_max_delay_steps"]) is int
     assert metadata["rtc_max_delay_steps"] == 0
@@ -68,11 +68,11 @@ def test_native_rtc_root_copy_rejects_equal_but_invalid_types_without_rewriting(
     before_files = _checkpoint_bytes(root)
     before_raw = copy.deepcopy(raw)
     try:
-        with pytest.raises(Mk1CheckpointContractError, match=mutation.field):
+        with pytest.raises(IsaacCheckpointContractError, match=mutation.field):
             if reader == "parser":
-                Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+                IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
             else:
-                load_mk1_vla_from_hf(
+                load_isaac_vla_from_hf(
                     root,
                     dtype=torch.float32,
                     device="cpu",

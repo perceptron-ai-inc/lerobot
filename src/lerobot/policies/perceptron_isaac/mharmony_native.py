@@ -44,13 +44,12 @@ DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS = (
         "size": 2048,
     },
 )
-# Genesis names the coordinate block by this exact marker
-# (genesis/data/mharmony/encoding_cache.py::COORD_GROUP_NAME).
+# The coordinate block is named by this exact marker.
 COORD_TOKEN_GROUP_NAME = "coord"  # nosec B105 - reserved-token group label, not a credential
-GENESIS_TEXT_TYPE_TAG = "genesis_text_type"
-GENESIS_TEXT_TYPE_TIMESTAMP = "timestamp"
-GENESIS_TEXT_TYPE_ACTION = "action"
-GENESIS_TEXT_TYPE_ACTION_C = "action_c"
+TEXT_TYPE_TAG = "text_type"
+TEXT_TYPE_TIMESTAMP = "timestamp"
+TEXT_TYPE_ACTION = "action"
+TEXT_TYPE_ACTION_C = "action_c"
 FLOW_ACTION_TOKEN_GROUP_NAME = "flow_action"  # nosec B105 - stream label, not a credential
 FAST_ACTION_TOKEN_GROUP_NAME = "fast_action"  # nosec B105 - stream label, not a credential
 FAST_ACTION_TOKENIZER_NAME = "physical-intelligence/fast"
@@ -112,9 +111,17 @@ class IsaacMharmonyRenderMetadata:
     min_num_patches: int | None = None
     image_resize_size: list[int] | None = None
     training_proprio_contract: dict[str, Any] | None = None
+    # Whether each observation is preceded by an episode-time item, as the checkpoint's
+    # recipe trained it. None means the metadata predates the field: loaders then read the
+    # checkpoint's selected recipe, and a checkpoint with no declaration keeps emitting.
+    emit_observation_timestamps: bool | None = None
 
     def __post_init__(self) -> None:
         reject_legacy_action_conditioning(self.action_conditioning)
+        if self.emit_observation_timestamps is not None and not isinstance(
+            self.emit_observation_timestamps, bool
+        ):
+            raise ValueError("ISAAC emit_observation_timestamps must be a boolean or null.")
         if self.image_resize_size is not None and (
             not isinstance(self.image_resize_size, list)
             or len(self.image_resize_size) != 2
@@ -165,7 +172,8 @@ class IsaacMharmonyRenderMetadata:
             action_conditioning=bool(config.action_conditioning),
             action_conditioning_role=str(config.action_conditioning_role),
             mistake_conditioning=bool(config.mistake_conditioning),
-            rtc_prefix_length=int(config.rtc_prefix_length),
+            # RTC prefixes enter only the DiT sampler, never the rendered prompt.
+            rtc_prefix_length=0,
             mharmony_version=config.mharmony_version,
             patch_size=int(config.render_patch_size),
             pixel_shuffle_scale=int(config.render_pixel_shuffle_scale),
@@ -292,8 +300,8 @@ def _matches_source_bound_libero_prompt(
 ) -> bool:
     """Reconcile an admitted source prompt, never weaken the physical LIBERO ABI.
 
-    Artifact admission authenticates the checkpoint-local recipe. This check
-    requires its selected source profile; a bare robot-name alias is insufficient.
+    This check requires the selected source profile of the checkpoint-local recipe; a bare
+    robot-name alias is insufficient.
     """
     if not (
         config.strict_environment_feature_contract is True
@@ -355,7 +363,7 @@ def build_isaac_training_proprio_contract(
     contract_version: int,
     contract_hash: str,
 ) -> dict[str, Any]:
-    """Compile the supported Genesis policy-state ABI into movable render metadata."""
+    """Compile the supported policy-state ABI into movable render metadata."""
     profile_components: dict[str, tuple[int, list[tuple[str, int, int]]]] = {
         "bi_yam": (
             14,
@@ -559,13 +567,13 @@ def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
     a wrong group set is not a cosmetic problem. The config-derived default
     (``DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS``) carries no coord block and no offset, so
     mHarmony bump-allocates its FAST pool to id 248087 while an Isaac-0.5 checkpoint is
-    trained with that pool at 249321 -- a 1234-id shift that would silently mis-encode
-    every FAST action token if it were ever used in place of the real declaration.
+    trained with that pool at 249321 -- a 1234-id shift that would silently encode every
+    FAST action token to the wrong id if it were ever used in place of the real declaration.
 
     Ordering is deliberately not constrained here: mHarmony resolves explicit offsets
     order-independently, and the shipped export lists its FAST group before its coord
     group. The checkpoint-range cross-check stays with
-    ``Mk1CheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
+    ``IsaacCheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
     an artifact independent of this recipe.
     """
     return _recipe_reserved_token_groups(load_json_object(path))
@@ -689,6 +697,70 @@ def _parse_recipe_image_preprocess(
     )
 
 
+def read_recipe_observation_timestamps(
+    path: str | Path,
+    *,
+    policy_state_dataset: str | None,
+    normalization_scope: str | None = None,
+) -> bool | None:
+    """Read ``emit_observation_timestamps`` from the checkpoint's selected Flow recipe.
+
+    The selection is the one normalization already uses: the Flow recipes of
+    ``policy_state_dataset``, narrowed to ``normalization_scope`` when a recipe carries
+    that scope. Returns None when the selected recipes do not declare the flag, and
+    raises when they disagree, because the prompt would then be ambiguous.
+    """
+    location = "policy_inference_recipe.json"
+    recipes = load_json_object(path).get("recipes")
+    if not isinstance(recipes, list):
+        raise ValueError(f"{location}.recipes must be a list.")
+    flow = [
+        recipe
+        for recipe in recipes
+        if isinstance(recipe, Mapping)
+        and recipe.get("objective") == "Flow"
+        and recipe.get("policy_state_dataset") == policy_state_dataset
+    ]
+    scoped = [recipe for recipe in flow if recipe.get("normalization_scope") == normalization_scope]
+    declared: set[bool] = set()
+    for recipe in scoped or flow:
+        lowering = recipe.get("lowering")
+        observation = lowering.get("observation") if isinstance(lowering, Mapping) else None
+        if not isinstance(observation, Mapping) or "emit_observation_timestamps" not in observation:
+            continue
+        value = observation["emit_observation_timestamps"]
+        if not isinstance(value, bool):
+            raise ValueError(f"{location} emit_observation_timestamps must be a boolean, got {value!r}.")
+        declared.add(value)
+    if len(declared) > 1:
+        raise ValueError(
+            f"{location} Flow recipes for dataset {policy_state_dataset!r} disagree on "
+            "emit_observation_timestamps."
+        )
+    return declared.pop() if declared else None
+
+
+def hydrate_isaac_observation_timestamps(
+    metadata: IsaacMharmonyRenderMetadata,
+    *,
+    recipe_path: str | Path | None,
+    policy_state_dataset: str | None = None,
+    normalization_scope: str | None = None,
+) -> IsaacMharmonyRenderMetadata:
+    """Resolve ``emit_observation_timestamps`` for render metadata that predates the field."""
+    if metadata.emit_observation_timestamps is not None:
+        return metadata
+    declared = None
+    if recipe_path is not None and Path(recipe_path).is_file():
+        declared = read_recipe_observation_timestamps(
+            recipe_path,
+            policy_state_dataset=str(policy_state_dataset or metadata.dataset_name),
+            normalization_scope=normalization_scope,
+        )
+    # With no declaration anywhere, keep the emission such checkpoints have always used.
+    return replace(metadata, emit_observation_timestamps=True if declared is None else declared)
+
+
 def load_native_render_metadata(
     config: PerceptronIsaacConfig, *, stats_fps: float | None = None
 ) -> IsaacMharmonyRenderMetadata:
@@ -704,6 +776,12 @@ def load_native_render_metadata(
                 mharmony_reserved_token_groups=_recipe_reserved_token_groups(recipe),
             )
             metadata = _apply_recipe_image_preprocess(metadata, recipe)
+    metadata = hydrate_isaac_observation_timestamps(
+        metadata,
+        recipe_path=config.resolve_inference_recipe_path(),
+        policy_state_dataset=config.policy_state_dataset,
+        normalization_scope=config.normalization_profile_scope,
+    )
     if stats_fps is not None and metadata.target_fps is None:
         metadata = replace(metadata, target_fps=float(stats_fps))
     metadata.validate_for_config(config)
@@ -746,9 +824,10 @@ def build_isaac_mharmony_content_plan(
 ) -> IsaacMharmonyContentPlan:
     """Build the native LIBERO no-scene mharmony content plan.
 
-    This mirrors the Genesis ``trajectory_flow_matching_pipeline`` inference
-    contract for the supported native eval surface: Flow actions, explicit deltas,
-    timestamps, RGB images, last-state-only proprio, and no scene description.
+    This is the inference contract for the supported native eval surface: Flow actions,
+    explicit deltas, RGB images, last-state-only proprio, and no scene description. Episode-time
+    items precede each observation only when the checkpoint's recipe emits them
+    (``emit_observation_timestamps``); the plan records the timestamps either way.
     """
     if not isinstance(inference_clip_normalized_proprio, bool):
         raise ValueError("inference_clip_normalized_proprio must be a boolean.")
@@ -784,8 +863,11 @@ def build_isaac_mharmony_content_plan(
             },
         }
     ]
+    # Unresolved metadata (None) keeps the emission every checkpoint used before the field.
+    emit_timestamps = metadata.emit_observation_timestamps is not False
     for step_idx, (frame, timestamp_seconds) in enumerate(zip(history, timestamps, strict=True)):
-        user_content.append(_timestamp_content_item(step_idx, timestamp_seconds, metadata))
+        if emit_timestamps:
+            user_content.append(_timestamp_content_item(step_idx, timestamp_seconds, metadata))
         for camera_idx, camera in enumerate(metadata.camera_order):
             user_content.append(
                 {
@@ -820,7 +902,7 @@ def build_isaac_mharmony_content_plan(
         terminal=terminal,
     )
     if training_prompt:
-        flow_tags = _project_genesis_training_action_tags(flow_tags)
+        flow_tags = _project_training_action_tags(flow_tags)
     assistant_content = [
         {
             "kind": "tokens",
@@ -916,16 +998,16 @@ class IsaacNativeMharmonyRenderer:
         terminal: bool = False,
         stats: IsaacNormalizationStats | None = None,
     ):
-        """Render one joint FAST+Flow training sample without Genesis transforms.
+        """Render one joint FAST+Flow training sample.
 
-        ``terminal`` mirrors Genesis's ``_action_completion_metadata``: a chunk whose last
+        ``terminal``: a chunk whose last
         action step is the trajectory's terminal step keeps the ``<|end|>`` footer, while every
         non-terminal chunk is supervised with ``<|return|>``. The dataset processor supplies
         terminality from the last real action and its authoritative episode endpoint.
         Without that metadata, non-terminal remains the conservative default.
 
         ``stats`` overrides the builder's normalization for this one sample, which is what
-        multi-suite LIBERO training needs: Genesis normalizes each LIBERO suite by its own
+        multi-suite LIBERO training needs: each LIBERO suite is normalized by its own
         quantiles, and the suites are not interchangeable -- end-effector height spans
         [0.916, 1.286] in libero_spatial but [0.010, 0.337] in libero_object, disjoint ranges
         that would push cross-normalized proprio far outside [-1, 1]. Defaults to the builder's
@@ -945,9 +1027,9 @@ class IsaacNativeMharmonyRenderer:
                 f"ISAAC normalized action max {max_abs:.6g} exceeds skip threshold "
                 f"{skip_outlier_threshold:.6g}."
             )
-        # Genesis clips the two objectives independently: the FAST tokenizer transform and the
+        # The two objectives are clipped independently: the FAST tokenizer transform and the
         # flow-target transform each carry their own cap. Sharing one clipped array would feed
-        # the tokenizer an action distribution Genesis never trains it on.
+        # the tokenizer an action distribution it was never trained on.
         if clip_normalized_actions:
             fast_cap = clip_normalized_max if fast_clip_normalized_max is None else fast_clip_normalized_max
             fast_normalized = np.clip(normalized, -fast_cap, fast_cap)
@@ -991,9 +1073,9 @@ class IsaacNativeMharmonyRenderer:
             min_num_patches=min_num_patches,
             pixel_shuffle_scale=pixel_shuffle_scale,
             temporal_patch_size=temporal_patch_size,
-            # Genesis sets message_stop_token="return" for any chunk whose last action step is
-            # not the trajectory terminal step (core/datasets/augment/trajectory.py), and
-            # render_document_to_stream swaps the rendered <|end|> for <|return|> accordingly.
+            # message_stop_token is "return" for any chunk whose last action step is not the
+            # trajectory terminal step, and the rendered <|end|> is swapped for <|return|>
+            # accordingly.
             # Terminal chunks keep <|end|>.
             rewrite_final_assistant_footer=not bool(terminal),
         )
@@ -1289,7 +1371,7 @@ def _timestamp_content_item(
         "normalized_seconds": normalized_seconds,
         "precision": precision,
         "tags": {
-            GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_TIMESTAMP,
+            TEXT_TYPE_TAG: TEXT_TYPE_TIMESTAMP,
             "timestamp_text": _format_timestamp_qwen(normalized_seconds, precision=precision),
             "timestamp_seconds": float(timestamp_seconds),
             "timestamp_normalized_seconds": normalized_seconds,
@@ -1420,12 +1502,12 @@ def _flow_action_tags(
         action_is_pad = [False] * horizon
     return {
         "token_group": FLOW_ACTION_TOKEN_GROUP_NAME,
-        GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C,
+        TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C,
         "trajectory_action": anchor_idx,
         "action_index": anchor_idx,
         "obs_window": [0, anchor_idx],
         "action_window": [anchor_idx, emitted_action_indices[-1]],
-        # Genesis drops message_stop_token from terminal chunks, which is what makes their
+        # Terminal chunks carry no message_stop_token, which is what makes their
         # footer <|end|> rather than <|return|>.
         "terminal": bool(terminal),
         "message_stop_token": None if terminal else metadata.message_stop_token,
@@ -1451,7 +1533,7 @@ def _fast_action_tags(flow_tags: dict[str, Any]) -> dict[str, Any]:
         {
             "token_group": FAST_ACTION_TOKEN_GROUP_NAME,
             "tokenizer": FAST_ACTION_TOKENIZER_NAME,
-            GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION,
+            TEXT_TYPE_TAG: TEXT_TYPE_ACTION,
             "objective_form": "FAST",
         }
     )
@@ -1460,9 +1542,9 @@ def _fast_action_tags(flow_tags: dict[str, Any]) -> dict[str, Any]:
     return tags
 
 
-_GENESIS_TRAINING_ACTION_TAG_KEYS = (
+_TRAINING_ACTION_TAG_KEYS = (
     "token_group",
-    GENESIS_TEXT_TYPE_TAG,
+    TEXT_TYPE_TAG,
     "action_index",
     "trajectory_action",
     "objective_form",
@@ -1478,9 +1560,9 @@ _GENESIS_TRAINING_ACTION_TAG_KEYS = (
 )
 
 
-def _project_genesis_training_action_tags(tags: dict[str, Any]) -> dict[str, Any]:
-    """Match Genesis conversation._collect_token_tags at the final TensorStream boundary."""
-    return {key: tags[key] for key in _GENESIS_TRAINING_ACTION_TAG_KEYS if key in tags}
+def _project_training_action_tags(tags: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the tags that reach the final TensorStream boundary."""
+    return {key: tags[key] for key in _TRAINING_ACTION_TAG_KEYS if key in tags}
 
 
 def _plan_item_to_mh_content(

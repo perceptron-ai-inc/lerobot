@@ -11,9 +11,14 @@ class _EventLike(Protocol):
 
 
 class _TensorStreamLike(Protocol):
-    streams: Sequence[Iterable[_EventLike]]
-    shape: tuple[int, int]
-    device: torch.device
+    @property
+    def streams(self) -> Sequence[Iterable[_EventLike]]: ...
+
+    @property
+    def shape(self) -> tuple[int, int]: ...
+
+    @property
+    def device(self) -> torch.device: ...
 
 
 def compute_mrope_pos_tensor_common(ts: _TensorStreamLike, n_pos_dims: int = 3) -> torch.Tensor:

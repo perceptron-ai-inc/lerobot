@@ -26,6 +26,11 @@ class ExecutionMode(StrEnum):
     RTC_TRAINED = "rtc_trained"
 
 
+# Batch key for an observation's episode-relative capture time in seconds. It is the dataset
+# ``timestamp`` key, which processors already carry through as complementary data.
+EPISODE_TIME_KEY = "timestamp"
+
+
 @dataclass(frozen=True)
 class FeatureSpec:
     """Named canonical values, ordered components, and semantic conventions."""
@@ -79,6 +84,10 @@ class ChunkPolicySpec:
     current_observation_only: bool = True
     retains_session_state: bool = True
     training_max_delay: int = 0
+    # The policy conditions on episode time. Chunk callers predict once per chunk rather than
+    # once per control step, so they supply each observation's episode-relative capture time
+    # under EPISODE_TIME_KEY.
+    needs_episode_time: bool = False
 
     def __post_init__(self) -> None:
         """Validate the policy's declared prediction and execution lengths."""

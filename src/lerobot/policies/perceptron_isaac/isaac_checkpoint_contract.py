@@ -1,8 +1,8 @@
-"""Allocation-free validation for the MK1 Fast VLA checkpoint contract.
+"""Allocation-free validation for the Isaac VLA checkpoint contract.
 
 This module treats ``hf_model/config.json`` and the safetensors index as data.
 It does not import Transformers, construct a model, or read tensor payloads.
-Only the single MK1/PR-3154 export ABI is accepted for production. A reduced
+Only a single export ABI is accepted for production. A reduced
 geometry is available solely for explicitly marked CPU test fixtures.
 """
 
@@ -18,26 +18,20 @@ from pathlib import Path
 from typing import Any, Never
 
 from .checkpoint_integrity import load_json_object
-from .rtc import (
-    DIT_CONTEXT_CONDITIONING_FIELDS,
-    ActionExpertConditioning,
-    SharedFinalContext,
-    validate_action_context,
-    validate_dit_action_metadata,
-)
+from .rtc import ActionExpertConditioning, SharedFinalContext, validate_dit_action_metadata
 
-MK1_MODEL_TYPE = "qwen3_5_moe"
-MK1_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
-MK1_ARCHITECTURE = "GenesisQwen3_5MoeForConditionalGeneration"
-MK1_VLA_SCHEMA_VERSION = 1
-MK1_BACKBONE_FAMILY = "mk1_qwen3_6_moe"
-MK1_STATE_DICT_SCHEMA = "pr3154_v1"
-MK1_RMSNORM_CONVENTION = "zero_centered_1_plus_weight"
-MK1_TEST_GEOMETRY_MARKER = "genesis_test_only_reduced_geometry"
-MK1_SAFETENSORS_INDEX = "model.safetensors.index.json"
-MK1_FAST_TOKENIZER = "physical-intelligence/fast"
-MK1_FAST_TOKEN_OFFSET = 249321
-MK1_FAST_TOKEN_SIZE = 2048
+ISAAC_MODEL_TYPE = "qwen3_5_moe"
+ISAAC_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
+ISAAC_ARCHITECTURE = "Isaac05ForConditionalGeneration"
+ISAAC_VLA_SCHEMA_VERSION = 1
+ISAAC_STATE_DICT_SCHEMA = "pr3154_v1"
+ISAAC_RMSNORM_CONVENTION = "zero_centered_1_plus_weight"
+ISAAC_TEST_GEOMETRY_MARKER = "isaac05_test_only_reduced_geometry"
+_LAYOUT_BLOCKS = ("artifact", "coord_tokens", "moe", "vla", "test_only_reduced_geometry")
+ISAAC_SAFETENSORS_INDEX = "model.safetensors.index.json"
+ISAAC_FAST_TOKENIZER = "physical-intelligence/fast"
+ISAAC_FAST_TOKEN_OFFSET = 249321
+ISAAC_FAST_TOKEN_SIZE = 2048
 _MAX_JSON_FILE_BYTES = 64 * 1024 * 1024
 _MAX_SAFETENSORS_HEADER_BYTES = 64 * 1024 * 1024
 
@@ -56,13 +50,10 @@ _CUSTOM_MOE_KEYS = {
     "route_norm",
     "route_scale",
     "score_before_experts",
-    "null_expert_semantics",
-    "shared_expert_mode",
     "uses_expert_bias",
 }
 _VLA_KEYS = {
     "schema_version",
-    "backbone_family",
     "state_dict_schema",
     "rmsnorm_weight_convention",
     "vector_encoder",
@@ -79,7 +70,6 @@ _ACTION_KEYS = {
     "num_heads",
     "mlp_ratio",
     "timestep_embed_dim",
-    "clean_at_0",
     "ffn_multiple_of",
     "qk_norm",
     "qk_norm_eps",
@@ -100,32 +90,22 @@ _ROPE_KEYS = {
 _ARTIFACT_IDENTITY_KEYS = {"schema_version", "artifact_kind"}
 
 
-class Mk1CheckpointContractError(ValueError):
-    """The checkpoint cannot be interpreted as the allowlisted MK1 VLA ABI."""
+class IsaacCheckpointContractError(ValueError):
+    """The checkpoint cannot be interpreted as the allowlisted Isaac VLA ABI."""
 
 
 def validate_checkpoint_action_expert_semantics(raw: Mapping[str, Any]) -> None:
-    """Validate both native copies or the migrated envelope before eager or lazy construction."""
+    """Validate both copies of the action expert block before eager or lazy construction."""
     text = _object_field(raw, "text_config")
     depth = _integer(text, "num_hidden_layers", "text_config")
     for path, block in (
         ("isaac05_vla.action_expert", raw.get("isaac05_vla")),
         ("action_expert", raw),
-        ("genesis_vla.action_expert", raw.get("genesis_vla")),
     ):
         if isinstance(block, Mapping):
             action = block.get("action_expert")
             if isinstance(action, Mapping):
-                if action.get("type") == "dit":
-                    _validate_native_action_metadata(action, path=path, backbone_num_layers=depth)
-                else:
-                    schema = block.get("schema_version")
-                    try:
-                        validate_action_context(action, schema_version=schema, backbone_num_layers=depth)
-                    except ValueError as exc:
-                        _fail(str(exc))
-                    expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
-                    _require_exact_keys(action, expected, path)
+                _validate_native_action_metadata(action, path=path, backbone_num_layers=depth)
     if raw.get("model_type") == "isaac_0_5":
         vla = _object_field(raw, "isaac05_vla")
         if _integer(vla, "schema_version", "isaac05_vla") != 1:
@@ -138,7 +118,7 @@ def validate_checkpoint_action_expert_semantics(raw: Mapping[str, Any]) -> None:
 
 
 @dataclass(frozen=True)
-class Mk1MoeContract:
+class IsaacMoeContract:
     num_real_experts: int
     num_null_experts: int
     physical_router_outputs: int
@@ -148,7 +128,7 @@ class Mk1MoeContract:
 
 
 @dataclass(frozen=True)
-class Mk1TextContract:
+class IsaacTextContract:
     hidden_size: int
     num_hidden_layers: int
     vocab_size: int
@@ -167,7 +147,7 @@ class Mk1TextContract:
 
 
 @dataclass(frozen=True)
-class Mk1VisionContract:
+class IsaacVisionContract:
     depth: int
     hidden_size: int
     intermediate_size: int
@@ -181,14 +161,14 @@ class Mk1VisionContract:
 
 
 @dataclass(frozen=True)
-class Mk1CoordTokenContract:
+class IsaacCoordTokenContract:
     enabled: bool
     offset: int | None = None
     size: int | None = None
 
 
 @dataclass(frozen=True)
-class Mk1SpecialTokenContract:
+class IsaacSpecialTokenContract:
     bos_token_id: int
     eos_token_id: int
     image_token_id: int
@@ -198,14 +178,14 @@ class Mk1SpecialTokenContract:
 
 
 @dataclass(frozen=True)
-class Mk1VectorEncoderContract:
+class IsaacVectorEncoderContract:
     max_states: int
     hidden_dim: int
     output_dim: int
 
 
 @dataclass(frozen=True)
-class Mk1ActionExpertContract:
+class IsaacActionExpertContract:
     action_dim: int
     action_horizon: int
     num_layers: int
@@ -224,7 +204,7 @@ class Mk1ActionExpertContract:
 
 
 @dataclass(frozen=True)
-class Mk1MtpContract:
+class IsaacMtpContract:
     present: bool
     physical_layers: int
     rollout_steps: int
@@ -235,7 +215,7 @@ class Mk1MtpContract:
 
 
 @dataclass(frozen=True)
-class Mk1ArtifactContract:
+class IsaacArtifactContract:
     schema_version: int
     artifact_kind: str
 
@@ -295,16 +275,16 @@ class SafetensorsInventory:
 
 
 @dataclass(frozen=True)
-class Mk1CheckpointContract:
-    artifact: Mk1ArtifactContract
-    text: Mk1TextContract
-    vision: Mk1VisionContract
-    moe: Mk1MoeContract
-    special_tokens: Mk1SpecialTokenContract
-    coord_tokens: Mk1CoordTokenContract
-    vector_encoder: Mk1VectorEncoderContract
-    action_expert: Mk1ActionExpertContract
-    mtp: Mk1MtpContract
+class IsaacCheckpointContract:
+    artifact: IsaacArtifactContract
+    text: IsaacTextContract
+    vision: IsaacVisionContract
+    moe: IsaacMoeContract
+    special_tokens: IsaacSpecialTokenContract
+    coord_tokens: IsaacCoordTokenContract
+    vector_encoder: IsaacVectorEncoderContract
+    action_expert: IsaacActionExpertContract
+    mtp: IsaacMtpContract
     test_only_reduced_geometry: bool = False
 
     @property
@@ -321,7 +301,7 @@ class Mk1CheckpointContract:
         raw_config: Mapping[str, Any],
         *,
         allow_test_only_reduced_geometry: bool = False,
-    ) -> Mk1CheckpointContract:
+    ) -> IsaacCheckpointContract:
         """Parse config data without invoking checkpoint-supplied Python.
 
         Reduced geometry requires two independent opt-ins: the serialized test
@@ -330,48 +310,42 @@ class Mk1CheckpointContract:
         """
         root = _object(raw_config, "config")
         validate_checkpoint_action_expert_semantics(root)
-        native_format = root.get("model_type") == "isaac_0_5"
-        if native_format:
-            root = _normalize_isaac05(root)
-        elif _object_field(_object_field(root, "genesis_vla"), "action_expert").get("type") == "dit":
-            _fail("legacy MK1 requires the molmoact action ABI")
-        test_marker = root.get(MK1_TEST_GEOMETRY_MARKER, False)
+        if root.get("model_type") != "isaac_0_5":
+            _fail("model_type must be 'isaac_0_5'")
+        root = _normalize_isaac05(root)
+        test_marker = root.get(ISAAC_TEST_GEOMETRY_MARKER, False)
         if test_marker is not False and test_marker is not True:
-            _fail(f"{MK1_TEST_GEOMETRY_MARKER} must be a boolean")
+            _fail(f"{ISAAC_TEST_GEOMETRY_MARKER} must be a boolean")
         if test_marker and not allow_test_only_reduced_geometry:
             _fail("reduced checkpoint geometry is test-only and was not explicitly enabled")
         test_geometry = bool(test_marker)
 
         if "apply_offset_norm" in root:
-            _fail("MK1 config must not contain the legacy apply_offset_norm override")
-        if root.get("model_type") != MK1_MODEL_TYPE:
-            _fail(f"model_type must be {MK1_MODEL_TYPE!r}")
-        if root.get("architectures") != [MK1_ARCHITECTURE]:
-            _fail(f"architectures must be [{MK1_ARCHITECTURE!r}]")
+            _fail("Isaac config must not contain the legacy apply_offset_norm override")
         if root.get("tie_word_embeddings") is not False:
             _fail("tie_word_embeddings must be false")
 
-        artifact = _parse_artifact(_object_field(root, "genesis_artifact"))
+        artifact = _parse_artifact(_object_field(root, "isaac05_artifact"))
         _validate_standard_runtime_fields(root, path="config")
 
         text_raw = _object_field(root, "text_config")
         vision_raw = _object_field(root, "vision_config")
         _validate_standard_runtime_fields(text_raw, path="text_config")
         _validate_standard_runtime_fields(vision_raw, path="vision_config")
-        root_moe = _object_field(root, "genesis_moe")
-        text_moe = _object_field(text_raw, "genesis_moe")
+        root_moe = _object_field(root, "isaac05_moe")
+        text_moe = _object_field(text_raw, "isaac05_moe")
         if root_moe != text_moe:
-            _fail("root and text_config genesis_moe blocks must be identical")
+            _fail("root and text_config isaac05_moe blocks must be identical")
         moe = _parse_moe(root_moe, test_geometry=test_geometry)
 
-        mtp_raw = _object_field(_object_field(root, "genesis_vla"), "mtp")
+        mtp_raw = _object_field(_object_field(root, "isaac05_vla"), "mtp")
         mtp = _parse_mtp(mtp_raw)
         text = _parse_text(text_raw, moe=moe, mtp=mtp, test_geometry=test_geometry)
         vision = _parse_vision(vision_raw, text=text, test_geometry=test_geometry)
         special_tokens = _parse_special_tokens(root, text_raw, text=text, test_geometry=test_geometry)
-        coord = _parse_coord(_object_field(root, "genesis_coord_tokens"), text, test_geometry=test_geometry)
+        coord = _parse_coord(_object_field(root, "isaac05_coord_tokens"), text, test_geometry=test_geometry)
         vector, action = _parse_vla(
-            _object_field(root, "genesis_vla"), text=text, test_geometry=test_geometry
+            _object_field(root, "isaac05_vla"), text=text, test_geometry=test_geometry
         )
 
         return cls(
@@ -393,7 +367,7 @@ class Mk1CheckpointContract:
 
         def add(key: str, *shape: int) -> None:
             if key in shapes:  # pragma: no cover - programmer invariant
-                raise AssertionError(f"duplicate expected MK1 tensor {key}")
+                raise AssertionError(f"duplicate expected Isaac tensor {key}")
             shapes[key] = tuple(shape)
 
         text = self.text
@@ -512,7 +486,7 @@ class Mk1CheckpointContract:
     def validate_coord_reserved_token_groups(self, groups: Any) -> None:
         """Cross-check the checkpoint coordinate range against mHarmony metadata.
 
-        Genesis identifies this reserved block by the exact ``name="coord"``
+        This reserved block is identified by the exact ``name="coord"``
         marker.  A tokenizer label is neither required nor sufficient: changing
         the name disables the coordinate-token render path even if the numeric
         range happens to match.
@@ -534,21 +508,21 @@ class Mk1CheckpointContract:
         fast_groups = [
             group
             for group in groups
-            if isinstance(group, Mapping) and group.get("tokenizer") == MK1_FAST_TOKENIZER
+            if isinstance(group, Mapping) and group.get("tokenizer") == ISAAC_FAST_TOKENIZER
         ]
         if self.requires_fast_reserved_token_group and len(fast_groups) != 1:
             _fail(
                 "production trained_policy mHarmony reserved-token groups must contain exactly one "
-                f"{MK1_FAST_TOKENIZER} entry"
+                f"{ISAAC_FAST_TOKENIZER} entry"
             )
         if not self.requires_fast_reserved_token_group and len(fast_groups) > 1:
-            _fail(f"mHarmony reserved-token groups must contain at most one {MK1_FAST_TOKENIZER} entry")
+            _fail(f"mHarmony reserved-token groups must contain at most one {ISAAC_FAST_TOKENIZER} entry")
         if fast_groups and not self.test_only_reduced_geometry:
             fast = fast_groups[0]
-            if (fast.get("offset"), fast.get("size")) != (MK1_FAST_TOKEN_OFFSET, MK1_FAST_TOKEN_SIZE):
+            if (fast.get("offset"), fast.get("size")) != (ISAAC_FAST_TOKEN_OFFSET, ISAAC_FAST_TOKEN_SIZE):
                 _fail(
-                    "production MK1 FAST reserved-token range must be "
-                    f"offset {MK1_FAST_TOKEN_OFFSET} with size {MK1_FAST_TOKEN_SIZE}"
+                    "production Isaac FAST reserved-token range must be "
+                    f"offset {ISAAC_FAST_TOKEN_OFFSET} with size {ISAAC_FAST_TOKEN_SIZE}"
                 )
 
         if not self.coord_tokens.enabled:
@@ -562,49 +536,51 @@ class Mk1CheckpointContract:
             _fail("mHarmony coord reserved-token size must be an integer")
         if (offset, size) != (self.coord_tokens.offset, self.coord_tokens.size):
             _fail(
-                "mHarmony coord reserved-token range disagrees with genesis_coord_tokens: "
+                "mHarmony coord reserved-token range disagrees with isaac05_coord_tokens: "
                 f"groups=({offset}, {size}), checkpoint=({self.coord_tokens.offset}, {self.coord_tokens.size})"
             )
 
 
-def read_mk1_config_data(
+def read_isaac_config_data(
     model_dir: str | Path,
     *,
     allow_test_only_reduced_geometry: bool = False,
-) -> tuple[dict[str, Any], Mk1CheckpointContract]:
+) -> tuple[dict[str, Any], IsaacCheckpointContract]:
     """Read strict config JSON once and return both its data and contract."""
     root = Path(model_dir).resolve()
     raw = _read_json_object(_local_file(root, "config.json"))
-    contract = Mk1CheckpointContract.parse_allowlisted(
+    contract = IsaacCheckpointContract.parse_allowlisted(
         raw,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
-    if raw.get("model_type") == "isaac_0_5":
-        artifact = _object_field(raw, "isaac05_artifact")
-        shapes = contract.expected_tensor_shapes()
-        expected_bytes = sum(math.prod(shape) * 4 for shape in shapes.values())
-        if artifact.get("tensor_count") != len(shapes) or artifact.get("tensor_bytes") != expected_bytes:
-            _fail("isaac05_artifact tensor count/bytes disagree with F32 geometry")
-        raw = _normalize_isaac05(raw)
-    return raw, contract
+    artifact = _object_field(raw, "isaac05_artifact")
+    if (artifact.get("tensor_count"), artifact.get("tensor_bytes")) != _f32_tensor_inventory(contract):
+        _fail("isaac05_artifact tensor count/bytes disagree with F32 geometry")
+    return _normalize_isaac05(raw), contract
 
 
-def read_mk1_config(
+def _f32_tensor_inventory(contract: IsaacCheckpointContract) -> tuple[int, int]:
+    """The tensor count and F32 byte total a config declares for this geometry."""
+    shapes = contract.expected_tensor_shapes()
+    return len(shapes), sum(math.prod(shape) * 4 for shape in shapes.values())
+
+
+def read_isaac_config(
     model_dir: str | Path,
     *,
     allow_test_only_reduced_geometry: bool = False,
-) -> Mk1CheckpointContract:
+) -> IsaacCheckpointContract:
     """Read and parse an inner HF config without model construction."""
-    _raw, contract = read_mk1_config_data(
+    _raw, contract = read_isaac_config_data(
         model_dir,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
     return contract
 
 
-def validate_mk1_tokenizer(
+def validate_isaac_tokenizer(
     model_dir: str | Path,
-    contract: Mk1CheckpointContract,
+    contract: IsaacCheckpointContract,
 ) -> None:
     """Require tokenizer IDs to agree with special and coordinate declarations."""
     root = Path(model_dir).resolve()
@@ -653,7 +629,7 @@ def validate_mk1_tokenizer(
         "<|video_pad|>": special.video_token_id,
     }
     if special.bos_token_id != special.eos_token_id:
-        _fail("MK1 bos_token_id and eos_token_id must share <|endoftext|>")
+        _fail("Isaac bos_token_id and eos_token_id must share <|endoftext|>")
     for token, expected_id in required.items():
         if by_token.get(token) != expected_id:
             _fail(f"tokenizer special token {token!r} has ID {by_token.get(token)!r}, expected {expected_id}")
@@ -671,8 +647,8 @@ def validate_mk1_tokenizer(
             _fail(f"tokenizer assigns explicit tokens inside the reserved coordinate range: {collisions[:8]}")
 
     if contract.requires_fast_reserved_token_group:
-        fast_end = MK1_FAST_TOKEN_OFFSET + MK1_FAST_TOKEN_SIZE
-        collisions = sorted(token_id for token_id in by_id if MK1_FAST_TOKEN_OFFSET <= token_id < fast_end)
+        fast_end = ISAAC_FAST_TOKEN_OFFSET + ISAAC_FAST_TOKEN_SIZE
+        collisions = sorted(token_id for token_id in by_id if ISAAC_FAST_TOKEN_OFFSET <= token_id < fast_end)
         if collisions:
             _fail(f"tokenizer assigns explicit tokens inside the reserved FAST range: {collisions[:8]}")
 
@@ -685,7 +661,7 @@ def read_and_validate_safetensors_index(model_dir: str | Path) -> SafetensorsInv
     if not root.is_dir():
         _fail(f"model directory does not exist: {root}")
     root = root.resolve()
-    index_path = _local_file(root, MK1_SAFETENSORS_INDEX)
+    index_path = _local_file(root, ISAAC_SAFETENSORS_INDEX)
     index = _read_json_object(index_path)
     unknown_index_keys = set(index) - {"metadata", "weight_map"}
     if unknown_index_keys:
@@ -743,7 +719,7 @@ def read_and_validate_safetensors_index(model_dir: str | Path) -> SafetensorsInv
                 )
             if header_size + 8 > shard_path.stat().st_size:
                 _fail(f"safetensors shard {shard_name} declares a truncated header")
-        except Mk1CheckpointContractError:
+        except IsaacCheckpointContractError:
             raise
         except OSError as exc:
             _fail(f"could not inspect safetensors shard {shard_name}: {exc}")
@@ -771,7 +747,7 @@ def read_and_validate_safetensors_index(model_dir: str | Path) -> SafetensorsInv
                     )
                 _verify_shard_identity(identity)
             _verify_shard_identity(identity)
-        except Mk1CheckpointContractError:
+        except IsaacCheckpointContractError:
             raise
         except Exception as exc:
             _fail(f"could not inspect safetensors shard {shard_name}: {exc}")
@@ -797,14 +773,14 @@ def read_and_validate_safetensors_index(model_dir: str | Path) -> SafetensorsInv
     )
 
 
-def validate_mk1_checkpoint(
+def validate_isaac_checkpoint(
     model_dir: str | Path,
     *,
     allow_test_only_reduced_geometry: bool = False,
     allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
-) -> tuple[Mk1CheckpointContract, SafetensorsInventory]:
+) -> tuple[IsaacCheckpointContract, SafetensorsInventory]:
     """Validate config and tensor headers before any module is allocated."""
-    _raw, contract = read_mk1_config_data(
+    _raw, contract = read_isaac_config_data(
         model_dir,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
@@ -813,38 +789,36 @@ def validate_mk1_checkpoint(
     return contract, inventory
 
 
-def finalize_mk1_runtime_checkpoint_layout(model_dir: str | Path) -> None:
+def finalize_isaac_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     """Drop source-only MTP metadata and ensure one authoritative sharded-model index."""
     from safetensors import safe_open
 
     root = Path(model_dir)
     config_path = root / "config.json"
     raw = _read_json_object(config_path)
-    # A raw Isaac-0.5 export stores the VLA block under ``isaac05_vla``; ``_normalize_isaac05``
-    # renames it to ``genesis_vla``, but only in the dict it returns, so both spellings are
-    # valid on disk. Read whichever the saved config actually uses.
-    vla = next(
-        (raw[name] for name in ("genesis_vla", "isaac05_vla") if isinstance(raw.get(name), dict)),
-        None,
-    )
+    vla = raw.get("isaac05_vla")
     text_config = raw.get("text_config")
     mtp = vla.get("mtp") if isinstance(vla, dict) else None
     if not isinstance(mtp, dict) or not isinstance(text_config, dict):
-        _fail("MK1 runtime checkpoint config is missing its MTP contract")
+        _fail("Isaac runtime checkpoint config is missing its MTP contract")
     if mtp.get("present") is True:
         mtp.update({"present": False, "physical_layers": 0, "rollout_steps": 0})
         text_config["mtp_num_hidden_layers"] = 0
-        Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+        contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+        # The declared inventory described the source, which still held the MTP tensors.
+        artifact = raw.get("isaac05_artifact")
+        if isinstance(artifact, dict):
+            artifact["tensor_count"], artifact["tensor_bytes"] = _f32_tensor_inventory(contract)
         temporary_config = config_path.with_suffix(".json.tmp")
         temporary_config.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temporary_config.replace(config_path)
 
-    index_path = root / MK1_SAFETENSORS_INDEX
+    index_path = root / ISAAC_SAFETENSORS_INDEX
     single_path = root / "model.safetensors"
     if index_path.is_file():
         return
     if not single_path.is_file():
-        _fail("MK1 runtime checkpoint save produced neither an index nor model.safetensors")
+        _fail("Isaac runtime checkpoint save produced neither an index nor model.safetensors")
     shard_name = "model-00001-of-00001.safetensors"
     shard_path = root / shard_name
     weight_map: dict[str, str] = {}
@@ -861,7 +835,7 @@ def finalize_mk1_runtime_checkpoint_layout(model_dir: str | Path) -> None:
             total_size += _tensor_payload_size(header)
             weight_map[key] = shard_name
     if not weight_map:
-        _fail("MK1 runtime checkpoint save produced no model tensors")
+        _fail("Isaac runtime checkpoint save produced no model tensors")
     single_path.replace(shard_path)
     temporary_index = index_path.with_suffix(".json.tmp")
     temporary_index.write_text(
@@ -899,7 +873,7 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
     _require_values(
         root,
         {
-            "architectures": ["Isaac05ForConditionalGeneration"],
+            "architectures": [ISAAC_ARCHITECTURE],
             "storage_dtype": "float32",
             "runtime_dtype": "bfloat16",
             "dtype": "bfloat16",
@@ -907,33 +881,15 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
         "isaac05",
     )
     text = _object_field(root, "text_config")
-    for name in ("artifact", "coord_tokens", "moe", "vla", "test_only_reduced_geometry"):
-        destination = f"genesis_{name}"
-        if destination in root:
-            _fail(f"isaac05 must not mix legacy field {destination}")
-        source = f"isaac05_{name}"
-        if source not in root:
-            _fail(f"isaac05 missing {source}")
-        root[destination] = root.pop(source)
-    if "genesis_moe" in text:
-        _fail("isaac05 text must not mix legacy genesis_moe")
-    moe = _object_field(root, "genesis_moe")
+    for name in _LAYOUT_BLOCKS:
+        if f"isaac05_{name}" not in root:
+            _fail(f"isaac05 missing isaac05_{name}")
+    moe = _object_field(root, "isaac05_moe")
     if moe != _object_field(text, "isaac05_moe"):
         _fail("root and text_config isaac05_moe blocks must be identical")
-    _require_exact_keys(
-        moe, _CUSTOM_MOE_KEYS - {"null_expert_semantics", "shared_expert_mode"}, "isaac05_moe"
-    )
-    normalized_moe = dict(
-        moe,
-        null_expert_semantics="skip_compute_renormalize_real_routes",
-        shared_expert_mode="sigmoid_gated_additive",
-    )
-    root["genesis_moe"] = normalized_moe
-    root["text_config"] = dict(text)
-    root["text_config"].pop("isaac05_moe")
-    root["text_config"]["genesis_moe"] = copy.deepcopy(normalized_moe)
-    vla = _object_field(root, "genesis_vla")
-    _require_exact_keys(vla, _VLA_KEYS - {"backbone_family"}, "isaac05_vla")
+    _require_exact_keys(moe, _CUSTOM_MOE_KEYS, "isaac05_moe")
+    vla = _object_field(root, "isaac05_vla")
+    _require_exact_keys(vla, _VLA_KEYS, "isaac05_vla")
     nested_action = _object_field(vla, "action_expert")
     root_action = _object_field(root, "action_expert")
     # Validate both copies before equality, which aliases booleans with numeric RTC values.
@@ -949,30 +905,28 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
     _require_values(root, {"vision_token": "<|image_pad|>", "vision_rescale_factor": 1 / 255}, "isaac05")
     fast = _object_field(root, "isaac05_fast_tokens")
     _require_exact_keys(fast, {"enabled", "offset", "size", "tokenizer"}, "isaac05_fast_tokens")
-    _require_values(fast, {"enabled": True, "tokenizer": MK1_FAST_TOKENIZER}, "isaac05_fast_tokens")
+    _require_values(fast, {"enabled": True, "tokenizer": ISAAC_FAST_TOKENIZER}, "isaac05_fast_tokens")
     offset, size = _integer(fast, "offset"), _integer(fast, "size")
     if offset < 0 or size <= 0 or offset + size > _integer(text, "vocab_size"):
         _fail("isaac05 FAST token range is outside the vocabulary")
-    if root[MK1_TEST_GEOMETRY_MARKER] is False and (offset, size) != (
-        MK1_FAST_TOKEN_OFFSET,
-        MK1_FAST_TOKEN_SIZE,
+    if root[ISAAC_TEST_GEOMETRY_MARKER] is False and (offset, size) != (
+        ISAAC_FAST_TOKEN_OFFSET,
+        ISAAC_FAST_TOKEN_SIZE,
     ):
         _fail("production isaac05 FAST token range differs from the native contract")
-    root["genesis_vla"] = dict(vla, backbone_family=MK1_BACKBONE_FAMILY)
-    artifact = dict(_object_field(root, "genesis_artifact"))
+    artifact = dict(_object_field(root, "isaac05_artifact"))
     for key in ("tensor_count", "tensor_bytes"):
         if key in artifact:
             if _integer(artifact, key, "isaac05_artifact") <= 0:
                 _fail(f"isaac05_artifact.{key} must be positive")
             artifact.pop(key)
-    root["genesis_artifact"] = artifact
-    root["model_type"] = MK1_MODEL_TYPE
-    root["architectures"] = [MK1_ARCHITECTURE]
+    root["isaac05_artifact"] = artifact
+    root["model_type"] = ISAAC_MODEL_TYPE
     return root
 
 
-def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> Mk1MoeContract:
-    _require_exact_keys(raw, _CUSTOM_MOE_KEYS, "genesis_moe")
+def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> IsaacMoeContract:
+    _require_exact_keys(raw, _CUSTOM_MOE_KEYS, "isaac05_moe")
     real = _integer(raw, "num_real_experts")
     null = _integer(raw, "num_null_experts")
     physical = _integer(raw, "physical_router_outputs")
@@ -981,32 +935,30 @@ def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> Mk1MoeContract
     route_scale = _number(raw, "route_scale")
     router_contract = raw.get("router_contract")
     if not isinstance(router_contract, list) or router_contract != [real, null]:
-        _fail("genesis_moe.router_contract must equal [num_real_experts, num_null_experts]")
+        _fail("isaac05_moe.router_contract must equal [num_real_experts, num_null_experts]")
     fixed = {
         "router_contract_version": 1,
         "shared_null_router_row": True,
         "score_func": "softmax",
         "route_norm": True,
         "score_before_experts": False,
-        "null_expert_semantics": "skip_compute_renormalize_real_routes",
-        "shared_expert_mode": "sigmoid_gated_additive",
         "uses_expert_bias": False,
     }
-    _require_values(raw, fixed, "genesis_moe")
+    _require_values(raw, fixed, "isaac05_moe")
     if real <= 0 or null != real:
-        _fail("genesis_moe requires equal positive real and logical-null expert counts")
+        _fail("isaac05_moe requires equal positive real and logical-null expert counts")
     if physical != real + 1 or logical != real + null:
-        _fail("genesis_moe compact physical/logical router dimensions are inconsistent")
+        _fail("isaac05_moe compact physical/logical router dimensions are inconsistent")
     if not 0 < top_k <= logical:
-        _fail("genesis_moe.top_k is outside the logical router range")
+        _fail("isaac05_moe.top_k is outside the logical router range")
     if route_scale != 1.0:
-        _fail("genesis_moe.route_scale must be 1.0")
+        _fail("isaac05_moe.route_scale must be 1.0")
     if not test_geometry and (real, null, physical, logical, top_k) != (256, 256, 257, 512, 8):
-        _fail("production MK1 requires the 256-real/256-null compact router and top-k 8")
-    return Mk1MoeContract(real, null, physical, logical, top_k, route_scale)
+        _fail("production Isaac requires the 256-real/256-null compact router and top-k 8")
+    return IsaacMoeContract(real, null, physical, logical, top_k, route_scale)
 
 
-def _parse_artifact(raw: Mapping[str, Any]) -> Mk1ArtifactContract:
+def _parse_artifact(raw: Mapping[str, Any]) -> IsaacArtifactContract:
     """Parse the exporter-owned artifact identity, not trainer progress.
 
     Neutral Step-0 exports may carry additional hash/provenance fields. Those
@@ -1015,16 +967,16 @@ def _parse_artifact(raw: Mapping[str, Any]) -> Mk1ArtifactContract:
     """
     missing = _ARTIFACT_IDENTITY_KEYS - set(raw)
     if missing:
-        _fail(f"genesis_artifact is missing required identity fields: {sorted(missing)}")
-    schema_version = _integer(raw, "schema_version", "genesis_artifact")
+        _fail(f"isaac05_artifact is missing required identity fields: {sorted(missing)}")
+    schema_version = _integer(raw, "schema_version", "isaac05_artifact")
     if schema_version != 1:
-        _fail(f"genesis_artifact.schema_version must be 1, got {schema_version}")
+        _fail(f"isaac05_artifact.schema_version must be 1, got {schema_version}")
     artifact_kind = raw.get("artifact_kind")
     if artifact_kind not in {"trained_policy", "neutral_debug"}:
-        _fail("genesis_artifact.artifact_kind must be 'trained_policy' or 'neutral_debug'")
-    if artifact_kind == "trained_policy" and set(raw) - {"trained_steps"} != _ARTIFACT_IDENTITY_KEYS:
-        _fail("trained genesis_artifact fields do not match schema version 1")
-    return Mk1ArtifactContract(schema_version, artifact_kind)
+        _fail("isaac05_artifact.artifact_kind must be 'trained_policy' or 'neutral_debug'")
+    if artifact_kind == "trained_policy" and set(raw) != _ARTIFACT_IDENTITY_KEYS:
+        _fail("trained isaac05_artifact fields do not match schema version 1")
+    return IsaacArtifactContract(schema_version, artifact_kind)
 
 
 def _validate_standard_runtime_fields(raw: Mapping[str, Any], *, path: str) -> None:
@@ -1054,18 +1006,18 @@ def _validate_standard_runtime_fields(raw: Mapping[str, Any], *, path: str) -> N
             _fail(f"{path}.{key} must be {wanted!r}, got {raw[key]!r}")
     for forbidden in ("use_return_dict", "_attn_implementation", "attn_implementation"):
         if forbidden in raw:
-            _fail(f"{path}.{forbidden} must not be serialized in an MK1 checkpoint")
+            _fail(f"{path}.{forbidden} must not be serialized in an Isaac checkpoint")
 
 
 def _parse_text(
     raw: Mapping[str, Any],
     *,
-    moe: Mk1MoeContract,
-    mtp: Mk1MtpContract,
+    moe: IsaacMoeContract,
+    mtp: IsaacMtpContract,
     test_geometry: bool,
-) -> Mk1TextContract:
-    if raw.get("model_type") != MK1_TEXT_MODEL_TYPE:
-        _fail(f"text_config.model_type must be {MK1_TEXT_MODEL_TYPE!r}")
+) -> IsaacTextContract:
+    if raw.get("model_type") != ISAAC_TEXT_MODEL_TYPE:
+        _fail(f"text_config.model_type must be {ISAAC_TEXT_MODEL_TYPE!r}")
     if raw.get("tie_word_embeddings") is not False:
         _fail("text_config.tie_word_embeddings must be false")
     hidden = _integer(raw, "hidden_size", "text_config")
@@ -1100,11 +1052,11 @@ def _parse_text(
     if moe_intermediate <= 0 or shared_intermediate <= 0:
         _fail("text_config expert widths must be positive")
     if _integer(raw, "num_experts", "text_config") != moe.num_real_experts:
-        _fail("text_config.num_experts must equal genesis_moe.num_real_experts")
+        _fail("text_config.num_experts must equal isaac05_moe.num_real_experts")
     if _integer(raw, "num_experts_per_tok", "text_config") != moe.top_k:
-        _fail("text_config.num_experts_per_tok must equal genesis_moe.top_k")
+        _fail("text_config.num_experts_per_tok must equal isaac05_moe.top_k")
     if _integer(raw, "mtp_num_hidden_layers", "text_config") != mtp.physical_layers:
-        _fail("text_config.mtp_num_hidden_layers must equal genesis_vla.mtp.physical_layers")
+        _fail("text_config.mtp_num_hidden_layers must equal isaac05_vla.mtp.physical_layers")
     fixed = {
         "attention_bias": False,
         "attention_dropout": 0.0,
@@ -1165,7 +1117,7 @@ def _parse_text(
     if not test_geometry:
         _require_values(raw, production, "text_config")
         if mrope != [11, 11, 10] or rope_theta != 10_000_000:
-            _fail("production MK1 requires mRoPE [11, 11, 10] and rope theta 10000000")
+            _fail("production Isaac requires mRoPE [11, 11, 10] and rope theta 10000000")
     elif (
         min(
             hidden,
@@ -1183,7 +1135,7 @@ def _parse_text(
         <= 0
     ):
         _fail("test-only text geometry values must be positive")
-    return Mk1TextContract(
+    return IsaacTextContract(
         hidden,
         layers,
         vocab,
@@ -1202,7 +1154,9 @@ def _parse_text(
     )
 
 
-def _parse_vision(raw: Mapping[str, Any], *, text: Mk1TextContract, test_geometry: bool) -> Mk1VisionContract:
+def _parse_vision(
+    raw: Mapping[str, Any], *, text: IsaacTextContract, test_geometry: bool
+) -> IsaacVisionContract:
     fields = {
         name: _integer(raw, name, "vision_config")
         for name in (
@@ -1225,7 +1179,7 @@ def _parse_vision(raw: Mapping[str, Any], *, text: Mk1TextContract, test_geometr
         {
             "deepstack_visual_indexes": [],
             "hidden_act": "gelu_pytorch_tanh",
-            "model_type": MK1_MODEL_TYPE,
+            "model_type": ISAAC_MODEL_TYPE,
         },
         "vision_config",
     )
@@ -1250,35 +1204,35 @@ def _parse_vision(raw: Mapping[str, Any], *, text: Mk1TextContract, test_geometr
             },
             "vision_config",
         )
-    return Mk1VisionContract(**fields)
+    return IsaacVisionContract(**fields)
 
 
 def _parse_coord(
-    raw: Mapping[str, Any], text: Mk1TextContract, *, test_geometry: bool
-) -> Mk1CoordTokenContract:
+    raw: Mapping[str, Any], text: IsaacTextContract, *, test_geometry: bool
+) -> IsaacCoordTokenContract:
     enabled = raw.get("enabled")
     if enabled is False:
-        _require_exact_keys(raw, _COORD_DISABLED_KEYS, "genesis_coord_tokens")
-        return Mk1CoordTokenContract(enabled=False)
+        _require_exact_keys(raw, _COORD_DISABLED_KEYS, "isaac05_coord_tokens")
+        return IsaacCoordTokenContract(enabled=False)
     if enabled is not True:
-        _fail("genesis_coord_tokens.enabled must be a boolean")
-    _require_exact_keys(raw, _COORD_ENABLED_KEYS, "genesis_coord_tokens")
-    offset = _integer(raw, "offset", "genesis_coord_tokens")
-    size = _integer(raw, "size", "genesis_coord_tokens")
+        _fail("isaac05_coord_tokens.enabled must be a boolean")
+    _require_exact_keys(raw, _COORD_ENABLED_KEYS, "isaac05_coord_tokens")
+    offset = _integer(raw, "offset", "isaac05_coord_tokens")
+    size = _integer(raw, "size", "isaac05_coord_tokens")
     if offset < 0 or size <= 0 or offset + size > text.vocab_size:
         _fail("coordinate token range lies outside the exported vocabulary")
     if not test_geometry and (offset, size) != (248320, 1001):
-        _fail("production MK1 coordinate range must be offset 248320 with size 1001")
-    return Mk1CoordTokenContract(enabled=True, offset=offset, size=size)
+        _fail("production Isaac coordinate range must be offset 248320 with size 1001")
+    return IsaacCoordTokenContract(enabled=True, offset=offset, size=size)
 
 
 def _parse_special_tokens(
     root: Mapping[str, Any],
     text_raw: Mapping[str, Any],
     *,
-    text: Mk1TextContract,
+    text: IsaacTextContract,
     test_geometry: bool,
-) -> Mk1SpecialTokenContract:
+) -> IsaacSpecialTokenContract:
     values = {
         "bos_token_id": _integer(text_raw, "bos_token_id", "text_config"),
         "eos_token_id": _integer(text_raw, "eos_token_id", "text_config"),
@@ -1302,8 +1256,8 @@ def _parse_special_tokens(
         }
         for key, wanted in expected.items():
             if values[key] != wanted:
-                _fail(f"production MK1 {key} must be {wanted}, got {values[key]}")
-    return Mk1SpecialTokenContract(**values)
+                _fail(f"production Isaac {key} must be {wanted}, got {values[key]}")
+    return IsaacSpecialTokenContract(**values)
 
 
 def _validate_native_action_metadata(
@@ -1331,85 +1285,66 @@ def _validate_native_action_metadata(
 
 
 def _parse_vla(
-    raw: Mapping[str, Any], *, text: Mk1TextContract, test_geometry: bool
-) -> tuple[Mk1VectorEncoderContract, Mk1ActionExpertContract]:
-    _require_exact_keys(raw, _VLA_KEYS, "genesis_vla")
-    schema = _integer(raw, "schema_version", "genesis_vla")
-    if schema not in (1, 2):
-        _fail("genesis_vla.schema_version must be 1 or 2")
+    raw: Mapping[str, Any], *, text: IsaacTextContract, test_geometry: bool
+) -> tuple[IsaacVectorEncoderContract, IsaacActionExpertContract]:
+    _require_exact_keys(raw, _VLA_KEYS, "isaac05_vla")
+    schema = _integer(raw, "schema_version", "isaac05_vla")
     _require_values(
         raw,
         {
-            "backbone_family": MK1_BACKBONE_FAMILY,
-            "state_dict_schema": MK1_STATE_DICT_SCHEMA,
-            "rmsnorm_weight_convention": MK1_RMSNORM_CONVENTION,
+            "state_dict_schema": ISAAC_STATE_DICT_SCHEMA,
+            "rmsnorm_weight_convention": ISAAC_RMSNORM_CONVENTION,
         },
-        "genesis_vla",
+        "isaac05_vla",
     )
-    vector_raw = _object_field(raw, "vector_encoder", "genesis_vla")
-    _require_exact_keys(vector_raw, _VECTOR_KEYS, "genesis_vla.vector_encoder")
+    vector_raw = _object_field(raw, "vector_encoder", "isaac05_vla")
+    _require_exact_keys(vector_raw, _VECTOR_KEYS, "isaac05_vla.vector_encoder")
     _require_values(
         vector_raw,
         {"type": "linear_silu_linear", "bias": False},
-        "genesis_vla.vector_encoder",
+        "isaac05_vla.vector_encoder",
     )
-    max_states = _integer(vector_raw, "max_states", "genesis_vla.vector_encoder")
-    hidden_dim = _integer(vector_raw, "hidden_dim", "genesis_vla.vector_encoder")
-    output_dim = _integer(vector_raw, "output_dim", "genesis_vla.vector_encoder")
+    max_states = _integer(vector_raw, "max_states", "isaac05_vla.vector_encoder")
+    hidden_dim = _integer(vector_raw, "hidden_dim", "isaac05_vla.vector_encoder")
+    output_dim = _integer(vector_raw, "output_dim", "isaac05_vla.vector_encoder")
     if min(max_states, hidden_dim, output_dim) <= 0:
         _fail("vector encoder dimensions must be positive")
     if hidden_dim != text.hidden_size or output_dim != text.hidden_size:
         _fail("vector encoder hidden/output widths must equal the backbone hidden size")
     if not test_geometry and max_states != 128:
-        _fail("production MK1 vector encoder max_states must be 128")
-    vector = Mk1VectorEncoderContract(max_states, hidden_dim, output_dim)
+        _fail("production Isaac vector encoder max_states must be 128")
+    vector = IsaacVectorEncoderContract(max_states, hidden_dim, output_dim)
 
-    action_raw = _object_field(raw, "action_expert", "genesis_vla")
-    native = action_raw.get("type") == "dit"
-    metadata = tuple(sorted(action_raw.items())) if native else ()
-    if native:
-        if schema != 1:
-            _fail(
-                "isaac05_vla.schema_version must remain 1; the native action_expert owns its schema_version"
-            )
-        conditioning = _validate_native_action_metadata(
-            action_raw, path="isaac05_vla.action_expert", backbone_num_layers=text.num_hidden_layers
-        )
-        action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
-        action_raw = dict(action_raw, type="molmoact", clean_at_0=False)
-    else:
-        try:
-            conditioning = validate_action_context(
-                action_raw, schema_version=schema, backbone_num_layers=text.num_hidden_layers
-            )
-        except ValueError as exc:
-            _fail(f"genesis_vla.action_expert: {exc}")
-        expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
-        _require_exact_keys(action_raw, expected, "genesis_vla.action_expert")
-        action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
-    _require_exact_keys(action_raw, _ACTION_KEYS, "genesis_vla.action_expert")
+    action_raw = _object_field(raw, "action_expert", "isaac05_vla")
+    metadata = tuple(sorted(action_raw.items()))
+    if schema != 1:
+        _fail("isaac05_vla.schema_version must remain 1; the native action_expert owns its schema_version")
+    conditioning = _validate_native_action_metadata(
+        action_raw, path="isaac05_vla.action_expert", backbone_num_layers=text.num_hidden_layers
+    )
+    action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
+    _require_exact_keys(action_raw, _ACTION_KEYS, "isaac05_vla.action_expert")
     _require_values(
         action_raw,
         {
-            "type": "molmoact",
-            "clean_at_0": False,
+            "type": "dit",
             "qk_norm": True,
             "qk_norm_eps": 1e-6,
             "rope": True,
             "context_layer_norm": True,
             "causal_attn": False,
         },
-        "genesis_vla.action_expert",
+        "isaac05_vla.action_expert",
     )
-    action = Mk1ActionExpertContract(
-        action_dim=_integer(action_raw, "action_dim", "genesis_vla.action_expert"),
-        action_horizon=_integer(action_raw, "action_horizon", "genesis_vla.action_expert"),
-        num_layers=_integer(action_raw, "num_layers", "genesis_vla.action_expert"),
-        hidden_dim=_integer(action_raw, "hidden_dim", "genesis_vla.action_expert"),
-        num_heads=_integer(action_raw, "num_heads", "genesis_vla.action_expert"),
-        mlp_ratio=_number(action_raw, "mlp_ratio", "genesis_vla.action_expert"),
-        timestep_embed_dim=_integer(action_raw, "timestep_embed_dim", "genesis_vla.action_expert"),
-        ffn_multiple_of=_integer(action_raw, "ffn_multiple_of", "genesis_vla.action_expert"),
+    action = IsaacActionExpertContract(
+        action_dim=_integer(action_raw, "action_dim", "isaac05_vla.action_expert"),
+        action_horizon=_integer(action_raw, "action_horizon", "isaac05_vla.action_expert"),
+        num_layers=_integer(action_raw, "num_layers", "isaac05_vla.action_expert"),
+        hidden_dim=_integer(action_raw, "hidden_dim", "isaac05_vla.action_expert"),
+        num_heads=_integer(action_raw, "num_heads", "isaac05_vla.action_expert"),
+        mlp_ratio=_number(action_raw, "mlp_ratio", "isaac05_vla.action_expert"),
+        timestep_embed_dim=_integer(action_raw, "timestep_embed_dim", "isaac05_vla.action_expert"),
+        ffn_multiple_of=_integer(action_raw, "ffn_multiple_of", "isaac05_vla.action_expert"),
     )
     if (
         min(
@@ -1427,25 +1362,25 @@ def _parse_vla(
         _fail("action expert dimensions must be positive")
     if action.hidden_dim % action.num_heads:
         _fail("action expert hidden_dim must be divisible by num_heads")
-    if not test_geometry and action != Mk1ActionExpertContract(64, 64, 36, 768, 8, 4.0, 256, 256):
-        _fail("production MK1 action expert geometry does not match the 36-layer MolmoAct contract")
+    if not test_geometry and action != IsaacActionExpertContract(64, 64, 36, 768, 8, 4.0, 256, 256):
+        _fail("production Isaac action expert geometry does not match the 36-layer MolmoAct contract")
     action = replace(action, native_metadata=metadata, conditioning=conditioning)
     return vector, action
 
 
-def _parse_mtp(raw: Mapping[str, Any]) -> Mk1MtpContract:
-    _require_exact_keys(raw, _MTP_KEYS, "genesis_vla.mtp")
-    _require_values(raw, {"action_runtime": "exclude"}, "genesis_vla.mtp")
+def _parse_mtp(raw: Mapping[str, Any]) -> IsaacMtpContract:
+    _require_exact_keys(raw, _MTP_KEYS, "isaac05_vla.mtp")
+    _require_values(raw, {"action_runtime": "exclude"}, "isaac05_vla.mtp")
     present = raw.get("present")
     if not isinstance(present, bool):
-        _fail("genesis_vla.mtp.present must be a boolean")
-    physical = _integer(raw, "physical_layers", "genesis_vla.mtp")
-    rollout = _integer(raw, "rollout_steps", "genesis_vla.mtp")
+        _fail("isaac05_vla.mtp.present must be a boolean")
+    physical = _integer(raw, "physical_layers", "isaac05_vla.mtp")
+    rollout = _integer(raw, "rollout_steps", "isaac05_vla.mtp")
     expected = (1, 3) if present else (0, 0)
     if (physical, rollout) != expected:
         state = "present=true" if present else "present=false"
-        _fail(f"MK1 MTP {state} requires physical_layers/rollout_steps={expected}")
-    return Mk1MtpContract(present, physical, rollout)
+        _fail(f"Isaac MTP {state} requires physical_layers/rollout_steps={expected}")
+    return IsaacMtpContract(present, physical, rollout)
 
 
 def _add_decoder_layer_shapes(add, prefix: str, *, text, moe, layer_type: str) -> None:
@@ -1493,10 +1428,10 @@ def _add_decoder_layer_shapes(add, prefix: str, *, text, moe, layer_type: str) -
         add(f"{prefix}.linear_attn.norm.weight", text.linear_value_head_dim)
         add(f"{prefix}.linear_attn.out_proj.weight", hidden, value_width)
     else:  # pragma: no cover - config parser prevents this
-        raise AssertionError(f"unknown MK1 layer type {layer_type}")
+        raise AssertionError(f"unknown Isaac layer type {layer_type}")
 
 
-def _add_action_expert_shapes(add, action: Mk1ActionExpertContract, *, context_dim: int) -> None:
+def _add_action_expert_shapes(add, action: IsaacActionExpertContract, *, context_dim: int) -> None:
     prefix = "model.action_expert.action_expert"
     hidden = action.hidden_dim
     intermediate = action.intermediate_size
@@ -1545,7 +1480,7 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     try:
         return load_json_object(path)
     except ValueError as exc:
-        raise Mk1CheckpointContractError(f"could not read JSON object {path}: {exc}") from exc
+        raise IsaacCheckpointContractError(f"could not read JSON object {path}: {exc}") from exc
 
 
 def _local_file(root: Path, name: str) -> Path:
@@ -1666,14 +1601,14 @@ def _object_field(raw: Mapping[str, Any], key: str, path: str = "config") -> Map
     return _object(raw.get(key), f"{path}.{key}")
 
 
-def _integer(raw: Mapping[str, Any], key: str, path: str = "genesis_moe") -> int:
+def _integer(raw: Mapping[str, Any], key: str, path: str = "isaac05_moe") -> int:
     value = raw.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
         _fail(f"{path}.{key} must be an integer")
     return value
 
 
-def _number(raw: Mapping[str, Any], key: str, path: str = "genesis_moe") -> float:
+def _number(raw: Mapping[str, Any], key: str, path: str = "isaac05_moe") -> float:
     value = raw.get(key)
     if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value):
         _fail(f"{path}.{key} must be a finite number")
@@ -1719,4 +1654,4 @@ def _same_json_value(actual: Any, expected: Any) -> bool:
 
 
 def _fail(message: str) -> Never:
-    raise Mk1CheckpointContractError(message)
+    raise IsaacCheckpointContractError(message)

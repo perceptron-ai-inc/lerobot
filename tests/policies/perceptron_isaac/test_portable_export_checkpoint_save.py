@@ -12,16 +12,12 @@ import pytest
 
 pytest.importorskip("transformers", reason="transformers is required (install lerobot[perceptron_isaac])")
 
-from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-    Mk1CheckpointContractError,
-    finalize_mk1_runtime_checkpoint_layout,
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+    IsaacCheckpointContractError,
+    finalize_isaac_runtime_checkpoint_layout,
 )
-from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import (
-    PerceptronIsaacPolicy,
-    _package_storage_dtypes,
-)
+from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 
 PACKAGE_DIRECTORY_NAME = "lerobot_policy"
 
@@ -68,17 +64,14 @@ def _unstarted_policy(config: PerceptronIsaacConfig, save_root: Path) -> Percept
     return policy
 
 
-def _portable_checkpoint(root: Path) -> Path:
+def _empty_model_dir(root: Path) -> None:
     model_root = root / "hf_model"
     model_root.mkdir(parents=True)
     (model_root / "config.json").write_text('{"model_type": "isaac_0_5"}\n')
-    adapter = root / "isaac_deployment_adapter.json"
-    adapter.write_text('{"schema": "isaac_deployment_adapter_v1"}\n')
-    return adapter
 
 
 @pytest.mark.parametrize("entry_point", ["save", "finalize"])
-@pytest.mark.parametrize("layout", ["raw", "portable"])
+@pytest.mark.parametrize("layout", ["nested", "outside"])
 def test_raw_export_saving_is_rejected_before_collectives_or_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry_point: str, layout: str
 ) -> None:
@@ -88,12 +81,14 @@ def test_raw_export_saving_is_rejected_before_collectives_or_writes(
     config = _config(hf_model_path="..")
     PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, package)
     destination = tmp_path / "saved"
-    if entry_point == "finalize" or layout == "portable":
-        adapter = _portable_checkpoint(destination)
-        config.deployment_adapter_sha256 = file_sha256(adapter)
-    if layout == "portable":
-        config.hf_model_path = str(destination / "hf_model")
-        config._checkpoint_source_root = str(destination)
+    if entry_point == "finalize":
+        _empty_model_dir(destination)
+    if layout == "outside":
+        # A package that points at model weights it does not hold cannot be copied and rewritten.
+        source = tmp_path / "package"
+        source.mkdir()
+        config.hf_model_path = str(tmp_path / "export")
+        config._checkpoint_source_root = str(source)
     before = {p.relative_to(destination): p.read_bytes() for p in destination.rglob("*") if p.is_file()}
     policy = _unstarted_policy(config, destination)
 
@@ -126,56 +121,25 @@ def test_resolve_refuses_a_sideways_escape_out_of_an_export(tmp_path: Path) -> N
         PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, package)
 
 
-def test_embedded_model_assets_keep_the_export_storage_contract(tmp_path: Path) -> None:
-    export = tmp_path / "export"
-    _write_raw_export(export)
-    assert _package_storage_dtypes(export) == frozenset({"F32"})
-    checkpoint = tmp_path / "checkpoint"
-    _portable_checkpoint(checkpoint)
-    assert _package_storage_dtypes(checkpoint / "hf_model") == frozenset({"F32"})
-    assert _package_storage_dtypes(checkpoint) == frozenset({"BF16"})
-
-
-def test_plain_mk1_model_directory_is_bf16_storage(tmp_path: Path) -> None:
-    model_root = tmp_path / "hf_model"
-    model_root.mkdir()
-    (model_root / "config.json").write_text('{"model_type": "qwen3_5_moe"}\n')
-    assert _package_storage_dtypes(model_root) == frozenset({"BF16"})
-
-
-@pytest.mark.parametrize("vla_namespace", ["genesis_vla", "isaac05_vla"])
-def test_finalize_reads_the_vla_namespace_the_saved_config_uses(tmp_path: Path, vla_namespace: str) -> None:
-    model_root = tmp_path / vla_namespace
+def test_finalize_reads_the_vla_block_of_the_saved_config(tmp_path: Path) -> None:
+    model_root = tmp_path / "model"
     model_root.mkdir()
     (model_root / "config.json").write_text(
         json.dumps(
             {
                 "model_type": "isaac_0_5",
-                vla_namespace: {"mtp": {"present": False, "physical_layers": 0, "rollout_steps": 0}},
+                "isaac05_vla": {"mtp": {"present": False, "physical_layers": 0, "rollout_steps": 0}},
                 "text_config": {"mtp_num_hidden_layers": 0},
             }
         )
     )
     (model_root / "model.safetensors.index.json").write_text('{"weight_map": {}}\n')
-    finalize_mk1_runtime_checkpoint_layout(model_root)
+    finalize_isaac_runtime_checkpoint_layout(model_root)
 
 
 def test_finalize_still_refuses_a_config_with_no_vla_block(tmp_path: Path) -> None:
     model_root = tmp_path / "no_vla"
     model_root.mkdir()
     (model_root / "config.json").write_text('{"model_type": "isaac_0_5", "text_config": {}}\n')
-    with pytest.raises(Mk1CheckpointContractError, match="missing its MTP contract"):
-        finalize_mk1_runtime_checkpoint_layout(model_root)
-
-
-def test_finalize_still_refuses_an_mk1_package_without_source_identity(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "checkpoint"
-    model_root = checkpoint / "hf_model"
-    model_root.mkdir(parents=True)
-    (model_root / "config.json").write_text(
-        json.dumps({"model_type": "qwen3_5_moe", "genesis_vla": {"backbone_family": "mk1_qwen3_6_moe"}})
-    )
-    config = _config(hf_model_path=str(model_root))
-    policy = _unstarted_policy(config, checkpoint)
-    with pytest.raises(RuntimeError, match="without source model-import identity"):
-        policy.finalize_pretrained_package(checkpoint)
+    with pytest.raises(IsaacCheckpointContractError, match="missing its MTP contract"):
+        finalize_isaac_runtime_checkpoint_layout(model_root)

@@ -168,10 +168,15 @@ def test_shared_peft_recipe_preserves_checkpoint_contract(tmp_path, monkeypatch,
     assert str(train.policy.pretrained_path) == str(checkpoint)
     assert train.policy._pretrained_config_directory == checkpoint.resolve()
     for key in vars(original):
-        if key not in overrides and key not in runtime_overrides and key not in {
-            "pretrained_path",
-            "_pretrained_config_directory",
-        }:
+        if (
+            key not in overrides
+            and key not in runtime_overrides
+            and key
+            not in {
+                "pretrained_path",
+                "_pretrained_config_directory",
+            }
+        ):
             assert getattr(train.policy, key) == getattr(original, key), key
     for key, value in runtime_overrides.items():
         assert getattr(train.policy, key) == value

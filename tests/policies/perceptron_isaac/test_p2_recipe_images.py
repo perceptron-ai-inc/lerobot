@@ -1,7 +1,6 @@
 """P2.04 recipe ingestion and real image-grid routing, without weight allocation.
 
-The fixture uses the frozen Genesis recipes[0].image_preprocess schema. It is not
-an authenticated model export: full manifest/SHA admission remains in P1 tests.
+The fixture uses the frozen recipes[0].image_preprocess schema. It is not a model export.
 """
 
 from __future__ import annotations
@@ -183,7 +182,9 @@ def test_explicit_render_sidecar_keeps_precedence_over_recipe(tmp_path: Path) ->
     sidecar.write_text(json.dumps(declared))
     config.native_render_metadata_path = str(sidecar)
     metadata = load_native_render_metadata(config)
-    assert metadata.to_json_dict() == declared
+    # The sidecar predates the timestamp flag and this recipe does not declare it, so the
+    # loader resolves the original emission; every sidecar value keeps its precedence.
+    assert metadata.to_json_dict() == {**declared, "emit_observation_timestamps": True}
 
 
 def test_runtime_image_override_cannot_silently_conflict_with_recipe(tmp_path: Path) -> None:

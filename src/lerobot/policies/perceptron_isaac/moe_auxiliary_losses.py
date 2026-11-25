@@ -1,4 +1,4 @@
-"""Genesis logical-null router statistics and global training auxiliaries.
+"""Logical-null router statistics and global training auxiliaries.
 
 Dispatch counts sum top-k lanes. One physical null row represents multiple
 logical slots. Only forwarded positions matter, not text or action loss masks.
@@ -24,7 +24,7 @@ class RouterAuxiliaryStatistics:
     num_null_experts: int
 
 
-class GenesisNullRouterAuxiliary(nn.Module):
+class IsaacNullRouterAuxiliary(nn.Module):
     """Parameter-free output for Transformers' maintained per-forward output recorder.
 
     Serving does no auxiliary tensor work and keeps no references between calls.

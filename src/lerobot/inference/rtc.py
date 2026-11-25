@@ -28,6 +28,7 @@ from typing import Any
 import torch
 
 from lerobot.policies import ActionQueue, PreTrainedPolicy, RTCConfig, prepare_observation_for_inference
+from lerobot.policies.chunk import EPISODE_TIME_KEY
 from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyProcessorPipeline,
@@ -79,6 +80,17 @@ def validate_local_chunk_policy(policy: PreTrainedPolicy) -> ChunkPolicySpec:
             "Use '--inference.type=sync' for the policy's synchronous execution path."
         ) from exc
     return spec
+
+
+def require_chunk_execution_mode(spec: ChunkPolicySpec, rtc_config: RTCConfig) -> ExecutionMode:
+    """Resolve the requested asynchronous mode and reject one the policy does not declare.
+
+    Rollout calls this before it connects hardware, and the engine calls it again when it starts.
+    """
+    mode = ExecutionMode(f"rtc_{rtc_config.mode}") if rtc_config.enabled else ExecutionMode.CHUNK
+    if mode not in spec.modes:
+        raise ValueError(f"Policy does not support asynchronous execution mode {mode.value!r}")
+    return mode
 
 
 def supports_rtc_inference(policy: PreTrainedPolicy) -> bool:
@@ -157,9 +169,7 @@ class RTCInferenceEngine(InferenceEngine):
             raise ValueError("Language deadline must be finite and positive")
         self._language_timeout_s = language_timeout_s
         self._action_timeout_s = action_timeout_s
-        mode = ExecutionMode(f"rtc_{rtc_config.mode}") if rtc_config.enabled else ExecutionMode.CHUNK
-        if mode not in self._policy_spec.modes:
-            raise ValueError(f"Policy does not support asynchronous execution mode {mode.value!r}")
+        mode = require_chunk_execution_mode(self._policy_spec, rtc_config)
         self._runtime = ChunkRuntime(
             mode=mode,
             action_interval=1 / fps,
@@ -502,6 +512,9 @@ class RTCInferenceEngine(InferenceEngine):
             inference_count = 0
             warmup_previous: tuple[torch.Tensor, torch.Tensor] | None = None
             consecutive_discards = 0
+            # Capture time of the episode's first predicted observation, for policies that
+            # declare needs_episode_time.
+            episode_origin: float | None = None
             while not self._shutdown_event.is_set() and not self.failed:
                 for event in self._runtime.drain_wait_events():
                     if event["event"] == "waiting":
@@ -517,6 +530,7 @@ class RTCInferenceEngine(InferenceEngine):
                     self._reset_pending = False
                 if reset_pending:
                     warmup_previous = None
+                    episode_origin = None
                     self._policy.reset()
                     self._preprocessor.reset()
                     self._postprocessor.reset()
@@ -594,6 +608,12 @@ class RTCInferenceEngine(InferenceEngine):
                     self._robot.robot_type,
                 )
                 batch["task"] = [task]
+                if self._policy_spec.needs_episode_time:
+                    if episode_origin is None:
+                        episode_origin = capture_time
+                    batch[EPISODE_TIME_KEY] = torch.tensor(
+                        [capture_time - episode_origin], dtype=torch.float32, device=policy_device
+                    )
                 with chunk_inference_context(request.mode):
                     preprocessed = self._preprocessor(batch)
                     prediction = predict_chunk(

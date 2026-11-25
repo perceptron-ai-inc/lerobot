@@ -228,7 +228,7 @@ dm05 = ["lerobot[transformers-dep]"]
 molmoact2 = ["lerobot[transformers-dep]", "lerobot[peft-dep]", "lerobot[scipy-dep]"]
 perceptron_isaac = [
     "lerobot[transformers-dep]",
-    # MK1 subclasses Qwen3.5-MoE internals: keep its tested attention/cache ABI exact.
+    # Isaac subclasses Qwen3.5-MoE internals: keep its tested attention/cache ABI exact.
     "transformers==5.5.4",
     "lerobot[accelerate-dep]",
     "lerobot[scipy-dep]",

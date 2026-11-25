@@ -1,7 +1,7 @@
 # Perceptron ISAAC native runtime (draft)
 
-In-tree `perceptron_isaac` policy and processors for preconverted native MK1
-and Isaac-0.5 packages. The offline checkpoint producer is not included.
+In-tree `perceptron_isaac` policy and processors for preconverted native
+Isaac-0.5 packages. The offline checkpoint producer is not included.
 Generic Qwen checkpoint packages, PEFT, expert-only training and FSDP1 training
 are unsupported and fail explicitly. Developer parity artifact tooling is not included.
 
@@ -41,15 +41,9 @@ tokenizers 0.22.2 and Accelerate 1.15.0. The SDK source remains pinned to
 
 ## Preconverted package and training entry point
 
-The qualified package is already published; do not run a converter:
+The qualified package is already published; do not run a converter.
 
-```text
-s3://perceptron-checkpoints/phil/isaac_0_5-step-100000-fp32-native-lerobot-vocabfix-113238
-69 files; 142,967,074,649 bytes
-SHA256SUMS: 85d9743e3f46d19cd5291a00607cfe0abc54eb56d1a40a4fbcd20493e293cc9b
-```
-
-Stage that complete package without changing its layout or authenticated assets.
+Stage that complete package without changing its layout.
 Set `NATIVE_POLICY_DIR` to its `lerobot_policy` directory, `DATASET_REPO_ID`
 to a compatible dataset, and `GPUS` to the number of GPUs on the training node.
 Use `torchrun` and set FSDP2 through LeRobot's CLI flags. Set `STEPS` to the
@@ -71,7 +65,7 @@ torchrun --standalone --nproc_per_node="$GPUS" -m lerobot.scripts.lerobot_train 
 Native FP32 initialization requires training, F32 package storage, live FSDP2,
 FP32 master storage, no PEFT and no expert-only training. It fails closed on
 unsupported private Torch interfaces, missing/root-uncovered trainables or
-non-FP32 masters. Other load paths retain BF16 behavior. Production MK1's
+non-FP32 masters. Other load paths retain BF16 behavior. The
 qualified hardware/ABI is H100 SM90 / CUDA 12.8. Budget for the 143 GB package,
 full model host materialization and optimizer state; the mechanics proof used
 16 H100s over two hosts, not a laptop or single-GPU recipe.
@@ -92,7 +86,7 @@ freezes completed environments and resets the entire group between rollouts;
 Changing the live batch size requires that global reset. Settling emits one idle
 row per environment without adding frames to model history or time.
 
-## Training objective and retired RTC
+## Training objective and RTC
 
 Native DiT uses clean-at-one flow: `x(t)=(1-t)*noise+t*action`, with velocity
 `action-noise`. Flow first averages valid weighted elements within each draw,
@@ -114,10 +108,52 @@ RoPE frequencies in F32 from the original formula, including BF16-source trainin
 They do not replace parameters or widen a rounded BF16 table. Inference retains
 the released BF16 frequency table and phase behavior.
 
-RTC execution, prefix pinning and dual-time conditioning are retired. Legacy
-RTC-off settings remain readable. Released RTC-capable source metadata and
-weights remain authenticated and unchanged; source recipe values do not enable
-RTC at runtime. Enabled requests fail before sampling or changing rollout clocks.
+The action expert is always the native DiT.
+
+Prompts carry an episode-time item before each observation only when the
+checkpoint's selected recipe sets `emit_observation_timestamps`. The released YAM
+and SO-100/101 recipes do not, and LIBERO does. New packages record the flag in
+their render metadata; older packages are resolved from the Flow recipe that
+`policy_state_dataset` and `normalization_profile_scope` select in
+`hf_model/policy_inference_recipe.json`, and a checkpoint with no declaration
+keeps emitting.
+
+RTC inference pins a prefix for checkpoints with a prefix budget. The budget is
+the action-expert recipe in `hf_model/config.json` (`rtc_max_delay_steps`, off
+when `rtc_probability` is 0), and training stages carry it forward unchanged. A
+training stage records its own setting in `rtc_final_stage_max_delay_steps`.
+ISAAC training does not sample RTC prefixes, so a fine-tune of an RTC-capable
+checkpoint records 0 there and keeps the source budget as an inherited
+declaration: prefixes are admitted, a warning says so, and nothing has validated
+them on the new weights. A checkpoint with no budget rejects every prefix.
+
+Two callers reach the prefix sampler. Pinned rows use clean flow time 1 and zero
+velocity in both.
+
+- Sync (`--inference.type=sync --policy.rtc_prefix_length=P`): each refill pins
+  its first `P` rows to the previous chunk's rows
+  `[n_action_steps, n_action_steps + P)`. `P` must fit the budget, which is
+  checked before the first action is returned, and `n_action_steps + P` must not
+  exceed `chunk_size`. Dropping the queued actions, as an instruction change
+  does, also drops the carried rows. `P=0`, the default, leaves sampling
+  unchanged.
+- Asynchronous (`--inference.type=rtc --inference.rtc.mode=trained`): the engine
+  passes its measured `inference_delay` and the previous chunk's remaining
+  normalized actions; the first `inference_delay` rows become the prefix, and a
+  zero delay samples without one. The 60-step YAM and SO-100/101 checkpoints
+  declare a budget of 30, which requires `--inference.rtc.execution_horizon=30`.
+  Guided RTC is not offered, and `lerobot-rollout` refuses it before connecting
+  the robot. FP32-storage packages defer their weight load to first use; asking
+  for the chunk spec loads them, so the load happens at startup and not inside
+  the engine's first deadline.
+
+Asynchronous callers predict once per chunk, so they cannot use the policy's
+per-step frame clock. A checkpoint whose recipe emits episode-time tokens sets
+`needs_episode_time` in its chunk spec. The engine then supplies each
+observation's capture time, relative to the episode's first predicted
+observation, as the batch `timestamp`, and the prompt renders that time. This
+covers plain asynchronous chunk mode too: LIBERO emits timestamps and has no
+RTC budget.
 
 ## Evidence and limits
 
@@ -129,9 +165,20 @@ modules. That proof was on HF base `8c920c4` plus runtime `9c315c1` and CUT
 not this updated HF base `ae2b57f`.
 
 Raw/portable-export saving is deferred and fails before gathering weights or writing
-package assets. Source-bound native MK1 saves remain implemented. Focused CPU tests
-cover reduced native save/finalize/moved reload, exact FP32 values and signed zero;
-that is not production-scale checkpoint qualification.
+package assets. Saving from a package that holds its own `hf_model/` remains
+implemented. Focused CPU tests cover reduced native save/finalize/moved reload, exact
+FP32 values and signed zero; that is not production-scale checkpoint qualification.
+
+Trained RTC ran through `lerobot-rollout` on one H100 against the published 60-step
+YAM and SO-100/101 packages on 2026-11-21, with a virtual robot replaying each
+package's sample observation. No hardware was driven. The first prediction had no
+prefix, later predictions pinned the engine's continuation exactly, and a reset
+cleared it. A prefix-conditioned prediction took about 0.95 s for YAM and 0.78 s for
+SO-100/101, which is 24 to 29 of the 30 budgeted steps at 30 Hz. With no margin, the
+30 Hz runs ended with an exhausted action buffer after 17 and 24 predictions. At
+15 Hz both ran 40 s to completion; YAM also needed
+`--inference.max_observation_age_s=10`, because its 2.6 s first prediction otherwise
+ages the first chunk past the 5 s default.
 
 This draft does not claim current-base multi-GPU qualification, production-scale
 save/reload/move, evaluation, convergence or model quality. Keep saving, evaluation

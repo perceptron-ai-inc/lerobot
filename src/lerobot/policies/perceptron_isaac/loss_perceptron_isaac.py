@@ -1,9 +1,8 @@
 """LeRobot-native joint text/FAST and flow-matching loss for ISAAC.
 
 The implementation intentionally operates on the policy's local TensorStream
-types and has no Genesis loss imports.  Flow randomness can be supplied as
-explicit tensors so Genesis-oracle fixtures replay across implementations
-without depending on RNG consumption order.
+types.  Flow randomness can be supplied as explicit tensors so oracle fixtures
+replay across implementations without depending on RNG consumption order.
 """
 
 from __future__ import annotations
@@ -63,7 +62,7 @@ class _FlowBatch:
 
 
 def _valid_next_token_labels(tokens: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
-    """Match Genesis valid_n_offset_tensor(..., n=1) without importing it."""
+    """Label each valid position with the token at the next valid position, where one exists."""
     batch_size, seq_len = tokens.shape
     prefix = torch.cumsum(valid, dim=1)
     targets = prefix + 1
@@ -128,7 +127,7 @@ def _collect_flow_batch(
     device: torch.device,
     exclude_non_agent_roles: bool = True,
 ) -> _FlowBatch:
-    # Mirror Genesis's _allowed_role_indices: honor the flag for the flow objective too, so
+    # Honor the flag for the flow objective too, so
     # exclude_non_agent_roles=False admits every role rather than silently dropping markers.
     allowed_roles = (
         {ROLE_TO_IDX["agent"], ROLE_TO_IDX["assistant"], ROLE_TO_IDX[None]}

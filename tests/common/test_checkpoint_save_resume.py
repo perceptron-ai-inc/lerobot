@@ -82,7 +82,7 @@ class TestSaveCheckpoint:
         assert not list(pretrained.glob("*.index.json"))
 
     def test_finalize_hook_runs_last_on_the_complete_pretrained_dir(self, tmp_path, monkeypatch):
-        """A policy that binds a manifest over its package must see every sidecar already written."""
+        """A policy that finalizes its package must see every sidecar already written."""
         policy = make_dummy_policy()
         seen: list[tuple[str, set[str]]] = []
 
@@ -93,8 +93,8 @@ class TestSaveCheckpoint:
         preprocessor = SimpleNamespace(
             save_pretrained=lambda directory: (directory / "policy_preprocessor.json").write_text("{}\n")
         )
-        # The postprocessor is the last writer before the hook, and the one whose bytes a
-        # package manifest must bind (the reason the hook exists).
+        # The postprocessor is the last writer before the hook, and a file a finalizer may
+        # rewrite (the reason the hook exists).
         postprocessor = SimpleNamespace(
             save_pretrained=lambda directory: (directory / "policy_postprocessor.json").write_text("{}\n")
         )

@@ -31,23 +31,12 @@ def test_policy_rejects_generic_qwen_packages_before_model_loading(
     )
     config.save_pretrained(tmp_path)
     # No model tensors exist: rejection must occur before model construction or weight reads.
-    with pytest.raises(RuntimeError, match="supports only native MK1/Isaac-0.5 checkpoints"):
+    with pytest.raises(RuntimeError, match="supports only native Isaac-0.5 checkpoints"):
         if entry_point == "from_pretrained":
             PerceptronIsaacPolicy.from_pretrained(tmp_path, config=config, local_files_only=True)
         else:
             config.hf_model_path = str(model)
             PerceptronIsaacPolicy(config)._load_backbone()
-
-
-@pytest.mark.parametrize("payload", ['{"outer": {"key": 1, "key": 2}}', "[]", "{broken", "\\udcff"])
-def test_policy_json_boundary_rejects_invalid_objects_with_context(tmp_path: Path, payload: str) -> None:
-    from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import _load_json_object
-
-    path = tmp_path / "package.json"
-    path.write_bytes(payload.encode("utf-8", errors="surrogateescape"))
-    with pytest.raises(RuntimeError, match="test package") as failure:
-        _load_json_object(path, "test package")
-    assert isinstance(failure.value.__cause__, ValueError)
 
 
 def _write_indexed_checkpoint(root: Path) -> None:
