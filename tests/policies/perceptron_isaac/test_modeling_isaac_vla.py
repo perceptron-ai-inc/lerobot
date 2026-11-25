@@ -272,7 +272,7 @@ def test_isaac_config_normalizes_real_export_omissions_to_qualified_runtime_defa
     assert config.text_config.output_router_logits is False
     assert config.text_config.norm_topk_prob is True
     # Loading may add runtime defaults to its private copy, never the strict
-    # checkpoint JSON object that was validated and authenticated.
+    # checkpoint JSON object that was validated.
     assert "output_attentions" not in raw
     assert "norm_topk_prob" not in raw["text_config"]
 

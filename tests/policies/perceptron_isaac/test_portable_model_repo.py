@@ -51,8 +51,6 @@ def _policy(model_path: Path, *, device: str = "cpu") -> PerceptronIsaacPolicy:
 
 
 def _native_portable_package(tmp_path: Path) -> tuple[Path, PerceptronIsaacConfig, torch.Tensor]:
-    import hashlib
-
     from lerobot.policies.perceptron_isaac.mharmony_native import IsaacMharmonyRenderMetadata
     from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
         _write_portable_isaac05_checkpoint,
@@ -65,8 +63,6 @@ def _native_portable_package(tmp_path: Path) -> tuple[Path, PerceptronIsaacConfi
     (model_path / "config.json").write_text(json.dumps(raw))
     policy_path = model_path / "lerobot_policy"
     policy_path.mkdir()
-    adapter = policy_path / "isaac_deployment_adapter.json"
-    adapter.write_text("{}\n")
     config = _policy(model_path).config
     config.hf_model_path = ".."
     config.artifact_kind = "neutral_debug"
@@ -75,7 +71,6 @@ def _native_portable_package(tmp_path: Path) -> tuple[Path, PerceptronIsaacConfi
     config.max_action_horizon = 3
     config.apply_offset_norm = False
     config.train_storage_fp32 = False
-    config.deployment_adapter_sha256 = hashlib.sha256(adapter.read_bytes()).hexdigest()
     metadata = IsaacMharmonyRenderMetadata.from_config(config).to_json_dict()
     metadata["mharmony_reserved_token_groups"] = [{"name": "coord", "offset": 24, "size": 4}]
     (policy_path / "render.json").write_text(json.dumps(metadata))
@@ -147,7 +142,7 @@ def test_policy_loads_portable_repo_through_native_isaac(
     assert not list(policy_path.parent.glob("*.py"))
 
 
-@pytest.mark.parametrize("defect", ["adapter", "path", "identity", "metadata", "dtype"])
+@pytest.mark.parametrize("defect", ["path", "identity", "metadata", "dtype"])
 def test_native_portable_public_load_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
 ) -> None:
@@ -157,10 +152,7 @@ def test_native_portable_public_load_fails_closed(
     monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", _forbid_checkpoint_code)
     monkeypatch.setattr(native, "IsaacQwen36VLAForActionGeneration", _forbid_checkpoint_code)
     expected = ""
-    if defect == "adapter":
-        config.deployment_adapter_sha256 = "0" * 64
-        expected = "digest mismatch"
-    elif defect == "path":
+    if defect == "path":
         config.hf_model_path = "../.."
         expected = "escapes the package root"
     elif defect == "identity":
@@ -214,23 +206,6 @@ def test_policy_allows_portable_parent_fast_processor(tmp_path: Path) -> None:
     PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, policy_path)
 
     assert config.fast_processor_path == str(fast_processor_path)
-
-
-def test_portable_package_verifies_adapter_without_legacy_manifest(tmp_path: Path) -> None:
-    model_path = _write_portable_repo(tmp_path / "artifact")
-    policy_path = model_path / "lerobot_policy"
-    policy_path.mkdir()
-    adapter_path = policy_path / "isaac_deployment_adapter.json"
-    adapter_path.write_text("{}\n")
-    import hashlib
-
-    config = PerceptronIsaacConfig(
-        hf_model_path="..",
-        deployment_adapter_sha256=hashlib.sha256(adapter_path.read_bytes()).hexdigest(),
-    )
-    PerceptronIsaacPolicy._resolve_checkpoint_local_paths(config, policy_path)
-
-    PerceptronIsaacPolicy._verify_packaged_contract_digests(config, policy_path)
 
 
 def test_policy_refuses_unsharded_dense_portable_training(

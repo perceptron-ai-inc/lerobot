@@ -1,4 +1,4 @@
-"""Reviewed semantic aliases for the authenticated SO100/SO101 wire layout."""
+"""Reviewed semantic aliases for the SO100/SO101 wire layout."""
 
 
 def so100_hardware_feature_aliases() -> dict[str, str]:

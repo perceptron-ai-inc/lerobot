@@ -300,8 +300,8 @@ def _matches_source_bound_libero_prompt(
 ) -> bool:
     """Reconcile an admitted source prompt, never weaken the physical LIBERO ABI.
 
-    Artifact admission authenticates the checkpoint-local recipe. This check
-    requires its selected source profile; a bare robot-name alias is insufficient.
+    This check requires the selected source profile of the checkpoint-local recipe; a bare
+    robot-name alias is insufficient.
     """
     if not (
         config.strict_environment_feature_contract is True
@@ -567,8 +567,8 @@ def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
     a wrong group set is not a cosmetic problem. The config-derived default
     (``DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS``) carries no coord block and no offset, so
     mHarmony bump-allocates its FAST pool to id 248087 while an Isaac-0.5 checkpoint is
-    trained with that pool at 249321 -- a 1234-id shift that would silently mis-encode
-    every FAST action token if it were ever used in place of the real declaration.
+    trained with that pool at 249321 -- a 1234-id shift that would silently encode every
+    FAST action token to the wrong id if it were ever used in place of the real declaration.
 
     Ordering is deliberately not constrained here: mHarmony resolves explicit offsets
     order-independently, and the shipped export lists its FAST group before its coord

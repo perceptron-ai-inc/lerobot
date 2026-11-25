@@ -21,7 +21,6 @@ from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import Perceptr
 from tests.policies.perceptron_isaac.test_p2_training_intent import (
     INTENTS,
     Intent,
-    _forbid_allocation_or_training,
     _train_config,
 )
 from tests.policies.perceptron_isaac.test_portable_model_repo import _native_portable_package
@@ -66,13 +65,13 @@ def _cache_policy(
     return cached
 
 
-def _cache_raw_policy(root: Path, monkeypatch: pytest.MonkeyPatch, intent: Intent | None) -> CachedPolicy:
+def _cache_native_policy(root: Path, monkeypatch: pytest.MonkeyPatch) -> CachedPolicy:
     source = root / "source"
     source.mkdir()
     policy_path, config, _ = _native_portable_package(source)
-    # Materialize the other maintained raw layout: package-local relative hf_model.
+    # A Hub repository holds the package at its root, with its own relative hf_model.
     config.hf_model_path = "hf_model"
-    _train_config(config, root / "unused", intent)
+    _train_config(config, root / "unused", None)
     cached = _cache_policy(root, config, monkeypatch)
     for asset in policy_path.iterdir():
         asset.rename(cached.snapshot / asset.name)
@@ -85,40 +84,10 @@ def _hub_cli(monkeypatch: pytest.MonkeyPatch, cached: CachedPolicy) -> None:
     monkeypatch.setattr(sys, "argv", ["lerobot-train", f"--policy.path={cached.repo_id}"])
 
 
-@pytest.mark.parametrize("intent", INTENTS)
-def test_cached_hub_raw_intent_refused_before_accelerator_policy_or_update(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intent: Intent
-) -> None:
-    pytest.importorskip("datasets", reason="requires the maintained stock training entry point")
-    import lerobot.scripts.lerobot_train as train_module
-
-    cached = _cache_raw_policy(tmp_path, monkeypatch, intent)
-    before = {path: path.read_bytes() for path in cached.snapshot.rglob("*") if path.is_file()}
-    cfg = _train_config(ACTConfig(device="cpu"), tmp_path / "run", intent)
-    _hub_cli(monkeypatch, cached)
-    # Real CLI resolution, config migration and validation run. No fake validator or loader.
-    monkeypatch.setattr(train_module, "make_accelerator", _forbid_allocation_or_training)
-    monkeypatch.setattr(train_module, "make_policy", _forbid_allocation_or_training)
-    monkeypatch.setattr(train_module, "update_policy", _forbid_allocation_or_training)
-    monkeypatch.setattr(PerceptronIsaacPolicy, "__init__", _forbid_allocation_or_training)
-
-    with pytest.raises(
-        ValueError, match=r"(?i)(raw|portable).*(unsupported|not supported)|unsupported.*(raw|portable)"
-    ):
-        train_module.train(cfg)
-
-    assert isinstance(cfg.policy, PerceptronIsaacConfig)
-    assert cfg.policy.pretrained_path == Path(cached.repo_id)
-    assert cfg.policy.hf_model_path == "hf_model", "preflight must not rewrite serialized relative paths"
-    assert {path: path.read_bytes() for path in cached.snapshot.rglob("*") if path.is_file()} == before
-    assert cfg.output_dir is not None
-    assert not cfg.output_dir.exists()
-
-
-def test_cached_hub_raw_explicit_no_save_and_real_inference_stay_supported(
+def test_cached_hub_package_explicit_no_save_and_real_inference_stay_supported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cached = _cache_raw_policy(tmp_path, monkeypatch, None)
+    cached = _cache_native_policy(tmp_path, monkeypatch)
     before = {path: path.read_bytes() for path in cached.snapshot.rglob("*") if path.is_file()}
     cfg = _train_config(ACTConfig(device="cpu"), tmp_path / "run", None)
     _hub_cli(monkeypatch, cached)

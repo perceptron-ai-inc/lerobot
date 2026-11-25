@@ -203,7 +203,7 @@ class IsaacStatsBlock:
 
 @dataclass(frozen=True, slots=True)
 class IsaacNormalizationProfile:
-    """Validated six-field profile metadata; source authentication stays with artifact admission."""
+    """Validated six-field profile metadata."""
 
     profile_id: str
     profile_sha256: str

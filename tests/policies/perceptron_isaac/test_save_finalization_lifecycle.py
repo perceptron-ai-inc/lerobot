@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -13,7 +12,6 @@ pytest.importorskip("transformers", reason="transformers is required (install le
 from lerobot.common.train_utils import save_checkpoint
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.policies.perceptron_isaac.checkpoint_integrity import file_sha256
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
@@ -35,7 +33,7 @@ def native_policy(tmp_path: Path) -> PerceptronIsaacPolicy:
 def _record_real_finalizations(
     policy: PerceptronIsaacPolicy, monkeypatch: pytest.MonkeyPatch
 ) -> list[frozenset[str]]:
-    """Observe finalizer entry without bypassing its real manifest and digest writes."""
+    """Observe finalizer entry without bypassing the real finalizer."""
     original = policy.finalize_pretrained_package
     inventories: list[frozenset[str]] = []
 
@@ -77,10 +75,8 @@ def test_save_checkpoint_finalizes_native_package_once_after_all_sidecars(
     sidecars = {"train_config.json", "policy_preprocessor.json", "policy_postprocessor.json"}
     assert len(finalizations) == 1, "Training saves must not finalize before writing their sidecars"
     assert sidecars <= finalizations[0]
-    manifest = json.loads((saved / "mk1_trained_package_manifest.json").read_text())
     for filename in sidecars:
-        assert manifest["files_sha256"][filename] == file_sha256(saved / filename)
-    PerceptronIsaacPolicy._verify_saved_package(saved)
+        assert (saved / filename).is_file()
 
 
 def test_standalone_native_save_finalizes_once(
@@ -93,8 +89,7 @@ def test_standalone_native_save_finalizes_once(
     native_policy.save_pretrained(saved)
 
     assert len(finalizations) == 1
-    assert (saved / "mk1_trained_package_manifest.json").is_file()
-    PerceptronIsaacPolicy._verify_saved_package(saved)
+    assert (saved / "hf_model" / "model.safetensors.index.json").is_file()
 
 
 def test_native_save_can_defer_finalization_until_sidecars_are_written(
@@ -113,6 +108,3 @@ def test_native_save_can_defer_finalization_until_sidecars_are_written(
 
     assert len(finalizations) == 1
     assert "train_config.json" in finalizations[0]
-    manifest = json.loads((saved / "mk1_trained_package_manifest.json").read_text())
-    assert manifest["files_sha256"]["train_config.json"] == file_sha256(saved / "train_config.json")
-    PerceptronIsaacPolicy._verify_saved_package(saved)

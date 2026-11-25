@@ -35,10 +35,7 @@ from tests.policies.perceptron_isaac._p2_data_fixtures import (
 
 
 def _profile_payload(payload: StatsPayload, cap: float) -> ProfilePayload:
-    """Synthetic post-authentication metadata with all six profile fields.
-
-    This exercises retention/consumption, not whole-export SHA authentication.
-    """
+    """Synthetic metadata with all six profile fields, to exercise retention and consumption."""
     action_bytes = json.dumps(payload["action"], sort_keys=True).encode()
     proprio_bytes = json.dumps(payload["proprio"], sort_keys=True).encode()
     return {
