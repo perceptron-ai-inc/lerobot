@@ -30,7 +30,6 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.train import TRAIN_CONFIG_NAME, TrainPipelineConfig
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.factory import make_policy
-from lerobot.policies.perceptron_isaac.checkpoint_integrity import canonical_json_sha256, file_sha256
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import (
     SUITE_BY_TASK_INDEX_EXPORT_FILENAME,
     SUITE_STATS_EXPORT_FILENAME,
@@ -99,9 +98,9 @@ def native_run(tmp_path: Path) -> Iterator[_NativeRun]:
         policy._isaac_model.model.vector_embedding[0].weight.fill_(-0.0)
 
     # Model weights are already materialized; live sidecars now have a private owner.
-    policy._retain_verified_runtime_assets(source)
-    assert policy._verified_runtime_assets is not None
-    assert policy._verified_runtime_assets.root != source
+    policy._retain_runtime_assets(source)
+    assert policy._runtime_assets is not None
+    assert policy._runtime_assets.root != source
     train_config = TrainPipelineConfig(
         dataset=DatasetConfig(repo_id="fixture/unused"),
         policy=config,
@@ -111,9 +110,9 @@ def native_run(tmp_path: Path) -> Iterator[_NativeRun]:
     try:
         yield _NativeRun(source, train_config, policy, optimizer)
     finally:
-        if policy._verified_runtime_assets is not None:
-            policy._verified_runtime_assets.cleanup()
-        for snapshot in policy._verified_external_runtime_assets:
+        if policy._runtime_assets is not None:
+            policy._runtime_assets.cleanup()
+        for snapshot in policy._external_runtime_assets:
             snapshot.cleanup()
 
 
@@ -154,7 +153,6 @@ def test_save_checkpoint_nested_policy_uses_portable_asset_paths(
     checkpoint = tmp_path / "checkpoint"
     original_paths = _LiveConfigPaths.capture(native_run.policy.config)
     tokenizer_bytes = (native_run.source / "hf_model" / "tokenizer.json").read_bytes()
-    source_identity = native_run.policy.config.mk1_source_model_import_sha256
 
     save_checkpoint(
         checkpoint, step=17, cfg=native_run.config, policy=native_run.policy, optimizer=native_run.optimizer
@@ -167,14 +165,7 @@ def test_save_checkpoint_nested_policy_uses_portable_asset_paths(
     _assert_portable_asset_paths(nested)
     assert standalone["type"] == nested["type"] == "perceptron_isaac"
     assert standalone["pretrained_path"] == nested["pretrained_path"] == str(native_run.source)
-    assert standalone["mk1_model_import_sha256"] is nested["mk1_model_import_sha256"] is None
-    assert standalone["mk1_source_model_import_sha256"] == nested["mk1_source_model_import_sha256"]
-    assert nested["mk1_source_model_import_sha256"] == source_identity
-    manifest_path = package / "mk1_trained_package_manifest.json"
-    canonical = dict(standalone, mk1_trained_package_manifest_sha256=None)
-    assert canonical == dict(nested, mk1_trained_package_manifest_sha256=None)
-    assert standalone["mk1_trained_package_manifest_sha256"] == file_sha256(manifest_path)
-    assert json.loads(manifest_path.read_text())["config_sha256"] == canonical_json_sha256(canonical)
+    assert standalone == nested
     assert (package / "hf_model" / "tokenizer.json").read_bytes() == tokenizer_bytes
     assert json.loads(tokenizer_bytes)["added_tokens"], "fixture must retain reserved token identities"
     assert _LiveConfigPaths.capture(native_run.policy.config) == original_paths
@@ -215,10 +206,6 @@ def test_moved_checkpoint_resumes_native_weights_and_optimizer(
     assert resumed.checkpoint_path == moved
     assert isinstance(resumed.policy, PerceptronIsaacConfig)
     package_config = json.loads((moved / PRETRAINED_MODEL_DIR / "config.json").read_text())
-    assert (
-        resumed.policy.mk1_trained_package_manifest_sha256
-        == package_config["mk1_trained_package_manifest_sha256"]
-    )
     assert resumed.policy.optimizer_lr == (package_config["optimizer_lr"] if resume_lr is None else resume_lr)
     assert resumed.policy.pretrained_path == native_run.source
     assert not resumed.policy.pretrained_path.exists()
@@ -308,11 +295,8 @@ def test_policy_and_nested_config_share_export_overrides_without_live_changes(tm
         device="cpu",
         native_stats_path="/runtime/base-stats.json",
         stats_path="/runtime/legacy-stats.json",
-        mk1_model_import_sha256="1" * 64,
         normalization_profile_id="base",
     )
-    config._export_mk1_model_import_sha256 = None
-    config._export_mk1_source_model_import_sha256 = "1" * 64
     config._export_native_stats = IsaacNormalizationStats(
         action=IsaacStatsBlock(q01=np.full(7, -1.0), q99=np.full(7, 1.0)),
         proprio=IsaacStatsBlock(q01=np.full(8, -1.0), q99=np.full(8, 1.0)),
@@ -329,8 +313,6 @@ def test_policy_and_nested_config_share_export_overrides_without_live_changes(tm
     portable = config.to_dict()
     assert train.to_dict()["policy"] == portable
     assert not list(tmp_path.iterdir()), "to_dict must not export sidecars"
-    assert portable["mk1_model_import_sha256"] is None
-    assert portable["mk1_source_model_import_sha256"] == "1" * 64
     assert portable["native_stats_path"] == "isaac_stats.json"
     assert portable["stats_path"] is None
     assert portable["normalization_profile_id"] == "finetune"

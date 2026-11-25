@@ -18,13 +18,7 @@ from pathlib import Path
 from typing import Any, Never
 
 from .checkpoint_integrity import load_json_object
-from .rtc import (
-    DIT_CONTEXT_CONDITIONING_FIELDS,
-    ActionExpertConditioning,
-    SharedFinalContext,
-    validate_action_context,
-    validate_dit_action_metadata,
-)
+from .rtc import ActionExpertConditioning, SharedFinalContext, validate_dit_action_metadata
 
 ISAAC_MODEL_TYPE = "qwen3_5_moe"
 ISAAC_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
@@ -33,12 +27,6 @@ ISAAC_VLA_SCHEMA_VERSION = 1
 ISAAC_STATE_DICT_SCHEMA = "pr3154_v1"
 ISAAC_RMSNORM_CONVENTION = "zero_centered_1_plus_weight"
 ISAAC_TEST_GEOMETRY_MARKER = "isaac05_test_only_reduced_geometry"
-# The layout that exports used before the Isaac-0.5 release. It is read by renaming its blocks
-# to the released names; nothing writes it.
-LEGACY_KEY_PREFIX = "genesis_"
-LEGACY_ARCHITECTURE = "GenesisQwen3_5MoeForConditionalGeneration"
-LEGACY_BACKBONE_FAMILY = "mk1_qwen3_6_moe"
-LEGACY_TEST_GEOMETRY_MARKER = f"{LEGACY_KEY_PREFIX}test_only_reduced_geometry"
 _LAYOUT_BLOCKS = ("artifact", "coord_tokens", "moe", "vla", "test_only_reduced_geometry")
 ISAAC_SAFETENSORS_INDEX = "model.safetensors.index.json"
 ISAAC_FAST_TOKENIZER = "physical-intelligence/fast"
@@ -62,8 +50,6 @@ _CUSTOM_MOE_KEYS = {
     "route_norm",
     "route_scale",
     "score_before_experts",
-    "null_expert_semantics",
-    "shared_expert_mode",
     "uses_expert_bias",
 }
 _VLA_KEYS = {
@@ -84,7 +70,6 @@ _ACTION_KEYS = {
     "num_heads",
     "mlp_ratio",
     "timestep_embed_dim",
-    "clean_at_0",
     "ffn_multiple_of",
     "qk_norm",
     "qk_norm_eps",
@@ -110,27 +95,17 @@ class IsaacCheckpointContractError(ValueError):
 
 
 def validate_checkpoint_action_expert_semantics(raw: Mapping[str, Any]) -> None:
-    """Validate both native copies or the migrated envelope before eager or lazy construction."""
+    """Validate both copies of the action expert block before eager or lazy construction."""
     text = _object_field(raw, "text_config")
     depth = _integer(text, "num_hidden_layers", "text_config")
     for path, block in (
         ("isaac05_vla.action_expert", raw.get("isaac05_vla")),
         ("action_expert", raw),
-        (f"{LEGACY_KEY_PREFIX}vla.action_expert", raw.get(f"{LEGACY_KEY_PREFIX}vla")),
     ):
         if isinstance(block, Mapping):
             action = block.get("action_expert")
             if isinstance(action, Mapping):
-                if action.get("type") == "dit":
-                    _validate_native_action_metadata(action, path=path, backbone_num_layers=depth)
-                else:
-                    schema = block.get("schema_version")
-                    try:
-                        validate_action_context(action, schema_version=schema, backbone_num_layers=depth)
-                    except ValueError as exc:
-                        _fail(str(exc))
-                    expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
-                    _require_exact_keys(action, expected, path)
+                _validate_native_action_metadata(action, path=path, backbone_num_layers=depth)
     if raw.get("model_type") == "isaac_0_5":
         vla = _object_field(raw, "isaac05_vla")
         if _integer(vla, "schema_version", "isaac05_vla") != 1:
@@ -335,7 +310,9 @@ class IsaacCheckpointContract:
         """
         root = _object(raw_config, "config")
         validate_checkpoint_action_expert_semantics(root)
-        root = _normalize_isaac05(root) if root.get("model_type") == "isaac_0_5" else _normalize_legacy(root)
+        if root.get("model_type") != "isaac_0_5":
+            _fail("model_type must be 'isaac_0_5'")
+        root = _normalize_isaac05(root)
         test_marker = root.get(ISAAC_TEST_GEOMETRY_MARKER, False)
         if test_marker is not False and test_marker is not True:
             _fail(f"{ISAAC_TEST_GEOMETRY_MARKER} must be a boolean")
@@ -345,10 +322,6 @@ class IsaacCheckpointContract:
 
         if "apply_offset_norm" in root:
             _fail("Isaac config must not contain the legacy apply_offset_norm override")
-        if root.get("model_type") != ISAAC_MODEL_TYPE:
-            _fail(f"model_type must be {ISAAC_MODEL_TYPE!r}")
-        if root.get("architectures") != [ISAAC_ARCHITECTURE]:
-            _fail(f"architectures must be [{ISAAC_ARCHITECTURE!r}]")
         if root.get("tie_word_embeddings") is not False:
             _fail("tie_word_embeddings must be false")
 
@@ -580,16 +553,16 @@ def read_isaac_config_data(
         raw,
         allow_test_only_reduced_geometry=allow_test_only_reduced_geometry,
     )
-    if raw.get("model_type") == "isaac_0_5":
-        artifact = _object_field(raw, "isaac05_artifact")
-        shapes = contract.expected_tensor_shapes()
-        expected_bytes = sum(math.prod(shape) * 4 for shape in shapes.values())
-        if artifact.get("tensor_count") != len(shapes) or artifact.get("tensor_bytes") != expected_bytes:
-            _fail("isaac05_artifact tensor count/bytes disagree with F32 geometry")
-        raw = _normalize_isaac05(raw)
-    else:
-        raw = _normalize_legacy(raw)
-    return raw, contract
+    artifact = _object_field(raw, "isaac05_artifact")
+    if (artifact.get("tensor_count"), artifact.get("tensor_bytes")) != _f32_tensor_inventory(contract):
+        _fail("isaac05_artifact tensor count/bytes disagree with F32 geometry")
+    return _normalize_isaac05(raw), contract
+
+
+def _f32_tensor_inventory(contract: IsaacCheckpointContract) -> tuple[int, int]:
+    """The tensor count and F32 byte total a config declares for this geometry."""
+    shapes = contract.expected_tensor_shapes()
+    return len(shapes), sum(math.prod(shape) * 4 for shape in shapes.values())
 
 
 def read_isaac_config(
@@ -823,9 +796,7 @@ def finalize_isaac_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     root = Path(model_dir)
     config_path = root / "config.json"
     raw = _read_json_object(config_path)
-    # The saved config keeps the layout of its source package, so read whichever name it uses.
-    vla_names = ("isaac05_vla", f"{LEGACY_KEY_PREFIX}vla")
-    vla = next((raw[name] for name in vla_names if isinstance(raw.get(name), dict)), None)
+    vla = raw.get("isaac05_vla")
     text_config = raw.get("text_config")
     mtp = vla.get("mtp") if isinstance(vla, dict) else None
     if not isinstance(mtp, dict) or not isinstance(text_config, dict):
@@ -833,7 +804,11 @@ def finalize_isaac_runtime_checkpoint_layout(model_dir: str | Path) -> None:
     if mtp.get("present") is True:
         mtp.update({"present": False, "physical_layers": 0, "rollout_steps": 0})
         text_config["mtp_num_hidden_layers"] = 0
-        IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+        contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+        # The declared inventory described the source, which still held the MTP tensors.
+        artifact = raw.get("isaac05_artifact")
+        if isinstance(artifact, dict):
+            artifact["tensor_count"], artifact["tensor_bytes"] = _f32_tensor_inventory(contract)
         temporary_config = config_path.with_suffix(".json.tmp")
         temporary_config.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temporary_config.replace(config_path)
@@ -907,26 +882,12 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
     )
     text = _object_field(root, "text_config")
     for name in _LAYOUT_BLOCKS:
-        legacy = f"{LEGACY_KEY_PREFIX}{name}"
-        if legacy in root:
-            _fail(f"isaac05 must not mix legacy field {legacy}")
         if f"isaac05_{name}" not in root:
             _fail(f"isaac05 missing isaac05_{name}")
-    if f"{LEGACY_KEY_PREFIX}moe" in text:
-        _fail(f"isaac05 text must not mix legacy {LEGACY_KEY_PREFIX}moe")
     moe = _object_field(root, "isaac05_moe")
     if moe != _object_field(text, "isaac05_moe"):
         _fail("root and text_config isaac05_moe blocks must be identical")
-    _require_exact_keys(
-        moe, _CUSTOM_MOE_KEYS - {"null_expert_semantics", "shared_expert_mode"}, "isaac05_moe"
-    )
-    normalized_moe = dict(
-        moe,
-        null_expert_semantics="skip_compute_renormalize_real_routes",
-        shared_expert_mode="sigmoid_gated_additive",
-    )
-    root["isaac05_moe"] = normalized_moe
-    root["text_config"] = dict(text, isaac05_moe=copy.deepcopy(normalized_moe))
+    _require_exact_keys(moe, _CUSTOM_MOE_KEYS, "isaac05_moe")
     vla = _object_field(root, "isaac05_vla")
     _require_exact_keys(vla, _VLA_KEYS, "isaac05_vla")
     nested_action = _object_field(vla, "action_expert")
@@ -964,46 +925,6 @@ def _normalize_isaac05(raw: Mapping[str, Any]) -> dict[str, Any]:
     return root
 
 
-def rename_legacy_blocks(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Return config data with the pre-release block names replaced by the released ones."""
-    root = dict(raw)
-    for name in _LAYOUT_BLOCKS:
-        legacy = f"{LEGACY_KEY_PREFIX}{name}"
-        if legacy in root:
-            root[f"isaac05_{name}"] = root.pop(legacy)
-    text = root.get("text_config")
-    legacy_moe = f"{LEGACY_KEY_PREFIX}moe"
-    if isinstance(text, Mapping) and legacy_moe in text:
-        text = dict(text)
-        text["isaac05_moe"] = text.pop(legacy_moe)
-        root["text_config"] = text
-    return root
-
-
-def declares_legacy_layout(raw: Mapping[str, Any]) -> bool:
-    """Whether config data names the pre-release layout; this does not validate it."""
-    vla = raw.get(f"{LEGACY_KEY_PREFIX}vla")
-    return (
-        raw.get("model_type") == ISAAC_MODEL_TYPE
-        and isinstance(vla, Mapping)
-        and vla.get("backbone_family") == LEGACY_BACKBONE_FAMILY
-    )
-
-
-def _normalize_legacy(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Check what only the pre-release layout declares, then give the parser the released names."""
-    legacy_vla = _object_field(raw, f"{LEGACY_KEY_PREFIX}vla")
-    if _object_field(legacy_vla, "action_expert").get("type") == "dit":
-        _fail("the legacy layout requires the molmoact action ABI")
-    if raw.get("architectures") != [LEGACY_ARCHITECTURE]:
-        _fail(f"architectures must be [{LEGACY_ARCHITECTURE!r}]")
-    _require_values(legacy_vla, {"backbone_family": LEGACY_BACKBONE_FAMILY}, f"{LEGACY_KEY_PREFIX}vla")
-    root = rename_legacy_blocks(raw)
-    root["architectures"] = [ISAAC_ARCHITECTURE]
-    root["isaac05_vla"] = {key: value for key, value in legacy_vla.items() if key != "backbone_family"}
-    return root
-
-
 def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> IsaacMoeContract:
     _require_exact_keys(raw, _CUSTOM_MOE_KEYS, "isaac05_moe")
     real = _integer(raw, "num_real_experts")
@@ -1021,8 +942,6 @@ def _parse_moe(raw: Mapping[str, Any], *, test_geometry: bool) -> IsaacMoeContra
         "score_func": "softmax",
         "route_norm": True,
         "score_before_experts": False,
-        "null_expert_semantics": "skip_compute_renormalize_real_routes",
-        "shared_expert_mode": "sigmoid_gated_additive",
         "uses_expert_bias": False,
     }
     _require_values(raw, fixed, "isaac05_moe")
@@ -1055,7 +974,7 @@ def _parse_artifact(raw: Mapping[str, Any]) -> IsaacArtifactContract:
     artifact_kind = raw.get("artifact_kind")
     if artifact_kind not in {"trained_policy", "neutral_debug"}:
         _fail("isaac05_artifact.artifact_kind must be 'trained_policy' or 'neutral_debug'")
-    if artifact_kind == "trained_policy" and set(raw) - {"trained_steps"} != _ARTIFACT_IDENTITY_KEYS:
+    if artifact_kind == "trained_policy" and set(raw) != _ARTIFACT_IDENTITY_KEYS:
         _fail("trained isaac05_artifact fields do not match schema version 1")
     return IsaacArtifactContract(schema_version, artifact_kind)
 
@@ -1370,8 +1289,6 @@ def _parse_vla(
 ) -> tuple[IsaacVectorEncoderContract, IsaacActionExpertContract]:
     _require_exact_keys(raw, _VLA_KEYS, "isaac05_vla")
     schema = _integer(raw, "schema_version", "isaac05_vla")
-    if schema not in (1, 2):
-        _fail("isaac05_vla.schema_version must be 1 or 2")
     _require_values(
         raw,
         {
@@ -1399,34 +1316,18 @@ def _parse_vla(
     vector = IsaacVectorEncoderContract(max_states, hidden_dim, output_dim)
 
     action_raw = _object_field(raw, "action_expert", "isaac05_vla")
-    native = action_raw.get("type") == "dit"
-    metadata = tuple(sorted(action_raw.items())) if native else ()
-    if native:
-        if schema != 1:
-            _fail(
-                "isaac05_vla.schema_version must remain 1; the native action_expert owns its schema_version"
-            )
-        conditioning = _validate_native_action_metadata(
-            action_raw, path="isaac05_vla.action_expert", backbone_num_layers=text.num_hidden_layers
-        )
-        action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
-        action_raw = dict(action_raw, type="molmoact", clean_at_0=False)
-    else:
-        try:
-            conditioning = validate_action_context(
-                action_raw, schema_version=schema, backbone_num_layers=text.num_hidden_layers
-            )
-        except ValueError as exc:
-            _fail(f"isaac05_vla.action_expert: {exc}")
-        expected = _ACTION_KEYS | (set(DIT_CONTEXT_CONDITIONING_FIELDS) if schema == 2 else set())
-        _require_exact_keys(action_raw, expected, "isaac05_vla.action_expert")
-        action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
+    metadata = tuple(sorted(action_raw.items()))
+    if schema != 1:
+        _fail("isaac05_vla.schema_version must remain 1; the native action_expert owns its schema_version")
+    conditioning = _validate_native_action_metadata(
+        action_raw, path="isaac05_vla.action_expert", backbone_num_layers=text.num_hidden_layers
+    )
+    action_raw = {key: value for key, value in action_raw.items() if key in _ACTION_KEYS}
     _require_exact_keys(action_raw, _ACTION_KEYS, "isaac05_vla.action_expert")
     _require_values(
         action_raw,
         {
-            "type": "molmoact",
-            "clean_at_0": False,
+            "type": "dit",
             "qk_norm": True,
             "qk_norm_eps": 1e-6,
             "rope": True,

@@ -41,15 +41,9 @@ tokenizers 0.22.2 and Accelerate 1.15.0. The SDK source remains pinned to
 
 ## Preconverted package and training entry point
 
-The qualified package is already published; do not run a converter:
+The qualified package is already published; do not run a converter.
 
-```text
-s3://perceptron-checkpoints/phil/isaac_0_5-step-100000-fp32-native-lerobot-vocabfix-113238
-69 files; 142,967,074,649 bytes
-SHA256SUMS: 85d9743e3f46d19cd5291a00607cfe0abc54eb56d1a40a4fbcd20493e293cc9b
-```
-
-Stage that complete package without changing its layout or authenticated assets.
+Stage that complete package without changing its layout.
 Set `NATIVE_POLICY_DIR` to its `lerobot_policy` directory, `DATASET_REPO_ID`
 to a compatible dataset, and `GPUS` to the number of GPUs on the training node.
 Use `torchrun` and set FSDP2 through LeRobot's CLI flags. Set `STEPS` to the
@@ -114,8 +108,7 @@ RoPE frequencies in F32 from the original formula, including BF16-source trainin
 They do not replace parameters or widen a rounded BF16 table. Inference retains
 the released BF16 frequency table and phase behavior.
 
-The action expert is always the native DiT. Legacy checkpoints, whose action
-block says `type="molmoact"`, hold the same network and load into it with RTC off.
+The action expert is always the native DiT.
 
 Prompts carry an episode-time item before each observation only when the
 checkpoint's selected recipe sets `emit_observation_timestamps`. The released YAM
@@ -172,9 +165,9 @@ modules. That proof was on HF base `8c920c4` plus runtime `9c315c1` and CUT
 not this updated HF base `ae2b57f`.
 
 Raw/portable-export saving is deferred and fails before gathering weights or writing
-package assets. Source-bound native saves remain implemented. Focused CPU tests
-cover reduced native save/finalize/moved reload, exact FP32 values and signed zero;
-that is not production-scale checkpoint qualification.
+package assets. Saving from a package that holds its own `hf_model/` remains
+implemented. Focused CPU tests cover reduced native save/finalize/moved reload, exact
+FP32 values and signed zero; that is not production-scale checkpoint qualification.
 
 Trained RTC ran through `lerobot-rollout` on one H100 against the published 60-step
 YAM and SO-100/101 packages on 2026-11-21, with a virtual robot replaying each

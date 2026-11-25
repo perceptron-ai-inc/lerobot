@@ -22,11 +22,11 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
 )
 
 from .isaac_checkpoint_contract import (
+    ISAAC_MODEL_TYPE,
     IsaacCheckpointContract,
     SafetensorsInventory,
     read_and_validate_safetensors_index,
     read_isaac_config_data,
-    rename_legacy_blocks,
     validate_isaac_tokenizer,
 )
 from .loss_perceptron_isaac import _global_sum_detached
@@ -44,7 +44,6 @@ from .modeling_qwen36_moe import (
 )
 from .moe_auxiliary_losses import materialize_router_auxiliaries
 from .tensor_stream import TensorStream
-from .trained_package import VerifiedTrainedTensorStorage
 
 TORCH_SDPA_ATTENTION_BACKEND: Literal["torch_sdpa_v1"] = "torch_sdpa_v1"
 QUALIFIED_TRANSFORMERS_VERSION = "5.5.4"
@@ -185,8 +184,9 @@ def _build_config(
     raw: dict[str, Any],
     contract: IsaacCheckpointContract,
 ) -> IsaacQwen36VLAConfig:
-    # Config data read directly from a pre-release file still carries its own block names.
-    normalized = rename_legacy_blocks(copy.deepcopy(raw))
+    normalized = copy.deepcopy(raw)
+    # The config class is the Qwen3.5-MoE one; the package's own model type names the layout.
+    normalized["model_type"] = ISAAC_MODEL_TYPE
     for key, value in _QUALIFIED_COMMON_EXECUTION_DEFAULTS.items():
         normalized.setdefault(key, value)
     for section_name in ("text_config", "vision_config"):
@@ -199,9 +199,6 @@ def _build_config(
         normalized["text_config"].setdefault(key, value)
 
     action_expert = dict(normalized["isaac05_vla"]["action_expert"])
-    # Sampler steps are runtime input to sample_action(), not module geometry.
-    if action_expert.get("type") != "dit":
-        action_expert.pop("num_inference_steps", None)
     normalized.pop("action_expert", None)
     normalized.pop("vector_max_states", None)
     config = IsaacQwen36VLAConfig(
@@ -367,31 +364,22 @@ def load_isaac_vla_from_hf(
     route_reduction: Literal["stable_token_segment_sum_v1"] = DETERMINISTIC_ROUTE_REDUCTION,
     allowed_storage_dtypes: frozenset[str] = frozenset({"BF16"}),
     load_intent: Literal["inference", "training"] = "inference",
-    verified_tensor_storage: VerifiedTrainedTensorStorage | None = None,
 ) -> tuple[IsaacQwen36VLAForActionGeneration, IsaacQwen36VLAConfig, IsaacCheckpointContract]:
     """Validate, construct once on meta, and stream an Isaac VLA using the qualified SDPA backend.
 
     ``device`` is where the weights are materialized. ``runtime_device`` (default: ``device``) is
     where the model will run: it selects the GDN kernels and gates the production CUDA ABI, so a
     host-memory build for a CUDA run keeps the CUDA kernels and the CUDA qualification gate.
-    Authenticated mixed trained storage may resume in F32: F32 values need no cast,
+    Mixed trained storage may resume in F32: F32 values need no cast,
     while BF16 values promote exactly (without recovering precision already lost).
     This also promotes frozen BF16 tensors and doubles their host storage.
     """
     if load_intent not in ("inference", "training"):
         raise ValueError("load_intent must be inference or training")
     root = Path(model_dir)
-    if verified_tensor_storage is not None and (
-        verified_tensor_storage.for_model(root) != allowed_storage_dtypes
-    ):
-        raise ValueError("Verified trained storage disagrees with allowed_storage_dtypes")
     if load_intent == "training":
-        authenticated_mixed = verified_tensor_storage is not None and allowed_storage_dtypes == frozenset(
-            {"BF16", "F32"}
-        )
-        if dtype != torch.float32 or not (
-            allowed_storage_dtypes == frozenset({"F32"}) or authenticated_mixed
-        ):
+        holds_f32 = allowed_storage_dtypes in (frozenset({"F32"}), frozenset({"BF16", "F32"}))
+        if dtype != torch.float32 or not holds_f32:
             raise ValueError("training load requires lossless F32 storage and runtime")
     _require_qualified_transformers_abi()
     raw, contract = read_isaac_config_data(
@@ -404,12 +392,7 @@ def load_isaac_vla_from_hf(
     _require_qualified_torch_cuda_abi(contract, run_device)
     inventory = read_and_validate_safetensors_index(root)
     contract.validate_tensor_inventory(inventory, allowed_storage_dtypes=allowed_storage_dtypes)
-    if verified_tensor_storage is not None:
-        verified_tensor_storage.require_header_dtypes(inventory)
     validate_isaac_tokenizer(root, contract)
-    if verified_tensor_storage is not None:
-        # Bind every loader-read metadata file through its final read, before allocation.
-        verified_tensor_storage.verify_for_materialization()
     config = _build_config(raw, contract)
     _configure_attention_backend(config, attention_backend)
     _configure_route_reduction(config, route_reduction)

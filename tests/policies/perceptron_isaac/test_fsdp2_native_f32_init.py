@@ -31,6 +31,7 @@ import stat
 import subprocess
 import sys
 import traceback
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -904,7 +905,7 @@ def test_fsdp1_training_refuses_before_backbone_load(tmp_path, monkeypatch) -> N
 def test_bf16_storage_package_fsdp2_training_load_is_unchanged(tmp_path, monkeypatch) -> None:
     """Control: a BF16-storage Isaac package keeps the BF16 load (no lossless F32 source exists).
 
-    Only the storage classification the load decision reads is stubbed to BF16; the preflight still
+    Only the header dtypes the load decision reads are restated as BF16; the preflight still
     validates the fixture's real F32 bytes. The loader call is recorded and stopped.
     """
     from lerobot.policies.perceptron_isaac import isaac_checkpoint_contract
@@ -912,14 +913,13 @@ def test_bf16_storage_package_fsdp2_training_load_is_unchanged(tmp_path, monkeyp
     policy_path, config, _, _ = _f32_package(tmp_path)
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
     real_validate = isaac_checkpoint_contract.validate_isaac_checkpoint
-    monkeypatch.setattr(
-        isaac_checkpoint_contract,
-        "validate_isaac_checkpoint",
-        lambda root, **kwargs: real_validate(
-            root, **{**kwargs, "allowed_storage_dtypes": frozenset({"F32"})}
-        ),
-    )
-    monkeypatch.setattr(modeling_perceptron_isaac, "_package_storage_dtypes", lambda _: frozenset({"BF16"}))
+
+    def validate_as_bf16(root, **kwargs):
+        contract, inventory = real_validate(root, **kwargs)
+        headers = {name: replace(header, dtype="BF16") for name, header in inventory.tensors.items()}
+        return contract, replace(inventory, tensors=headers)
+
+    monkeypatch.setattr(isaac_checkpoint_contract, "validate_isaac_checkpoint", validate_as_bf16)
     calls = _record_loader_calls(monkeypatch, stop=True)
     _live_fsdp2(monkeypatch)
 

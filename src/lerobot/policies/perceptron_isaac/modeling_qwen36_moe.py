@@ -42,8 +42,6 @@ from transformers.utils.output_capturing import OutputRecorder
 
 from .moe_auxiliary_losses import IsaacNullRouterAuxiliary
 
-_NULL_EXPERT_SEMANTICS = "skip_compute_renormalize_real_routes"
-_SIGMOID_GATED_SHARED_EXPERT = "sigmoid_gated_additive"
 _ROUTER_CONTRACT_VERSION = 1
 DETERMINISTIC_ROUTE_REDUCTION: Literal["stable_token_segment_sum_v1"] = "stable_token_segment_sum_v1"
 ROTARY_PRECISION = "checkpoint_bf16_inv_freq_fp32_phase_v1"
@@ -210,8 +208,6 @@ class IsaacNullMoeContract:
             "score_func": "softmax",
             "route_norm": True,
             "score_before_experts": False,
-            "null_expert_semantics": _NULL_EXPERT_SEMANTICS,
-            "shared_expert_mode": _SIGMOID_GATED_SHARED_EXPERT,
             "uses_expert_bias": False,
         }
         for key, expected in exact_values.items():

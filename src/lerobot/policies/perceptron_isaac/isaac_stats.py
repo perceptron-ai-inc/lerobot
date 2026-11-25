@@ -19,7 +19,7 @@ import torch
 
 # The native quantile math is hardcoded to this epsilon, the value the bases were trained
 # with. Checkpoints declaring a different value cannot be served
-# faithfully, so the importer rejects them rather than silently substituting this one.
+# faithfully, so a package must not be built from them.
 NATIVE_NORMALIZATION_EPS = 1e-6
 
 
@@ -203,7 +203,7 @@ class IsaacStatsBlock:
 
 @dataclass(frozen=True, slots=True)
 class IsaacNormalizationProfile:
-    """Validated six-field profile metadata; source authentication stays with artifact admission."""
+    """Validated six-field profile metadata."""
 
     profile_id: str
     profile_sha256: str

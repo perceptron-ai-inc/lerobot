@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import shutil
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
@@ -12,7 +13,6 @@ from safetensors.torch import save_file
 
 from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
     ISAAC_TEST_GEOMETRY_MARKER,
-    LEGACY_TEST_GEOMETRY_MARKER,
     IsaacCheckpointContract,
     IsaacCheckpointContractError,
     read_and_validate_safetensors_index,
@@ -36,9 +36,34 @@ def _moe(*, real: int, top_k: int) -> dict:
         "route_norm": True,
         "route_scale": 1.0,
         "score_before_experts": False,
-        "null_expert_semantics": "skip_compute_renormalize_real_routes",
-        "shared_expert_mode": "sigmoid_gated_additive",
         "uses_expert_bias": False,
+    }
+
+
+def _action_expert(geometry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "dit",
+        "schema_version": 1,
+        **geometry,
+        "qk_norm": True,
+        "qk_norm_eps": 1e-6,
+        "rope": True,
+        "context_layer_norm": True,
+        "causal_attn": False,
+        "num_inference_steps": 10,
+        "timestep_sampling_alpha": 1.5,
+        "timestep_sampling_beta": 1.0,
+        "timestep_sampling_scale": 0.999,
+        "timestep_sampling_offset": 0.001,
+        "train_samples_per_chunk": 8,
+        "rtc_max_delay_steps": 12,
+        "rtc_probability": 0.5,
+        "rtc_delay_sampling": "poisson",
+        "rtc_poisson_mean": 5.0,
+        "mask_padded_action_rows": True,
+        "drop_action_dim_overflow": False,
+        "k_batched_cross_attn": True,
+        "k_batched_cross_attn_backend": "flash_gqa",
     }
 
 
@@ -131,14 +156,22 @@ def _config(*, test_geometry: bool, mtp_present: bool = True, coord_enabled: boo
         }
 
     moe = _moe(real=num_experts, top_k=top_k)
+    action_expert = _action_expert(action)
     config = {
-        "model_type": "qwen3_5_moe",
-        "architectures": ["GenesisQwen3_5MoeForConditionalGeneration"],
+        "model_type": "isaac_0_5",
+        "architectures": ["Isaac05ForConditionalGeneration"],
+        "auto_map": {
+            "AutoConfig": "configuration_isaac05.Isaac05Config",
+            "AutoModelForCausalLM": "modeling_isaac05.Isaac05ForConditionalGeneration",
+            "AutoProcessor": "processing_isaac05.Isaac05Processor",
+        },
+        "storage_dtype": "float32",
+        "runtime_dtype": "bfloat16",
+        "dtype": "bfloat16",
         "tie_word_embeddings": False,
-        "genesis_artifact": {
+        "isaac05_artifact": {
             "schema_version": 1,
             "artifact_kind": "trained_policy",
-            "trained_steps": 100_000,
         },
         "image_token_id": 4 if test_geometry else 248056,
         "video_token_id": 5 if test_geometry else 248057,
@@ -189,7 +222,7 @@ def _config(*, test_geometry: bool, mtp_present: bool = True, coord_enabled: boo
             "tie_word_embeddings": False,
             "use_cache": True,
             "vocab_size": vocab_size,
-            "genesis_moe": copy.deepcopy(moe),
+            "isaac05_moe": copy.deepcopy(moe),
         },
         "vision_config": {
             **vision,
@@ -197,8 +230,8 @@ def _config(*, test_geometry: bool, mtp_present: bool = True, coord_enabled: boo
             "hidden_act": "gelu_pytorch_tanh",
             "model_type": "qwen3_5_moe",
         },
-        "genesis_moe": copy.deepcopy(moe),
-        "genesis_coord_tokens": (
+        "isaac05_moe": copy.deepcopy(moe),
+        "isaac05_coord_tokens": (
             {
                 "enabled": True,
                 "offset": 24 if test_geometry else 248320,
@@ -207,9 +240,8 @@ def _config(*, test_geometry: bool, mtp_present: bool = True, coord_enabled: boo
             if coord_enabled
             else {"enabled": False}
         ),
-        "genesis_vla": {
+        "isaac05_vla": {
             "schema_version": 1,
-            "backbone_family": "mk1_qwen3_6_moe",
             "state_dict_schema": "pr3154_v1",
             "rmsnorm_weight_convention": "zero_centered_1_plus_weight",
             "vector_encoder": {
@@ -219,16 +251,7 @@ def _config(*, test_geometry: bool, mtp_present: bool = True, coord_enabled: boo
                 "output_dim": hidden,
                 "bias": False,
             },
-            "action_expert": {
-                "type": "molmoact",
-                **action,
-                "clean_at_0": False,
-                "qk_norm": True,
-                "qk_norm_eps": 1e-6,
-                "rope": True,
-                "context_layer_norm": True,
-                "causal_attn": False,
-            },
+            "action_expert": action_expert,
             "mtp": {
                 "present": mtp_present,
                 "physical_layers": 1 if mtp_present else 0,
@@ -236,10 +259,26 @@ def _config(*, test_geometry: bool, mtp_present: bool = True, coord_enabled: boo
                 "action_runtime": "exclude",
             },
         },
+        "action_expert": copy.deepcopy(action_expert),
+        "vector_max_states": vector_max_states,
+        "max_sequence_length": max_positions,
+        "vision_token": "<|image_pad|>",
+        "vision_rescale_factor": 1 / 255,
+        "isaac05_fast_tokens": {
+            "enabled": True,
+            "offset": 28 if test_geometry else 249321,
+            "size": 4 if test_geometry else 2048,
+            "tokenizer": "physical-intelligence/fast",
+        },
+        ISAAC_TEST_GEOMETRY_MARKER: test_geometry,
     }
-    if test_geometry:
-        config[LEGACY_TEST_GEOMETRY_MARKER] = True
     return config
+
+
+def _update_action_expert(config: dict[str, Any], **changes: Any) -> None:
+    """Change both copies of the action expert block that the layout stores."""
+    for block in (config, config["isaac05_vla"]):
+        block["action_expert"].update(changes)
 
 
 def _parse_test_config(config: dict | None = None) -> IsaacCheckpointContract:
@@ -292,13 +331,16 @@ def _write_checkpoint(
 ) -> IsaacCheckpointContract:
     root.mkdir()
     checkpoint_config = _config(test_geometry=True) if config is None else copy.deepcopy(config)
+    contract = _parse_test_config(checkpoint_config)
+    shapes = contract.expected_tensor_shapes()
+    artifact = checkpoint_config["isaac05_artifact"]
+    artifact.setdefault("tensor_count", len(shapes))
+    artifact.setdefault("tensor_bytes", sum(math.prod(shape) * 4 for shape in shapes.values()))
     (root / "config.json").write_text(json.dumps(checkpoint_config), encoding="utf-8")
     (root / "tokenizer.json").write_text(
         json.dumps(_tokenizer_payload()),
         encoding="utf-8",
     )
-    contract = _parse_test_config(checkpoint_config)
-    shapes = contract.expected_tensor_shapes()
     if missing_key is not None:
         shapes.pop(missing_key)
     if extra_key is not None:
@@ -362,8 +404,6 @@ def test_production_contract_parses_exact_documented_geometry() -> None:
 
 def test_production_contract_accepts_actual_non_mtp_coord_disabled_variant() -> None:
     config = _config(test_geometry=False, mtp_present=False, coord_enabled=False)
-    config["genesis_artifact"]["trained_steps"] = 10_000
-
     contract = IsaacCheckpointContract.parse_allowlisted(config)
     shapes = contract.expected_tensor_shapes()
 
@@ -526,17 +566,17 @@ def test_reduced_geometry_requires_serialized_and_call_site_opt_in() -> None:
     with pytest.raises(IsaacCheckpointContractError, match="test-only"):
         IsaacCheckpointContract.parse_allowlisted(config)
 
-    del config[LEGACY_TEST_GEOMETRY_MARKER]
-    with pytest.raises(IsaacCheckpointContractError, match="production Isaac"):
+    # Without the marker the tiny geometry is held to the production contract.
+    config[ISAAC_TEST_GEOMETRY_MARKER] = False
+    with pytest.raises(IsaacCheckpointContractError, match="production"):
         IsaacCheckpointContract.parse_allowlisted(config, allow_test_only_reduced_geometry=True)
 
 
 def test_reduced_geometry_permission_accepts_unmarked_production_geometry() -> None:
     config = _config(test_geometry=False)
-    config["genesis_artifact"] = {
+    config["isaac05_artifact"] = {
         "schema_version": 1,
         "artifact_kind": "neutral_debug",
-        "trained_steps": 0,
     }
 
     contract = IsaacCheckpointContract.parse_allowlisted(
@@ -550,23 +590,26 @@ def test_reduced_geometry_permission_accepts_unmarked_production_geometry() -> N
 @pytest.mark.parametrize(
     ("artifact", "message"),
     [
-        ({"artifact_kind": "trained_policy", "trained_steps": 1}, "missing required"),
-        ({"schema_version": 2, "artifact_kind": "trained_policy", "trained_steps": 1}, "schema_version"),
-        ({"schema_version": 1, "artifact_kind": "other", "trained_steps": 1}, "artifact_kind"),
+        ({"artifact_kind": "trained_policy"}, "missing required"),
+        ({"schema_version": 2, "artifact_kind": "trained_policy"}, "schema_version"),
+        ({"schema_version": 1, "artifact_kind": "other"}, "artifact_kind"),
         (
             {
                 "schema_version": 1,
                 "artifact_kind": "trained_policy",
-                "trained_steps": 1,
                 "unbound_provenance": "x",
             },
+            "fields do not match",
+        ),
+        (
+            {"schema_version": 1, "artifact_kind": "trained_policy", "trained_steps": 1},
             "fields do not match",
         ),
     ],
 )
 def test_artifact_identity_is_versioned_and_kind_consistent(artifact: dict, message: str) -> None:
     config = _config(test_geometry=True)
-    config["genesis_artifact"] = artifact
+    config["isaac05_artifact"] = artifact
 
     with pytest.raises(IsaacCheckpointContractError, match=message):
         _parse_test_config(config)
@@ -574,10 +617,9 @@ def test_artifact_identity_is_versioned_and_kind_consistent(artifact: dict, mess
 
 def test_neutral_artifact_accepts_inert_exporter_provenance() -> None:
     config = _config(test_geometry=True)
-    config["genesis_artifact"] = {
+    config["isaac05_artifact"] = {
         "schema_version": 1,
         "artifact_kind": "neutral_debug",
-        "trained_steps": 0,
         "provenance_sha256": "0" * 64,
     }
 
@@ -589,15 +631,15 @@ def test_neutral_artifact_accepts_inert_exporter_provenance() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (("genesis_vla", "schema_version", 2), "schema_version"),
-        (("genesis_vla", "backbone_family", "other"), "backbone_family"),
-        (("genesis_vla", "rmsnorm_weight_convention", "legacy"), "rmsnorm"),
-        (("genesis_vla", "mtp", "present", False), "present"),
-        (("genesis_vla", "mtp", "action_runtime", "execute"), "action_runtime"),
-        (("genesis_coord_tokens", "enabled", False), "unexpected"),
+        (("isaac05_vla", "schema_version", 2), "schema_version"),
+        (("isaac05_vla", "unknown_block", "other"), "unknown_block"),
+        (("isaac05_vla", "rmsnorm_weight_convention", "legacy"), "rmsnorm"),
+        (("isaac05_vla", "mtp", "present", False), "present"),
+        (("isaac05_vla", "mtp", "action_runtime", "execute"), "action_runtime"),
+        (("isaac05_coord_tokens", "enabled", False), "unexpected"),
         (("image_token_id", 99), "inside the exported vocabulary"),
         (("text_config", "tie_word_embeddings", True), "tie_word_embeddings"),
-        (("genesis_vla", "action_expert", "num_layers", 0), "positive"),
+        (("isaac05_vla", "action_expert", "num_layers", 0), "positive"),
         (("output_hidden_states", True), "output_hidden_states"),
         (("return_dict", False), "return_dict"),
         (("attn_implementation", "flash_attention_2"), "must not be serialized"),
@@ -615,6 +657,9 @@ def test_structural_config_mutations_fail_closed(mutation: tuple, message: str) 
     for key in mutation[:-2]:
         target = target[key]
     target[mutation[-2]] = mutation[-1]
+    if mutation[:2] == ("isaac05_vla", "action_expert"):
+        # Keep the two copies equal so the mutated value itself is what gets rejected.
+        config["action_expert"] = copy.deepcopy(config["isaac05_vla"]["action_expert"])
 
     with pytest.raises(IsaacCheckpointContractError, match=message):
         _parse_test_config(config)
@@ -622,7 +667,7 @@ def test_structural_config_mutations_fail_closed(mutation: tuple, message: str) 
 
 def test_root_and_text_null_contracts_must_be_identical() -> None:
     config = _config(test_geometry=True)
-    config["text_config"]["genesis_moe"]["route_scale"] = 0.5
+    config["text_config"]["isaac05_moe"]["route_scale"] = 0.5
 
     with pytest.raises(IsaacCheckpointContractError, match="must be identical"):
         _parse_test_config(config)
@@ -630,7 +675,7 @@ def test_root_and_text_null_contracts_must_be_identical() -> None:
 
 def test_unknown_custom_contract_field_fails_closed() -> None:
     config = _config(test_geometry=True)
-    config["genesis_vla"]["action_expert"]["local_default"] = True
+    config["isaac05_vla"]["action_expert"]["local_default"] = True
 
     with pytest.raises(IsaacCheckpointContractError, match="unexpected"):
         _parse_test_config(config)
@@ -851,55 +896,7 @@ def _write_portable_isaac05_checkpoint(
     """Write a tiny F32 source; optional geometry must pass the real native parser."""
     from safetensors.torch import load_file
 
-    native = _config(test_geometry=True, mtp_present=False) if config is None else config
-    raw = copy.deepcopy(native)
-    raw["model_type"] = "isaac_0_5"
-    raw["architectures"] = ["Isaac05ForConditionalGeneration"]
-    raw["auto_map"] = {
-        "AutoConfig": "configuration_isaac05.Isaac05Config",
-        "AutoModelForCausalLM": "modeling_isaac05.Isaac05ForConditionalGeneration",
-        "AutoProcessor": "processing_isaac05.Isaac05Processor",
-    }
-    raw["storage_dtype"] = "float32"
-    raw["runtime_dtype"] = raw["dtype"] = "bfloat16"
-    raw[ISAAC_TEST_GEOMETRY_MARKER] = raw.pop(LEGACY_TEST_GEOMETRY_MARKER)
-    for name in ("artifact", "coord_tokens", "moe", "vla"):
-        raw[f"isaac05_{name}"] = raw.pop(f"genesis_{name}")
-    raw["text_config"]["isaac05_moe"] = raw["text_config"].pop("genesis_moe")
-    for moe in (raw["isaac05_moe"], raw["text_config"]["isaac05_moe"]):
-        del moe["null_expert_semantics"], moe["shared_expert_mode"]
-    del raw["isaac05_vla"]["backbone_family"]
-    action = raw["isaac05_vla"]["action_expert"]
-    del action["clean_at_0"]
-    action.update(
-        type="dit",
-        schema_version=1,
-        num_inference_steps=10,
-        timestep_sampling_alpha=1.5,
-        timestep_sampling_beta=1.0,
-        timestep_sampling_scale=0.999,
-        timestep_sampling_offset=0.001,
-        train_samples_per_chunk=8,
-        rtc_max_delay_steps=12,
-        rtc_probability=0.5,
-        rtc_delay_sampling="poisson",
-        rtc_poisson_mean=5.0,
-        mask_padded_action_rows=True,
-        drop_action_dim_overflow=False,
-        k_batched_cross_attn=True,
-        k_batched_cross_attn_backend="flash_gqa",
-    )
-    raw["action_expert"] = copy.deepcopy(action)
-    raw["vector_max_states"] = 4
-    raw["max_sequence_length"] = 128
-    raw["vision_token"] = "<|image_pad|>"
-    raw["vision_rescale_factor"] = 1 / 255
-    raw["isaac05_fast_tokens"] = {
-        "enabled": True,
-        "offset": 28,
-        "size": 4,
-        "tokenizer": "physical-intelligence/fast",
-    }
+    raw = copy.deepcopy(_config(test_geometry=True, mtp_present=False) if config is None else config)
     expected = _write_checkpoint(root, config=raw)
     total_bytes = 0
     tensor_count = 0

@@ -55,8 +55,6 @@ def _metadata(
         "route_norm": True,
         "route_scale": route_scale,
         "score_before_experts": False,
-        "null_expert_semantics": "skip_compute_renormalize_real_routes",
-        "shared_expert_mode": "sigmoid_gated_additive",
         "uses_expert_bias": False,
     }
 
@@ -200,7 +198,6 @@ def test_deterministic_null_moe_block_is_bitwise_stable_on_cuda() -> None:
         ("score_func", "sigmoid", "score_func"),
         ("route_norm", False, "route_norm"),
         ("score_before_experts", True, "score_before_experts"),
-        ("shared_expert_mode", "ungated_additive", "shared_expert_mode"),
         ("uses_expert_bias", True, "uses_expert_bias"),
     ],
 )

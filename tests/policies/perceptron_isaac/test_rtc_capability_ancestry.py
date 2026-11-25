@@ -24,7 +24,6 @@ from lerobot.policies.chunk import ExecutionMode
 from lerobot.policies.perceptron_isaac.configuration_perceptron_isaac import PerceptronIsaacConfig
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.rtc import RtcCapability, resolve_rtc_capability
-from lerobot.policies.perceptron_isaac.trained_package import finalize_canonical_trained_package
 from tests.policies.perceptron_isaac.test_checkpoint_lifecycle import _config, _source_package
 from tests.policies.perceptron_isaac.test_trained_storage_contract import (
     _render_metadata,
@@ -46,7 +45,7 @@ reduced_loader = _reduced_loader
         pytest.param({"rtc_max_delay_steps": 30, "rtc_probability": 0.5}, 8, 0, 7, True, id="short_chunk"),
         pytest.param({"rtc_max_delay_steps": 30, "rtc_probability": 0.0}, 60, 0, 0, False, id="zero_prob"),
         pytest.param({"rtc_max_delay_steps": 0, "rtc_probability": None}, 60, 0, 0, False, id="no_budget"),
-        pytest.param({"type": "molmoact"}, 60, None, 0, False, id="legacy_block"),
+        pytest.param({"type": "dit"}, 60, None, 0, False, id="no_rtc_fields"),
         pytest.param(None, 60, 0, 0, False, id="no_recipe"),
     ],
 )
@@ -124,13 +123,11 @@ def _trained_policy(root: Path, *, max_delay: int, probability: float | None) ->
     render_metadata = json.loads(render_metadata_path.read_text())
     render_metadata["emit_observation_timestamps"] = False
     render_metadata_path.write_text(json.dumps(render_metadata))
-    finalize_canonical_trained_package(
-        config, root, mk1_source_model_import_sha256=config.mk1_source_model_import_sha256
-    )
+    config._save_pretrained(root)
     policy = PerceptronIsaacPolicy.from_pretrained(root, local_files_only=True)
     assert policy.config.rtc_final_stage_max_delay_steps is None, "a source package records no stage"
     policy._load_backbone()
-    policy._retain_verified_runtime_assets(root)
+    policy._retain_runtime_assets(root)
     policy._configure_training_parameters()
     return policy
 
@@ -152,16 +149,14 @@ def test_rtc_off_finetune_of_an_rtc_capable_source_inherits_the_budget(
     source = tmp_path / "source"
     policy = _trained_policy(source, max_delay=12, probability=0.5)
     source_model_config = (source / "hf_model" / "config.json").read_bytes()
-    source_identity = policy.config.mk1_source_model_import_sha256
     assert policy.config.flow_rtc_max_delay_steps == 0
     saved = tmp_path / "saved"
 
     reloaded = _save_and_reload(policy, saved)
 
-    # The declared budget and its source provenance are carried forward byte for byte.
+    # The declared budget is carried forward byte for byte.
     assert (saved / "hf_model" / "config.json").read_bytes() == source_model_config
     saved_config = json.loads((saved / "config.json").read_text())
-    assert saved_config["mk1_source_model_import_sha256"] == source_identity
     # The stage records that it trained without RTC, separately from that declaration.
     assert saved_config["rtc_final_stage_max_delay_steps"] == 0
     assert saved_config["flow_rtc_max_delay_steps"] == 0

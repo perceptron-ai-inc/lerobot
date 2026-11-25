@@ -25,7 +25,7 @@ from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import (
     build_action_expert_head,
     setup_qwen35_vla_for_training,
 )
-from tests.policies.perceptron_isaac.test_action_expert_contract import _dit_contract, _molmoact_cfg
+from tests.policies.perceptron_isaac.test_action_expert_contract import _dit_contract
 from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _write_portable_isaac05_checkpoint,
 )
@@ -142,8 +142,8 @@ def _prefix_length(length_form: str) -> int | list[int] | Tensor | None:
 
 
 @pytest.mark.parametrize("length_form", ["inferred", "scalar", "tensor"])
-def test_legacy_expert_also_rejects_rtc_execution_prefix(length_form: str) -> None:
-    head = build_action_expert_head(_molmoact_cfg(), vlm_dim=16)
+def test_expert_without_declared_rtc_also_rejects_rtc_execution_prefix(length_form: str) -> None:
+    head = build_action_expert_head(_dit_contract(), vlm_dim=16)
     with pytest.raises(ValueError, match="(?i)(rtc|prefix)"):
         head.sample(
             torch.zeros(1, 3, 16),
@@ -193,7 +193,7 @@ def test_rtc_capable_weights_keep_ordinary_sampling_abi_and_rng_order() -> None:
         with torch.no_grad():
             head.action_expert.final_layer.linear.weight.normal_(std=0.03)
             head.action_expert.final_layer.linear.bias.fill_(0.2)
-        reference = build_action_expert_head(_molmoact_cfg(), vlm_dim=16)
+        reference = build_action_expert_head(_dit_contract(), vlm_dim=16)
         reference.load_state_dict(head.state_dict(), strict=True)
         context = torch.linspace(-1, 1, 48).reshape(1, 3, 16)
         torch.manual_seed(23)

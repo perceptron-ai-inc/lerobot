@@ -4,6 +4,7 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -45,7 +46,17 @@ from lerobot.policies.perceptron_isaac.tensor_stream import (
 from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _config as _isaac_config,
     _write_checkpoint,
+    _write_portable_isaac05_checkpoint,
 )
+
+# An F32 runtime is only available to the training load path, which needs F32 storage.
+_F32_TRAINING_LOAD: dict[str, Any] = {
+    "dtype": torch.float32,
+    "device": "cpu",
+    "allow_test_only_reduced_geometry": True,
+    "allowed_storage_dtypes": frozenset({"F32"}),
+    "load_intent": "training",
+}
 
 
 def _action_stream() -> TensorStream:
@@ -199,7 +210,7 @@ def test_isaac_runtime_checkpoint_layout_real_loader_survives_move(tmp_path) -> 
     )
 
     runtime_config = json.loads((runtime / "config.json").read_text())
-    assert runtime_config["genesis_vla"]["mtp"] == {
+    assert runtime_config["isaac05_vla"]["mtp"] == {
         "present": False,
         "physical_layers": 0,
         "rollout_steps": 0,
@@ -261,35 +272,19 @@ def test_isaac_config_normalizes_real_export_omissions_to_qualified_runtime_defa
     assert config.text_config.output_router_logits is False
     assert config.text_config.norm_topk_prob is True
     # Loading may add runtime defaults to its private copy, never the strict
-    # checkpoint JSON object that was validated and authenticated.
+    # checkpoint JSON object that was validated.
     assert "output_attentions" not in raw
     assert "norm_topk_prob" not in raw["text_config"]
 
 
-def test_isaac_loader_can_cast_checkpoint_storage_for_training(tmp_path) -> None:
-    model_dir = tmp_path / "isaac"
-    _write_checkpoint(model_dir)
-
-    model, _, _ = load_isaac_vla_from_hf(
-        model_dir,
-        dtype=torch.float32,
-        device="cpu",
-        allow_test_only_reduced_geometry=True,
-    )
-
-    assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
-
-
 def test_isaac_loader_applies_explicit_runtime_sdpa_to_text_and_vision(tmp_path) -> None:
     model_dir = tmp_path / "isaac"
-    _write_checkpoint(model_dir)
+    _write_portable_isaac05_checkpoint(model_dir)
 
     model, config, _ = load_isaac_vla_from_hf(
         model_dir,
-        dtype=torch.float32,
-        device="cpu",
-        allow_test_only_reduced_geometry=True,
         attention_backend=TORCH_SDPA_ATTENTION_BACKEND,
+        **_F32_TRAINING_LOAD,
     )
 
     assert config._attn_implementation == "sdpa"
@@ -445,7 +440,7 @@ def test_isaac_loader_rejects_unknown_runtime_attention_backend(tmp_path) -> Non
     with pytest.raises(ValueError, match="Unsupported Isaac attention backend"):
         load_isaac_vla_from_hf(
             model_dir,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             device="cpu",
             allow_test_only_reduced_geometry=True,
             # Deliberately violate the static Literal at the runtime validation boundary.
@@ -604,13 +599,8 @@ def test_isaac_loader_rejects_tokenizer_mutation_before_model_allocation(tmp_pat
 
 def test_reduced_checkpoint_runs_existing_vla_action_path_deterministically(tmp_path) -> None:
     model_dir = tmp_path / "isaac"
-    contract = _write_checkpoint(model_dir)
-    model, _, _ = load_isaac_vla_from_hf(
-        model_dir,
-        dtype=torch.float32,
-        device="cpu",
-        allow_test_only_reduced_geometry=True,
-    )
+    contract, _, _ = _write_portable_isaac05_checkpoint(model_dir)
+    model, _, _ = load_isaac_vla_from_hf(model_dir, **_F32_TRAINING_LOAD)
     stream = _action_stream()
 
     torch.manual_seed(123)
