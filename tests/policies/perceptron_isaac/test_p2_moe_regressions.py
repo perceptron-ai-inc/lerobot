@@ -19,20 +19,20 @@ from torch import Tensor, nn
 
 pytest.importorskip("transformers", reason="requires lerobot[perceptron_isaac]")
 
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContract
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import perceptron_isaac_training_loss
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAForActionGeneration,
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAForActionGeneration,
     _build_config,
 )
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import ModelOutput
 from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import (
-    GenesisNullSparseMoeBlock,
-    GenesisNullTopKRouter,
+    IsaacNullSparseMoeBlock,
+    IsaacNullTopKRouter,
 )
 from lerobot.policies.perceptron_isaac.tensor_stream import Event, TensorStream, TextType, create_stream
 from tests.policies.perceptron_isaac._fixtures import ZeroExpert, flow_stream
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config
 from tests.policies.perceptron_isaac.test_modeling_qwen36_moe import _text_config
 
 
@@ -59,7 +59,7 @@ def _reference_auxiliary(physical_logits: Tensor, *, real: int, null: int, top_k
 
 
 def _capture_router_logits(module: nn.Module, inputs: tuple[Tensor, ...], captures: list[Tensor]) -> None:
-    assert isinstance(module, GenesisNullSparseMoeBlock)
+    assert isinstance(module, IsaacNullSparseMoeBlock)
     hidden = inputs[0].reshape(-1, module.gate.in_features)
     captures.append(functional.linear(hidden, module.gate.weight))
 
@@ -73,11 +73,11 @@ def test_native_null_model_joint_loss_has_exact_layer_mean_auxiliary_and_null_gr
     raw = _config(test_geometry=True, mtp_present=False)
     raw["text_config"]["layer_types"] = ["full_attention", "full_attention"]
     raw["text_config"]["full_attention_interval"] = 1
-    contract = Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+    contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
     with torch.random.fork_rng():
         torch.manual_seed(47)
-        model = Mk1Qwen36VLAForActionGeneration(_build_config(raw, contract)).float().train()
-    blocks = [module for module in model.modules() if isinstance(module, GenesisNullSparseMoeBlock)]
+        model = IsaacQwen36VLAForActionGeneration(_build_config(raw, contract)).float().train()
+    blocks = [module for module in model.modules() if isinstance(module, IsaacNullSparseMoeBlock)]
     assert len(blocks) == 2
     with torch.no_grad():
         for layer, block in enumerate(blocks):
@@ -157,7 +157,7 @@ def test_native_null_model_joint_loss_has_exact_layer_mean_auxiliary_and_null_gr
 
 @pytest.mark.parametrize("routing", ["all_null", "real_first_tie"])
 def test_reference_router_terms_reach_backward_even_when_task_has_no_null_signal(routing: str) -> None:
-    router = GenesisNullTopKRouter(_text_config(num_null_experts=3))
+    router = IsaacNullTopKRouter(_text_config(num_null_experts=3))
     with torch.no_grad():
         router.weight.zero_()
         if routing == "all_null":

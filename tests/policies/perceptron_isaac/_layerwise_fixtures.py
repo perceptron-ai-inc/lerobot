@@ -10,9 +10,9 @@ from typing import Any
 
 import torch
 
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContract
 from tests.policies.perceptron_isaac.test_action_expert_contract import _dit_contract
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
     _write_portable_isaac05_checkpoint,
 )
 
@@ -51,7 +51,7 @@ def declare_native_layerwise(raw: dict[str, Any], *, layers: tuple[int, ...] = (
 class LayerwiseCheckpoint:
     root: Path
     raw: dict[str, Any]
-    schema1_contract: Mk1CheckpointContract
+    schema1_contract: IsaacCheckpointContract
     source_value: torch.Tensor
 
 

@@ -39,9 +39,9 @@ from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import (
     ISAAC_FLOW_NOISE_KEY,
     ISAAC_FLOW_TIMESTEPS_KEY,
 )
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAForActionGeneration,
-    Mk1Qwen36VLAModel,
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAForActionGeneration,
+    IsaacQwen36VLAModel,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import Qwen35VLAModel, _ordered_modality_input
@@ -120,7 +120,7 @@ def _assert_rng_equal(actual: dict[str, Tensor], expected: dict[str, Tensor]) ->
 
 def _expected_schedule_metrics(
     policy: PerceptronIsaacPolicy,
-    model: Mk1Qwen36VLAForActionGeneration,
+    model: IsaacQwen36VLAForActionGeneration,
     stream: TensorStream,
 ) -> dict[str, float]:
     """Use native predictions, but no production loss or supervision selector as the oracle."""
@@ -404,8 +404,8 @@ def _schedule_worker(rank: int, directory: str, case: ScheduleCase) -> None:
             dist.destroy_process_group()
 
 
-def test_mk1_borrows_the_shared_sharded_modality_schedule() -> None:
-    assert Mk1Qwen36VLAModel._embed_sharded_modalities is Qwen35VLAModel._embed_sharded_modalities
+def test_isaac_borrows_the_shared_sharded_modality_schedule() -> None:
+    assert IsaacQwen36VLAModel._embed_sharded_modalities is Qwen35VLAModel._embed_sharded_modalities
 
 
 @pytest.mark.parametrize("frozen", [False, True], ids=["active", "frozen"])

@@ -2,13 +2,12 @@
 
 Processors own mharmony packing, FAST target construction, stats
 normalization, and action unnormalization. The policy owns inference state and
-the joint text/FAST/flow training loss. Genesis bridge rendering and loss paths
-are intentionally unsupported.
+the joint text/FAST/flow training loss.
 """
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
 
@@ -30,13 +29,16 @@ from .rtc import RtcCapability, resolve_rtc_capability
 # Checkpoint-local stats sidecar, saved relative to keep native packages relocatable.
 NATIVE_STATS_EXPORT_FILENAME = "isaac_stats.json"
 
-# The inference recipe a Genesis export ships at its root. Its rendering block is the
+# The inference recipe an export ships at its root. Its rendering block is the
 # checkpoint's own declaration of the mHarmony reserved-token layout it was trained with.
 NATIVE_RECIPE_EXPORT_FILENAME = "policy_inference_recipe.json"
 
-# Fields that the runtime config no longer has. Authenticated packages still carry them, so they are
+# Fields that the runtime config no longer has. Saved packages may still carry them, so they are
 # dropped when a config is read and their files are never rewritten.
-RETIRED_CONFIG_FIELDS = frozenset({"trained_steps", "action_expert_type"})
+RETIRED_CONFIG_FIELDS = frozenset({"action_expert_type"})
+# Packages used to bind their files with SHA-256 digests stored in the config. Those digests are no
+# longer checked, so a stored digest key that is not a field any more is dropped the same way.
+RETIRED_DIGEST_SUFFIX = "_sha256"
 
 
 def reject_legacy_action_conditioning(enabled: bool) -> None:
@@ -98,12 +100,12 @@ def _ensure_vla_feature_contract(
 @PreTrainedConfig.register_subclass("perceptron_isaac")
 @dataclass
 class PerceptronIsaacConfig(PreTrainedConfig):
-    """Native MK1/Isaac-0.5 policy geometry, rendering, inference and dense-training configuration."""
+    """Native Isaac-0.5 policy geometry, rendering, inference and dense-training configuration."""
 
     # --- observation / action geometry ---
     # Released ISAAC checkpoints use either one observation (post3279) or a
-    # three-frame history (nobs3 experiments). The importer writes the exact
-    # checkpoint-owned value into the packaged policy config.
+    # three-frame history (nobs3 experiments). The packaged policy config carries the
+    # exact checkpoint-owned value.
     n_obs_steps: int = 3
     chunk_size: int = 30
     n_action_steps: int = 30
@@ -114,27 +116,27 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     max_state_dim: int = 128
 
     # --- expert / inference ---
-    # Native eval/serving backend. No Genesis bridge backend is supported.
+    # Native eval/serving backend.
     inference_backend: str = "native_mharmony"
     num_inference_steps: int = 10
     # Flow-sample averaging: sample the flow ODE `num_flow_samples` times (fresh noise each) and
     # mean the normalized chunks before unnormalize. 1 = single sample (no averaging).
     num_flow_samples: int = 1
     flow_seed_base: int | None = None
-    # Deployment-only clamp control. Quantile normalization and authenticated source
+    # Deployment-only clamp control. Quantile normalization and source
     # profiles remain unchanged; training/replay always retain their source clipping.
     inference_clip_normalized_proprio: bool = True
     # Flow-target clip. This is the checkpoint-owned value: the inference recipe carries it on
-    # the ``flow_action`` wire, and the importer copies it from there.
+    # the ``flow_action`` wire, and the package is built with it copied from there.
     clip_normalized_max: float = 10.0
-    # FAST-target clip, applied only to the tokenizer input. Genesis lowers the two objectives
+    # FAST-target clip, applied only to the tokenizer input. Pretraining lowers the two objectives
     # through separate transforms with independent caps, so a single shared cap trains FAST on
-    # a different action distribution than Genesis does.
+    # a different action distribution than the base saw.
     #
     # This default is NOT universal -- it must match the base recipe's
     # ``dataset.transforms.strategies.overrides.action.clip_normalized_max``, which each
     # pretraining run sets independently of the ``fast_tokenizer`` library default of 1.0:
-    #   LIBERO/Genesis lineage (hf-genesis-ft10, hf-genesis-ft40k):        FAST 1.0,  Flow 10.0
+    #   LIBERO lineage:                                                    FAST 1.0,  Flow 10.0
     #   bi-YAM lineage (hf-midtrain-step80000, hf-r4-step-200000):         FAST 10.0, Flow 10.0
     # Check the base's config.toml before finetuning, and set this deliberately rather than
     # inheriting the default. The caps are not interchangeable: q01/q99 normalization puts real
@@ -150,8 +152,8 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # start of each episode before the policy controls, so the sim stabilizes from the init state.
     # 0 disables.
     #
-    # This is NOT the right lever for matching Genesis's LIBERO settling. Genesis waits
-    # NUM_STEPS_WAIT=50 inside its adapter's reset, stepping the simulator directly, so that
+    # This is NOT the right lever for LIBERO settling. The bases were evaluated with a wait of
+    # NUM_STEPS_WAIT=50 inside the environment reset, stepping the simulator directly, so that
     # wait is free and the policy still gets the full 280-step episode budget. These idle
     # actions instead come out of `select_action` and are consumed from that same budget.
     # LeRobot's LiberoEnv has the equivalent free wait (`num_steps_wait`, applied in reset);
@@ -178,10 +180,10 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     # second. Saving this mapping prevents those slot labels from being
     # misread as mount semantics at deployment time.
     serving_camera_roles: dict[str, str] | None = None
-    allow_image_key_fallback: bool = True  # compatibility only; authenticated imports set false
+    allow_image_key_fallback: bool = True  # compatibility only; built packages set false
     # False passes gripper dimensions through in physical units instead of q01/q99-normalizing
     # them, matching MolmoAct2's `normalize_gripper: false` and its saved per-dim stat mask.
-    # Genesis normalizes every dimension, so True is what the ISAAC bases were pretrained with;
+    # The ISAAC bases were pretrained with every dimension normalized, which is True here;
     # setting False changes the representation the base saw and is an opt-in experiment.
     # The gripper dimensions are found by name from action_feature_names/state_feature_names,
     # as MolmoAct2's _default_feature_mask does, and the resulting mask is serialized into the
@@ -214,7 +216,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     training_action_frame_contract_version: int = 2
 
     # --- model / checkpoint paths (filled by the user / launcher) ---
-    hf_model_path: str | None = None  # native MK1 composite model directory
+    hf_model_path: str | None = None  # native Isaac composite model directory
     # Zero-step packages exercise checkpoint/model plumbing but are never deployable.
     artifact_kind: str = "trained_policy"
     # Read existing native configs that serialized false; native norms need no conversion.
@@ -246,9 +248,9 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     robot_type: str = "generic"
     control_mode: str = "joint"
     target_fps: float | None = None
-    # Importer-owned deployment geometry. Generic rollout consumes these
+    # Deployment geometry written when the package is built. Generic rollout consumes these
     # fields without branching on policy type and fails before connect when
-    # the robot cannot satisfy an authenticated package contract.
+    # the robot cannot satisfy the package contract.
     action_feature_names: list[str] | None = None
     state_feature_names: list[str] | None = None
     strict_hardware_feature_contract: bool = False
@@ -256,15 +258,10 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     normalization_profile_id: str | None = None
     normalization_profile_scope: str | None = None
     normalization_validation_status: str | None = None
-    deployment_adapter_sha256: str | None = None
-    qwen35_trained_package_manifest_sha256: str | None = None
-    mk1_model_import_sha256: str | None = None
-    mk1_source_model_import_sha256: str | None = None
-    mk1_trained_package_manifest_sha256: str | None = None
     native_render_metadata_path: str | None = None
     native_stats_path: str | None = None
     # Per-suite training normalization. Multi-suite LIBERO training (all four suites in one
-    # dataset, as Genesis's cloud/libero:1.0 does) must normalize each sample by its own suite:
+    # dataset) must normalize each sample by its own suite:
     # end-effector height spans [0.916, 1.286] in libero_spatial but [0.010, 0.337] in
     # libero_object, so cross-normalizing pushes proprio far outside [-1, 1]. Set both together;
     # inference is single-scope by contract and leaves them unset.
@@ -335,8 +332,14 @@ class PerceptronIsaacConfig(PreTrainedConfig):
 
     @classmethod
     def migrate_config(cls, config: dict[str, Any]) -> dict[str, Any]:
-        """Retire fields only in memory; authenticated files stay byte-exact."""
-        return {key: value for key, value in config.items() if key not in RETIRED_CONFIG_FIELDS}
+        """Retire fields only in memory; saved files stay byte-exact."""
+        current = {item.name for item in fields(cls)}
+        return {
+            key: value
+            for key, value in config.items()
+            if key not in RETIRED_CONFIG_FIELDS
+            and not (key.endswith(RETIRED_DIGEST_SUFFIX) and key not in current)
+        }
 
     def raw_export_saving_unsupported(self, package_root: Path | None = None) -> bool:
         """Recognize raw layouts without allocating a policy or changing relative paths."""
@@ -348,8 +351,11 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         model_root = Path(self.hf_model_path)
         if not model_root.is_absolute() and root is not None:
             model_root = Path(root) / model_root
-        return is_portable_isaac05_repository(model_root) and not (
-            self.mk1_model_import_sha256 or self.mk1_source_model_import_sha256
+        package_model_root = Path(root) / "hf_model" if root is not None else None
+        # Saving copies the package and rewrites its own hf_model/, so a model directory that lives
+        # anywhere else cannot be saved.
+        return is_portable_isaac05_repository(model_root) and (
+            package_model_root is None or model_root.resolve() != package_model_root.resolve()
         )
 
     def validate_training_intent(self, intent: PolicyTrainingIntent) -> None:
@@ -371,7 +377,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         ):
             raise ValueError(
                 "Raw/portable-export save, publish and EMA training intents are unsupported; "
-                "disable checkpoint saving, Hub publishing and EMA, or use a source-bound native MK1 package."
+                "disable checkpoint saving, Hub publishing and EMA, or use a package that holds its own hf_model/."
             )
 
     def __post_init__(self) -> None:
@@ -380,7 +386,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         if not isinstance(self.inference_clip_normalized_proprio, bool):
             raise ValueError("inference_clip_normalized_proprio must be a boolean.")
         if self.apply_offset_norm is not False:
-            raise ValueError("Native MK1 checkpoints forbid apply_offset_norm=True.")
+            raise ValueError("Native Isaac checkpoints forbid apply_offset_norm=True.")
         if self.use_peft or self.train_expert_only:
             raise ValueError(
                 "Perceptron ISAAC supports only dense training; PEFT and expert-only training are unsupported."
@@ -540,16 +546,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
             raise ValueError("Perceptron Isaac native metadata requires a non-empty control_mode.")
         if self.policy_state_dataset is not None and not str(self.policy_state_dataset).strip():
             raise ValueError("policy_state_dataset must be a non-empty string when set.")
-        for field_name in (
-            "deployment_adapter_sha256",
-            "qwen35_trained_package_manifest_sha256",
-            "mk1_model_import_sha256",
-            "mk1_source_model_import_sha256",
-            "mk1_trained_package_manifest_sha256",
-        ):
-            value = getattr(self, field_name)
-            if value is not None and not is_lowercase_sha256(value):
-                raise ValueError(f"{field_name} must be a lowercase SHA-256 digest.")
         if self.target_fps is not None and float(self.target_fps) <= 0.0:
             raise ValueError("Perceptron Isaac target_fps must be positive when set.")
         for label, names, width in (
@@ -601,7 +597,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         ``pretrained_path`` is the policy package, which for a raw Isaac-0.5 export is
         ``<root>/lerobot_policy`` while the documented sidecars sit at ``<root>``.
         """
-        # The policy loader retains already-verified sidecars here. Never rediscover
+        # The policy loader retains the package sidecars here. Never rediscover
         # recipe/stats bytes from the mutable original package after that handoff.
         retained_root = vars(self).get("_pretrained_processor_root")
         if retained_root is not None:
@@ -619,7 +615,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
     def resolve_native_stats_path(self) -> str | None:
         """Return the normalization stats path this config can actually load.
 
-        The declared fields win, so an importer-written package keeps pointing at its
+        The declared fields win, so a built package keeps pointing at its
         own sidecar. A raw export declares neither, so fall back to the conventional
         ``isaac_stats.json`` beside the package it was loaded from: the same filename
         ``_save_pretrained`` writes, carrying the same quantiles the packaged
@@ -638,7 +634,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         """Return the inference recipe shipped beside the package this config was loaded from.
 
         A raw export keeps ``policy_inference_recipe.json`` at its root, next to the
-        ``lerobot_policy/`` package, exactly like ``isaac_stats.json``. An importer-written
+        ``lerobot_policy/`` package, exactly like ``isaac_stats.json``. A built
         package ships ``native_render_metadata.json`` instead, and a config with no
         ``pretrained_path`` has no checkpoint to read, so both return ``None`` here.
         """
@@ -652,7 +648,7 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         """Return the checkpoint's inference recipe wherever its layout keeps it.
 
         A raw export keeps it at the export root and a package keeps it in ``hf_model``.
-        After loading, both are read from the verified runtime snapshot.
+        After loading, both are read from the retained runtime snapshot.
         """
         for root in self.checkpoint_asset_roots():
             for candidate in (
@@ -723,13 +719,6 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         """
         config = super().to_dict()
         metadata = vars(self)
-        for name in (
-            "mk1_model_import_sha256",
-            "mk1_source_model_import_sha256",
-        ):
-            export_name = f"_export_{name}"
-            if export_name in metadata:
-                config[name] = metadata[export_name]
         for name, record in metadata.get("_checkpoint_relative_paths", {}).items():
             if (
                 isinstance(record, dict)
@@ -944,6 +933,10 @@ class PerceptronIsaacConfig(PreTrainedConfig):
         native mharmony packer pads/normalizes the proprio vector for the model.
         """
         self._validate_declared_feature_widths()
+        if self.input_features is None or self.output_features is None:
+            raise ValueError(
+                "`input_features` and `output_features` must be resolved before validating them."
+            )
         _ensure_vla_feature_contract(
             self.input_features,
             self.output_features,

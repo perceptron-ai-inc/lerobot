@@ -31,6 +31,7 @@ import stat
 import subprocess
 import sys
 import traceback
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,13 +45,13 @@ pytest.importorskip("transformers", reason="transformers is required (install le
 
 from accelerate import Accelerator  # noqa: E402
 
-from lerobot.policies.perceptron_isaac import modeling_mk1_vla, modeling_perceptron_isaac  # noqa: E402
+from lerobot.policies.perceptron_isaac import modeling_isaac_vla, modeling_perceptron_isaac  # noqa: E402
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import (  # noqa: E402
     FullShardTopology,
     PerceptronIsaacPolicy,
     inspect_fsdp2_trainable_masters,
 )
-from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import GenesisQwen36GatedDeltaNet  # noqa: E402
+from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import IsaacQwen36GatedDeltaNet  # noqa: E402
 from tests.policies.perceptron_isaac.test_portable_model_repo import (  # noqa: E402
     _install_distributed_state,
     _native_portable_package,
@@ -180,8 +181,8 @@ class _LoaderStoppedError(Exception):
 
 
 def _record_loader_calls(monkeypatch: pytest.MonkeyPatch, *, stop: bool = False) -> list[dict]:
-    """Record the keyword arguments the policy passes to the MK1 loader (then load, or stop)."""
-    real_loader = modeling_mk1_vla.load_mk1_vla_from_hf
+    """Record the keyword arguments the policy passes to the Isaac loader (then load, or stop)."""
+    real_loader = modeling_isaac_vla.load_isaac_vla_from_hf
     calls: list[dict] = []
 
     def recording_loader(*args: object, **kwargs: object):
@@ -190,20 +191,20 @@ def _record_loader_calls(monkeypatch: pytest.MonkeyPatch, *, stop: bool = False)
             raise _LoaderStoppedError("recorded")
         return real_loader(*args, **kwargs)
 
-    monkeypatch.setattr(modeling_mk1_vla, "load_mk1_vla_from_hf", recording_loader)
+    monkeypatch.setattr(modeling_isaac_vla, "load_isaac_vla_from_hf", recording_loader)
     return calls
 
 
-def _gdn_modules(model: torch.nn.Module) -> list[GenesisQwen36GatedDeltaNet]:
-    modules = [module for module in model.modules() if isinstance(module, GenesisQwen36GatedDeltaNet)]
+def _gdn_modules(model: torch.nn.Module) -> list[IsaacQwen36GatedDeltaNet]:
+    modules = [module for module in model.modules() if isinstance(module, IsaacQwen36GatedDeltaNet)]
     assert modules, "the reduced fixture must contain gated-delta-net layers"
     return modules
 
 
 def _uses_torch_gdn_fallbacks(module: torch.nn.Module) -> bool:
     return (
-        module.causal_conv1d_update is modeling_mk1_vla.torch_causal_conv1d_update
-        and module.chunk_gated_delta_rule is modeling_mk1_vla.torch_chunk_gated_delta_rule
+        module.causal_conv1d_update is modeling_isaac_vla.torch_causal_conv1d_update
+        and module.chunk_gated_delta_rule is modeling_isaac_vla.torch_chunk_gated_delta_rule
     )
 
 
@@ -289,8 +290,8 @@ import json, sys
 from pathlib import Path
 import torch
 from accelerate import init_empty_weights
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import read_and_validate_safetensors_index
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import _stream_checkpoint_tensors
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import read_and_validate_safetensors_index
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import _stream_checkpoint_tensors
 
 def anon():
     for line in Path("/proc/self/status").read_text().splitlines():
@@ -347,7 +348,7 @@ def test_the_f32_streaming_primitive_adds_no_anonymous_copy_in_a_fresh_process(t
     """R2 (isolated characterization of the unchanged loader primitive, with a copying control).
 
     A fresh process per measurement, warmed up through the same primitive. The F32 stream must add
-    under 10% of the tensor bytes; the BF16 stream -- the pre-candidate MK1 call -- must add at least
+    under 10% of the tensor bytes; the BF16 stream -- the pre-candidate Isaac call -- must add at least
     40% (a BF16 copy is 50%), proving the measurement detects a copy.
     """
     numel = 16 * 1024 * 1024  # 64 MiB of F32: well above allocator noise
@@ -391,20 +392,23 @@ def test_fsdp2_policy_passes_the_run_device_to_the_loader(tmp_path, monkeypatch)
 
 
 def _production_loader_spies(monkeypatch, tmp_path):
-    from tests.policies.perceptron_isaac.test_modeling_mk1_vla import _mk1_config, _production_mk1_contract
+    from tests.policies.perceptron_isaac.test_modeling_isaac_vla import (
+        _isaac_config,
+        _production_isaac_contract,
+    )
 
-    raw = _mk1_config(test_geometry=True)
-    contract = _production_mk1_contract(raw)
+    raw = _isaac_config(test_geometry=True)
+    contract = _production_isaac_contract(raw)
     reads: list[object] = []
 
     def unexpected_read(*args, **kwargs):
         reads.append(args)
         raise AssertionError("safetensors must not be read before the qualified Torch ABI gate")
 
-    monkeypatch.setattr(modeling_mk1_vla, "read_mk1_config_data", lambda *a, **k: (raw, contract))
-    monkeypatch.setattr(modeling_mk1_vla, "read_and_validate_safetensors_index", unexpected_read)
-    monkeypatch.setattr(modeling_mk1_vla.torch, "__version__", "2.11.0+cu128")
-    monkeypatch.setattr(modeling_mk1_vla.torch.version, "cuda", "12.8")
+    monkeypatch.setattr(modeling_isaac_vla, "read_isaac_config_data", lambda *a, **k: (raw, contract))
+    monkeypatch.setattr(modeling_isaac_vla, "read_and_validate_safetensors_index", unexpected_read)
+    monkeypatch.setattr(modeling_isaac_vla.torch, "__version__", "2.11.0+cu128")
+    monkeypatch.setattr(modeling_isaac_vla.torch.version, "cuda", "12.8")
     return reads
 
 
@@ -415,7 +419,7 @@ def test_host_materialization_for_a_cuda_run_refuses_an_unqualified_production_a
     reads = _production_loader_spies(monkeypatch, tmp_path)
 
     with pytest.raises(RuntimeError, match="requires.*parity-qualified"):
-        modeling_mk1_vla.load_mk1_vla_from_hf(
+        modeling_isaac_vla.load_isaac_vla_from_hf(
             tmp_path / "config-is-mocked",
             dtype=torch.float32,
             device="cpu",
@@ -802,7 +806,7 @@ def test_loader_default_keeps_the_cpu_abi_exemption(tmp_path, monkeypatch) -> No
     reads = _production_loader_spies(monkeypatch, tmp_path)
 
     with pytest.raises(AssertionError, match="safetensors must not be read"):
-        modeling_mk1_vla.load_mk1_vla_from_hf(tmp_path / "config-is-mocked", device="cpu")
+        modeling_isaac_vla.load_isaac_vla_from_hf(tmp_path / "config-is-mocked", device="cpu")
     assert len(reads) == 1, "the cpu load passed the ABI gate and reached the safetensors read"
 
 
@@ -811,19 +815,19 @@ def test_loader_default_cuda_load_still_refuses_an_unqualified_abi(tmp_path, mon
     reads = _production_loader_spies(monkeypatch, tmp_path)
 
     with pytest.raises(RuntimeError, match="requires.*parity-qualified"):
-        modeling_mk1_vla.load_mk1_vla_from_hf(tmp_path / "config-is-mocked", device="cuda")
+        modeling_isaac_vla.load_isaac_vla_from_hf(tmp_path / "config-is-mocked", device="cuda")
     assert reads == []
 
 
 def test_loader_default_cpu_load_keeps_the_torch_gdn_fallbacks(tmp_path) -> None:
     """Control: a plain cpu load (no run device) still runs GDN on the torch CPU fallbacks."""
-    from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import (
+    from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
         _write_portable_isaac05_checkpoint,
     )
 
     root = tmp_path / "portable"
     _write_portable_isaac05_checkpoint(root)
-    model, _, _ = modeling_mk1_vla.load_mk1_vla_from_hf(
+    model, _, _ = modeling_isaac_vla.load_isaac_vla_from_hf(
         root,
         dtype=torch.float32,
         device="cpu",
@@ -899,24 +903,23 @@ def test_fsdp1_training_refuses_before_backbone_load(tmp_path, monkeypatch) -> N
 
 
 def test_bf16_storage_package_fsdp2_training_load_is_unchanged(tmp_path, monkeypatch) -> None:
-    """Control: a BF16-storage MK1 package keeps the BF16 load (no lossless F32 source exists).
+    """Control: a BF16-storage Isaac package keeps the BF16 load (no lossless F32 source exists).
 
-    Only the storage classification the load decision reads is stubbed to BF16; the preflight still
+    Only the header dtypes the load decision reads are restated as BF16; the preflight still
     validates the fixture's real F32 bytes. The loader call is recorded and stopped.
     """
-    from lerobot.policies.perceptron_isaac import mk1_checkpoint_contract
+    from lerobot.policies.perceptron_isaac import isaac_checkpoint_contract
 
     policy_path, config, _, _ = _f32_package(tmp_path)
     policy = PerceptronIsaacPolicy.from_pretrained(policy_path, config=config, local_files_only=True)
-    real_validate = mk1_checkpoint_contract.validate_mk1_checkpoint
-    monkeypatch.setattr(
-        mk1_checkpoint_contract,
-        "validate_mk1_checkpoint",
-        lambda root, **kwargs: real_validate(
-            root, **{**kwargs, "allowed_storage_dtypes": frozenset({"F32"})}
-        ),
-    )
-    monkeypatch.setattr(modeling_perceptron_isaac, "_package_storage_dtypes", lambda _: frozenset({"BF16"}))
+    real_validate = isaac_checkpoint_contract.validate_isaac_checkpoint
+
+    def validate_as_bf16(root, **kwargs):
+        contract, inventory = real_validate(root, **kwargs)
+        headers = {name: replace(header, dtype="BF16") for name, header in inventory.tensors.items()}
+        return contract, replace(inventory, tensors=headers)
+
+    monkeypatch.setattr(isaac_checkpoint_contract, "validate_isaac_checkpoint", validate_as_bf16)
     calls = _record_loader_calls(monkeypatch, stop=True)
     _live_fsdp2(monkeypatch)
 

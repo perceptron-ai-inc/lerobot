@@ -12,16 +12,16 @@ from torch import Tensor
 
 pytest.importorskip("transformers", reason="requires lerobot[perceptron_isaac]")
 
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContract
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import perceptron_isaac_training_loss
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAForActionGeneration,
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAForActionGeneration,
     _build_config,
 )
-from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import GenesisNullSparseMoeBlock
+from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import IsaacNullSparseMoeBlock
 from lerobot.policies.perceptron_isaac.tensor_stream import Event, TensorStream, TextType, create_stream
 from tests.policies.perceptron_isaac._fixtures import flow_stream
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config
 from tests.policies.perceptron_isaac.test_p2_moe_regressions import (
     _capture_router_logits,
     _reference_auxiliary,
@@ -35,10 +35,10 @@ def _global_moe_worker(rank: int, rendezvous: str) -> None:
         raw = _config(test_geometry=True, mtp_present=False)
         raw["text_config"]["layer_types"] = ["full_attention", "full_attention"]
         raw["text_config"]["full_attention_interval"] = 1
-        contract = Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+        contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
         torch.manual_seed(47)
-        model = Mk1Qwen36VLAForActionGeneration(_build_config(raw, contract)).float().train()
-        blocks = [module for module in model.modules() if isinstance(module, GenesisNullSparseMoeBlock)]
+        model = IsaacQwen36VLAForActionGeneration(_build_config(raw, contract)).float().train()
+        blocks = [module for module in model.modules() if isinstance(module, IsaacNullSparseMoeBlock)]
         with torch.no_grad():
             for layer, block in enumerate(blocks):
                 block.gate.weight.zero_()

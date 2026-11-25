@@ -37,7 +37,7 @@ _ISAAC_PRIORITY = [
     VisionType.P,
 ]
 _CONTROL_MODALITIES = frozenset({"control", "special_token", "role_marker", "modality_tag"})
-_TEXT_TYPE_TAG = "genesis_text_type"
+_TEXT_TYPE_TAG = "text_type"
 _TEXT_TYPES = {
     "text": TextType.text,
     "timestamp": TextType.timestamp,
@@ -146,7 +146,7 @@ def _load_mharmony_encoding_cached(
     _qwen35_vocab_path: str | None,
 ):
     # qwen35_vocab_path is deliberately part of the cache identity. The native
-    # loader reads QWEN35_VOCAB_PATH itself, but two authenticated checkpoints
+    # loader reads QWEN35_VOCAB_PATH itself, but two checkpoints
     # can provide different checkpoint-local vocabularies in one process.
     groups = json.loads(reserved_groups_key)
     return load_mharmony().load_harmony_encoding(

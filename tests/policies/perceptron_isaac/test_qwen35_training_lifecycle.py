@@ -1,4 +1,4 @@
-"""Reduced native MK1 training fixtures; no pretrained weights or robot data."""
+"""Reduced native Isaac training fixtures; no pretrained weights or robot data."""
 
 from dataclasses import replace
 from pathlib import Path
@@ -13,30 +13,32 @@ from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.optim.optimizers import AdamWConfig
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAConfig,
-    Mk1Qwen36VLAForActionGeneration,
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAConfig,
+    IsaacQwen36VLAForActionGeneration,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
 from lerobot.policies.perceptron_isaac.processor_perceptron_isaac import PERCEPTRON_ISAAC_STREAM_KEY
 from tests.policies.perceptron_isaac._fixtures import flow_stream
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config as _mk1_config
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config as _isaac_config
 from tests.policies.perceptron_isaac.test_modeling_training import _config
 
 
 def reduced_native_model(
     *, vocab_size: int = 32, action_dim: int = 2, proprio_dim: int = 2
-) -> Mk1Qwen36VLAForActionGeneration:
+) -> IsaacQwen36VLAForActionGeneration:
     """Build real native attention, vision, vector encoder and expert with tiny geometry."""
-    raw = _mk1_config(test_geometry=True, mtp_present=False, coord_enabled=False)
+    raw = _isaac_config(test_geometry=True, mtp_present=False, coord_enabled=False)
     raw["text_config"]["vocab_size"] = vocab_size
     raw["vision_config"]["patch_size"] = 16
-    expert = dict(raw["genesis_vla"]["action_expert"], action_dim=action_dim, action_horizon=2)
-    config = Mk1Qwen36VLAConfig(vector_max_states=proprio_dim, action_expert=expert, **raw)
+    expert = dict(raw["isaac05_vla"]["action_expert"], action_dim=action_dim, action_horizon=2)
+    # The model type and the two overridden fields are passed explicitly, not from the file data.
+    fields = {k: v for k, v in raw.items() if k not in {"model_type", "action_expert", "vector_max_states"}}
+    config = IsaacQwen36VLAConfig(vector_max_states=proprio_dim, action_expert=expert, **fields)
     config._attn_implementation = "sdpa"
     config.text_config._attn_implementation = "sdpa"
     config.vision_config._attn_implementation = "sdpa"
-    return Mk1Qwen36VLAForActionGeneration(config)
+    return IsaacQwen36VLAForActionGeneration(config)
 
 
 def reduced_native_policy(
@@ -64,7 +66,7 @@ def test_dense_optimizer_preserves_serializable_trainable_set(tmp_path: Path) ->
     policy = reduced_native_policy(tmp_path)
     policy.config.freeze_input_embeddings = True
     cfg = TrainPipelineConfig(
-        dataset=DatasetConfig(repo_id="synthetic/native-mk1"),
+        dataset=DatasetConfig(repo_id="synthetic/native-isaac"),
         policy=policy.config,
         optimizer=AdamWConfig(lr=0.002),
     )

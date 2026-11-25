@@ -24,7 +24,7 @@ from tests.policies.perceptron_isaac.test_mharmony_training import _metadata
 from tests.policies.perceptron_isaac.test_qwen35_training_lifecycle import reduced_native_policy
 
 
-def test_cached_native_image_stream_trains_and_samples_reduced_real_mk1(tmp_path, monkeypatch):
+def test_cached_native_image_stream_trains_and_samples_reduced_real_isaac(tmp_path, monkeypatch):
     pytest.importorskip("mharmony")
     monkeypatch.delenv("QWEN35_VOCAB_PATH", raising=False)
     qwen = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface")) / (

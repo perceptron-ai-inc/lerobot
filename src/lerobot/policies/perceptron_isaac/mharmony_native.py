@@ -44,13 +44,12 @@ DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS = (
         "size": 2048,
     },
 )
-# Genesis names the coordinate block by this exact marker
-# (genesis/data/mharmony/encoding_cache.py::COORD_GROUP_NAME).
+# The coordinate block is named by this exact marker.
 COORD_TOKEN_GROUP_NAME = "coord"  # nosec B105 - reserved-token group label, not a credential
-GENESIS_TEXT_TYPE_TAG = "genesis_text_type"
-GENESIS_TEXT_TYPE_TIMESTAMP = "timestamp"
-GENESIS_TEXT_TYPE_ACTION = "action"
-GENESIS_TEXT_TYPE_ACTION_C = "action_c"
+TEXT_TYPE_TAG = "text_type"
+TEXT_TYPE_TIMESTAMP = "timestamp"
+TEXT_TYPE_ACTION = "action"
+TEXT_TYPE_ACTION_C = "action_c"
 FLOW_ACTION_TOKEN_GROUP_NAME = "flow_action"  # nosec B105 - stream label, not a credential
 FAST_ACTION_TOKEN_GROUP_NAME = "fast_action"  # nosec B105 - stream label, not a credential
 FAST_ACTION_TOKENIZER_NAME = "physical-intelligence/fast"
@@ -301,8 +300,8 @@ def _matches_source_bound_libero_prompt(
 ) -> bool:
     """Reconcile an admitted source prompt, never weaken the physical LIBERO ABI.
 
-    Artifact admission authenticates the checkpoint-local recipe. This check
-    requires its selected source profile; a bare robot-name alias is insufficient.
+    This check requires the selected source profile of the checkpoint-local recipe; a bare
+    robot-name alias is insufficient.
     """
     if not (
         config.strict_environment_feature_contract is True
@@ -364,7 +363,7 @@ def build_isaac_training_proprio_contract(
     contract_version: int,
     contract_hash: str,
 ) -> dict[str, Any]:
-    """Compile the supported Genesis policy-state ABI into movable render metadata."""
+    """Compile the supported policy-state ABI into movable render metadata."""
     profile_components: dict[str, tuple[int, list[tuple[str, int, int]]]] = {
         "bi_yam": (
             14,
@@ -568,13 +567,13 @@ def read_recipe_reserved_token_groups(path: str | Path) -> list[dict[str, Any]]:
     a wrong group set is not a cosmetic problem. The config-derived default
     (``DEFAULT_MHARMONY_RESERVED_TOKEN_GROUPS``) carries no coord block and no offset, so
     mHarmony bump-allocates its FAST pool to id 248087 while an Isaac-0.5 checkpoint is
-    trained with that pool at 249321 -- a 1234-id shift that would silently mis-encode
-    every FAST action token if it were ever used in place of the real declaration.
+    trained with that pool at 249321 -- a 1234-id shift that would silently encode every
+    FAST action token to the wrong id if it were ever used in place of the real declaration.
 
     Ordering is deliberately not constrained here: mHarmony resolves explicit offsets
     order-independently, and the shipped export lists its FAST group before its coord
     group. The checkpoint-range cross-check stays with
-    ``Mk1CheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
+    ``IsaacCheckpointContract.validate_coord_reserved_token_groups``, which reads config.json,
     an artifact independent of this recipe.
     """
     return _recipe_reserved_token_groups(load_json_object(path))
@@ -825,9 +824,8 @@ def build_isaac_mharmony_content_plan(
 ) -> IsaacMharmonyContentPlan:
     """Build the native LIBERO no-scene mharmony content plan.
 
-    This mirrors the Genesis ``trajectory_flow_matching_pipeline`` inference
-    contract for the supported native eval surface: Flow actions, explicit deltas,
-    RGB images, last-state-only proprio, and no scene description. Episode-time
+    This is the inference contract for the supported native eval surface: Flow actions,
+    explicit deltas, RGB images, last-state-only proprio, and no scene description. Episode-time
     items precede each observation only when the checkpoint's recipe emits them
     (``emit_observation_timestamps``); the plan records the timestamps either way.
     """
@@ -904,7 +902,7 @@ def build_isaac_mharmony_content_plan(
         terminal=terminal,
     )
     if training_prompt:
-        flow_tags = _project_genesis_training_action_tags(flow_tags)
+        flow_tags = _project_training_action_tags(flow_tags)
     assistant_content = [
         {
             "kind": "tokens",
@@ -1000,16 +998,16 @@ class IsaacNativeMharmonyRenderer:
         terminal: bool = False,
         stats: IsaacNormalizationStats | None = None,
     ):
-        """Render one joint FAST+Flow training sample without Genesis transforms.
+        """Render one joint FAST+Flow training sample.
 
-        ``terminal`` mirrors Genesis's ``_action_completion_metadata``: a chunk whose last
+        ``terminal``: a chunk whose last
         action step is the trajectory's terminal step keeps the ``<|end|>`` footer, while every
         non-terminal chunk is supervised with ``<|return|>``. The dataset processor supplies
         terminality from the last real action and its authoritative episode endpoint.
         Without that metadata, non-terminal remains the conservative default.
 
         ``stats`` overrides the builder's normalization for this one sample, which is what
-        multi-suite LIBERO training needs: Genesis normalizes each LIBERO suite by its own
+        multi-suite LIBERO training needs: each LIBERO suite is normalized by its own
         quantiles, and the suites are not interchangeable -- end-effector height spans
         [0.916, 1.286] in libero_spatial but [0.010, 0.337] in libero_object, disjoint ranges
         that would push cross-normalized proprio far outside [-1, 1]. Defaults to the builder's
@@ -1029,9 +1027,9 @@ class IsaacNativeMharmonyRenderer:
                 f"ISAAC normalized action max {max_abs:.6g} exceeds skip threshold "
                 f"{skip_outlier_threshold:.6g}."
             )
-        # Genesis clips the two objectives independently: the FAST tokenizer transform and the
+        # The two objectives are clipped independently: the FAST tokenizer transform and the
         # flow-target transform each carry their own cap. Sharing one clipped array would feed
-        # the tokenizer an action distribution Genesis never trains it on.
+        # the tokenizer an action distribution it was never trained on.
         if clip_normalized_actions:
             fast_cap = clip_normalized_max if fast_clip_normalized_max is None else fast_clip_normalized_max
             fast_normalized = np.clip(normalized, -fast_cap, fast_cap)
@@ -1075,9 +1073,9 @@ class IsaacNativeMharmonyRenderer:
             min_num_patches=min_num_patches,
             pixel_shuffle_scale=pixel_shuffle_scale,
             temporal_patch_size=temporal_patch_size,
-            # Genesis sets message_stop_token="return" for any chunk whose last action step is
-            # not the trajectory terminal step (core/datasets/augment/trajectory.py), and
-            # render_document_to_stream swaps the rendered <|end|> for <|return|> accordingly.
+            # message_stop_token is "return" for any chunk whose last action step is not the
+            # trajectory terminal step, and the rendered <|end|> is swapped for <|return|>
+            # accordingly.
             # Terminal chunks keep <|end|>.
             rewrite_final_assistant_footer=not bool(terminal),
         )
@@ -1373,7 +1371,7 @@ def _timestamp_content_item(
         "normalized_seconds": normalized_seconds,
         "precision": precision,
         "tags": {
-            GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_TIMESTAMP,
+            TEXT_TYPE_TAG: TEXT_TYPE_TIMESTAMP,
             "timestamp_text": _format_timestamp_qwen(normalized_seconds, precision=precision),
             "timestamp_seconds": float(timestamp_seconds),
             "timestamp_normalized_seconds": normalized_seconds,
@@ -1504,12 +1502,12 @@ def _flow_action_tags(
         action_is_pad = [False] * horizon
     return {
         "token_group": FLOW_ACTION_TOKEN_GROUP_NAME,
-        GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C,
+        TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C,
         "trajectory_action": anchor_idx,
         "action_index": anchor_idx,
         "obs_window": [0, anchor_idx],
         "action_window": [anchor_idx, emitted_action_indices[-1]],
-        # Genesis drops message_stop_token from terminal chunks, which is what makes their
+        # Terminal chunks carry no message_stop_token, which is what makes their
         # footer <|end|> rather than <|return|>.
         "terminal": bool(terminal),
         "message_stop_token": None if terminal else metadata.message_stop_token,
@@ -1535,7 +1533,7 @@ def _fast_action_tags(flow_tags: dict[str, Any]) -> dict[str, Any]:
         {
             "token_group": FAST_ACTION_TOKEN_GROUP_NAME,
             "tokenizer": FAST_ACTION_TOKENIZER_NAME,
-            GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION,
+            TEXT_TYPE_TAG: TEXT_TYPE_ACTION,
             "objective_form": "FAST",
         }
     )
@@ -1544,9 +1542,9 @@ def _fast_action_tags(flow_tags: dict[str, Any]) -> dict[str, Any]:
     return tags
 
 
-_GENESIS_TRAINING_ACTION_TAG_KEYS = (
+_TRAINING_ACTION_TAG_KEYS = (
     "token_group",
-    GENESIS_TEXT_TYPE_TAG,
+    TEXT_TYPE_TAG,
     "action_index",
     "trajectory_action",
     "objective_form",
@@ -1562,9 +1560,9 @@ _GENESIS_TRAINING_ACTION_TAG_KEYS = (
 )
 
 
-def _project_genesis_training_action_tags(tags: dict[str, Any]) -> dict[str, Any]:
-    """Match Genesis conversation._collect_token_tags at the final TensorStream boundary."""
-    return {key: tags[key] for key in _GENESIS_TRAINING_ACTION_TAG_KEYS if key in tags}
+def _project_training_action_tags(tags: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the tags that reach the final TensorStream boundary."""
+    return {key: tags[key] for key in _TRAINING_ACTION_TAG_KEYS if key in tags}
 
 
 def _plan_item_to_mh_content(

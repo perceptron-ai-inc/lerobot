@@ -17,7 +17,7 @@ def test_perceptron_isaac_extra_installs_standalone_mharmony() -> None:
     ) in project["optional-dependencies"].get("perceptron_isaac", [])
 
 
-def test_mharmony_boundary_does_not_import_genesis(monkeypatch) -> None:
+def test_mharmony_boundary_imports_only_mharmony(monkeypatch) -> None:
     from lerobot.policies.perceptron_isaac import mharmony_adapter
     from lerobot.policies.perceptron_isaac.mharmony_contract import SUPPORTED_MHARMONY_VERSION
 

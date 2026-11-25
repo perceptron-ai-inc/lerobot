@@ -1,15 +1,15 @@
 # ruff: noqa
 """Shared VLA stream shell, vector encoder and flow-matching action expert.
 
-Native MK1 borrows the stream embedding, mRoPE, training and sampling methods.
-Checkpoint validation and loading live in the native MK1 loader, not this module.
+Native Isaac borrows the stream embedding, mRoPE, training and sampling methods.
+Checkpoint validation and loading live in the native Isaac loader, not this module.
 """
 
 from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from numbers import Real
 from typing import Any, Literal, Optional, TypeAlias
 from collections.abc import Sequence
@@ -27,10 +27,9 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Model, Qwen3_5Pr
 
 from lerobot.utils.random_utils import deserialize_rng_state, serialize_rng_state
 
-# --- Genesis TensorStream layout / mrope / context-mask utilities ---
+# --- TensorStream layout / mrope / context-mask utilities ---
 from .rtc import (
     DIT_ACTION_EXPERT_CONFIG_V1_FIELDS,
-    DIT_CONTEXT_CONDITIONING_FIELDS,
     ActionExpertConditioning,
     ActionExpertStepModulation,
     LayerHiddenContext,
@@ -40,7 +39,6 @@ from .rtc import (
     prepare_rtc_conditioning,
     project_rtc_modulation,
     resolve_rtc_action_prefix,
-    validate_action_context,
     validate_dit_action_metadata,
 )
 from .tensor_stream import ModalityType, TensorStream, TextType, VectorType, VisionType, group_streams
@@ -52,8 +50,8 @@ from .tensor_stream_utils import (
     reconstruct_tensor_stream_from_compact_dict,
 )
 
-# The continuous-action marker type that delimits where the action chunk begins. Genesis sets
-# FLOW_ACTION_TEXT_TYPE = TextType.action_c (value 15); the expert never attends to action tokens.
+# The continuous-action marker type that delimits where the action chunk begins:
+# TextType.action_c (value 15). The expert never attends to action tokens.
 FLOW_ACTION_TEXT_TYPE = TextType.action_c
 
 
@@ -85,7 +83,7 @@ def normalize_vector_tokens(vector_tokens: torch.Tensor, max_states: int | None)
     if vector_tokens.shape[-1] < max_states:
         return F.pad(vector_tokens, (0, max_states - vector_tokens.shape[-1]))
     if vector_tokens.shape[-1] > max_states:
-        # Genesis stream_embedding raises here rather than dropping trailing state dims; a
+        # Raise here rather than drop trailing state dims; a
         # partially-fed proprio encoder produces plausible but wrong actions with no error.
         raise ValueError(
             f"vector width {vector_tokens.shape[-1]} exceeds the configured model budget "
@@ -136,8 +134,7 @@ def expand_single_frame_patches_to_temporal_tubelets(
 ) -> torch.Tensor:
     """Expand ``[N, C*P*P]`` per-frame patch rows to Qwen-temporal ``[N, C*T*P*P]`` rows.
 
-    Vendored verbatim from ``genesis/core/models/perceptron/vision/qwen35.py``. The genesis
-    rendering emits per-frame ``C*P*P`` patches, but the native ``Qwen3_5VisionPatchEmbed`` expects
+    The rendering emits per-frame ``C*P*P`` patches, but the native ``Qwen3_5VisionPatchEmbed`` expects
     pre-tiled ``C*T*P*P`` rows (it does ``.view(-1, C, T, P, P)``). This tiles along the temporal axis
     so the same packed patches feed the native Conv3d.
     """
@@ -156,7 +153,7 @@ def expand_single_frame_patches_to_temporal_tubelets(
 
 
 def build_vector_encoder(vector_max_states: int, hidden: int) -> nn.Module:
-    """Proprio encoder mirroring genesis ``build_vector_encoder`` (2-Linear SiLU MLP, no bias).
+    """Proprio encoder (2-Linear SiLU MLP, no bias).
 
     Loads ``model.vector_embedding.0.weight`` ``[hidden, vector_max_states]`` and
     ``model.vector_embedding.2.weight`` ``[hidden, hidden]``.
@@ -1313,7 +1310,7 @@ class DiTActionExpertHead(nn.Module):
             rope_cache=rope_cache,
         )
 
-    # -- training timestep sampling: genesis Beta(1.5,1.0) noise level (== MolmoAct2's t-dist) --
+    # -- training timestep sampling: Beta(1.5,1.0) noise level (== MolmoAct2's t-dist) --
     def sample_timesteps(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         a = self.args
         beta = torch.distributions.Beta(
@@ -1511,49 +1508,6 @@ class DiTActionExpertHead(nn.Module):
         return averaged
 
 
-# Geometry fields a legacy action block may carry; it never declares a recipe or RTC support.
-_LEGACY_ACTION_FIELDS = frozenset(
-    {
-        "type",
-        "clean_at_0",
-        "action_dim",
-        "action_horizon",
-        "num_layers",
-        "hidden_dim",
-        "num_heads",
-        "mlp_ratio",
-        "num_inference_steps",
-        "timestep_embed_dim",
-        "ffn_multiple_of",
-        "qk_norm",
-        "qk_norm_eps",
-        "rope",
-        "context_layer_norm",
-        "causal_attn",
-    }
-)
-
-
-def _dit_metadata_from_legacy_block(cfg: dict[str, Any], *, schema_version: int) -> dict[str, Any]:
-    """Express a legacy action block as native DiT metadata.
-
-    Legacy checkpoints store the same clean-at-1 network under ``type="molmoact"``
-    without the native recipe fields. Their missing fields take the DiT defaults, which
-    equal the legacy sampling and training defaults; RTC stays off.
-    """
-    if cfg.get("clean_at_0", False) is not False:
-        raise ValueError("clean-at-0 action experts are unsupported; Isaac uses the clean-at-1 DiT.")
-    native = asdict(DiTActionExpertArgs())
-    unexpected = sorted(set(cfg) - _LEGACY_ACTION_FIELDS - set(DIT_CONTEXT_CONDITIONING_FIELDS))
-    if unexpected:
-        raise ValueError(f"legacy action_expert metadata has unexpected fields: {unexpected}.")
-    native.update({key: value for key, value in cfg.items() if key in native})
-    native.update({key: cfg[key] for key in DIT_CONTEXT_CONDITIONING_FIELDS if key in cfg})
-    native["type"] = "dit"
-    native["schema_version"] = schema_version
-    return native
-
-
 def build_action_expert_head(
     action_expert_cfg: dict[str, Any] | None,
     vlm_dim: int,
@@ -1563,26 +1517,14 @@ def build_action_expert_head(
 ) -> DiTActionExpertHead | None:
     """Construct the native DiT action-expert head.
 
-    DiT schemas 1 and 2 share the native clean-at-one head and weight ABI. Legacy
-    ``type="molmoact"`` blocks hold the same network and load as DiT metadata with RTC
-    off; their conditioning schema comes from the VLA envelope, not the action block.
-    Prefix RTC inference is gated by the checkpoint's declared RTC support.
+    DiT schemas 1 and 2 share the native clean-at-one head and weight ABI. Prefix RTC
+    inference is gated by the checkpoint's declared RTC support.
     """
     if action_expert_cfg is None:
         return None
     cfg = dict(action_expert_cfg)
-    head_type = cfg.get("type", "molmoact")
-    if head_type == "molmoact":
-        if "schema_version" in cfg:
-            raise ValueError(
-                "legacy action_expert type 'molmoact' does not define a schema_version "
-                f"contract; got schema_version={cfg['schema_version']!r}."
-            )
-        validate_action_context(
-            cfg, schema_version=context_schema_version, backbone_num_layers=backbone_num_layers
-        )
-        cfg = _dit_metadata_from_legacy_block(cfg, schema_version=context_schema_version)
-    elif head_type != "dit":
+    head_type = cfg.get("type")
+    if head_type != "dit":
         raise ValueError(f"unknown action_expert type {head_type!r}; only 'dit' is supported.")
     conditioning = validate_dit_action_metadata(cfg, backbone_num_layers=backbone_num_layers)
     return DiTActionExpertHead(cfg, vlm_dim=vlm_dim, conditioning=conditioning)
@@ -1653,7 +1595,7 @@ class Qwen35VLAModel(Qwen3_5Model):
         vcfg = self.config.vision_config
         # The InferenceStreamBuilder already patchifies to temporal tubelets (C*T*P*P) when
         # temporal_patch_size>1, so the stream payload is the native-expected width. Only tile if
-        # the renderer emitted per-frame (C*P*P) rows — mirrors genesis Qwen35MoeVisionPatchEmbed.
+        # the renderer emitted per-frame (C*P*P) rows.
         per_frame_dim = vcfg.in_channels * vcfg.patch_size * vcfg.patch_size
         if patches.shape[-1] == per_frame_dim:
             patches = expand_single_frame_patches_to_temporal_tubelets(
@@ -1740,7 +1682,7 @@ class Qwen35VLAModel(Qwen3_5Model):
     def embed_stream(self, tensor_stream: TensorStream) -> torch.Tensor:
         """Embed each modality in place and compact -> ``[B, T, D]`` interleaved embeddings.
 
-        Mirrors genesis ``balanced_embed_stream`` / sglang ``embed_and_interleave``: group events by
+        Group events by
         modality, embed each group with the matching encoder, write back, then ``compact()`` (events
         are stored in sequence order, so the concat IS the interleave).
         """
@@ -1787,13 +1729,13 @@ class Qwen35VLAModel(Qwen3_5Model):
     def forward(self, tensor_stream: TensorStream, **kwargs: Any) -> BaseModelOutputWithPast:
         """Run one VLM pass, retaining hidden-state boundaries only for layerwise conditioning.
 
-        Replicates genesis ``PerceptronTransformer.forward``: interleave -> MRoPE positions ->
+        Interleave -> MRoPE positions ->
         next-token-prediction truncation ``[:, :-1]`` -> native hybrid decoder -> final norm.
-        ``last_hidden_state`` has length ``L_model = stream_len - 1`` (= genesis ``final_activations``).
+        ``last_hidden_state`` has length ``L_model = stream_len - 1``.
         """
         inputs_embeds = self.embed_stream(tensor_stream)  # [B, L, D]
 
-        # MRoPE positions with genesis's "1-D rotation equivalence": only image tokens keep their
+        # MRoPE positions with "1-D rotation equivalence": only image tokens keep their
         # (t, h, w) grid; every non-spatial token (text / proprio / action / timestamp) collapses to
         # (t, t, t). Mirrors PerceptronTransformer.compute_position_embeddings. Skipping this is
         # silently wrong: raw (t, h, w) on text tokens compounds into a garbage final state.
@@ -1804,7 +1746,7 @@ class Qwen35VLAModel(Qwen3_5Model):
         pos[not_spatial] = pos[not_spatial][..., 0:1].expand(-1, pos.shape[-1])
         position_ids = pos.permute(2, 0, 1).contiguous()  # [3, B, L] (native mrope format)
 
-        # Next-token-prediction truncation, exactly as genesis model.forward (h, pos = h[:, :-1], pos[:, :-1]).
+        # Next-token-prediction truncation (h, pos = h[:, :-1], pos[:, :-1]).
         inputs_embeds = inputs_embeds[:, :-1]
         position_ids = position_ids[:, :, :-1]
 
@@ -1881,7 +1823,7 @@ class Qwen35VLAForActionGeneration(Qwen3_5PreTrainedModel):
     ) -> torch.Tensor:
         """Integrate the flow expert into a ``[B, num_action_steps or H, action_dim]`` chunk.
 
-        Numerically mirrors genesis ``PerceptronTransformer.sample_action``: one VLM forward over the
+        One VLM forward over the
         stream, select the declared context (already ``[:, :-1]``-truncated by ``forward``),
         build the pre-action context mask (excludes action-marker positions), and run the expert's
         clean-at-1 Euler ODE. Output is in normalized action space (caller unnormalizes).
@@ -1954,22 +1896,22 @@ def setup_qwen35_vla_for_training(
     dual_timestep_ratio: float = 0.0,
     mask_padded_action_rows: bool = True,
 ) -> Qwen35VLAForActionGeneration:
-    """Put a loaded VLA into training mode and set the action expert's genesis-flow-loss args.
+    """Put a loaded VLA into training mode and set the action expert's flow-loss args.
 
     - ``model.train()`` + ``requires_grad`` (``train_expert_only`` freezes everything but
       ``model.action_expert.*``; otherwise the whole VLA trains).
-    - tunes ``expert.args`` (the train-only knobs the genesis flow loss reads) to the finetune recipe;
+    - tunes ``expert.args`` (the train-only knobs the flow loss reads) to the finetune recipe;
       RTC training stays disabled; defaults retain 4 MC samples and pad masking.
 
     Does NOT touch the offset-norm correction (applied once at load).
     """
     if rtc_max_delay_steps != 0 or dual_timestep_ratio != 0:
         raise ValueError("RTC delay and dual-timestep training are unsupported.")
-    from .modeling_qwen36_moe import GenesisQwen36TextRotaryEmbedding
+    from .modeling_qwen36_moe import IsaacQwen36TextRotaryEmbedding
 
     # BF16-source training retains its serving load path; rederive before distributed preparation too.
     for module in model.modules():
-        if isinstance(module, GenesisQwen36TextRotaryEmbedding):
+        if isinstance(module, IsaacQwen36TextRotaryEmbedding):
             module.prepare_for_training()
     expert = model.model.action_expert
     if expert is not None and hasattr(expert, "args"):

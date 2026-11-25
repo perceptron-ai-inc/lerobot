@@ -16,20 +16,20 @@ from torch import Tensor, nn
 
 pytest.importorskip("transformers", reason="requires lerobot[perceptron_isaac]")
 
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContract
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import perceptron_isaac_training_loss
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAForActionGeneration,
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAForActionGeneration,
     _build_config,
 )
 from lerobot.policies.perceptron_isaac.modeling_qwen35_vla import ModelOutput
 from lerobot.policies.perceptron_isaac.modeling_qwen36_moe import (
-    GenesisNullDispatchTrace,
-    GenesisNullSparseMoeBlock,
+    IsaacNullDispatchTrace,
+    IsaacNullSparseMoeBlock,
 )
 from lerobot.policies.perceptron_isaac.tensor_stream import Event, TensorStream, TextType, create_stream
 from tests.policies.perceptron_isaac._fixtures import flow_stream
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config
 from tests.policies.perceptron_isaac.test_p2_moe_regressions import (
     AuxiliaryOracle,
     _capture_router_logits,
@@ -41,17 +41,17 @@ from tests.policies.perceptron_isaac.test_p2_moe_regressions import (
 class NativeRouterCapture:
     output: ModelOutput
     logits: tuple[Tensor, ...]
-    dispatch: tuple[GenesisNullDispatchTrace, ...]
+    dispatch: tuple[IsaacNullDispatchTrace, ...]
 
 
-def _all_null_native_model() -> Mk1Qwen36VLAForActionGeneration:
+def _all_null_native_model() -> IsaacQwen36VLAForActionGeneration:
     raw = _config(test_geometry=True, mtp_present=False)
     raw["text_config"]["layer_types"] = ["full_attention", "full_attention"]
     raw["text_config"]["full_attention_interval"] = 1
-    contract = Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+    contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
     with torch.random.fork_rng():
         torch.manual_seed(47)
-        model = Mk1Qwen36VLAForActionGeneration(_build_config(raw, contract)).float().train()
+        model = IsaacQwen36VLAForActionGeneration(_build_config(raw, contract)).float().train()
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.zero_()
@@ -61,8 +61,8 @@ def _all_null_native_model() -> Mk1Qwen36VLAForActionGeneration:
     return model
 
 
-def _native_blocks(model: Mk1Qwen36VLAForActionGeneration) -> tuple[GenesisNullSparseMoeBlock, ...]:
-    blocks = tuple(module for module in model.modules() if isinstance(module, GenesisNullSparseMoeBlock))
+def _native_blocks(model: IsaacQwen36VLAForActionGeneration) -> tuple[IsaacNullSparseMoeBlock, ...]:
+    blocks = tuple(module for module in model.modules() if isinstance(module, IsaacNullSparseMoeBlock))
     assert len(blocks) == 2
     return blocks
 
@@ -81,11 +81,11 @@ def _padded_stream(padding: int) -> TensorStream:
 
 
 def _capture_native_forward(
-    model: Mk1Qwen36VLAForActionGeneration, stream: TensorStream
+    model: IsaacQwen36VLAForActionGeneration, stream: TensorStream
 ) -> NativeRouterCapture:
     blocks = _native_blocks(model)
     logits: list[list[Tensor]] = [[], []]
-    dispatch: list[list[GenesisNullDispatchTrace]] = [[], []]
+    dispatch: list[list[IsaacNullDispatchTrace]] = [[], []]
     handles = []
     for layer, block in enumerate(blocks):
         handles.append(
@@ -222,7 +222,7 @@ def test_disabled_native_z_overflow_preserves_finite_task_loss_and_gradients(bal
 
 
 def _record_layer_visit(module: nn.Module, inputs: tuple[Tensor, ...], *, visits: list[int]) -> None:
-    assert isinstance(module, GenesisNullSparseMoeBlock)
+    assert isinstance(module, IsaacNullSparseMoeBlock)
     visits.append(inputs[0].shape[1])
 
 

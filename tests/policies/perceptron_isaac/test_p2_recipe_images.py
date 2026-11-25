@@ -1,7 +1,6 @@
 """P2.04 recipe ingestion and real image-grid routing, without weight allocation.
 
-The fixture uses the frozen Genesis recipes[0].image_preprocess schema. It is not
-an authenticated model export: full manifest/SHA admission remains in P1 tests.
+The fixture uses the frozen recipes[0].image_preprocess schema. It is not a model export.
 """
 
 from __future__ import annotations

@@ -1,5 +1,4 @@
 import json
-from typing import Any
 
 import pytest
 from draccus.utils import DecodingError
@@ -55,21 +54,29 @@ def test_native_config_rejects_saved_true_offset_norm(tmp_path) -> None:
         PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
 
 
-@pytest.mark.parametrize("label", ["molmoact", "dit"])
-def test_retired_action_expert_label_is_dropped_on_read_and_not_saved(tmp_path, label: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("action_expert_type", "molmoact"),
+        ("action_expert_type", "dit"),
+        ("deployment_adapter_sha256", "0" * 64),
+        ("package_manifest_sha256", None),
+    ],
+)
+def test_retired_fields_are_dropped_on_read_and_not_saved(tmp_path, field: str, value: str | None) -> None:
     PerceptronIsaacConfig(device="cpu").save_pretrained(tmp_path)
     config_path = tmp_path / "config.json"
     payload = json.loads(config_path.read_text())
-    assert "action_expert_type" not in payload
+    assert field not in payload
     # Packages saved before the field was retired still carry it.
-    payload["action_expert_type"] = label
+    payload[field] = value
     config_path.write_text(json.dumps(payload))
 
     loaded = PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
 
-    assert not hasattr(loaded, "action_expert_type")
-    assert "action_expert_type" not in loaded.to_dict()
-    assert json.loads(config_path.read_text())["action_expert_type"] == label, "the file is not rewritten"
+    assert not hasattr(loaded, field)
+    assert field not in loaded.to_dict()
+    assert json.loads(config_path.read_text())[field] == value, "the file is not rewritten"
 
 
 def test_unknown_config_fields_are_still_rejected(tmp_path) -> None:
@@ -79,13 +86,6 @@ def test_unknown_config_fields_are_still_rejected(tmp_path) -> None:
 
     with pytest.raises(DecodingError, match="not_a_field"):
         PreTrainedConfig.from_pretrained(tmp_path, local_files_only=True)
-
-
-def test_legacy_mharmony_marker_is_explicitly_upgraded() -> None:
-    with pytest.warns(FutureWarning, match="genesis-in-tree"):
-        config = PerceptronIsaacConfig(mharmony_version="genesis-in-tree")
-
-    assert config.mharmony_version == SUPPORTED_MHARMONY_VERSION
 
 
 def test_unknown_mharmony_version_is_rejected() -> None:
@@ -145,24 +145,15 @@ def test_config_rejects_nonpositive_action_steps(n_action_steps) -> None:
         PerceptronIsaacConfig(device="cpu", n_action_steps=n_action_steps)
 
 
-@pytest.mark.parametrize(
-    "field_name",
-    [
-        "fast_processor_tree_sha256",
-        "deployment_adapter_sha256",
-        "qwen35_trained_package_manifest_sha256",
-        "mk1_model_import_sha256",
-        "mk1_source_model_import_sha256",
-        "mk1_trained_package_manifest_sha256",
-    ],
-)
-def test_config_rejects_noncanonical_checkpoint_digests(field_name) -> None:
-    values: dict[str, Any] = {field_name: "A" * 64}
-    if field_name == "fast_processor_tree_sha256":
-        values["fast_processor_path"] = "FAST"
+def test_config_rejects_noncanonical_fast_processor_digest() -> None:
+    with pytest.raises(ValueError, match="fast_processor_tree_sha256 must be a lowercase SHA-256 digest"):
+        PerceptronIsaacConfig(device="cpu", fast_processor_path="FAST", fast_processor_tree_sha256="A" * 64)
 
-    with pytest.raises(ValueError, match=rf"{field_name} must be a lowercase SHA-256 digest"):
-        PerceptronIsaacConfig(device="cpu", **values)
+
+def test_reading_a_config_keeps_the_digest_fields_it_still_has() -> None:
+    stored = {"fast_processor_tree_sha256": "0" * 64, "deployment_adapter_sha256": "1" * 64}
+
+    assert PerceptronIsaacConfig.migrate_config(stored) == {"fast_processor_tree_sha256": "0" * 64}
 
 
 def test_config_rejects_proprio_wider_than_vector_encoder() -> None:

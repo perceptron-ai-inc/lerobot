@@ -46,6 +46,7 @@ from lerobot.distributed.factory import make_accelerator
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.optim.optimizers import SGDConfig
 from lerobot.optim.schedulers import ConstantWithWarmupSchedulerConfig
+from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import IsaacCheckpointContract
 from lerobot.policies.perceptron_isaac.isaac_stats import IsaacNormalizationStats, IsaacStatsBlock
 from lerobot.policies.perceptron_isaac.loss_perceptron_isaac import (
     ISAAC_FLOW_LOSS_MASK_KEY,
@@ -58,9 +59,8 @@ from lerobot.policies.perceptron_isaac.mharmony_native import (
     IsaacMharmonyRenderMetadata,
     IsaacNativeMharmonyRenderer,
 )
-from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import Mk1CheckpointContract
-from lerobot.policies.perceptron_isaac.modeling_mk1_vla import (
-    Mk1Qwen36VLAForActionGeneration,
+from lerobot.policies.perceptron_isaac.modeling_isaac_vla import (
+    IsaacQwen36VLAForActionGeneration,
     _build_config,
 )
 from lerobot.policies.perceptron_isaac.modeling_perceptron_isaac import PerceptronIsaacPolicy
@@ -81,7 +81,10 @@ from lerobot.scripts import lerobot_train
 from lerobot.utils.constants import ACTION, OBS_STATE, TRAINING_STATE_DIR, TRAINING_STEP
 from lerobot.utils.io_utils import write_json
 from tests.fixtures.dummy_checkpoint_policy import DummyCheckpointConfig, DummyCheckpointPolicy
-from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config as _native_config
+from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import (
+    _config as _native_config,
+    _update_action_expert,
+)
 from tests.policies.perceptron_isaac.test_modeling_training import _config
 
 
@@ -160,15 +163,15 @@ class CadencePolicy(DummyCheckpointPolicy):
         self.applied_updates += 1
 
 
-class NativeCaptureModel(Mk1Qwen36VLAForActionGeneration):
+class NativeCaptureModel(IsaacQwen36VLAForActionGeneration):
     """Observe real recorder/materialization outputs without changing native computation."""
 
     def __init__(self) -> None:
         raw = _native_config(test_geometry=True, mtp_present=False)
         raw["text_config"]["layer_types"] = ["full_attention", "full_attention"]
         raw["text_config"]["full_attention_interval"] = 1
-        raw["genesis_vla"]["action_expert"].update(action_dim=2, action_horizon=2)
-        contract = Mk1CheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
+        _update_action_expert(raw, action_dim=2, action_horizon=2)
+        contract = IsaacCheckpointContract.parse_allowlisted(raw, allow_test_only_reduced_geometry=True)
         super().__init__(_build_config(raw, contract))
         self.router_records: list[NativeRouterRecord] = []
 

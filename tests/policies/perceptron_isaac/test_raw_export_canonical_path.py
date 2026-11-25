@@ -49,7 +49,7 @@ PACK_STATE_FILENAME = "policy_preprocessor_step_4_perceptron_isaac_mharmony_pack
 # Same value the shipped export stores, because fast_processor_pinned/ is a sibling of
 # lerobot_policy/ rather than a child of it.
 SIBLING_FAST_PROCESSOR_PATH = "../fast_processor_pinned"
-# Synthetic stand-in for the Genesis policy-state contract identity; only its format
+# Synthetic stand-in for the policy-state contract identity; only its format
 # matters to the hydration path.
 POLICY_STATE_CONTRACT_HASH = "3d5a0c1f9b7e4a2d8c6b5f4e3a2d1c0b9a8f7e6d5c4b3a291807f6e5d4c3b2a1"
 
@@ -478,14 +478,14 @@ def test_ambiguous_recipe_reserved_groups_are_refused(tmp_path: Path, groups, ma
 def test_recipe_groups_stay_subject_to_the_checkpoint_cross_check(tmp_path: Path) -> None:
     """Item 4: the recipe is read verbatim so config.json remains the independent check.
 
-    The reserved groups are reused from the canonical MK1 contract test rather than
+    The reserved groups are reused from the canonical Isaac contract test rather than
     rebuilt, because the cross-check being exercised is that contract's own rule.
     """
-    from lerobot.policies.perceptron_isaac.mk1_checkpoint_contract import (
-        Mk1CheckpointContract,
-        Mk1CheckpointContractError,
+    from lerobot.policies.perceptron_isaac.isaac_checkpoint_contract import (
+        IsaacCheckpointContract,
+        IsaacCheckpointContractError,
     )
-    from tests.policies.perceptron_isaac.test_mk1_checkpoint_contract import _config as _mk1_config
+    from tests.policies.perceptron_isaac.test_isaac_checkpoint_contract import _config as _isaac_config
 
     root = tmp_path / "isaac_0_5-export"
     policy_dir = _write_raw_isaac05_export(root)
@@ -495,12 +495,12 @@ def test_recipe_groups_stay_subject_to_the_checkpoint_cross_check(tmp_path: Path
     ]
     _write_inference_recipe(root, wrong_coord_range)
     config = _config(policy_dir)
-    contract = Mk1CheckpointContract.parse_allowlisted(_mk1_config(test_geometry=False))
+    contract = IsaacCheckpointContract.parse_allowlisted(_isaac_config(test_geometry=False))
 
     metadata = load_native_render_metadata(config)
 
     assert metadata.mharmony_reserved_token_groups == wrong_coord_range
-    with pytest.raises(Mk1CheckpointContractError, match="disagrees"):
+    with pytest.raises(IsaacCheckpointContractError, match="disagrees"):
         contract.validate_coord_reserved_token_groups(metadata.mharmony_reserved_token_groups)
 
     good_root = tmp_path / "good-export"

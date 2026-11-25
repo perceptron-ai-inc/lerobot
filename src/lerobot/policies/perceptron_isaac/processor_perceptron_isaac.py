@@ -9,8 +9,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, fields as dataclass_fields
-from dataclasses import replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -186,6 +185,7 @@ def _dataset_stats_to_isaac_stats(
     base_profile_id = config.normalization_profile_id
     if base_profile_id is None and source_profile is not None:
         base_profile_id = source_profile.profile_id
+    profile_id: str | None
     if base_profile_id and not str(base_profile_id).endswith("#finetune_dataset"):
         profile_id = f"{base_profile_id}#finetune_dataset"
     else:
@@ -310,7 +310,7 @@ def _record_config_stats_export(config: PerceptronIsaacConfig, preprocessor) -> 
 
 
 def normalize_perceptron_isaac_task_text(text: str) -> str:
-    """Normalize task text before Genesis prompt assembly."""
+    """Normalize task text before prompt assembly."""
     normalized = re.sub(r"\s+", " ", str(text or "")).strip()
     if not normalized:
         return ""
@@ -331,7 +331,7 @@ def build_perceptron_isaac_observation_window(
     states: Any,
     camera_order: tuple[str, ...],
 ) -> list[dict[str, Any]]:
-    """Convert stacked image/state tensors to Genesis ObservationFrame dictionaries."""
+    """Convert stacked image/state tensors to ObservationFrame dictionaries."""
     image_arr = _to_numpy(images)
     state_arr = _to_numpy(states).astype(np.float32, copy=False)
     if image_arr.ndim != 5:
@@ -453,7 +453,7 @@ class PerceptronIsaacRenderProcessorStep(ProcessorStep):
     inference_clip_normalized_proprio: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     train_clip_normalized_actions: bool = field(default=True, metadata=_PACK_CONFIG_METADATA)
     clip_normalized_max: float = field(default=10.0, metadata=_PACK_CONFIG_METADATA)
-    # FAST tokenizer input cap; Genesis lowers FAST and Flow with independent caps.
+    # FAST tokenizer input cap; FAST and Flow are lowered with independent caps.
     fast_clip_normalized_max: float = field(default=1.0, metadata=_PACK_CONFIG_METADATA)
     train_skip_outlier_threshold: float = field(default=20.0, metadata=_PACK_CONFIG_METADATA)
     train_max_sequence_length: int = field(default=4096, metadata=_PACK_CONFIG_METADATA)
@@ -1484,7 +1484,7 @@ class PerceptronIsaacActionUnnormalizeProcessorStep(ProcessorStep):
         action = transition.get(TransitionKey.ACTION)
         if action is None:
             return transition
-        if not torch.is_tensor(action):
+        if not isinstance(action, torch.Tensor):
             raise ValueError(
                 f"Perceptron Isaac action postprocessor expected a tensor, got {type(action).__name__}."
             )
@@ -1534,7 +1534,7 @@ class _PerceptronIsaacJointFrameTransformStep(ProcessorStep):
         if self.joint_signs is None or self.joint_offsets is None:
             return transition
 
-        container = transition
+        container: Any = transition
         if self._container_key is not None:
             container = transition.get(self._container_key)
             if not isinstance(container, dict) or self._value_key not in container:
@@ -1959,7 +1959,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
     render metadata into the pack-step config. Relative paths are retained as
     a compatibility fallback for older serialized pipelines only.
 
-    When the policy loader has retained a verified snapshot of the processor assets it
+    When the policy loader has retained a snapshot of the processor assets it
     records the snapshot root on the config, and the pipelines are restored from that
     immutable local directory (so no Hub revision applies) instead of the caller's source.
     """
@@ -2039,7 +2039,7 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
             if not normalization_path.is_file():
                 raise FileNotFoundError(
                     "Existing ISAAC package needs policy_normalization.json to hydrate its "
-                    "Genesis-compatible training prompt contract."
+                    "training prompt contract."
                 )
             metadata = hydrate_isaac_training_proprio_contract(
                 IsaacMharmonyRenderMetadata(**step.render_metadata),
@@ -2140,7 +2140,9 @@ def make_perceptron_isaac_pre_post_processors_from_pretrained(
                 or stats.action_horizon != config.chunk_size
                 or stats.target_fps != config.target_fps
             ):
-                raise ValueError(f"LIBERO stats for {config.libero_suite!r} disagree with the policy contract.")
+                raise ValueError(
+                    f"LIBERO stats for {config.libero_suite!r} disagree with the policy contract."
+                )
             stats = _maybe_passthrough_grippers(config, stats)
             require_closed_loop_safe_isaac_stats(stats)
             _install_normalization_stats(preprocessor, postprocessor, stats)

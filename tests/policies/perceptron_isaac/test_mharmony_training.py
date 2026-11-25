@@ -26,9 +26,9 @@ from lerobot.policies.perceptron_isaac.mharmony_adapter import (
     rendered_stream_to_local_tensor_stream,
 )
 from lerobot.policies.perceptron_isaac.mharmony_native import (
-    GENESIS_TEXT_TYPE_ACTION,
-    GENESIS_TEXT_TYPE_ACTION_C,
-    GENESIS_TEXT_TYPE_TAG,
+    TEXT_TYPE_ACTION,
+    TEXT_TYPE_ACTION_C,
+    TEXT_TYPE_TAG,
     IsaacMharmonyContentPlan,
     IsaacMharmonyRenderMetadata,
     IsaacNativeMharmonyRenderer,
@@ -111,8 +111,8 @@ def test_joint_plan_places_flow_marker_immediately_before_fast_span():
 
     assert len(plan.assistant_content) == 2
     marker, fast = plan.assistant_content
-    assert marker["tags"][GENESIS_TEXT_TYPE_TAG] == GENESIS_TEXT_TYPE_ACTION_C
-    assert fast["tags"][GENESIS_TEXT_TYPE_TAG] == GENESIS_TEXT_TYPE_ACTION
+    assert marker["tags"][TEXT_TYPE_TAG] == TEXT_TYPE_ACTION_C
+    assert fast["tags"][TEXT_TYPE_TAG] == TEXT_TYPE_ACTION
     assert fast["tokens"] == [7, 8]
     np.testing.assert_allclose(marker["tags"]["action_target"], action)
     for key in ("action_index", "action_window", "action_indices", "action_is_pad"):
@@ -155,12 +155,12 @@ class _StubFastProcessor:
 
 
 def test_fast_and_flow_targets_are_clipped_independently():
-    """Genesis lowers FAST and Flow through separate transforms with independent caps.
+    """FAST and Flow are lowered through separate transforms with independent caps.
 
     ``fast_tokenizer`` defaults to ``clip_normalized_max=1.0`` while
     ``attach_flow_matching_action_target`` takes the recipe's value (10.0 for the shipped
     LIBERO identity) — the ``fastcap1_flowcap10`` run naming. Sharing a single clipped array
-    feeds the tokenizer an action distribution Genesis never trains it on: on
+    feeds the tokenizer an action distribution it was never trained on: on
     lerobot/libero_spatial_image, |normalized| reaches 1.99, so the 1.0 cap binds on ~1.4% of
     values across ~9.4% of frames while the 10.0 cap never binds at all.
     """
@@ -197,12 +197,11 @@ def test_fast_and_flow_targets_are_clipped_independently():
 
 
 def test_non_terminal_training_chunks_supervise_the_return_footer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Genesis sets message_stop_token="return" for every chunk short of the terminal step.
+    """message_stop_token is "return" for every chunk short of the terminal step.
 
-    ``_action_completion_metadata`` (core/datasets/augment/trajectory.py) attaches the token
-    whenever the chunk is non-terminal, and ``render_document_to_stream`` then swaps the
-    rendered ``<|end|>`` footer for ``<|return|>``. Genesis's LeRobot-native training builder
-    emits a window that never reaches the terminal step, so this is the default.
+    The token is attached whenever the chunk is non-terminal, and the rendered ``<|end|>``
+    footer is then swapped for ``<|return|>``. The default training window never reaches the
+    terminal step, so this is the default.
     """
     assert _footer_rewrite_for(None, monkeypatch) is True
     assert _footer_rewrite_for(False, monkeypatch) is True
@@ -212,7 +211,7 @@ def test_terminal_training_chunks_keep_the_end_footer(monkeypatch: pytest.Monkey
     assert _footer_rewrite_for(True, monkeypatch) is False
 
 
-def test_joint_plan_exactly_matches_genesis_final_prompt_metadata():
+def test_joint_plan_exactly_matches_final_prompt_metadata():
     bounds = IsaacStatsBlock(q01=np.zeros(14), q99=np.ones(14))
     stats = IsaacNormalizationStats(
         schema="flow_matching_stats_v1",
@@ -278,7 +277,7 @@ def test_joint_plan_exactly_matches_genesis_final_prompt_metadata():
     flow, fast = plan.assistant_content
     shared_keys = {
         "token_group",
-        GENESIS_TEXT_TYPE_TAG,
+        TEXT_TYPE_TAG,
         "action_index",
         "trajectory_action",
         "objective_form",
@@ -327,7 +326,7 @@ def test_public_rendered_stream_lowering_preserves_isaac_contract():
                     "time": [0.5, 0.5],
                     "modality": "text",
                     "role": "developer",
-                    "tags": {GENESIS_TEXT_TYPE_TAG: "timestamp"},
+                    "tags": {TEXT_TYPE_TAG: "timestamp"},
                     "data": {"Tokens": [21]},
                 },
                 {
@@ -350,7 +349,7 @@ def test_public_rendered_stream_lowering_preserves_isaac_contract():
                     "role": "assistant",
                     "channel": "final",
                     "tags": {
-                        GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C,
+                        TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C,
                         "action_target": [[0.25, -0.5]],
                         "action_is_pad": [False],
                     },
@@ -762,7 +761,7 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
                             "modality": "text",
                             "role": "assistant",
                             "channel": "final",
-                            "tags": {GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C},
+                            "tags": {TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C},
                             "data": {"Tokens": [248_087]},
                         }
                     ]
@@ -785,7 +784,7 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
                 "kind": "timestamp",
                 "normalized_seconds": 1.25,
                 "precision": 2,
-                "tags": {GENESIS_TEXT_TYPE_TAG: "timestamp"},
+                "tags": {TEXT_TYPE_TAG: "timestamp"},
             },
             {
                 "kind": "image",
@@ -805,7 +804,7 @@ def test_native_renderer_constructs_the_public_conversation_directly(monkeypatch
             {
                 "kind": "tokens",
                 "tokens": [0],
-                "tags": {GENESIS_TEXT_TYPE_TAG: GENESIS_TEXT_TYPE_ACTION_C},
+                "tags": {TEXT_TYPE_TAG: TEXT_TYPE_ACTION_C},
             }
         ],
     )
@@ -943,8 +942,8 @@ def test_real_cached_fast_and_mharmony_render_joint_training_stream(
         assert controls
         return controls[-1]
 
-    # Genesis supervises <|return|> for any chunk short of the trajectory's terminal step, and
-    # its LeRobot-native builder never reaches that step, so the default render carries
+    # <|return|> is supervised for any chunk short of the trajectory's terminal step, and
+    # the default training window never reaches that step, so the default render carries
     # <|return|>. Only an explicitly terminal chunk keeps <|end|>.
     assert final_control_id(stream) == return_id
 
